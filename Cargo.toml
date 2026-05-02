@@ -1,0 +1,30 @@
+[package]
+name = "everly"
+version = "0.1.0"
+edition = "2024"
+description = "Everly — a 3D strategy-camera sandbox built with Bevy 0.18."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+bevy = "0.18.1"
+bevy_water = "0.18.1"
+rand = "0.8"
+
+# Opt-in feature for blazing-fast iterative dev builds via Bevy's dynamic linking.
+# Enable with: `cargo run --features dev`
+[features]
+default = []
+dev = ["bevy/dynamic_linking"]
+
+# Keep debug builds snappy by trimming Bevy's heavy compile-time work
+# without sacrificing runtime performance.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,190 @@
+//! Strategy-style camera: a tilted overhead view that pans on the world's
+//! XZ plane via WASD or arrow keys (with velocity and coasting), and zooms
+//! with the mouse wheel.
+
+use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
+use bevy::pbr::{ScreenSpaceAmbientOcclusion, ScreenSpaceReflections};
+use bevy::post_process::bloom::Bloom;
+use bevy::prelude::*;
+use bevy::render::view::Hdr;
+
+/// Marker + parameters for the player-controlled strategy camera.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct StrategyCamera {
+    /// World-space ground point the camera orbits around.
+    pub focus: Vec3,
+    /// Ground-plane pan velocity in world space (Y should stay zero).
+    pub pan_velocity: Vec3,
+    /// Distance from `focus` to the camera position, in world units.
+    pub distance: f32,
+    /// Yaw around the world Y axis, in radians (0 looks toward -Z).
+    pub yaw: f32,
+    /// Tilt below the horizon, in radians (π/2 = straight down).
+    pub pitch: f32,
+    /// Max pan speed in world units per second at the reference distance.
+    pub pan_speed: f32,
+    /// How quickly pan velocity approaches the target while keys are held
+    /// (world units per second squared, scaled like `pan_speed`).
+    pub pan_acceleration: f32,
+    /// Exponential decay rate for `pan_velocity` when no pan input (per second).
+    /// Higher values stop the camera sooner after key release.
+    pub pan_drag: f32,
+    /// Zoom speed in world units per scroll tick.
+    pub zoom_speed: f32,
+    /// Distance bounds the zoom is clamped to.
+    pub min_distance: f32,
+    pub max_distance: f32,
+}
+
+impl Default for StrategyCamera {
+    fn default() -> Self {
+        Self {
+            focus: Vec3::ZERO,
+            pan_velocity: Vec3::ZERO,
+            distance: 30.0,
+            yaw: 0.0,
+            pitch: 55.0_f32.to_radians(),
+            pan_speed: 18.0,
+            pan_acceleration: 55.0,
+            pan_drag: 3.2,
+            zoom_speed: 4.0,
+            min_distance: 8.0,
+            max_distance: 80.0,
+        }
+    }
+}
+
+/// Reference distance used to scale pan speed. Panning feels equally fast
+/// regardless of how zoomed-in or zoomed-out the player currently is.
+const PAN_REFERENCE_DISTANCE: f32 = 30.0;
+
+pub struct StrategyCameraPlugin;
+
+impl Plugin for StrategyCameraPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(Startup, spawn_camera)
+            .add_systems(Update, (pan_camera, zoom_camera, sync_camera_transform));
+    }
+}
+
+fn spawn_camera(mut commands: Commands) {
+    let cam = StrategyCamera::default();
+    let transform = strategy_transform(&cam);
+
+    commands.spawn((
+        Name::new("Strategy Camera"),
+        Camera3d::default(),
+        Hdr,
+        Tonemapping::TonyMcMapface,
+        Bloom {
+            // Bloom strength for the whole view; per-mesh glow comes from
+            // `StandardMaterial::emissive` in linear luminance (nits).
+            intensity: 0.26,
+            ..Bloom::default()
+        },
+        // Requires deferred + prepasses (`DepthPrepass`, `DeferredPrepass` via `#[require]`).
+        ScreenSpaceReflections {
+            // Only fairly smooth pixels trace SSR; rougher surfaces skip (less mirror-like).
+            perceptual_roughness_threshold: 0.68,
+            ..Default::default()
+        },
+        // SSAO: needs depth + normal prepasses (`#[require]` on the component).
+        ScreenSpaceAmbientOcclusion::default(),
+        transform,
+        cam,
+    ));
+}
+
+fn pan_camera(keys: Res<ButtonInput<KeyCode>>, time: Res<Time>, mut cameras: Query<&mut StrategyCamera>) {
+    let mut input = Vec2::ZERO;
+    if keys.any_pressed([KeyCode::KeyW, KeyCode::ArrowUp]) {
+        input.y += 1.0;
+    }
+    if keys.any_pressed([KeyCode::KeyS, KeyCode::ArrowDown]) {
+        input.y -= 1.0;
+    }
+    if keys.any_pressed([KeyCode::KeyA, KeyCode::ArrowLeft]) {
+        input.x -= 1.0;
+    }
+    if keys.any_pressed([KeyCode::KeyD, KeyCode::ArrowRight]) {
+        input.x += 1.0;
+    }
+
+    let has_input = input != Vec2::ZERO;
+    let input_dir = if has_input {
+        input.normalize()
+    } else {
+        Vec2::ZERO
+    };
+
+    let dt = time.delta_secs();
+
+    for mut cam in &mut cameras {
+        let (sin_yaw, cos_yaw) = cam.yaw.sin_cos();
+        // Ground-plane basis derived from yaw. At yaw = 0:
+        //   forward = -Z (into the screen)
+        //   right   = +X
+        let forward = Vec3::new(-sin_yaw, 0.0, -cos_yaw);
+        let right = Vec3::new(cos_yaw, 0.0, -sin_yaw);
+
+        let scale = (cam.distance / PAN_REFERENCE_DISTANCE).max(0.25);
+
+        if has_input {
+            let desired = (right * input_dir.x + forward * input_dir.y) * cam.pan_speed * scale;
+            let max_step = cam.pan_acceleration * scale * dt;
+            cam.pan_velocity = cam.pan_velocity.move_towards(desired, max_step);
+        } else {
+            let factor = (-cam.pan_drag * dt).exp();
+            cam.pan_velocity *= factor;
+            if cam.pan_velocity.length_squared() < 1e-6 {
+                cam.pan_velocity = Vec3::ZERO;
+            }
+        }
+
+        let vel = cam.pan_velocity;
+        cam.focus += vel * dt;
+    }
+}
+
+fn zoom_camera(
+    mut wheel_messages: MessageReader<MouseWheel>,
+    mut cameras: Query<&mut StrategyCamera>,
+) {
+    let mut scroll = 0.0;
+    for ev in wheel_messages.read() {
+        scroll += match ev.unit {
+            MouseScrollUnit::Line => ev.y,
+            // Trackpads emit pixel deltas; rescale so they feel similar to a wheel notch.
+            MouseScrollUnit::Pixel => ev.y * 0.05,
+        };
+    }
+
+    if scroll == 0.0 {
+        return;
+    }
+
+    for mut cam in &mut cameras {
+        let new_distance = cam.distance - scroll * cam.zoom_speed;
+        cam.distance = new_distance.clamp(cam.min_distance, cam.max_distance);
+    }
+}
+
+fn sync_camera_transform(mut cameras: Query<(&StrategyCamera, &mut Transform), Changed<StrategyCamera>>) {
+    for (cam, mut transform) in &mut cameras {
+        *transform = strategy_transform(cam);
+    }
+}
+
+/// Build a camera `Transform` that places it `distance` units away from
+/// `focus`, tilted by `pitch` and rotated by `yaw`, looking at `focus`.
+fn strategy_transform(cam: &StrategyCamera) -> Transform {
+    let (sin_yaw, cos_yaw) = cam.yaw.sin_cos();
+    let (sin_pitch, cos_pitch) = cam.pitch.sin_cos();
+
+    // Direction from focus toward the camera.
+    let offset = Vec3::new(sin_yaw * cos_pitch, sin_pitch, cos_yaw * cos_pitch);
+    let position = cam.focus + offset * cam.distance;
+
+    Transform::from_translation(position).looking_at(cam.focus, Vec3::Y)
+}

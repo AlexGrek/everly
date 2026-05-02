@@ -1,0 +1,16 @@
+# Cargo build output
+/target/
+
+# rustfmt backups
+**/*.rs.bk
+
+# Local env / secrets (never commit)
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# Editor swap / temp
+*.swp
+*~

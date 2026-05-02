@@ -1,0 +1,25 @@
+# Fast-compile setup recommended by Bevy 0.18.
+#
+# The defaults here are safe everywhere. Uncomment a target block below to
+# switch to `lld` / `mold`, which can cut iterative debug link times by 5-10x.
+#
+# macOS (Apple Silicon) — requires `brew install llvm`:
+# [target.aarch64-apple-darwin]
+# rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/opt/llvm/bin/ld64.lld"]
+#
+# macOS (Intel) — requires `brew install llvm`:
+# [target.x86_64-apple-darwin]
+# rustflags = ["-C", "link-arg=-fuse-ld=/usr/local/opt/llvm/bin/ld64.lld"]
+#
+# Linux — requires `sudo apt install lld clang` (or `mold`):
+# [target.x86_64-unknown-linux-gnu]
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+#
+# Windows — requires `cargo install -f cargo-binutils` and `rustup component add llvm-tools-preview`:
+# [target.x86_64-pc-windows-msvc]
+# linker = "rust-lld.exe"
+
+[build]
+# Share build artifacts across workspaces if you have multiple Bevy projects.
+# target-dir = "../target"
