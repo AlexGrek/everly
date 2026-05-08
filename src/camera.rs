@@ -75,6 +75,7 @@ fn spawn_camera(mut commands: Commands) {
     commands.spawn((
         Name::new("Strategy Camera"),
         Camera3d::default(),
+        Msaa::Off,
         Hdr,
         Tonemapping::TonyMcMapface,
         Bloom {

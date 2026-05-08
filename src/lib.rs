@@ -13,6 +13,10 @@ use bevy_water::{WaterPlugin, WaterQuality, WaterSettings};
 pub mod boxes;
 pub mod camera;
 pub mod ground;
+pub mod hypermap;
+pub mod hypermap_world;
+pub mod sun;
+pub mod world_map;
 
 /// Aggregates every gameplay subsystem of Everly.
 pub struct GamePlugin;
@@ -27,7 +31,7 @@ impl Plugin for GamePlugin {
             .insert_resource(DefaultOpaqueRendererMethod::deferred())
             .insert_resource(WaterSettings {
                 spawn_tiles: None,
-                height: ground::WATER_SURFACE_Y,
+                height: world_map::WATER_SURFACE_Y,
                 amplitude: 0.5,
                 clarity: 0.38,
                 water_quality: WaterQuality::High,
@@ -37,8 +41,8 @@ impl Plugin for GamePlugin {
             .add_plugins((
                 WaterPlugin,
                 camera::StrategyCameraPlugin,
-                ground::GroundPlugin,
-                boxes::BoxesPlugin,
+                hypermap_world::HypermapWorldPlugin,
+                sun::SunPlugin,
             ));
     }
 }

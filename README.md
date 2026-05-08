@@ -13,6 +13,12 @@ The starter scene gives you:
   (heights **3–8** in whole units; random occupied cells in the ~73×73 field;
   some dark, some emissive) to fly over.
 
+## Map authoring
+
+The startup tilemap is read from `world_map.txt` on each run.
+
+For token format and rendering semantics, see `docs/tilemap.md`.
+
 ## Project layout
 
 The game is split into small focused submodules, each exposing a single

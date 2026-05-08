@@ -22,6 +22,8 @@ Rust, `Cargo.toml`, or `*.wgsl` files. It is the source of truth for
 Bevy 0.18 idioms (observers, atmospheres, post-processing, UI, cameras,
 features, fast-compile setup).
 
+For the tilemap text format used at startup, see `docs/tilemap.md`.
+
 ## Repository layout
 
 ```
@@ -30,13 +32,15 @@ everly/
 ├── .cargo/config.toml    # safe defaults + commented lld blocks
 ├── README.md             # user-facing docs (run, controls, license)
 ├── CLAUDE.md             # this file
+├── world_map.txt         # startup map input (2 chars per cell)
+├── docs/
+│   └── tilemap.md        # tilemap encoding + authoring guide
 ├── .claude/SKILLS/       # repo-local skills (read these first)
 └── src/
     ├── main.rs           # window setup + DefaultPlugins + GamePlugin
     ├── lib.rs            # GamePlugin wires every submodule
     ├── camera.rs         # StrategyCameraPlugin
-    ├── ground.rs         # GroundPlugin (200×200 plane)
-    └── boxes.rs          # BoxesPlugin (sparse grid columns + emissive mix)
+    └── world_map.rs      # parser + world floor data + tilemap rendering
 ```
 
 ## Architecture conventions
