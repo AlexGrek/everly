@@ -13,33 +13,42 @@ use bevy::prelude::*;
 use bevy::render::render_resource::PrimitiveTopology;
 use bevy::tasks::{AsyncComputeTaskPool, Task};
 use bevy_water::water::material::{StandardWaterMaterial, WaterMaterial};
-use bevy_water::{setup_water, WaterQuality, WaterSettings, WaterTile, WaterTiles, WaveDirection};
+use bevy_water::{WaterQuality, WaterSettings, WaterTile, WaterTiles, WaveDirection};
 use futures_lite::future;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::camera::StrategyCamera;
-use crate::floor_level::{ActiveFloorLevel, HYPERMAP_FLOOR_HEIGHT, HYPERMAP_WALL_HEIGHT};
-use crate::hypermap::{
+use crate::edit::map_selection::{floor_grid_click, MapSelectionRoadMaterial};
+use crate::map::floor_level::{ActiveFloorLevel, HYPERMAP_FLOOR_HEIGHT, HYPERMAP_WALL_HEIGHT};
+use crate::map::hypermap::{
     world_to_chunk_local, ChunkCoord, Hypermap, HypermapChunk, LocalCoord, HYPERMAP_CHUNK_SIZE,
     HYPERMAP_FLOOR_COUNT,
 };
-use crate::map_selection::{floor_grid_click, MapSelectionRoadMaterial};
-use crate::world_map::{
-    for_each_wall_segment, CellType, WallMask, WorldMapFloor, WALL_THICKNESS, MASK_EAST,
-    MASK_NORTH, MASK_SOUTH, MASK_WEST, WATER_SURFACE_Y,
+use crate::map::level::{chunk_geometry_path, try_load_chunk_geometry_file, LevelName};
+use crate::menu::main_menu::GameState;
+use crate::map::world_map::{
+    cell_passability, for_each_wall_segment, CellType, WallMask, WorldMapFloor, WALL_THICKNESS,
+    MASK_EAST, MASK_NORTH, MASK_SOUTH, MASK_WEST, WATER_SURFACE_Y, WORLD_MAP_FILE_PATH,
 };
+use crate::scene::camera::StrategyCamera;
 
 /// Wall slab height — [`HYPERMAP_WALL_HEIGHT`] (floor plane spacing is slightly larger).
 const WALL_HEIGHT: f32 = HYPERMAP_WALL_HEIGHT;
-/// Void margin around each generated chunk (water / shoreline).
-const PROCEDURAL_VOID_MARGIN: u8 = 2;
+/// Border-cell margin reserved between chunk edges and house plots in
+/// procedurally generated chunks. The margin itself is **road**, not void, so
+/// adjacent chunks meet flush; only houses are inset.
+const PROCEDURAL_VOID_MARGIN: i32 = 2;
+/// Floor-0 void must fall inside this inset (local cell coords) before a water
+/// plane is spawned; the water mesh is also shrunk by this strip so nothing
+/// renders in the chunk border band.
+const WATER_MESH_EDGE_STRIP: i32 = PROCEDURAL_VOID_MARGIN;
+/// Chance a procedural chunk gets a small interior void pond (after houses).
+const PROCEDURAL_POND_CHUNK_CHANCE: f64 = 0.045;
 /// Alley width between house plots in procedural chunks.
-const PROCEDURAL_ALLEY: u8 = 2;
-const WORLD_MAP_FILE_PATH: &str = "world_map.txt";
+const PROCEDURAL_ALLEY: i32 = 2;
 const WORLD_MAP_FLOOR1_FILE_PATH: &str = "world_map_floor1.txt";
 const CENTER_CHUNK: ChunkCoord = ChunkCoord { x: 0, y: 0 };
-const DEAD_ZONE_SIZE: u8 = 20;
+const DEAD_ZONE_SIZE: i32 = 20;
 const RENDER_TICK_HZ: f32 = 30.0;
 const MAX_SPAWNS_PER_TICK: usize = 1;
 const MAX_DESPAWNS_PER_TICK: usize = 1;
@@ -82,6 +91,11 @@ pub fn queue_hypermap_chunk_remesh(queue: &mut HypermapChunkRemeshQueue, world_x
 #[derive(Resource)]
 pub(crate) struct HypermapRuntime {
     pub(crate) map: Arc<Hypermap<CellType>>,
+    /// Per-cell static passability (`0.0` blocked, `1.0` walkable) mirroring [`map`](Self::map).
+    /// Derived from [`CellType`] via [`cell_passability`] whenever a chunk is generated or a
+    /// cell is edited (see [`write_world_cell`] / [`ensure_chunk_generated`]). "Static" because
+    /// no runtime obstacles (units, doors) participate — only the authored / procedural geometry.
+    pub(crate) static_passability_map: Arc<Hypermap<f32>>,
     desired_chunks: HashSet<ChunkCoord>,
     chunk_roots: HashMap<ChunkCoord, Entity>,
     chunk_upper_meshes: HashMap<ChunkCoord, ChunkUpperMeshEntities>,
@@ -90,23 +104,24 @@ pub(crate) struct HypermapRuntime {
     ready_renders: VecDeque<(ChunkCoord, PreparedChunkRender)>,
     despawn_queue: VecDeque<ChunkCoord>,
     last_center_chunk: Option<ChunkCoord>,
-    active_side: HorizontalSide,
     water_root: Entity,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HorizontalSide {
-    West,
-    East,
+impl HypermapRuntime {
+    /// Chunk coordinates currently targeted for rendering (see `update_visible_hypermap_chunks`).
+    pub fn desired_chunk_coords(&self) -> Vec<ChunkCoord> {
+        self.desired_chunks.iter().copied().collect()
+    }
 }
 
 struct PreparedChunkRender {
-    /// True when ground floor (`0`) has void in this chunk (drives shoreline water for that chunk).
+    /// True when floor `0` has void **strictly inside** [`WATER_MESH_EDGE_STRIP`]
+    /// from each chunk edge — drives an inset water plane (no water in the border band).
     has_void_floor0_water: bool,
     /// Non-void ground floor tiles (never depends on HUD floor; mesh is baked once per chunk).
-    floor0_cells: Vec<(u8, u8, CellType)>,
+    floor0_cells: Vec<(i32, i32, CellType)>,
     /// Upper-floor tiles for the active level at **bake** time (`floor > 0 && floor >= active_floor`).
-    upper_cells: Vec<(u8, u8, u8, CellType)>,
+    upper_cells: Vec<(i32, i32, i32, CellType)>,
 }
 
 #[derive(Resource)]
@@ -116,6 +131,8 @@ struct ChunkRenderCadence {
 
 #[derive(Resource)]
 struct HypermapRenderAssets {
+    /// Horizontal water plane sized to the chunk **interior** (excluding
+    /// [`WATER_MESH_EDGE_STRIP`] cells on each side) so water never covers the border band.
     water_mesh: Handle<Mesh>,
     /// Invisible placeholder mesh for upper layers when empty.
     empty_mesh: Handle<Mesh>,
@@ -128,17 +145,24 @@ pub struct HypermapWorldPlugin;
 
 impl Plugin for HypermapWorldPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, setup_hypermap_runtime)
-            .add_systems(Startup, setup_hypermap_assets.after(setup_hypermap_runtime).after(setup_water))
-            .add_systems(
-                Update,
-                (
-                    refresh_chunk_upper_layers_on_floor_change,
-                    update_visible_hypermap_chunks,
-                    render_chunks_30fps,
-                )
-                    .chain(),
-            );
+        // `setup_water` runs in `Startup` (before any state transition), so by
+        // the time we enter `GameState::InGame` its resources are ready and
+        // the cross-schedule `.after(setup_water)` from before is no longer
+        // needed.
+        app.add_systems(
+            OnEnter(GameState::InGame),
+            (setup_hypermap_runtime, setup_hypermap_assets).chain(),
+        )
+        .add_systems(
+            Update,
+            (
+                refresh_chunk_upper_layers_on_floor_change,
+                update_visible_hypermap_chunks,
+                render_chunks_30fps,
+            )
+                .chain()
+                .run_if(in_state(GameState::InGame)),
+        );
     }
 }
 
@@ -149,6 +173,7 @@ fn setup_hypermap_runtime(mut commands: Commands) {
     commands.init_resource::<HypermapChunkRemeshQueue>();
     commands.insert_resource(HypermapRuntime {
         map: Arc::new(Hypermap::new(CellType::Road)),
+        static_passability_map: Arc::new(Hypermap::new(cell_passability(CellType::Road))),
         desired_chunks: HashSet::new(),
         chunk_roots: HashMap::new(),
         chunk_upper_meshes: HashMap::new(),
@@ -157,7 +182,6 @@ fn setup_hypermap_runtime(mut commands: Commands) {
         ready_renders: VecDeque::new(),
         despawn_queue: VecDeque::new(),
         last_center_chunk: None,
-        active_side: HorizontalSide::East,
         water_root,
     });
     commands.insert_resource(ChunkRenderCadence {
@@ -172,8 +196,8 @@ fn setup_hypermap_assets(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut water_materials: ResMut<Assets<StandardWaterMaterial>>,
 ) {
-    let chunk_size = HYPERMAP_CHUNK_SIZE as f32;
-    let water_mesh = meshes.add(PlaneMeshBuilder::from_size(Vec2::new(chunk_size, chunk_size)));
+    let interior = (HYPERMAP_CHUNK_SIZE - 2 * WATER_MESH_EDGE_STRIP).max(1) as f32;
+    let water_mesh = meshes.add(PlaneMeshBuilder::from_size(Vec2::new(interior, interior)));
     let empty_mesh = meshes.add(PlaneMeshBuilder::from_size(Vec2::splat(0.02)));
 
     let road_material = materials.add(StandardMaterial {
@@ -190,8 +214,8 @@ fn setup_hypermap_assets(
         ..default()
     });
     let normalized_dir = settings.wave_direction.normalize_or_zero();
-    let coord_scale = Vec2::splat(chunk_size);
-    let coord_offset = Vec2::splat(-chunk_size * 0.5);
+    let coord_scale = Vec2::splat(interior);
+    let coord_offset = Vec2::splat(-interior * 0.5);
     let water_material = water_materials.add(StandardWaterMaterial {
         base: StandardMaterial {
             base_color: settings.base_color,
@@ -227,7 +251,7 @@ fn setup_hypermap_assets(
 
 fn refresh_chunk_upper_layers_on_floor_change(
     floor: Res<ActiveFloorLevel>,
-    mut prev_floor: Local<Option<u8>>,
+    mut prev_floor: Local<Option<i32>>,
     runtime: Res<HypermapRuntime>,
     mut meshes: ResMut<Assets<Mesh>>,
     assets: Res<HypermapRenderAssets>,
@@ -294,6 +318,7 @@ fn update_visible_hypermap_chunks(
     mut runtime: ResMut<HypermapRuntime>,
     cameras: Query<&StrategyCamera>,
     active_floor: Res<ActiveFloorLevel>,
+    level: Res<LevelName>,
 ) {
     let Ok(camera) = cameras.single() else {
         return;
@@ -311,8 +336,7 @@ fn update_visible_hypermap_chunks(
         return;
     }
 
-    runtime.active_side = select_horizontal_side(local.x, runtime.active_side);
-    let target_chunks = target_chunks_for(center, runtime.active_side);
+    let target_chunks = target_chunks_for(center);
     if target_chunks == runtime.desired_chunks {
         return;
     }
@@ -331,7 +355,12 @@ fn update_visible_hypermap_chunks(
     let task_pool = AsyncComputeTaskPool::get();
     let floor_for_render = active_floor.0;
     for chunk in target_chunks.iter().copied() {
-        ensure_chunk_generated(&runtime.map, chunk);
+        ensure_chunk_generated(
+            &runtime.map,
+            &runtime.static_passability_map,
+            chunk,
+            level.0.as_str(),
+        );
         if runtime.chunk_roots.contains_key(&chunk) || runtime.pending_renders.contains_key(&chunk) {
             continue;
         }
@@ -358,6 +387,7 @@ fn render_chunks_30fps(
     mut runtime: ResMut<HypermapRuntime>,
     mut remesh: ResMut<HypermapChunkRemeshQueue>,
     active_floor: Res<ActiveFloorLevel>,
+    level: Res<LevelName>,
     roots: Query<Entity, With<RenderedChunkRoot>>,
     waters: Query<Entity, With<RenderedChunkWater>>,
 ) {
@@ -366,10 +396,15 @@ fn render_chunks_30fps(
         if !runtime.desired_chunks.contains(&coord) {
             continue;
         }
-        ensure_chunk_generated(&runtime.map, coord);
-        if runtime.chunk_roots.contains_key(&coord) {
-            despawn_chunk_entities(&mut commands, &mut runtime, &roots, &waters, coord);
-        }
+        ensure_chunk_generated(
+            &runtime.map,
+            &runtime.static_passability_map,
+            coord,
+            level.0.as_str(),
+        );
+        // Keep existing meshes until the new bake is ready; despawn happens in the
+        // `ready_renders` spawn path. Eager despawn here left a hole (async bake +
+        // 30 Hz cadence) and read as a black blink on each paint click.
         runtime.pending_renders.remove(&coord);
         runtime
             .ready_renders
@@ -400,7 +435,7 @@ fn render_chunks_30fps(
     }
 
     cadence.timer.tick(time.delta());
-    if !cadence.timer.just_finished() {
+    if !cadence.timer.just_finished() && runtime.ready_renders.is_empty() {
         return;
     }
 
@@ -495,12 +530,23 @@ fn despawn_chunk_entities(
     }
 }
 
-pub(crate) fn ensure_chunk_generated(map: &Hypermap<CellType>, coord: ChunkCoord) {
+pub(crate) fn ensure_chunk_generated(
+    map: &Hypermap<CellType>,
+    passability: &Hypermap<f32>,
+    coord: ChunkCoord,
+    level_name: &str,
+) {
     if map.has_chunk(coord) {
         return;
     }
 
+    let path = chunk_geometry_path(level_name, coord);
     map.with_chunk_write(coord, |chunk| {
+        match try_load_chunk_geometry_file(&path, chunk) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => warn!("level geometry `{}`: {e}", path.display()),
+        }
         fill_chunk_random(chunk, coord);
         if coord == CENTER_CHUNK {
             if let Err(err) = apply_world_map_file_to_floor(chunk, 0, WORLD_MAP_FILE_PATH) {
@@ -511,6 +557,47 @@ pub(crate) fn ensure_chunk_generated(map: &Hypermap<CellType>, coord: ChunkCoord
             }
         }
     });
+
+    mirror_chunk_into_passability(map, passability, coord);
+}
+
+/// Reads every cell of a freshly written world chunk and writes the corresponding
+/// passability value into the same chunk of [`HypermapRuntime::static_passability_map`].
+fn mirror_chunk_into_passability(
+    map: &Hypermap<CellType>,
+    passability: &Hypermap<f32>,
+    coord: ChunkCoord,
+) {
+    let Some(world_handle) = map.get_chunk(coord) else {
+        return;
+    };
+    let world = world_handle.read().expect("chunk lock poisoned");
+    passability.with_chunk_write(coord, |pchunk| {
+        for y in 0..HYPERMAP_CHUNK_SIZE {
+            for x in 0..HYPERMAP_CHUNK_SIZE {
+                let local = LocalCoord::new(x, y);
+                for floor in 0..HYPERMAP_FLOOR_COUNT as i32 {
+                    let cell = *world.get_local_floor(local, floor);
+                    pchunk.set_local_floor(local, floor, cell_passability(cell));
+                }
+            }
+        }
+    });
+}
+
+/// Writes a world cell **and** mirrors its passability in lock-step. Use this from edit
+/// systems instead of touching `runtime.map` directly so the two maps never drift.
+pub(crate) fn write_world_cell(
+    runtime: &HypermapRuntime,
+    world_x: i32,
+    world_y: i32,
+    floor: i32,
+    cell: CellType,
+) {
+    runtime.map.set_floor(world_x, world_y, floor, cell);
+    runtime
+        .static_passability_map
+        .set_floor(world_x, world_y, floor, cell_passability(cell));
 }
 
 fn fill_chunk_random(chunk: &mut HypermapChunk<CellType>, coord: ChunkCoord) {
@@ -520,33 +607,30 @@ fn fill_chunk_random(chunk: &mut HypermapChunk<CellType>, coord: ChunkCoord) {
 
 /// Procedural authoring only fills ground floor; upper levels stay open void until edited.
 fn clear_upper_floors_to_void(chunk: &mut HypermapChunk<CellType>) {
-    let sz = HYPERMAP_CHUNK_SIZE as u8;
+    let sz = HYPERMAP_CHUNK_SIZE;
     for y in 0..sz {
         for x in 0..sz {
             let local = LocalCoord::new(x, y);
-            for floor in 1..HYPERMAP_FLOOR_COUNT as u8 {
+            for floor in 1..HYPERMAP_FLOOR_COUNT as i32 {
                 chunk.set_local_floor(local, floor, CellType::Void);
             }
         }
     }
 }
 
-/// Seeded procedural neighborhood: void ring, streets, and rectangular houses with
-/// internal partitions and door gaps (missing wall segments on `__` cells).
+/// Seeded procedural neighborhood: full road carpet, streets, and rectangular
+/// houses with internal partitions and door gaps. House plots are inset from
+/// the chunk border by [`PROCEDURAL_VOID_MARGIN`] so adjacent chunks meet flush
+/// across roads — no void ring at chunk edges.
 fn fill_chunk_neighborhood(chunk: &mut HypermapChunk<CellType>, coord: ChunkCoord) {
     let seed = hash_chunk_seed(coord) ^ 0xBEE5_00D0_C0BB_1Eu64;
     let mut rng = StdRng::seed_from_u64(seed);
-    let sz = HYPERMAP_CHUNK_SIZE as u8;
+    let sz = HYPERMAP_CHUNK_SIZE;
     let m = PROCEDURAL_VOID_MARGIN;
 
     for y in 0..sz {
         for x in 0..sz {
-            let tile = if x < m || y < m || x >= sz - m || y >= sz - m {
-                CellType::Void
-            } else {
-                CellType::Road
-            };
-            chunk.set_local(LocalCoord::new(x, y), tile);
+            chunk.set_local(LocalCoord::new(x, y), CellType::Road);
         }
     }
 
@@ -568,27 +652,63 @@ fn fill_chunk_neighborhood(chunk: &mut HypermapChunk<CellType>, coord: ChunkCoor
         }
         ox += plot_w + PROCEDURAL_ALLEY;
     }
+
+    try_stamp_procedural_pond(chunk, &mut rng, sz, m);
+}
+
+/// Rare interior void blob on road cells only (keeps walls intact). Interior
+/// void enables the inset water plane (see [`partition_chunk_cells_from_vec`]).
+fn try_stamp_procedural_pond(chunk: &mut HypermapChunk<CellType>, rng: &mut StdRng, sz: i32, m: i32) {
+    if !rng.gen_bool(PROCEDURAL_POND_CHUNK_CHANCE) {
+        return;
+    }
+    let pad = m + 6;
+    if pad * 2 + 10 >= sz {
+        return;
+    }
+    let cx = rng.gen_range(pad..sz - pad);
+    let cy = rng.gen_range(pad..sz - pad);
+    let r = rng.gen_range(2.0..=5.5_f32);
+    let r2 = r * r;
+    let search = (r.ceil() as i32).max(2) + 1;
+    for dy in -search..=search {
+        for dx in -search..=search {
+            let x = cx + dx;
+            let y = cy + dy;
+            if x < m || y < m || x >= sz - m || y >= sz - m {
+                continue;
+            }
+            let d2 = (dx as f32 * dx as f32) + (dy as f32 * dy as f32);
+            if d2 > r2 {
+                continue;
+            }
+            let local = LocalCoord::new(x, y);
+            if matches!(*chunk.get_local(local), CellType::Road) {
+                chunk.set_local(local, CellType::Void);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 struct Plot {
-    x0: u8,
-    y0: u8,
-    w: u8,
-    h: u8,
+    x0: i32,
+    y0: i32,
+    w: i32,
+    h: i32,
 }
 
 impl Plot {
-    fn x1(self) -> u8 {
+    fn x1(self) -> i32 {
         self.x0 + self.w - 1
     }
 
-    fn y1(self) -> u8 {
+    fn y1(self) -> i32 {
         self.y0 + self.h - 1
     }
 }
 
-fn stamp_house(chunk: &mut HypermapChunk<CellType>, rng: &mut StdRng, x0: u8, y0: u8, w: u8, h: u8) {
+fn stamp_house(chunk: &mut HypermapChunk<CellType>, rng: &mut StdRng, x0: i32, y0: i32, w: i32, h: i32) {
     let p = Plot { x0, y0, w, h };
     if p.w < 8 || p.h < 8 {
         return;
@@ -609,8 +729,19 @@ fn stamp_house(chunk: &mut HypermapChunk<CellType>, rng: &mut StdRng, x0: u8, y0
     }
 }
 
-fn set_cell(chunk: &mut HypermapChunk<CellType>, x: u8, y: u8, t: CellType) {
+fn set_cell(chunk: &mut HypermapChunk<CellType>, x: i32, y: i32, t: CellType) {
     chunk.set_local(LocalCoord::new(x, y), t);
+}
+
+/// Adds `bit` to an existing wall cell, or creates a new wall with just `bit`.
+/// Used to merge horizontal/vertical wall bits at intersection cells.
+fn add_wall_edge(chunk: &mut HypermapChunk<CellType>, x: i32, y: i32, bit: u8) {
+    let local = LocalCoord::new(x, y);
+    let bits = match *chunk.get_local(local) {
+        CellType::Wall(mask) => mask.bits() | bit,
+        _ => bit,
+    };
+    chunk.set_local(local, wall_cell(bits));
 }
 
 fn wall_cell(bits: u8) -> CellType {
@@ -619,7 +750,7 @@ fn wall_cell(bits: u8) -> CellType {
 
 /// Clears one edge bit on a wall cell (opening onto road / interior). If no
 /// wall bits remain, the cell becomes [`CellType::Road`].
-fn clear_wall_edge_bit(chunk: &mut HypermapChunk<CellType>, x: u8, y: u8, bit: u8) {
+fn clear_wall_edge_bit(chunk: &mut HypermapChunk<CellType>, x: i32, y: i32, bit: u8) {
     let local = LocalCoord::new(x, y);
     let CellType::Wall(mask) = *chunk.get_local(local) else {
         return;
@@ -692,6 +823,7 @@ fn stamp_two_rooms_horizontal(chunk: &mut HypermapChunk<CellType>, rng: &mut Std
             continue;
         }
         set_cell(chunk, x, hy, wall_cell(MASK_SOUTH));
+        set_cell(chunk, x, hy + 1, wall_cell(MASK_NORTH));
     }
 }
 
@@ -722,7 +854,8 @@ fn stamp_three_rooms_el(chunk: &mut HypermapChunk<CellType>, rng: &mut StdRng, p
         if x == door_hx {
             continue;
         }
-        set_cell(chunk, x, hy, wall_cell(MASK_SOUTH));
+        add_wall_edge(chunk, x, hy, MASK_SOUTH);
+        add_wall_edge(chunk, x, hy + 1, MASK_NORTH);
     }
 }
 
@@ -759,6 +892,9 @@ fn stamp_four_rooms_quad(chunk: &mut HypermapChunk<CellType>, rng: &mut StdRng, 
         if y == hy {
             set_cell(chunk, vx, y, wall_cell(MASK_SOUTH | MASK_EAST));
             set_cell(chunk, vx + 1, y, wall_cell(MASK_SOUTH | MASK_WEST));
+        } else if y == hy + 1 {
+            set_cell(chunk, vx, y, wall_cell(MASK_NORTH | MASK_EAST));
+            set_cell(chunk, vx + 1, y, wall_cell(MASK_NORTH | MASK_WEST));
         } else {
             set_cell(chunk, vx, y, wall_cell(MASK_EAST));
             set_cell(chunk, vx + 1, y, wall_cell(MASK_WEST));
@@ -773,6 +909,7 @@ fn stamp_four_rooms_quad(chunk: &mut HypermapChunk<CellType>, rng: &mut StdRng, 
             continue;
         }
         set_cell(chunk, x, hy, wall_cell(MASK_SOUTH));
+        set_cell(chunk, x, hy + 1, wall_cell(MASK_NORTH));
     }
 }
 
@@ -894,7 +1031,7 @@ fn spawn_chunk_meshes(
     }
 }
 
-pub(crate) fn build_floor0_road_mesh(cells: &[(u8, u8, CellType)], origin_x: i32, origin_y: i32) -> Option<Mesh> {
+pub(crate) fn build_floor0_road_mesh(cells: &[(i32, i32, CellType)], origin_x: i32, origin_y: i32) -> Option<Mesh> {
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
     let mut uvs: Vec<[f32; 2]> = Vec::new();
@@ -927,7 +1064,7 @@ pub(crate) fn build_floor0_road_mesh(cells: &[(u8, u8, CellType)], origin_x: i32
     finalize_mesh_from_buffers(positions, normals, uvs, indices)
 }
 
-pub(crate) fn build_floor0_wall_mesh(cells: &[(u8, u8, CellType)], origin_x: i32, origin_y: i32) -> Option<Mesh> {
+pub(crate) fn build_floor0_wall_mesh(cells: &[(i32, i32, CellType)], origin_x: i32, origin_y: i32) -> Option<Mesh> {
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
     let mut uvs: Vec<[f32; 2]> = Vec::new();
@@ -978,7 +1115,7 @@ pub(crate) fn build_floor0_wall_mesh(cells: &[(u8, u8, CellType)], origin_x: i32
     finalize_mesh_from_buffers(positions, normals, uvs, indices)
 }
 
-pub(crate) fn build_upper_road_mesh(cells: &[(u8, u8, u8, CellType)], origin_x: i32, origin_y: i32) -> Option<Mesh> {
+pub(crate) fn build_upper_road_mesh(cells: &[(i32, i32, i32, CellType)], origin_x: i32, origin_y: i32) -> Option<Mesh> {
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
     let mut uvs: Vec<[f32; 2]> = Vec::new();
@@ -1012,7 +1149,7 @@ pub(crate) fn build_upper_road_mesh(cells: &[(u8, u8, u8, CellType)], origin_x: 
     finalize_mesh_from_buffers(positions, normals, uvs, indices)
 }
 
-pub(crate) fn build_upper_wall_mesh(cells: &[(u8, u8, u8, CellType)], origin_x: i32, origin_y: i32) -> Option<Mesh> {
+pub(crate) fn build_upper_wall_mesh(cells: &[(i32, i32, i32, CellType)], origin_x: i32, origin_y: i32) -> Option<Mesh> {
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
     let mut uvs: Vec<[f32; 2]> = Vec::new();
@@ -1201,10 +1338,10 @@ fn hash_chunk_seed(coord: ChunkCoord) -> u64 {
 
 fn clone_chunk_for_render_start(chunk: &HypermapChunk<CellType>) -> Vec<CellType> {
     let mut cells = Vec::with_capacity(HYPERMAP_CHUNK_SIZE as usize * HYPERMAP_CHUNK_SIZE as usize * HYPERMAP_FLOOR_COUNT);
-    for y in 0..HYPERMAP_CHUNK_SIZE as u8 {
-        for x in 0..HYPERMAP_CHUNK_SIZE as u8 {
+    for y in 0..HYPERMAP_CHUNK_SIZE {
+        for x in 0..HYPERMAP_CHUNK_SIZE {
             let local = LocalCoord::new(x, y);
-            for floor in 0..HYPERMAP_FLOOR_COUNT as u8 {
+            for floor in 0..HYPERMAP_FLOOR_COUNT as i32 {
                 cells.push(*chunk.get_local_floor(local, floor));
             }
         }
@@ -1214,26 +1351,31 @@ fn clone_chunk_for_render_start(chunk: &HypermapChunk<CellType>) -> Vec<CellType
 
 fn partition_chunk_cells_from_vec(
     cells: Vec<CellType>,
-    active_floor: u8,
-) -> (bool, Vec<(u8, u8, CellType)>, Vec<(u8, u8, u8, CellType)>) {
+    active_floor: i32,
+) -> (bool, Vec<(i32, i32, CellType)>, Vec<(i32, i32, i32, CellType)>) {
     let mut has_void_floor0_water = false;
     let mut floor0_cells = Vec::new();
     let mut upper_cells = Vec::new();
+    let w = WATER_MESH_EDGE_STRIP;
+    let sz = HYPERMAP_CHUNK_SIZE;
     let mut i = 0usize;
-    for y in 0..HYPERMAP_CHUNK_SIZE as u8 {
-        for x in 0..HYPERMAP_CHUNK_SIZE as u8 {
-            for floor in 0..HYPERMAP_FLOOR_COUNT as u8 {
+    for y in 0..HYPERMAP_CHUNK_SIZE {
+        for x in 0..HYPERMAP_CHUNK_SIZE {
+            for floor in 0..HYPERMAP_FLOOR_COUNT as i32 {
                 let cell_type = cells[i];
                 i += 1;
                 if cell_type == CellType::Void {
                     if floor == 0 {
-                        has_void_floor0_water = true;
+                        let interior = x >= w && y >= w && x < sz - w && y < sz - w;
+                        if interior {
+                            has_void_floor0_water = true;
+                        }
                     }
                     continue;
                 }
                 if floor == 0 {
                     floor0_cells.push((x, y, cell_type));
-                } else if active_floor > 0 && floor >= active_floor {
+                } else if floor == active_floor {
                     upper_cells.push((x, y, floor, cell_type));
                 }
             }
@@ -1242,7 +1384,7 @@ fn partition_chunk_cells_from_vec(
     (has_void_floor0_water, floor0_cells, upper_cells)
 }
 
-fn build_chunk_render_data(cells: Vec<CellType>, active_floor: u8) -> PreparedChunkRender {
+fn build_chunk_render_data(cells: Vec<CellType>, active_floor: i32) -> PreparedChunkRender {
     let (has_void_floor0_water, floor0_cells, upper_cells) = partition_chunk_cells_from_vec(cells, active_floor);
     PreparedChunkRender {
         has_void_floor0_water,
@@ -1251,54 +1393,35 @@ fn build_chunk_render_data(cells: Vec<CellType>, active_floor: u8) -> PreparedCh
     }
 }
 
-fn target_chunks_for(center: ChunkCoord, side: HorizontalSide) -> HashSet<ChunkCoord> {
-    let side_chunk = match side {
-        HorizontalSide::West => ChunkCoord::new(center.x - 1, center.y),
-        HorizontalSide::East => ChunkCoord::new(center.x + 1, center.y),
-    };
-    let north_of_side = ChunkCoord::new(side_chunk.x, side_chunk.y - 1);
-    HashSet::from([
-        center,
-        ChunkCoord::new(center.x, center.y - 1), // north
-        side_chunk,
-        north_of_side,
-    ])
-}
-
-fn select_horizontal_side(local_x: u8, current: HorizontalSide) -> HorizontalSide {
-    let distance_to_west = local_x as i32;
-    let distance_to_east = (HYPERMAP_CHUNK_SIZE - 1 - local_x as i32).max(0);
-    if distance_to_west < distance_to_east {
-        HorizontalSide::West
-    } else if distance_to_east < distance_to_west {
-        HorizontalSide::East
-    } else {
-        current
+fn target_chunks_for(center: ChunkCoord) -> HashSet<ChunkCoord> {
+    let mut set = HashSet::with_capacity(9);
+    for dy in -1i32..=1 {
+        for dx in -1i32..=1 {
+            set.insert(ChunkCoord::new(center.x + dx, center.y + dy));
+        }
     }
+    set
 }
 
 fn is_in_center_dead_zone(local: LocalCoord) -> bool {
-    let center = (HYPERMAP_CHUNK_SIZE / 2) as i32;
-    let half = (DEAD_ZONE_SIZE as i32) / 2;
+    let center = HYPERMAP_CHUNK_SIZE / 2;
+    let half = DEAD_ZONE_SIZE / 2;
     let min = center - half;
     let max = center + half;
-    let lx = local.x as i32;
-    let ly = local.y as i32;
-    lx >= min && lx < max && ly >= min && ly < max
+    local.x >= min && local.x < max && local.y >= min && local.y < max
 }
 
 fn apply_world_map_file_to_floor(
     chunk: &mut HypermapChunk<CellType>,
-    floor: u8,
+    floor: i32,
     path: &str,
 ) -> Result<(), String> {
     let text = std::fs::read_to_string(Path::new(path))
         .map_err(|err| format!("read `{path}`: {err}"))?;
     let map = WorldMapFloor::from_ascii(&text).map_err(|err| format!("parse `{path}`: {err}"))?;
 
-    let chunk_size = HYPERMAP_CHUNK_SIZE as usize;
-    let start_x = (chunk_size as i32 - map.width() as i32) / 2;
-    let start_y = (chunk_size as i32 - map.height() as i32) / 2;
+    let start_x = (HYPERMAP_CHUNK_SIZE - map.width() as i32) / 2;
+    let start_y = (HYPERMAP_CHUNK_SIZE - map.height() as i32) / 2;
 
     for map_y in 0..map.height() {
         for map_x in 0..map.width() {
@@ -1315,7 +1438,7 @@ fn apply_world_map_file_to_floor(
             let Some(cell) = map.get(map_x, map_y) else {
                 continue;
             };
-            let local = LocalCoord::new(local_x as u8, local_y as u8);
+            let local = LocalCoord::new(local_x, local_y);
             chunk.set_local_floor(local, floor, cell.get_cell_type());
         }
     }

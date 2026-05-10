@@ -1,13 +1,13 @@
 //! Hypermap: an infinite, chunked, concurrent tile store.
 //!
 //! World space is addressed by signed integer tile coordinates. Tiles are grouped
-//! into fixed 64x64 chunks that are allocated lazily on first write.
+//! into fixed 128x128 chunks that are allocated lazily on first write.
 //! Each chunk has its own lock so disconnected regions can be accessed concurrently.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-pub const HYPERMAP_CHUNK_SIZE: i32 = 64;
+pub const HYPERMAP_CHUNK_SIZE: i32 = 128;
 const HYPERMAP_CHUNK_AREA: usize = (HYPERMAP_CHUNK_SIZE as usize) * (HYPERMAP_CHUNK_SIZE as usize);
 /// Number of vertical floors per column (indices `0..HYPERMAP_FLOOR_COUNT`).
 pub const HYPERMAP_FLOOR_COUNT: usize = 10;
@@ -26,15 +26,17 @@ impl ChunkCoord {
     }
 }
 
-/// Local coordinate inside one 64x64 chunk.
+/// Local coordinate inside one 128x128 chunk. Components are `i32` so
+/// callers can do unrestricted arithmetic; values must be in
+/// `0..HYPERMAP_CHUNK_SIZE` when used to index a chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalCoord {
-    pub x: u8,
-    pub y: u8,
+    pub x: i32,
+    pub y: i32,
 }
 
 impl LocalCoord {
-    pub const fn new(x: u8, y: u8) -> Self {
+    pub const fn new(x: i32, y: i32) -> Self {
         Self { x, y }
     }
 }
@@ -58,12 +60,12 @@ where
     }
 
     #[inline]
-    pub fn get_local_floor(&self, local: LocalCoord, floor: u8) -> &T {
+    pub fn get_local_floor(&self, local: LocalCoord, floor: i32) -> &T {
         &self.cells[local_floor_to_index(local, floor)]
     }
 
     #[inline]
-    pub fn set_local_floor(&mut self, local: LocalCoord, floor: u8, value: T) {
+    pub fn set_local_floor(&mut self, local: LocalCoord, floor: i32, value: T) {
         self.cells[local_floor_to_index(local, floor)] = value;
     }
 
@@ -112,7 +114,7 @@ where
     }
 
     /// Tile at world `(x, y)` and elevation `floor` in `0..HYPERMAP_FLOOR_COUNT`.
-    pub fn get_floor(&self, world_x: i32, world_y: i32, floor: u8) -> T {
+    pub fn get_floor(&self, world_x: i32, world_y: i32, floor: i32) -> T {
         let (chunk, local) = world_to_chunk_local(world_x, world_y);
         if let Some(chunk_handle) = self.get_chunk(chunk) {
             let guard = chunk_handle.read().expect("chunk lock poisoned");
@@ -122,7 +124,7 @@ where
         }
     }
 
-    pub fn set_floor(&self, world_x: i32, world_y: i32, floor: u8, value: T) {
+    pub fn set_floor(&self, world_x: i32, world_y: i32, floor: i32, value: T) {
         let (chunk_coord, local) = world_to_chunk_local(world_x, world_y);
         let chunk_handle = self.get_or_create_chunk(chunk_coord);
         let mut guard = chunk_handle.write().expect("chunk lock poisoned");
@@ -150,6 +152,16 @@ where
 
     pub fn loaded_chunk_count(&self) -> usize {
         self.chunks.read().expect("hypermap lock poisoned").len()
+    }
+
+    /// Snapshot of every chunk coordinate currently held in memory. Order is unspecified.
+    pub fn loaded_chunks(&self) -> Vec<ChunkCoord> {
+        self.chunks
+            .read()
+            .expect("hypermap lock poisoned")
+            .keys()
+            .copied()
+            .collect()
     }
 
     pub fn get_chunk(&self, coord: ChunkCoord) -> Option<HypermapChunkHandle<T>> {
@@ -197,19 +209,21 @@ pub fn world_to_chunk_local(world_x: i32, world_y: i32) -> (ChunkCoord, LocalCoo
     let chunk_x = floor_div(world_x, HYPERMAP_CHUNK_SIZE);
     let chunk_y = floor_div(world_y, HYPERMAP_CHUNK_SIZE);
 
-    let local_x = floor_mod(world_x, HYPERMAP_CHUNK_SIZE) as u8;
-    let local_y = floor_mod(world_y, HYPERMAP_CHUNK_SIZE) as u8;
+    let local_x = floor_mod(world_x, HYPERMAP_CHUNK_SIZE);
+    let local_y = floor_mod(world_y, HYPERMAP_CHUNK_SIZE);
 
     (ChunkCoord::new(chunk_x, chunk_y), LocalCoord::new(local_x, local_y))
 }
 
 fn local_to_index(local: LocalCoord) -> usize {
+    debug_assert!(local.x >= 0 && local.x < HYPERMAP_CHUNK_SIZE);
+    debug_assert!(local.y >= 0 && local.y < HYPERMAP_CHUNK_SIZE);
     local.y as usize * HYPERMAP_CHUNK_SIZE as usize + local.x as usize
 }
 
 #[inline]
-fn local_floor_to_index(local: LocalCoord, floor: u8) -> usize {
-    debug_assert!((floor as usize) < HYPERMAP_FLOOR_COUNT);
+fn local_floor_to_index(local: LocalCoord, floor: i32) -> usize {
+    debug_assert!(floor >= 0 && (floor as usize) < HYPERMAP_FLOOR_COUNT);
     local_to_index(local) * HYPERMAP_FLOOR_COUNT + floor as usize
 }
 
@@ -230,15 +244,15 @@ mod tests {
     fn maps_negative_world_coords_to_correct_chunk_and_local() {
         let (chunk, local) = world_to_chunk_local(-1, -1);
         assert_eq!(chunk, ChunkCoord::new(-1, -1));
-        assert_eq!(local, LocalCoord::new(63, 63));
+        assert_eq!(local, LocalCoord::new(127, 127));
 
-        let (chunk, local) = world_to_chunk_local(-64, -64);
+        let (chunk, local) = world_to_chunk_local(-128, -128);
         assert_eq!(chunk, ChunkCoord::new(-1, -1));
         assert_eq!(local, LocalCoord::new(0, 0));
 
-        let (chunk, local) = world_to_chunk_local(-65, 64);
+        let (chunk, local) = world_to_chunk_local(-129, 128);
         assert_eq!(chunk, ChunkCoord::new(-2, 1));
-        assert_eq!(local, LocalCoord::new(63, 0));
+        assert_eq!(local, LocalCoord::new(127, 0));
     }
 
     #[test]

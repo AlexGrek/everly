@@ -1,25 +1,32 @@
 # In-game map editor
 
-Runtime tool for painting **hypermap** tiles under the cursor: void, road, bitmask walls, and corner pillars. Implemented as `MapEditPlugin` in `src/map_edit.rs`, wired from `GamePlugin` in `src/lib.rs` after `HypermapWorldPlugin` in `src/hypermap_world.rs`.
+Runtime tool for painting **hypermap** tiles under the cursor: void, road, bitmask walls, closed wall outlines (**Room**), and corner pillars. Implemented as `MapEditPlugin` in `src/edit/map_edit.rs`, wired from `GamePlugin` in `src/lib.rs` after `HypermapWorldPlugin` in `src/map/hypermap_world.rs`.
 
 This editor updates the **live hypermap** chunk data (see `hypermap.md`) and triggers a **chunk mesh rebuild**. It does **not** write `world_map.txt` or `world_map_floor1.txt`; those files are still the authored startup overlay for the center chunk only.
 
 ## Enabling the palette
 
 1. Press **Edit** in the bottom HUD (next to **Map**). The label toggles between `Edit` and `Edit ✓`.
-2. A **palette strip** appears just above the 52 px bottom bar: buttons **Void**, **Road**, **Wall**, **Corner**.
+2. A **palette strip** appears just above the 52 px bottom bar: buttons **Void**, **Road**, **Wall**, **Room**, **Corner**, and **Save**.
 3. Press **Edit** again to close the palette. Closing also clears any active placement brush.
 
-HUD wiring for the toggle lives in `src/game_hud.rs`; the palette root is spawned by `spawn_map_edit_palette` in `src/map_edit.rs` (scheduled after `spawn_bottom_hud` in `GamePlugin`).
+HUD wiring for the toggle lives in `src/hud/game_hud.rs`; the palette root is spawned by `spawn_map_edit_palette` in `src/edit/map_edit.rs` (scheduled after `spawn_bottom_hud` in `GamePlugin`).
 
 ## Placement workflow
 
 1. With the palette open, click a tile type (e.g. **Wall**). You enter **placement mode**: `MapEditState.placement_tile` is set and the wall **variant** resets to index `0`.
-2. Move the mouse over the world. A **semi-transparent lime, emissive** preview mesh shows the geometry that would be placed at the hovered **integer grid cell** `(x, z)` on the **active floor** (see `ActiveFloorLevel` in `src/floor_level.rs` and plane height `floor * HYPERMAP_FLOOR_HEIGHT`).
-3. **Left-click** to commit: the cell is written with `Hypermap::set_floor` in `src/hypermap.rs`, the owning chunk is queued on `HypermapChunkRemeshQueue` in `src/hypermap_world.rs`, and `render_chunks_30fps` there re-bakes that chunk’s meshes when the queue is drained.
+2. Move the mouse over the world. A **semi-transparent lime unlit** preview mesh shows what would be painted on the **active floor** (see `ActiveFloorLevel` in `src/map/floor_level.rs` and plane height `floor * HYPERMAP_FLOOR_HEIGHT`).
+3. **Left mouse down** stores the start tile; **left mouse up** commits the stroke (see below). Writes go through `write_world_cell` in `src/map/hypermap_world.rs` (world map + static passability); affected chunks are queued on `HypermapChunkRemeshQueue` and `render_chunks_30fps` re-bakes meshes when the queue is drained.
 4. **Right-click** to leave placement mode (brush cleared) so you can pick another palette entry without turning Edit off.
 
-The preview is a separate entity; it does not modify picking or existing meshes until you left-click.
+Stroke rules (world grid `(x, z)`):
+
+- **Wall:** strictly orthogonal segment from start to end. Compare `|Δx|` and `|Δz|` from start; the axis with the **larger** span gets the line (constant `z` from start when `|Δx| > |Δz|`, constant `x` from start when `|Δz| > |Δx|`). If `|Δx| == |Δz|` (including diagonal endpoints), the stroke is the **horizontal** segment at start `z`. One tile if start equals end.
+- **Void / Road:** axis-aligned **rectangle** (filled) between start and end on mouse up. New “floor” palette kinds should extend `MapTileKind`, `stroke_world_cells`, and `map_edit_update_preview` in `map_edit.rs` the same way.
+- **Room:** same drag as void/road, but only the **rectangle border** is written. Each border cell gets a [`WallMask`](tilemap.md) on the **outer** sides of the selection (`perimeter_wall_mask` in `map_edit.rs`), consistent with the world-space rules in `tilemap.md` § Wall bitmask. The interior is left unchanged.
+- **Corner:** single pillar at the **mouse-up** cell (variant still from the wheel).
+
+Releasing over the HUD dead zone or with no valid ray cancels the stroke (nothing written). The preview entity does not modify picking or existing meshes until mouse up.
 
 ## Mouse wheel variants
 
@@ -27,32 +34,50 @@ The preview is a separate entity; it does not modify picking or existing meshes 
 |--------------|----------------|
 | **Wall** | Cycles bitmask **1 … 15** (same numeric masks as hex `w1`…`wF` in [`tilemap.md`](tilemap.md)). Order is variant index modulo 15, mapped to `bits = (index % 15) + 1`. |
 | **Corner** | Cycles pillar corners **NW → NE → SW → SE** (same semantics as `c7` / `c9` / `c1` / `c3`). |
-| **Void**, **Road** | No variants. The wheel does **not** reserve placement input for these types. |
+| **Void**, **Road**, **Room** | No variants. The wheel does **not** reserve placement input for these types. |
 
-While placing **Wall** or **Corner**, the **strategy camera zoom** is disabled so the wheel only changes the variant (`zoom_camera` in `src/camera.rs` checks `MapEditState`). With **Void** or **Road** selected, zoom behaves normally.
+While placing **Wall** or **Corner**, the **strategy camera zoom** is disabled so the wheel only changes the variant (`zoom_camera` in `src/scene/camera.rs` checks `MapEditState`). With **Void**, **Road**, or **Room** selected, zoom behaves normally.
 
 ## UI chrome guard
 
-Hover and **placement clicks** are ignored when the cursor is in the **bottom ~120 px** of the window (bottom HUD + palette). That avoids accidental paints when using **Map**, **Edit**, floor **+/−**, or palette buttons.
+Hover and **stroke start / end** (mouse down / up over the map) are ignored when the cursor is in the **bottom ~120 px** of the window (bottom HUD + palette). That avoids accidental paints when using **Map**, **Edit**, floor **+/−**, or palette buttons.
 
 ## Coordinate system
 
-Hover uses a ray from the **strategy camera** through the cursor, intersected with a horizontal plane at the active floor’s `y`. Floor indices match the hypermap: world `x` / `z` integer floors are the tile column / row used by `world_to_chunk_local` in `src/hypermap.rs` and chunk rendering (see `hypermap.md`).
+Hover uses a ray from the **strategy camera** through the cursor, intersected with a horizontal plane at the active floor’s `y`. Floor indices match the hypermap: world `x` / `z` integer floors are the tile column / row used by `world_to_chunk_local` in `src/map/hypermap.rs` and chunk rendering (see `hypermap.md`).
 
-## Persistence and scope
+## Level geometry save / load
 
-- **In memory only** for edited cells: data lives in the `HypermapRuntime` resource (`Arc<Hypermap<CellType>>` in `src/hypermap_world.rs`) after chunks are generated or touched.
+- **Save** (palette button): writes each chunk in the **current render window**
+  (`HypermapRuntime::desired_chunks` — same set `ensure_chunk_generated` keeps meshed) to
+  `levels/level_{name}/geometry/{chunk_x}_{chunk_y}.txt` (relative to the process working directory).
+  `name` comes from the `LevelName` resource in `src/map/level.rs` (default **`default`**).
+  Chunks that are not yet loaded in the hypermap are skipped.
+- **Format:** `# floor N` sections (`N` in `0..=9`), each followed by `HYPERMAP_CHUNK_SIZE`
+  lines of space-separated two-character tokens (same encoding as `tilemap.md`).
+  Floors that are entirely void are omitted from the file; missing floors load as void.
+- **Load:** when a chunk is first generated, `ensure_chunk_generated` tries that path
+  before procedural fill. If a file exists and parses, `world_map.txt` / `world_map_floor1.txt`
+  overlays are **not** applied for that chunk (the level file is authoritative). If the file
+  is missing or invalid, behavior falls back to procedural generation plus center-chunk overlays.
+- **Level name:** the `LevelName` resource in `src/map/level.rs` (default `default`) picks the folder under `levels/`. The active value is set by the **main menu** (see [`main-menu.md`](main-menu.md)) when the player picks a level, before the world is generated.
+
+- **In memory** while playing: edited cells live in `HypermapRuntime` (`Arc<Hypermap<CellType>>` plus the mirrored passability map in `src/map/hypermap_world.rs`).
+- **On disk** via **Save** and the `levels/level_{name}/geometry/` layout above.
+- **Startup overlay:** `world_map.txt` / `world_map_floor1.txt` still apply only when
+  generating the center chunk **from** procedural defaults (no level geometry file for that chunk).
 - **Remesh** applies to whichever **chunk** contains `(x, z)`; the visible set is still driven by the strategy camera and chunk visibility rules in `hypermap_world`.
-- To ship a layout as a file, continue to author or export **`world_map.txt`** (and paired **`world_map_floor1.txt`**) per [`tilemap.md`](tilemap.md); the in-game editor is a convenience for iterating on the loaded world, not a map file exporter.
 
 ## Related code
 
 | Piece | Role |
 |-------|------|
 | `MapEditState` | `panel_open`, `placement_tile` |
+| `MapEditDragAnchor` | Start tile for in-progress wall line / floor rectangle / room outline |
+| `room_outline_cells` / `perimeter_wall_mask` | Border tiles and outward-facing `WallMask` for **Room** |
 | `HypermapChunkRemeshQueue` | Chunks to re-bake after edits |
 | `queue_hypermap_chunk_remesh` | Enqueue by world tile |
-| `ensure_chunk_generated` | Ensures chunk exists (procedural + file overlay) before `set_floor` |
+| `ensure_chunk_generated` | Ensures chunk exists (level geometry file, else procedural + center overlay) before edits |
 | `build_floor0_*` / `build_upper_*` | Shared mesh builders for preview and chunk bake |
 
 For encoding of wall bits and corner tokens in ASCII maps, see [`tilemap.md`](tilemap.md). For how chunks are meshed and updated over time, see [`rendering-pipeline.md`](rendering-pipeline.md).

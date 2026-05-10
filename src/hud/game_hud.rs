@@ -3,18 +3,18 @@
 use bevy::prelude::*;
 use bevy::ui::widget::Button;
 
-use crate::camera::{
-    StrategyCamera, StrategyCameraRig, StrategyCameraViewMode, STRATEGY_CAMERA_DEFAULT_PITCH,
-    STRATEGY_CAMERA_MAP_PITCH,
+use crate::scene::camera::{
+    spawn_camera, AmbientFillEnabled, StrategyCamera, StrategyCameraRig,
+    StrategyCameraViewMode, STRATEGY_CAMERA_DEFAULT_PITCH, STRATEGY_CAMERA_MAP_PITCH,
 };
-use crate::floor_level::{ActiveFloorLevel, HYPERMAP_FLOOR_MAX};
-use crate::map_edit::{MapEditToggleButton, MapEditToggleLabel};
+use crate::edit::map_edit::{MapEditToggleButton, MapEditToggleLabel};
+use crate::map::floor_level::{ActiveFloorLevel, HYPERMAP_FLOOR_MAX};
+use crate::menu::main_menu::GameState;
 
 const BAR_BG: Color = Color::srgba(0.06, 0.07, 0.1, 0.62);
 const BTN_BG: Color = Color::srgba(0.18, 0.2, 0.24, 0.55);
 const BTN_BORDER: Color = Color::srgba(0.9, 0.92, 0.96, 0.35);
 const TEXT_MAIN: Color = Color::srgba(0.95, 0.96, 0.98, 0.92);
-const TEXT_DIM: Color = Color::srgba(0.75, 0.78, 0.82, 0.55);
 
 #[derive(Component)]
 struct MapViewToggleButton;
@@ -28,17 +28,34 @@ struct FloorLevelUpButton;
 #[derive(Component)]
 struct FloorHudLevelText;
 
+#[derive(Component)]
+struct AmbientToggleButton;
+
+#[derive(Component)]
+struct AmbientToggleLabel;
+
 pub struct GameHudPlugin;
 
 impl Plugin for GameHudPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(PostStartup, spawn_bottom_hud).add_systems(
+        // The HUD attaches itself to the strategy camera (`UiTargetCamera`),
+        // so it must spawn after `spawn_camera`'s entity is on the world.
+        // Without `.after`, both systems run in parallel inside `OnEnter` and
+        // the HUD's `Query<&StrategyCameraRig>::single()` returns `Err`.
+        app.add_systems(
+            OnEnter(GameState::InGame),
+            spawn_bottom_hud.after(spawn_camera),
+        )
+        .add_systems(
             Update,
             (
                 map_button_toggle_views,
+                ambient_fill_toggle_button,
+                sync_ambient_toggle_label,
                 floor_level_buttons,
                 update_floor_level_readout,
-            ),
+            )
+                .run_if(in_state(GameState::InGame)),
         );
     }
 }
@@ -124,10 +141,11 @@ pub(crate) fn spawn_bottom_hud(mut commands: Commands, camera: Query<Entity, Wit
 
             parent
                 .spawn((
-                    Name::new("HUD placeholder button"),
+                    Name::new("HUD ambient fill toggle"),
+                    AmbientToggleButton,
                     Button,
                     Node {
-                        min_width: Val::Px(72.0),
+                        min_width: Val::Px(118.0),
                         height: Val::Px(36.0),
                         padding: UiRect::horizontal(Val::Px(12.0)),
                         justify_content: JustifyContent::Center,
@@ -141,9 +159,10 @@ pub(crate) fn spawn_bottom_hud(mut commands: Commands, camera: Query<Entity, Wit
                 ))
                 .with_children(|p| {
                     p.spawn((
-                        Text::new("…"),
+                        AmbientToggleLabel,
+                        Text::new("Ambient: On"),
                         TextFont::from_font_size(17.0),
-                        TextColor(TEXT_DIM),
+                        TextColor(TEXT_MAIN),
                     ));
                 });
 
@@ -182,7 +201,7 @@ pub(crate) fn spawn_bottom_hud(mut commands: Commands, camera: Query<Entity, Wit
                     ))
                     .with_children(|p| {
                         p.spawn((
-                            Text::new("−"),
+                            Text::new("-"),
                             TextFont::from_font_size(22.0),
                             TextColor(TEXT_MAIN),
                         ));
@@ -223,6 +242,31 @@ pub(crate) fn spawn_bottom_hud(mut commands: Commands, camera: Query<Entity, Wit
         });
 }
 
+fn ambient_fill_toggle_button(
+    interactions: Query<&Interaction, (With<AmbientToggleButton>, Changed<Interaction>)>,
+    mut fill: ResMut<AmbientFillEnabled>,
+) {
+    for interaction in &interactions {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        fill.0 = !fill.0;
+    }
+}
+
+fn sync_ambient_toggle_label(
+    fill: Res<AmbientFillEnabled>,
+    mut texts: Query<&mut Text, With<AmbientToggleLabel>>,
+) {
+    if !fill.is_changed() {
+        return;
+    }
+    let label = if fill.0 { "Ambient: On" } else { "Ambient: Off" };
+    for mut text in &mut texts {
+        **text = label.to_string();
+    }
+}
+
 fn map_button_toggle_views(
     interactions: Query<&Interaction, (With<MapViewToggleButton>, Changed<Interaction>)>,
     mut cameras: Query<&mut StrategyCamera>,
@@ -253,7 +297,7 @@ fn floor_level_buttons(
 ) {
     for interaction in &down {
         if *interaction == Interaction::Pressed {
-            floor.0 = floor.0.saturating_sub(1);
+            floor.0 = (floor.0 - 1).max(0);
         }
     }
     for interaction in &up {

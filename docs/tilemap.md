@@ -12,7 +12,7 @@ Everly uses **1 world unit = 1 meter** for map-related geometry:
 - Each tile is **1 m × 1 m** in the XZ plane (integer grid).
 - **Wall slab thickness** (the thin axis perpendicular to the cell edge) is **one-fifth of a cell** (**0.2 m**); see `world_map::WALL_THICKNESS` and `for_each_wall_segment`.
 - **Wall height** is **`HYPERMAP_WALL_HEIGHT` (3.0 m)** per storey.
-- **Vertical spacing between floor planes** is **`HYPERMAP_FLOOR_HEIGHT`** in `src/floor_level.rs` — currently **wall height + 0.03 m** so the next storey’s floor mesh sits slightly above wall tops and avoids z-fighting.
+- **Vertical spacing between floor planes** is **`HYPERMAP_FLOOR_HEIGHT`** in `src/map/floor_level.rs` — currently **wall height + 0.03 m** so the next storey’s floor mesh sits slightly above wall tops and avoids z-fighting.
 
 ## Encoding
 
@@ -45,34 +45,40 @@ Rules:
 
 ### Wall bitmask
 
-Each wall cell stores **which edges** of the cell carry wall geometry, as a
-4-bit value 1–15:
+Each wall cell stores **which slab directions** to draw from the cell center, as a
+4-bit value 1–15. Names (`N`/`S`/… and tokens `wn`/`ws`/…) are **historic labels**; **placement**
+follows world axes in `for_each_wall_segment` in `src/map/world_map.rs`.
 
-| Bit | Value | Edge  |
-|-----|-------|-------|
-| N   | 1     | North |
-| S   | 2     | South |
-| E   | 4     | East  |
-| W   | 8     | West  |
+| Bit | Value | ASCII alias | Slab in world **XZ** (cell center = tile midpoint; +Y is up) |
+|-----|-------|-------------|------------------------------------------------------------------|
+| N   | 1     | `wn`, `w1`  | Full width along **X**, offset toward **−Z** (smaller `z`).      |
+| S   | 2     | `ws`, `w2`  | Full width along **X**, offset toward **+Z**.                  |
+| E   | 4     | `we`, `w4`  | Full depth along **Z**, offset toward **+X**.                  |
+| W   | 8     | `ww`, `w8`  | Full depth along **Z**, offset toward **−X**.                  |
 
-Corners and T-junctions are the same type: combine bits (e.g. north + west =
-`1 + 8 = 9`). Rendering draws one thin slab per set bit.
+Corners and T-junctions combine bits (e.g. N+W = `1 + 8 = 9`). Mesher draws **one thin slab per set bit**
+(thickness `WALL_THICKNESS` in `world_map.rs`).
 
-**Doors** are not a separate token: omit the wall bit on the edge that should
-open (e.g. south façade → use mask without `MASK_SOUTH`, often `__` if that was
-the only bit). Facing `__` reads as a doorway onto road or another room.
+**Doors** are not a separate token: omit the bit for the side that should stay open. Example:
+omit `MASK_SOUTH` to leave the cell’s **+Z** side open toward the neighboring tile (often `__`
+if that was the only bit). Facing `__` reads as a doorway onto road or another room.
 
 ### Text tokens
 
-- **`w` + one hex digit** — explicit mask (`w1` … `w9`, `wa` … `wf`, or
-  uppercase `wA` … `wF`). The digit is the value 1–15 in hex (`w0` is invalid).
-- **Shortcuts** (same as single-bit hex, kept for readability):
+- **`w` + one hex digit** — explicit mask (`w1` … `w9`, `wA` … `wF`).
+  The digit is the value 1–15 in hex (`w0` is invalid). **Hex letters
+  must be uppercase**: lowercase `wa` … `wf` are rejected (`InvalidToken`),
+  so the parser never has to disambiguate them from the single-edge
+  aliases below.
+- **Shortcuts** (single-edge aliases, always lowercase):
   - `wn` → north only (`w1`)
   - `ws` → south only (`w2`)
   - `we` → east only (`w4`)
   - `ww` → west only (`w8`)
 
-`we` is **never** interpreted as hex `e` (14); use `wE` for mask 14.
+The case rule is the structural distinction: **uppercase letter = explicit
+hex bitmask, lowercase letter = single-edge alias.** So `we` is **never**
+interpreted as hex `e` (14) — write `wE` for mask 14.
 
 ### Corner pillar (`c*`)
 
@@ -82,25 +88,25 @@ cell draws a single vertical column with footprint **`WALL_THICKNESS`²**
 in the chosen **corner** of the 1 m cell (same inset as slab centers in
 `for_each_wall_segment`).
 
-| Token | Corner (numpad on a north-up map) |
-|-------|-----------------------------------|
-| `c7`  | NW (`C7` allowed)                 |
-| `c9`  | NE                                |
-| `c1`  | SW                                |
-| `c3`  | SE                                |
+| Token | Corner in **XZ** (−X/+X vs −Z/+Z from cell center; +Y up) |
+|-------|-------------------------------------------------------------|
+| `c7`  | NW (`C7` allowed)                                           |
+| `c9`  | NE                                                          |
+| `c1`  | SW                                                          |
+| `c3`  | SE                                                          |
 
 Other `c*` combinations are invalid. Parsed as `CellType::Corner` in
-`src/world_map.rs`; passability matches walls (blocked).
+`src/map/world_map.rs`; passability matches walls (blocked).
 
 ## Wall Types At Runtime
 
 Parsed cells use `CellType::Wall(WallMask)` or `CellType::Corner(WallCorner)`;
-see `src/world_map.rs` for `WallMask`, `WallCorner`, `MASK_NORTH`, `MASK_SOUTH`,
+see `src/map/world_map.rs` for `WallMask`, `WallCorner`, `MASK_NORTH`, `MASK_SOUTH`,
 `MASK_EAST`, and `MASK_WEST`.
 
 ## Placement Rules
 
-- The parsed map is centered into a `64x64` center chunk (the authored file can
+- The parsed map is centered into a `128x128` center chunk (the authored file can
   be up to that full size).
 - Cells that fall outside chunk bounds are skipped.
 - Procedural neighborhood terrain is generated first, then the center chunk is
@@ -111,4 +117,5 @@ see `src/world_map.rs` for `WallMask`, `WallCorner`, `MASK_NORTH`, `MASK_SOUTH`,
 - Row has odd character count (cannot split into 2-char tokens).
 - Rows are not rectangular.
 - Unknown token, or wall token with mask `0` (e.g. `w0`).
+- Lowercase hex letter in a `w` token (e.g. `wa`, `wf`); use uppercase `wA` … `wF`.
 - Duplicate `>A` or duplicate `>B` when using the marker-aware parser.

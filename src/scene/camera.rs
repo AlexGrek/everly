@@ -4,15 +4,17 @@
 
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
+use bevy::light::AmbientLight;
 use bevy::pbr::{ScreenSpaceAmbientOcclusion, ScreenSpaceReflections};
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::render::view::Hdr;
 
-use crate::floor_level::{
+use crate::map::floor_level::{
     ActiveFloorLevel, CAMERA_FLOOR_Y_SMOOTH_PER_S, HYPERMAP_FLOOR_HEIGHT,
 };
-use crate::map_edit::{MapEditState, MapTileKind};
+use crate::edit::map_edit::{MapEditState, MapTileKind};
+use crate::menu::main_menu::GameState;
 
 /// Tilt used for the normal RTS-style view (degrees → radians in [`StrategyCamera::default`]).
 pub const STRATEGY_CAMERA_DEFAULT_PITCH: f32 = 55.0_f32.to_radians();
@@ -83,25 +85,48 @@ impl Default for StrategyCamera {
 /// regardless of how zoomed-in or zoomed-out the player currently is.
 const PAN_REFERENCE_DISTANCE: f32 = 30.0;
 
+/// Cool fill so unlit faces read in shadow; kept modest so the sun + emissive mood stay primary.
+const STRATEGY_AMBIENT_COLOR: Color = Color::srgb(0.9, 0.93, 0.98);
+const STRATEGY_AMBIENT_BRIGHTNESS_ON: f32 = 40.0;
+
+/// Toolbar-controlled ambient fill on [`StrategyCameraRig`] ([`AmbientLight`] overrides [`GlobalAmbientLight`] for that view).
+#[derive(Resource, Clone, Copy, PartialEq, Eq)]
+pub struct AmbientFillEnabled(pub bool);
+
+impl Default for AmbientFillEnabled {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
 pub struct StrategyCameraPlugin;
 
 impl Plugin for StrategyCameraPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_camera).add_systems(
-            Update,
-            (
-                pan_camera,
-                zoom_camera,
-                smooth_focus_y_for_active_floor,
-                sync_camera_transform,
-            ),
-        );
+        app.init_resource::<AmbientFillEnabled>()
+            .add_systems(OnEnter(GameState::InGame), spawn_camera)
+            .add_systems(
+                Update,
+                (
+                    pan_camera,
+                    zoom_camera,
+                    smooth_focus_y_for_active_floor,
+                    sync_camera_transform,
+                    sync_ambient_fill_brightness,
+                )
+                    .run_if(in_state(GameState::InGame)),
+            );
     }
 }
 
-fn spawn_camera(mut commands: Commands) {
+pub(crate) fn spawn_camera(mut commands: Commands, ambient_fill: Res<AmbientFillEnabled>) {
     let cam = StrategyCamera::default();
     let transform = strategy_transform(&cam);
+    let ambient_brightness = if ambient_fill.0 {
+        STRATEGY_AMBIENT_BRIGHTNESS_ON
+    } else {
+        0.0
+    };
 
     commands.spawn((
         Name::new("Strategy Camera"),
@@ -109,6 +134,11 @@ fn spawn_camera(mut commands: Commands) {
         Camera3d::default(),
         Msaa::Off,
         Hdr,
+        AmbientLight {
+            color: STRATEGY_AMBIENT_COLOR,
+            brightness: ambient_brightness,
+            ..default()
+        },
         Tonemapping::TonyMcMapface,
         Bloom {
             // Bloom strength for the whole view; per-mesh glow comes from
@@ -127,6 +157,23 @@ fn spawn_camera(mut commands: Commands) {
         transform,
         cam,
     ));
+}
+
+fn sync_ambient_fill_brightness(
+    fill: Res<AmbientFillEnabled>,
+    mut lights: Query<&mut AmbientLight, With<StrategyCameraRig>>,
+) {
+    if !fill.is_changed() {
+        return;
+    }
+    let brightness = if fill.0 {
+        STRATEGY_AMBIENT_BRIGHTNESS_ON
+    } else {
+        0.0
+    };
+    for mut light in &mut lights {
+        light.brightness = brightness;
+    }
 }
 
 fn pan_camera(keys: Res<ButtonInput<KeyCode>>, time: Res<Time>, mut cameras: Query<&mut StrategyCamera>) {

@@ -15,7 +15,12 @@ The starter scene gives you:
 
 ## Map authoring
 
-The startup tilemap is read from `world_map.txt` on each run.
+On launch the player lands on a **main menu** that lists every folder
+under `levels/level_*/`. Picking one sets the active level and drops
+you into the world. Levels are stored as one text file per chunk under
+`levels/level_{name}/geometry/{x}_{y}.txt`; chunks not present on disk
+fall back to procedural generation (and the center chunk overlays
+`world_map.txt` if it exists).
 
 For token format, **world scale** (1 m tiles, 0.2 m wall thickness, 3 m walls, storey spacing slightly above 3 m), and rendering semantics, see:
 
@@ -26,16 +31,25 @@ For token format, **world scale** (1 m tiles, 0.2 m wall thickness, 3 m walls, s
 
 ## Project layout
 
-The game is split into small focused submodules, each exposing a single
-Bevy `Plugin`:
+The game is split into small focused submodules grouped by concern,
+each (where applicable) exposing a single Bevy `Plugin`:
 
-| Module          | Responsibility                                       |
-| --------------- | ---------------------------------------------------- |
-| `src/main.rs`   | App entry point and window setup.                    |
-| `src/lib.rs`    | Top-level `GamePlugin` that wires everything up.     |
-| `src/camera.rs` | `StrategyCameraPlugin` — pan + zoom controller.      |
-| `src/ground.rs` | `GroundPlugin` — large flat ground plane.            |
-| `src/boxes.rs`  | `BoxesPlugin` — 121 random grid cells, full span, heights 3–8. |
+| Module                          | Responsibility                                                    |
+| ------------------------------- | ----------------------------------------------------------------- |
+| `src/main.rs`                   | App entry point and window setup.                                 |
+| `src/lib.rs`                    | Top-level `GamePlugin` that wires every subsystem.                |
+| `src/menu/main_menu.rs`         | `MainMenuPlugin` + `GameState` (MainMenu / InGame), level picker. |
+| `src/scene/camera.rs`           | `StrategyCameraPlugin` — RTS pan/zoom + post-processing stack.    |
+| `src/scene/sun.rs`              | `SunPlugin` — directional sun light.                              |
+| `src/hud/game_hud.rs`           | `GameHudPlugin` — bottom HUD (floor selector, edit toggle).       |
+| `src/map/hypermap.rs`           | Generic chunked, concurrent tile store.                           |
+| `src/map/floor_level.rs`        | `FloorLevelPlugin` — `ActiveFloorLevel` + storey-height constants.|
+| `src/map/world_map.rs`          | `world_map.txt` parser, `CellType`, wall masks.                   |
+| `src/map/level.rs`              | `LevelPlugin` — `LevelName` + `levels/level_{name}/geometry/` I/O.  |
+| `src/map/hypermap_world.rs`     | `HypermapWorldPlugin` — chunk meshing + water tiles.              |
+| `src/map/hypermap_pathfind.rs`  | A* over hypermap floors.                                          |
+| `src/edit/map_edit.rs`          | `MapEditPlugin` — paint palette, preview, remesh queue.           |
+| `src/edit/map_selection.rs`     | `MapSelectionPlugin` — click-to-select cell + highlight.          |
 
 ## Getting started
 

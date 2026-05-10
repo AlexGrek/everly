@@ -4,7 +4,7 @@ Handcrafted Everly center chunk map (64×64, 2-char cells).
 
 Produces `world_map.txt`: void margin, road spine, varied building footprints
 (rectangles, L-shapes, hollow frames, unions). Wall tokens use the same
-bitmask rules as `docs/tilemap.md` / `src/world_map.rs`.
+bitmask rules as `docs/tilemap.md` / `src/map/world_map.rs`.
 
 Each building gets at least one **exterior door**: an edge wall cell loses the
 one wall bit that faces `__` (road), so there is a gap onto the street/courtyard.
@@ -49,7 +49,9 @@ def on_road_spine(x: int, y: int) -> bool:
 def cell_token(mask: int) -> str:
     if mask <= 0:
         return "__"
-    return f"w{mask:x}"
+    # Hex letters are uppercase by contract (parser rejects `wa`…`wf`); the
+    # `wn`/`ws`/`we`/`ww` aliases stay lowercase as the single-edge form.
+    return f"w{mask:X}"
 
 
 def shortcut_token(mask: int) -> str:

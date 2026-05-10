@@ -1,10 +1,13 @@
-//! Text-driven world map parsing and rendering.
+//! Text-driven world map parsing.
 //!
 //! Encoding uses two characters per map cell:
 //! - `..` = void, `__` = road
-//! - Walls: bitmask over north / south / east / west edges of the cell (see
-//!   [`MASK_NORTH`], [`MASK_SOUTH`], [`MASK_EAST`], [`MASK_WEST`]).
-//! - `w` + one hex digit (`w1` … `wf`, `wA` … `wF`) = explicit mask 1–15.
+//! - Walls: bitmask over four named edges; each bit selects a thin slab offset
+//!   from the cell center in **world XZ** (see [`MASK_NORTH`] … [`MASK_WEST`] and
+//!   [`for_each_wall_segment`]).
+//! - `w` + one **uppercase** hex digit (`w1` … `w9`, `wA` … `wF`) = explicit
+//!   mask 1–15. **Lowercase letters are reserved for the single-edge aliases**
+//!   below and are rejected as hex (so `we` is never mask 14 — use `wE`).
 //! - Shortcuts `wn`, `ws`, `we`, `ww` = single-edge masks (same as `w1`, `w2`,
 //!   `w4`, `w8`). `w0` is invalid.
 //! - Corner pillars `c7` / `c9` / `c1` / `c3` = one 0.2×0.2 m wall column in
@@ -13,36 +16,23 @@
 use std::fmt::{Display, Formatter};
 use std::num::NonZeroU8;
 use std::ops::Index;
-use std::path::Path;
 use std::sync::Arc;
-
-use bevy::light::{NotShadowCaster, NotShadowReceiver};
-use bevy::mesh::PlaneMeshBuilder;
-use bevy::prelude::*;
-use bevy_water::water::material::{StandardWaterMaterial, WaterMaterial};
-use bevy_water::{setup_water, WaterQuality, WaterSettings, WaterTile, WaterTiles, WaveDirection};
-
-use crate::floor_level::HYPERMAP_WALL_HEIGHT;
 
 /// Vertical position for map water so void cells reveal it.
 pub const WATER_SURFACE_Y: f32 = -0.25;
 
+pub(crate) const WORLD_MAP_FILE_PATH: &str = "world_map.txt";
+
 /// Slab thickness perpendicular to the cell edge — **one fifth** of a 1 m × 1 m cell (0.2 m).
 pub(crate) const WALL_THICKNESS: f32 = 0.2;
 
-/// Wall height — [`HYPERMAP_WALL_HEIGHT`] (storey spacing is slightly larger; see `floor_level`).
-const WALL_HEIGHT: f32 = HYPERMAP_WALL_HEIGHT;
-const WATER_MARGIN: f32 = 24.0;
-
-const WORLD_MAP_FILE_PATH: &str = "world_map.txt";
-
-/// North edge of the cell (+Z / “back” in default overhead view).
+/// Thin wall slab toward **decreasing world Z** (−Z from cell center; `for_each_wall_segment` uses `oz = −inset`).
 pub const MASK_NORTH: u8 = 1;
-/// South edge.
+/// Thin slab toward **increasing world Z** (+Z; `oz = +inset`).
 pub const MASK_SOUTH: u8 = 2;
-/// East edge.
+/// Thin slab toward **increasing world X** (+X; `ox = +inset`).
 pub const MASK_EAST: u8 = 4;
-/// West edge.
+/// Thin slab toward **decreasing world X** (−X; `ox = −inset`).
 pub const MASK_WEST: u8 = 8;
 
 /// Non-zero 4-bit mask: which cell edges carry wall geometry (corners and
@@ -96,6 +86,17 @@ pub enum CellType {
     Corner(WallCorner),
 }
 
+/// Static (geometry-only) passability of a [`CellType`]: `1.0` for [`CellType::Road`],
+/// `0.0` for everything else. The mirror written into
+/// [`crate::map::hypermap_world::HypermapRuntime::static_passability_map`].
+#[inline]
+pub fn cell_passability(cell: CellType) -> f32 {
+    match cell {
+        CellType::Road => 1.0,
+        CellType::Void | CellType::Wall(_) | CellType::Corner(_) => 0.0,
+    }
+}
+
 /// Single cell object stored by reference in the map.
 #[derive(Debug)]
 pub struct Cell {
@@ -108,10 +109,7 @@ impl Cell {
     }
 
     pub fn get_passability(&self) -> f32 {
-        match self.cell_type {
-            CellType::Void | CellType::Wall(_) | CellType::Corner(_) => 0.0,
-            CellType::Road => 1.0,
-        }
+        cell_passability(self.cell_type)
     }
 
     pub fn get_cell_type(&self) -> CellType {
@@ -277,10 +275,13 @@ impl Index<(usize, usize)> for WorldMapFloor {
     }
 }
 
+/// Hex digit value for a cell-token byte. **Letters must be uppercase**: `wa`
+/// is _not_ accepted as mask 10 — that token would otherwise collide with the
+/// single-edge `we` alias semantics. Use uppercase `wA` … `wF` for masks 10–15.
+/// (Digits `0`–`9` are the same in both cases and remain unambiguous.)
 fn ascii_hex_value(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
@@ -382,7 +383,41 @@ fn parse_ascii_path_token(token: &str) -> Option<AsciiPathToken> {
     }
 }
 
-fn parse_cell_token(token: &str) -> Option<CellType> {
+/// Renders a [`CellType`] back as the canonical 2-character token consumed by
+/// [`parse_cell_token`]. Inverse of parsing for the level save/load format.
+pub(crate) fn cell_to_token(cell: CellType) -> &'static str {
+    match cell {
+        CellType::Void => "..",
+        CellType::Road => "__",
+        // Uppercase hex digits for masks 10-15 so they don't collide with the
+        // single-edge aliases `wn` / `ws` / `we` / `ww` that the parser checks
+        // **before** falling through to the generic `w` + hex-digit branch.
+        CellType::Wall(mask) => match mask.bits() & 0x0f {
+            0x1 => "w1",
+            0x2 => "w2",
+            0x3 => "w3",
+            0x4 => "w4",
+            0x5 => "w5",
+            0x6 => "w6",
+            0x7 => "w7",
+            0x8 => "w8",
+            0x9 => "w9",
+            0xa => "wA",
+            0xb => "wB",
+            0xc => "wC",
+            0xd => "wD",
+            0xe => "wE",
+            0xf => "wF",
+            _ => unreachable!("WallMask::from_bits enforces non-zero 4-bit value"),
+        },
+        CellType::Corner(WallCorner::Nw) => "c7",
+        CellType::Corner(WallCorner::Ne) => "c9",
+        CellType::Corner(WallCorner::Sw) => "c1",
+        CellType::Corner(WallCorner::Se) => "c3",
+    }
+}
+
+pub(crate) fn parse_cell_token(token: &str) -> Option<CellType> {
     let bytes = token.as_bytes();
     if bytes.len() != 2 {
         return None;
@@ -437,185 +472,6 @@ pub(crate) fn for_each_wall_segment(mask_bits: u8, mut f: impl FnMut(f32, f32, f
     }
 }
 
-#[derive(Resource, Debug, Clone)]
-pub struct ActiveWorldMapFloor(pub WorldMapFloor);
-
-pub struct WorldMapPlugin;
-
-impl Plugin for WorldMapPlugin {
-    fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_world_map).add_systems(
-            Startup,
-            spawn_world_water.after(spawn_world_map).after(setup_water),
-        );
-    }
-}
-
-fn spawn_world_map(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    let map_text = std::fs::read_to_string(Path::new(WORLD_MAP_FILE_PATH))
-        .unwrap_or_else(|err| panic!("failed to read `{WORLD_MAP_FILE_PATH}`: {err}"));
-    let map = WorldMapFloor::from_ascii(&map_text)
-        .unwrap_or_else(|err| panic!("failed to parse `{WORLD_MAP_FILE_PATH}`: {err}"));
-    commands.insert_resource(ActiveWorldMapFloor(map.clone()));
-
-    let map_w = map.width() as f32;
-    let map_h = map.height() as f32;
-    let origin = Vec2::new(-map_w * 0.5, -map_h * 0.5);
-
-    let floor_mesh = meshes.add(Plane3d::default().mesh().size(1.0, 1.0));
-    let wall_ns_mesh = meshes.add(Cuboid::new(1.0, WALL_HEIGHT, WALL_THICKNESS));
-    let wall_ew_mesh = meshes.add(Cuboid::new(WALL_THICKNESS, WALL_HEIGHT, 1.0));
-    let corner_mesh = meshes.add(Cuboid::new(
-        WALL_THICKNESS,
-        WALL_HEIGHT,
-        WALL_THICKNESS,
-    ));
-
-    let road_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.36, 0.36, 0.38),
-        perceptual_roughness: 0.98,
-        metallic: 0.0,
-        ..default()
-    });
-    let wall_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.78, 0.79, 0.82),
-        perceptual_roughness: 0.72,
-        metallic: 0.02,
-        ..default()
-    });
-
-    for (x, y, cell) in map.iter_xy() {
-        let cell_type = cell.get_cell_type();
-        if cell_type == CellType::Void {
-            continue;
-        }
-
-        let world_x = origin.x + x as f32 + 0.5;
-        let world_z = origin.y + y as f32 + 0.5;
-
-        commands.spawn((
-            Name::new(format!("Map floor {x},{y}")),
-            Mesh3d(floor_mesh.clone()),
-            MeshMaterial3d(road_material.clone()),
-            Transform::from_xyz(world_x, 0.0, world_z),
-        ));
-
-        if let CellType::Wall(mask) = cell_type {
-            let mut part_index = 0usize;
-            for_each_wall_segment(mask.bits(), |sx, sz, ox, oz| {
-                let use_ns = sz <= sx;
-                let mesh = if use_ns {
-                    wall_ns_mesh.clone()
-                } else {
-                    wall_ew_mesh.clone()
-                };
-                let offset = Vec3::new(ox, WALL_HEIGHT * 0.5, oz);
-                commands.spawn((
-                    Name::new(format!("Map wall {x},{y}-{part_index}")),
-                    Mesh3d(mesh),
-                    MeshMaterial3d(wall_material.clone()),
-                    Transform::from_translation(Vec3::new(world_x, 0.0, world_z) + offset),
-                ));
-                part_index += 1;
-            });
-        }
-        if let CellType::Corner(corner) = cell_type {
-            let (ox, oz) = corner.xz_offset_from_cell_center();
-            let offset = Vec3::new(ox, WALL_HEIGHT * 0.5, oz);
-            commands.spawn((
-                Name::new(format!("Map corner pillar {x},{y}-{corner:?}")),
-                Mesh3d(corner_mesh.clone()),
-                MeshMaterial3d(wall_material.clone()),
-                Transform::from_translation(Vec3::new(world_x, 0.0, world_z) + offset),
-            ));
-        }
-    }
-}
-
-fn spawn_world_water(
-    mut commands: Commands,
-    map: Res<ActiveWorldMapFloor>,
-    settings: Res<WaterSettings>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardWaterMaterial>>,
-) {
-    let width = map.0.width() as f32 + WATER_MARGIN * 2.0;
-    let depth = map.0.height() as f32 + WATER_MARGIN * 2.0;
-    let coord_offset = Vec2::new(-width * 0.5, -depth * 0.5);
-    let coord_scale = Vec2::new(width, depth);
-    let normalized_dir = settings.wave_direction.normalize_or_zero();
-    let quality: WaterQuality = settings.water_quality;
-
-    let mut plane_builder = PlaneMeshBuilder::from_size(Vec2::new(width, depth));
-    plane_builder = match quality {
-        WaterQuality::Basic | WaterQuality::Medium => plane_builder,
-        WaterQuality::High => {
-            let sub = (width.max(depth) as u32 / 16).clamp(1, 24);
-            plane_builder.subdivisions(sub)
-        }
-        WaterQuality::Ultra => {
-            let sub = (width.max(depth) as u32 / 4).clamp(4, 48);
-            plane_builder.subdivisions(sub)
-        }
-    };
-
-    let mesh = Mesh3d(meshes.add(plane_builder));
-    let mut wave_dir = WaveDirection::with_duration(
-        settings.wave_direction,
-        settings.wave_direction_blend_duration,
-    );
-    wave_dir.tile_offset = 0.0;
-
-    let material = MeshMaterial3d(materials.add(StandardWaterMaterial {
-        base: StandardMaterial {
-            base_color: settings.base_color,
-            alpha_mode: settings.alpha_mode,
-            perceptual_roughness: 0.22,
-            ..default()
-        },
-        extension: WaterMaterial {
-            amplitude: settings.amplitude,
-            clarity: settings.clarity,
-            deep_color: settings.deep_color,
-            shallow_color: settings.shallow_color,
-            edge_color: settings.edge_color,
-            edge_scale: settings.edge_scale,
-            coord_offset,
-            coord_scale,
-            wave_dir_a: normalized_dir,
-            wave_dir_b: normalized_dir,
-            wave_blend: 1.0,
-            quality: settings.water_quality.into(),
-        },
-    }));
-
-    commands
-        .spawn((WaterTiles, Name::new("WorldMap water layer")))
-        .with_children(|parent| {
-            let mut tile = parent.spawn((
-                WaterTile {
-                    offset: coord_offset,
-                },
-                Name::new("WorldMap water tile"),
-                mesh,
-                material,
-                wave_dir,
-                Transform::from_xyz(0.0, settings.height, 0.0),
-                NotShadowCaster,
-            ));
-
-            match quality {
-                WaterQuality::Basic | WaterQuality::Medium => {
-                    tile.insert(NotShadowReceiver);
-                }
-                _ => {}
-            };
-        });
-}
 
 #[cfg(test)]
 mod tests {
@@ -667,6 +523,19 @@ mod tests {
     fn rejects_zero_wall_mask() {
         let err = WorldMapFloor::from_ascii("..w0\n").expect_err("w0 must be invalid");
         assert!(matches!(err, MapParseError::InvalidToken { .. }));
+    }
+
+    #[test]
+    fn rejects_lowercase_hex_letters() {
+        // `wA` is the canonical mask-10 token; lowercase `wa` must not parse —
+        // it would otherwise blur the line between the hex form and the
+        // single-edge `we` alias and break the "uppercase hex" invariant.
+        for token in ["wa", "wb", "wc", "wd", "wf"] {
+            let line = format!("{token}\n");
+            let err = WorldMapFloor::from_ascii(&line)
+                .expect_err(&format!("{token} must be invalid (lowercase hex)"));
+            assert!(matches!(err, MapParseError::InvalidToken { .. }));
+        }
     }
 
     #[test]

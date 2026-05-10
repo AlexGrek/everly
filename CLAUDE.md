@@ -28,7 +28,7 @@ Bevy 0.18 idioms (observers, atmospheres, post-processing, UI, cameras,
 features, fast-compile setup).
 
 For the tilemap text format and **map world units** (1 m cells, wall thickness,
-wall height vs storey spacing), see `docs/tilemap.md` and `src/floor_level.rs`.
+wall height vs storey spacing), see `docs/tilemap.md` and `src/map/floor_level.rs`.
 When authoring or refactoring `world_map.txt`, `world_map_floor1.txt`, or map
 encoding, read `.claude/SKILLS/map-creator/SKILL.md` first.
 
@@ -52,20 +52,41 @@ everly/
 │   ├── bevy-engineer/
 │   └── map-creator/
 └── src/
-    ├── main.rs           # window setup + DefaultPlugins + GamePlugin
-    ├── lib.rs            # GamePlugin wires every submodule
-    ├── camera.rs         # StrategyCameraPlugin
-    ├── map_edit.rs       # MapEditPlugin (HUD palette, paint, remesh queue)
-    └── world_map.rs      # parser + world floor data + tilemap rendering
+    ├── main.rs                   # window setup + DefaultPlugins + GamePlugin
+    ├── lib.rs                    # GamePlugin wires every subsystem
+    ├── scene/                    # how the world is presented
+    │   ├── camera.rs             #   StrategyCameraPlugin (RTS cam + post-fx stack)
+    │   └── sun.rs                #   SunPlugin (directional light)
+    ├── hud/                      # 2D UI overlay
+    │   └── game_hud.rs           #   GameHudPlugin (bottom bar, floor selector, edit toggle)
+    ├── menu/                     # pre-gameplay screens (run only in MainMenu state)
+    │   └── main_menu.rs          #   MainMenuPlugin + GameState (MainMenu / InGame), level picker
+    ├── map/                      # world data + rendering + pathfinding
+    │   ├── hypermap.rs           #   chunked, concurrent tile store
+    │   ├── floor_level.rs        #   ActiveFloorLevel + storey-height constants
+    │   ├── world_map.rs          #   `.txt` parser, CellType, wall masks
+    │   ├── level.rs              #   LevelPlugin + `levels/level_{name}/geometry/{x}_{y}.txt`
+    │   ├── hypermap_world.rs     #   HypermapWorldPlugin (chunk meshing + water)
+    │   └── hypermap_pathfind.rs  #   A* over hypermap floors
+    └── edit/                     # in-game editing tools
+        ├── map_edit.rs           #   MapEditPlugin (HUD palette, paint, remesh queue)
+        └── map_selection.rs      #   MapSelectionPlugin (click-to-select + highlight)
 ```
 
 ## Architecture conventions
 
 - **One subsystem = one module = one `Plugin`.** Never bolt new
   startup logic onto an unrelated module. If a feature doesn't fit an
-  existing plugin, add a new `src/<feature>.rs` exposing
-  `pub struct <Feature>Plugin` and register it inside `GamePlugin` in
-  `src/lib.rs`.
+  existing plugin, add a new `src/<group>/<feature>.rs` (under
+  `scene/`, `hud/`, `menu/`, `map/`, or `edit/` — or create a new
+  top-level group folder) exposing `pub struct <Feature>Plugin`,
+  declare it in the group's `mod.rs`, and register it inside
+  `GamePlugin` in `src/lib.rs`.
+- **Gate gameplay on `GameState::InGame`.** The menu (`MainMenu`) is
+  the default state. Spawning camera/HUD/world entities and
+  per-frame gameplay systems must use `OnEnter(GameState::InGame)` /
+  `.run_if(in_state(GameState::InGame))` so the menu starts with no
+  world entities and no half-initialized resources.
 - **`main.rs` stays tiny.** It owns window/`DefaultPlugins`
   configuration and nothing else. All gameplay wiring goes through
   `GamePlugin`.
@@ -116,7 +137,7 @@ cost a recompile each — don't repeat them.
   navigation) before writing custom ones. Use `TextFont` +
   `FontFeatures` for OpenType features.
 
-## Strategy camera (`src/camera.rs`)
+## Strategy camera (`src/scene/camera.rs`)
 
 The camera entity also carries `AmbientLight` (no directional sun),
 `ScreenSpaceAmbientOcclusion`, `Bloom`, `Hdr`, `Tonemapping`, and optional
@@ -140,7 +161,7 @@ systems implement the controller:
 - `sync_camera_transform` — uses `Changed<StrategyCamera>` so the
   `Transform` is only rebuilt when params actually change.
 
-`focus.y` eases toward the active hypermap floor height each frame (exponential blend in `src/camera.rs`, rate `floor_level::CAMERA_FLOOR_Y_SMOOTH_PER_S`), not an instant snap.
+`focus.y` eases toward the active hypermap floor height each frame (exponential blend in `src/scene/camera.rs`, rate `map::floor_level::CAMERA_FLOOR_Y_SMOOTH_PER_S`), not an instant snap.
 
 When extending the camera (e.g. rotation, edge-pan, follow target),
 add new systems and component fields rather than special-casing inside

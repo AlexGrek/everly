@@ -8,6 +8,8 @@
 use bevy::light::light_consts::lux;
 use bevy::prelude::*;
 
+use crate::menu::main_menu::GameState;
+
 /// Marker for the world's primary sun entity.
 #[derive(Component, Debug)]
 pub struct Sun;
@@ -27,7 +29,7 @@ pub struct SunPlugin;
 
 impl Plugin for SunPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_sun);
+        app.add_systems(OnEnter(GameState::InGame), spawn_sun);
     }
 }
 

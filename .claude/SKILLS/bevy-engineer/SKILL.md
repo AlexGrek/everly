@@ -75,7 +75,7 @@ Avoid one-off fly or pan cameras for dev workflows. Bevy 0.18 ships first-party 
 
 ## Everly map scale (hypermap)
 
-When touching **`src/hypermap_world.rs`**, **`src/world_map.rs`**, **`src/floor_level.rs`**, **`src/map_selection.rs`**, or floor/camera height:
+When touching **`src/map/hypermap_world.rs`**, **`src/map/world_map.rs`**, **`src/map/floor_level.rs`**, **`src/edit/map_selection.rs`**, or floor/camera height:
 
 - **1 world unit = 1 m** for map geometry; each tile is **1 m × 1 m** in XZ.
 - **Wall slabs:** thickness **`WALL_THICKNESS` = 0.2** (one-fifth of a cell); one thin box per wall bitmask edge via `for_each_wall_segment`.

@@ -1,16 +1,20 @@
-//! Pathfinding on [`crate::hypermap::Hypermap`] world tiles and on finite [`crate::world_map::WorldMapFloor`] grids.
+//! Pathfinding on the world's [`HypermapRuntime::static_passability_map`](crate::map::hypermap_world::HypermapRuntime::static_passability_map)
+//! and on finite [`crate::map::world_map::WorldMapFloor`] grids.
 //!
-//! Walkability matches movement intent: only [`crate::world_map::CellType::Road`] is traversable
-//! (4-neighbor grid, unit step cost). [`WorldMapFloor`](crate::world_map::WorldMapFloor) tests can
-//! encode start/end with `>A` / `>B` via [`WorldMapFloor::from_ascii_with_path_markers`](crate::world_map::WorldMapFloor::from_ascii_with_path_markers).
+//! World-tile pathfinding consumes a `Hypermap<f32>` of static passability
+//! (see [`crate::map::world_map::cell_passability`]) — a tile is walkable iff
+//! its passability is `> 0.0`. 4-neighbor grid, unit step cost.
+//! [`WorldMapFloor`](crate::map::world_map::WorldMapFloor) tests can encode
+//! start/end with `>A` / `>B` via
+//! [`WorldMapFloor::from_ascii_with_path_markers`](crate::map::world_map::WorldMapFloor::from_ascii_with_path_markers).
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
 use pathfinding::directed::astar::astar;
 
-use crate::hypermap::Hypermap;
-use crate::world_map::{CellType, MapParseError, WorldMapFloor};
+use crate::map::hypermap::Hypermap;
+use crate::map::world_map::{CellType, MapParseError, WorldMapFloor};
 
 /// Stops expanding the open set after this many **pop** operations (tile expansions).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,9 +51,17 @@ pub fn tile_walkable(cell: CellType) -> bool {
     matches!(cell, CellType::Road)
 }
 
+/// Walkability predicate for a static-passability sample (see
+/// [`crate::map::world_map::cell_passability`]). `> 0.0` walkable, `0.0` blocked.
 #[inline]
-pub fn world_tile_walkable(map: &Hypermap<CellType>, wx: i32, wy: i32) -> bool {
-    tile_walkable(map.get(wx, wy))
+pub fn passability_walkable(p: f32) -> bool {
+    p > 0.0
+}
+
+/// Walkability for a world tile read from the static-passability hypermap.
+#[inline]
+pub fn world_tile_walkable(map: &Hypermap<f32>, wx: i32, wy: i32) -> bool {
+    passability_walkable(map.get(wx, wy))
 }
 
 /// Manhattan distance on the tile grid (admissible for 4-neighbors, unit cost).
@@ -68,7 +80,7 @@ fn four_neighbors(wx: i32, wy: i32) -> [(i32, i32); 4] {
 }
 
 fn push_neighbor_if_walkable(
-    map: &Hypermap<CellType>,
+    map: &Hypermap<f32>,
     acc: &mut Vec<((i32, i32), u32)>,
     n: (i32, i32),
 ) {
@@ -77,7 +89,7 @@ fn push_neighbor_if_walkable(
     }
 }
 
-fn hypermap_successors(map: &Hypermap<CellType>, pos: &(i32, i32)) -> Vec<((i32, i32), u32)> {
+fn hypermap_successors(map: &Hypermap<f32>, pos: &(i32, i32)) -> Vec<((i32, i32), u32)> {
     let mut out = Vec::with_capacity(4);
     for n in four_neighbors(pos.0, pos.1) {
         push_neighbor_if_walkable(map, &mut out, n);
@@ -87,7 +99,7 @@ fn hypermap_successors(map: &Hypermap<CellType>, pos: &(i32, i32)) -> Vec<((i32,
 
 /// A* shortest path on world tile coordinates. Honors [`HypermapSearchLimits::max_expanded`].
 pub fn astar_shortest_world_path(
-    map: &Hypermap<CellType>,
+    map: &Hypermap<f32>,
     start: (i32, i32),
     goal: (i32, i32),
     limits: HypermapSearchLimits,
@@ -181,7 +193,7 @@ pub fn astar_shortest_world_path(
 
 /// Bounded uniform-cost expansion from `start` (Dijkstra / A* with \(h=0\)).
 pub fn explore_walkable_tiles_limited(
-    map: &Hypermap<CellType>,
+    map: &Hypermap<f32>,
     start: (i32, i32),
     limits: HypermapSearchLimits,
 ) -> HypermapExploreResult {
@@ -314,8 +326,8 @@ pub fn shortest_path_from_ascii_markers(ascii: &str) -> Result<Option<Vec<(usize
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hypermap::Hypermap;
-    use crate::world_map::{CellType, WorldMapFloor};
+    use crate::map::hypermap::Hypermap;
+    use crate::map::world_map::WorldMapFloor;
 
     #[test]
     fn floor_astar_straight_line() {
@@ -351,9 +363,9 @@ mod tests {
 
     #[test]
     fn hypermap_crosses_chunk_boundary() {
-        let map = Hypermap::new(CellType::Void);
+        let map: Hypermap<f32> = Hypermap::new(0.0);
         for x in 0..70 {
-            map.set(x, 0, CellType::Road);
+            map.set(x, 0, 1.0);
         }
         let r = astar_shortest_world_path(
             &map,
@@ -375,7 +387,7 @@ mod tests {
 
     #[test]
     fn hypermap_limit_triggers() {
-        let map = Hypermap::new(CellType::Road);
+        let map: Hypermap<f32> = Hypermap::new(1.0);
         let r = astar_shortest_world_path(
             &map,
             (0, 0),
@@ -395,10 +407,10 @@ mod tests {
 
     #[test]
     fn explore_respects_void_default() {
-        let map = Hypermap::new(CellType::Void);
-        map.set(0, 0, CellType::Road);
-        map.set(1, 0, CellType::Road);
-        map.set(2, 0, CellType::Road);
+        let map: Hypermap<f32> = Hypermap::new(0.0);
+        map.set(0, 0, 1.0);
+        map.set(1, 0, 1.0);
+        map.set(2, 0, 1.0);
         let r = explore_walkable_tiles_limited(
             &map,
             (0, 0),

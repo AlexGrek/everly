@@ -5,7 +5,8 @@ use bevy::pbr::StandardMaterial;
 use bevy::picking::prelude::*;
 use bevy::prelude::*;
 
-use crate::floor_level::HYPERMAP_FLOOR_HEIGHT;
+use crate::map::floor_level::{HYPERMAP_FLOOR_HEIGHT, HYPERMAP_FLOOR_MAX};
+use crate::menu::main_menu::GameState;
 
 /// Vertical offset of the duplicated floor tile for the active selection.
 pub const SELECTED_CELL_LIFT_Y: f32 = 0.2;
@@ -16,7 +17,7 @@ pub struct MapSelectionRoadMaterial(pub Handle<StandardMaterial>);
 
 /// Selected grid column, row, and floor index (`0..=9`).
 #[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct SelectedMapCell(pub Option<(i32, i32, u8)>);
+pub struct SelectedMapCell(pub Option<(i32, i32, i32)>);
 
 #[derive(Component)]
 pub(crate) struct SelectedCellHighlight;
@@ -26,7 +27,10 @@ pub struct MapSelectionPlugin;
 impl Plugin for MapSelectionPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SelectedMapCell>()
-            .add_systems(Update, sync_selected_cell_lift);
+            .add_systems(
+                Update,
+                sync_selected_cell_lift.run_if(in_state(GameState::InGame)),
+            );
     }
 }
 
@@ -39,7 +43,7 @@ pub(crate) fn floor_grid_click(click: On<Pointer<Click>>, mut selected: ResMut<S
     };
     let ix = pos.x.floor() as i32;
     let iz = pos.z.floor() as i32;
-    let fy = (pos.y / HYPERMAP_FLOOR_HEIGHT).floor().clamp(0.0, 9.0) as u8;
+    let fy = (pos.y / HYPERMAP_FLOOR_HEIGHT).floor().clamp(0.0, HYPERMAP_FLOOR_MAX as f32) as i32;
     selected.0 = Some((ix, iz, fy));
 }
 
