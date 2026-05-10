@@ -17,7 +17,12 @@ The starter scene gives you:
 
 The startup tilemap is read from `world_map.txt` on each run.
 
-For token format and rendering semantics, see `docs/tilemap.md`.
+For token format, **world scale** (1 m tiles, 0.2 m wall thickness, 3 m walls, storey spacing slightly above 3 m), and rendering semantics, see:
+
+- `docs/tilemap.md`
+- `docs/hypermap.md`
+- `docs/rendering-pipeline.md`
+- `docs/map-editor.md` — in-game hypermap paint mode (Edit button, palette, preview, remesh)
 
 ## Project layout
 
@@ -52,7 +57,7 @@ cargo run --features dev
 | Action      | Keys                        |
 | ----------- | --------------------------- |
 | Pan camera  | `W` `A` `S` `D` or arrows   |
-| Zoom        | Mouse wheel / trackpad scroll |
+| Zoom        | Mouse wheel / trackpad scroll (disabled while placing **Wall** or **Corner** in map edit mode; wheel then cycles variants) |
 
 ## Faster iterative builds
 

@@ -73,6 +73,18 @@ Avoid one-off fly or pan cameras for dev workflows. Bevy 0.18 ships first-party 
 - **3D fly:** `FreeCameraPlugin` and `FreeCamera`.
 - **2D pan/zoom:** `PanCameraPlugin` and `PanCamera`.
 
+## Everly map scale (hypermap)
+
+When touching **`src/hypermap_world.rs`**, **`src/world_map.rs`**, **`src/floor_level.rs`**, **`src/map_selection.rs`**, or floor/camera height:
+
+- **1 world unit = 1 m** for map geometry; each tile is **1 m × 1 m** in XZ.
+- **Wall slabs:** thickness **`WALL_THICKNESS` = 0.2** (one-fifth of a cell); one thin box per wall bitmask edge via `for_each_wall_segment`.
+- **Wall height:** **`HYPERMAP_WALL_HEIGHT` = 3.0** — vertical extent of wall meshes.
+- **Storey spacing:** **`HYPERMAP_FLOOR_HEIGHT` = `HYPERMAP_WALL_HEIGHT + 0.03`** — use for camera `focus.y`, upper-floor road quads, and picking floor index; keep wall meshes tied to **`HYPERMAP_WALL_HEIGHT`** only so storeys stay visually separated.
+- **Chunk floor meshes** include **every non-void cell** (road **and** wall): a shared floor quad plus separate wall geometry (see `docs/rendering-pipeline.md`).
+
+Authoring reference: **`docs/tilemap.md`**, agent checklist: **`.claude/SKILLS/map-creator/SKILL.md`**.
+
 ## Project workflow
 
 - **ECS:** Keep data in `Component`s and logic in systems; avoid god objects.

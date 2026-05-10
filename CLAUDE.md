@@ -2,6 +2,11 @@
 
 Guidance for Claude (and other coding agents) working in this repo.
 
+**Always read docs before reading code.** For whatever you are changing,
+read the relevant material under `docs/`, `README.md`, and any skills
+this file tells you to use *before* opening `src/` or scripts — unless
+the task is a one-line fix with no behavioral surface.
+
 ## Project
 
 **Everly** — a 3D strategy-camera sandbox built with the
@@ -22,7 +27,10 @@ Rust, `Cargo.toml`, or `*.wgsl` files. It is the source of truth for
 Bevy 0.18 idioms (observers, atmospheres, post-processing, UI, cameras,
 features, fast-compile setup).
 
-For the tilemap text format used at startup, see `docs/tilemap.md`.
+For the tilemap text format and **map world units** (1 m cells, wall thickness,
+wall height vs storey spacing), see `docs/tilemap.md` and `src/floor_level.rs`.
+When authoring or refactoring `world_map.txt`, `world_map_floor1.txt`, or map
+encoding, read `.claude/SKILLS/map-creator/SKILL.md` first.
 
 ## Repository layout
 
@@ -33,13 +41,21 @@ everly/
 ├── README.md             # user-facing docs (run, controls, license)
 ├── CLAUDE.md             # this file
 ├── world_map.txt         # startup map input (2 chars per cell)
+├── scripts/              # e.g. generate_world_map.py → regen world_map.txt
 ├── docs/
-│   └── tilemap.md        # tilemap encoding + authoring guide
+│   ├── README.md         # index of behavior docs
+│   ├── tilemap.md        # encoding + world units (1 m cells, walls, storeys)
+│   ├── hypermap.md       # chunks, multi-floor, visibility, water
+│   ├── rendering-pipeline.md  # batched meshes, floor vs wall layers
+│   └── map-editor.md     # in-game tile paint + chunk remesh
 ├── .claude/SKILLS/       # repo-local skills (read these first)
+│   ├── bevy-engineer/
+│   └── map-creator/
 └── src/
     ├── main.rs           # window setup + DefaultPlugins + GamePlugin
     ├── lib.rs            # GamePlugin wires every submodule
     ├── camera.rs         # StrategyCameraPlugin
+    ├── map_edit.rs       # MapEditPlugin (HUD palette, paint, remesh queue)
     └── world_map.rs      # parser + world floor data + tilemap rendering
 ```
 
@@ -124,6 +140,8 @@ systems implement the controller:
 - `sync_camera_transform` — uses `Changed<StrategyCamera>` so the
   `Transform` is only rebuilt when params actually change.
 
+`focus.y` eases toward the active hypermap floor height each frame (exponential blend in `src/camera.rs`, rate `floor_level::CAMERA_FLOOR_Y_SMOOTH_PER_S`), not an instant snap.
+
 When extending the camera (e.g. rotation, edge-pan, follow target),
 add new systems and component fields rather than special-casing inside
 the existing systems.
@@ -144,18 +162,23 @@ strictly necessary — they're slow.
 
 ## Workflow expectations
 
-1. **Read the bevy-engineer skill first** when touching Rust, Cargo,
+1. **Docs before code** (see the rule at the top of this file).
+2. **Read the bevy-engineer skill first** when touching Rust, Cargo,
    or shaders.
-2. **Run `cargo check`** after substantive edits and before declaring
+3. **Run `cargo check`** after substantive edits and before declaring
    work done. Fix all warnings you introduce.
-3. **Keep modules narrowly scoped.** Splitting a growing module is
+4. **Keep modules narrowly scoped.** Splitting a growing module is
    preferred over letting it become a kitchen sink.
-4. **Don't add comments that narrate code.** Comments should explain
+5. **Don't add comments that narrate code.** Comments should explain
    non-obvious intent, trade-offs, or constraints — never restate what
    the line below already says.
-5. **Don't introduce new top-level dependencies casually.** Prefer
+6. **Don't introduce new top-level dependencies casually.** Prefer
    what Bevy already bundles. If a new crate is genuinely required,
    pick a maintained, mainstream one and pin a recent version.
-6. **Verify Bevy API shapes against `https://docs.rs/bevy/0.18.1/`**
+7. **Verify Bevy API shapes against `https://docs.rs/bevy/0.18.1/`**
    before guessing. The 0.17 → 0.18 jump renamed enough things that
    training-data recall is unreliable.
+
+# IMPORTANT
+
+**Never use python for map generation, it always fails**

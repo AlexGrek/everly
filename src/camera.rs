@@ -9,6 +9,28 @@ use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::render::view::Hdr;
 
+use crate::floor_level::{
+    ActiveFloorLevel, CAMERA_FLOOR_Y_SMOOTH_PER_S, HYPERMAP_FLOOR_HEIGHT,
+};
+use crate::map_edit::{MapEditState, MapTileKind};
+
+/// Tilt used for the normal RTS-style view (degrees → radians in [`StrategyCamera::default`]).
+pub const STRATEGY_CAMERA_DEFAULT_PITCH: f32 = 55.0_f32.to_radians();
+/// Near-vertical pitch for the map / top-down view (slightly off 90° so `look_at` stays stable).
+pub const STRATEGY_CAMERA_MAP_PITCH: f32 = 89.0_f32.to_radians();
+
+/// How the strategy camera interprets tilt: angled gameplay vs map-style top-down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StrategyCameraViewMode {
+    #[default]
+    Strategy,
+    Map,
+}
+
+/// Marker on the entity that carries [`Camera3d`] + [`StrategyCamera`] (for UI target wiring).
+#[derive(Component, Debug, Clone, Copy)]
+pub struct StrategyCameraRig;
+
 /// Marker + parameters for the player-controlled strategy camera.
 #[derive(Component, Debug, Clone, Copy)]
 pub struct StrategyCamera {
@@ -22,6 +44,7 @@ pub struct StrategyCamera {
     pub yaw: f32,
     /// Tilt below the horizon, in radians (π/2 = straight down).
     pub pitch: f32,
+    pub view_mode: StrategyCameraViewMode,
     /// Max pan speed in world units per second at the reference distance.
     pub pan_speed: f32,
     /// How quickly pan velocity approaches the target while keys are held
@@ -44,7 +67,8 @@ impl Default for StrategyCamera {
             pan_velocity: Vec3::ZERO,
             distance: 30.0,
             yaw: 0.0,
-            pitch: 55.0_f32.to_radians(),
+            pitch: STRATEGY_CAMERA_DEFAULT_PITCH,
+            view_mode: StrategyCameraViewMode::default(),
             pan_speed: 18.0,
             pan_acceleration: 55.0,
             pan_drag: 3.2,
@@ -63,8 +87,15 @@ pub struct StrategyCameraPlugin;
 
 impl Plugin for StrategyCameraPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_camera)
-            .add_systems(Update, (pan_camera, zoom_camera, sync_camera_transform));
+        app.add_systems(Startup, spawn_camera).add_systems(
+            Update,
+            (
+                pan_camera,
+                zoom_camera,
+                smooth_focus_y_for_active_floor,
+                sync_camera_transform,
+            ),
+        );
     }
 }
 
@@ -74,6 +105,7 @@ fn spawn_camera(mut commands: Commands) {
 
     commands.spawn((
         Name::new("Strategy Camera"),
+        StrategyCameraRig,
         Camera3d::default(),
         Msaa::Off,
         Hdr,
@@ -149,9 +181,19 @@ fn pan_camera(keys: Res<ButtonInput<KeyCode>>, time: Res<Time>, mut cameras: Que
 }
 
 fn zoom_camera(
+    map_edit: Option<Res<MapEditState>>,
     mut wheel_messages: MessageReader<MouseWheel>,
     mut cameras: Query<&mut StrategyCamera>,
 ) {
+    if map_edit.as_ref().is_some_and(|s| {
+        matches!(
+            s.placement_tile,
+            Some(MapTileKind::Wall | MapTileKind::Corner)
+        )
+    }) {
+        return;
+    }
+
     let mut scroll = 0.0;
     for ev in wheel_messages.read() {
         scroll += match ev.unit {
@@ -168,6 +210,24 @@ fn zoom_camera(
     for mut cam in &mut cameras {
         let new_distance = cam.distance - scroll * cam.zoom_speed;
         cam.distance = new_distance.clamp(cam.min_distance, cam.max_distance);
+    }
+}
+
+fn smooth_focus_y_for_active_floor(
+    floor: Res<ActiveFloorLevel>,
+    time: Res<Time>,
+    mut cameras: Query<&mut StrategyCamera>,
+) {
+    let target_y = floor.0 as f32 * HYPERMAP_FLOOR_HEIGHT;
+    let dt = time.delta_secs();
+    let blend = 1.0 - (-CAMERA_FLOOR_Y_SMOOTH_PER_S * dt).exp();
+    for mut cam in &mut cameras {
+        let dy = target_y - cam.focus.y;
+        if dy.abs() < 1e-4 {
+            cam.focus.y = target_y;
+        } else {
+            cam.focus.y += dy * blend;
+        }
     }
 }
 

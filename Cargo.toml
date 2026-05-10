@@ -10,6 +10,7 @@ publish = false
 bevy = "0.18.1"
 bevy_water = "0.18.1"
 futures-lite = "2.6.1"
+pathfinding = "4.15"
 rand = "0.8"
 
 # Opt-in feature for blazing-fast iterative dev builds via Bevy's dynamic linking.

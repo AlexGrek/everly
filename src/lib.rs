@@ -11,10 +11,15 @@ use bevy::prelude::*;
 use bevy_water::{WaterPlugin, WaterQuality, WaterSettings};
 
 pub mod boxes;
+pub mod map_edit;
 pub mod camera;
+pub mod floor_level;
+pub mod game_hud;
 pub mod ground;
 pub mod hypermap;
+pub mod hypermap_pathfind;
 pub mod hypermap_world;
+pub mod map_selection;
 pub mod sun;
 pub mod world_map;
 
@@ -40,9 +45,18 @@ impl Plugin for GamePlugin {
             })
             .add_plugins((
                 WaterPlugin,
+                MeshPickingPlugin,
                 camera::StrategyCameraPlugin,
+                game_hud::GameHudPlugin,
+                floor_level::FloorLevelPlugin,
                 hypermap_world::HypermapWorldPlugin,
+                map_edit::MapEditPlugin,
+                map_selection::MapSelectionPlugin,
                 sun::SunPlugin,
-            ));
+            ))
+            .add_systems(
+                PostStartup,
+                map_edit::spawn_map_edit_palette.after(game_hud::spawn_bottom_hud),
+            );
     }
 }
