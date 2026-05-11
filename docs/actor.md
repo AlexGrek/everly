@@ -128,6 +128,34 @@ fn spawn_actor(mut commands: Commands) {
 }
 ```
 
+## New actor checklist
+
+Use this when introducing a new actor class:
+
+- [ ] Define a concrete actor struct with `state: ActorState`.
+- [ ] Initialize `ActorState` with:
+  - [ ] `center` in tile-space (`Vec2`)
+  - [ ] `radius_subtiles`
+  - [ ] `rotation`
+  - [ ] `move_buffer: ActorMoveBuffer::default()`
+  - [ ] `last_movement_error: None`
+  - [ ] `footprint: ActorFootprint::new()`
+- [ ] Implement `Actor`:
+  - [ ] `state()` and `state_mut()`
+  - [ ] `think_low_level()` if needed
+  - [ ] `prepare_movement()` to fill `move_buffer`
+- [ ] Do not mutate `center` directly in gameplay systems; let `try_move` / `move_actor` apply accepted motion.
+- [ ] Keep movement intent in subtile units (`IVec2`) and remember `1 tile = 5 subtiles`.
+- [ ] Spawn the actor as `ActorObject::new(Box::new(...))` and add a `Name`.
+- [ ] Add/adjust unit tests for:
+  - [ ] successful movement
+  - [ ] blocked movement error path
+  - [ ] footprint persistence expectations (self-overlap should be ignored by passability updates)
+- [ ] Run:
+  - [ ] `cargo check`
+  - [ ] `cargo test -p everly -- actor`
+  - [ ] `cargo test -p everly -- passability`
+
 ## Notes and extension points
 
 - Keep `think_low_level` cheap and deterministic; heavy planning belongs in a separate async layer.

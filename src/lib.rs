@@ -49,6 +49,7 @@ impl Plugin for GamePlugin {
                 map::hypermap_world::HypermapWorldPlugin,
                 map::passability::PassabilityMapPlugin,
                 actor::ActorPlugin,
+                actor::glitch_bot::GlitchBotPlugin,
                 edit::map_edit::MapEditPlugin,
                 edit::map_selection::MapSelectionPlugin,
             ))

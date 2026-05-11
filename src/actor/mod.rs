@@ -19,6 +19,8 @@
 //! - Actors use circular integer "shadows" with radius measured in subtiles.
 //! - Shadow offsets are baked and cached per-radius, then reused.
 
+pub mod glitch_bot;
+
 use bevy::prelude::*;
 
 use crate::map::passability::{
@@ -205,7 +207,7 @@ impl Plugin for ActorPlugin {
 }
 
 /// Drives the complete low-level actor pipeline for all registered actors.
-fn process_actors(mut actors: Query<&mut ActorObject>, passability: Res<DynamicPassabilityMap>) {
+pub fn process_actors(mut actors: Query<&mut ActorObject>, passability: Res<DynamicPassabilityMap>) {
     for mut actor in &mut actors {
         let actor = actor.inner.as_mut();
         actor.state_mut().last_movement_error = None;

@@ -69,4 +69,5 @@ For generic Bevy API usage, still read `.claude/SKILLS/bevy-engineer/SKILL.md` f
 When actor behavior changes, update:
 
 - `docs/actor.md` (primary reference).
+- Follow `docs/actor.md#new-actor-checklist` for onboarding new actor classes.
 - `docs/README.md` if scope/discoverability changed.

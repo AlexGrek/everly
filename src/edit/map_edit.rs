@@ -19,6 +19,7 @@ use crate::map::world_map::{
     CellType, WallCorner, WallMask, MASK_EAST, MASK_NORTH, MASK_SOUTH, MASK_WEST,
 };
 use crate::menu::main_menu::GameState;
+use crate::actor::glitch_bot::{self, GlitchBotRng};
 use crate::scene::camera::StrategyCameraRig;
 
 /// Pixels from the bottom of the window where raycasting and clicks are suppressed
@@ -51,6 +52,8 @@ pub enum MapTileKind {
     /// Drag a rectangle; on mouse up, place walls only on the **border** with masks facing outward (closed loop).
     Room,
     Corner,
+    /// Places a GlitchBot actor at the clicked tile (single-click, no drag).
+    GlitchBot,
 }
 
 #[derive(Resource, Default)]
@@ -138,6 +141,7 @@ pub(crate) fn spawn_map_edit_palette(mut commands: Commands, camera: Query<Entit
                 ("Wall", MapTileKind::Wall),
                 ("Room", MapTileKind::Room),
                 ("Corner", MapTileKind::Corner),
+                ("Bot", MapTileKind::GlitchBot),
             ] {
                 row.spawn((
                     Name::new(format!("Map edit pick {label}")),
@@ -435,6 +439,7 @@ fn stroke_world_cells(kind: MapTileKind, start: (i32, i32), end: (i32, i32)) -> 
         MapTileKind::Void | MapTileKind::Road => floor_rect_cells(start, end),
         MapTileKind::Room => room_outline_cells(start, end),
         MapTileKind::Corner => vec![end],
+        MapTileKind::GlitchBot => vec![end],
     }
 }
 
@@ -479,6 +484,7 @@ fn resolved_cell(kind: MapTileKind, variant: u32) -> CellType {
             };
             CellType::Corner(c)
         }
+        MapTileKind::GlitchBot => CellType::Road,
     }
 }
 
@@ -570,6 +576,7 @@ fn map_edit_update_preview(
                 let (ix, iz) = strokes[0];
                 build_floor0_wall_mesh(&[(0, 0, c)], ix, iz).or_else(void_preview_plane)
             }
+            MapTileKind::GlitchBot => void_preview_plane(),
         }
     } else {
         match kind {
@@ -611,6 +618,7 @@ fn map_edit_update_preview(
                 let (ix, iz) = strokes[0];
                 build_upper_wall_mesh(&[(0, 0, f, c)], ix, iz).or_else(void_preview_plane)
             }
+            MapTileKind::GlitchBot => void_preview_plane(),
         }
     };
 
@@ -660,6 +668,7 @@ fn void_preview_plane() -> Option<Mesh> {
 struct MapEditPreviewMaterial(Handle<StandardMaterial>);
 
 fn map_edit_pointer_stroke(
+    mut commands: Commands,
     mouse: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window>,
     cameras: Query<(&Camera, &GlobalTransform), With<StrategyCameraRig>>,
@@ -670,6 +679,9 @@ fn map_edit_pointer_stroke(
     level: Res<LevelName>,
     runtime: Res<HypermapRuntime>,
     mut remesh: ResMut<HypermapChunkRemeshQueue>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut bot_rng: ResMut<GlitchBotRng>,
 ) {
     let Some(kind) = state.placement_tile else {
         drag.0 = None;
@@ -706,6 +718,18 @@ fn map_edit_pointer_stroke(
     let Some(end) = map_edit_plane_cell(&window, &cam, &cam_gt, floor.0) else {
         return;
     };
+
+    if kind == MapTileKind::GlitchBot {
+        let center = Vec2::new(end.0 as f32 + 0.5, end.1 as f32 + 0.5);
+        glitch_bot::spawn_glitch_bot(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            &mut bot_rng.0,
+            center,
+        );
+        return;
+    }
 
     let tiles = stroke_world_cells(kind, start, end);
     if tiles.is_empty() {
@@ -769,7 +793,7 @@ fn map_edit_scroll_variants(
     let max_v = match kind {
         MapTileKind::Wall => 15,
         MapTileKind::Corner => 4,
-        MapTileKind::Void | MapTileKind::Road | MapTileKind::Room => return,
+        MapTileKind::Void | MapTileKind::Road | MapTileKind::Room | MapTileKind::GlitchBot => return,
     };
 
     let mut scroll = 0.0f32;
