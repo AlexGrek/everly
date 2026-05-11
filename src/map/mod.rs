@@ -12,4 +12,5 @@ pub mod hypermap;
 pub mod level;
 pub mod hypermap_pathfind;
 pub mod hypermap_world;
+pub mod passability;
 pub mod world_map;

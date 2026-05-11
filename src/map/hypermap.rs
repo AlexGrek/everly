@@ -92,6 +92,20 @@ where
     default_tile: T,
 }
 
+/// Two [`Hypermap`]s in a front/back arrangement.
+///
+/// Reads hit the **read** buffer; writes hit the **write** buffer.
+/// [`flush`](Self::flush) atomically promotes the write buffer to the read
+/// side and resets the write buffer to its clean (default-tile) state.
+#[derive(Debug)]
+pub struct DoubleBufferedHypermap<T>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    read: Hypermap<T>,
+    write: Hypermap<T>,
+}
+
 impl<T> Hypermap<T>
 where
     T: Clone + Send + Sync + 'static,
@@ -203,6 +217,110 @@ where
         let mut guard = handle.write().expect("chunk lock poisoned");
         f(&mut guard)
     }
+
+    /// Removes and returns all chunk handles, leaving the map empty.
+    fn drain_chunks(&self) -> HashMap<ChunkCoord, HypermapChunkHandle<T>> {
+        let mut chunks = self.chunks.write().expect("hypermap lock poisoned");
+        std::mem::take(&mut *chunks)
+    }
+
+    /// Replaces the chunk table wholesale. Previous contents are dropped.
+    fn replace_chunks(&self, new_chunks: HashMap<ChunkCoord, HypermapChunkHandle<T>>) {
+        let mut chunks = self.chunks.write().expect("hypermap lock poisoned");
+        *chunks = new_chunks;
+    }
+}
+
+impl<T> DoubleBufferedHypermap<T>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    pub fn new(default_tile: T) -> Self {
+        Self {
+            read: Hypermap::new(default_tile.clone()),
+            write: Hypermap::new(default_tile),
+        }
+    }
+
+    // --- read-side delegates ---
+
+    pub fn get(&self, world_x: i32, world_y: i32) -> T {
+        self.read.get(world_x, world_y)
+    }
+
+    pub fn get_floor(&self, world_x: i32, world_y: i32, floor: i32) -> T {
+        self.read.get_floor(world_x, world_y, floor)
+    }
+
+    pub fn has_chunk(&self, coord: ChunkCoord) -> bool {
+        self.read.has_chunk(coord)
+    }
+
+    pub fn loaded_chunk_count(&self) -> usize {
+        self.read.loaded_chunk_count()
+    }
+
+    pub fn loaded_chunks(&self) -> Vec<ChunkCoord> {
+        self.read.loaded_chunks()
+    }
+
+    pub fn get_chunk(&self, coord: ChunkCoord) -> Option<HypermapChunkHandle<T>> {
+        self.read.get_chunk(coord)
+    }
+
+    pub fn with_chunk_read<R, F>(&self, coord: ChunkCoord, f: F) -> Option<R>
+    where
+        F: FnOnce(&HypermapChunk<T>) -> R,
+    {
+        self.read.with_chunk_read(coord, f)
+    }
+
+    // --- write-side delegates ---
+
+    pub fn set(&self, world_x: i32, world_y: i32, value: T) {
+        self.write.set(world_x, world_y, value);
+    }
+
+    pub fn set_floor(&self, world_x: i32, world_y: i32, floor: i32, value: T) {
+        self.write.set_floor(world_x, world_y, floor, value);
+    }
+
+    pub fn update<F>(&self, world_x: i32, world_y: i32, f: F)
+    where
+        F: FnOnce(&mut T),
+    {
+        self.write.update(world_x, world_y, f);
+    }
+
+    pub fn get_or_create_chunk(&self, coord: ChunkCoord) -> HypermapChunkHandle<T> {
+        self.write.get_or_create_chunk(coord)
+    }
+
+    pub fn with_chunk_write<R, F>(&self, coord: ChunkCoord, f: F) -> R
+    where
+        F: FnOnce(&mut HypermapChunk<T>) -> R,
+    {
+        self.write.with_chunk_write(coord, f)
+    }
+
+    // --- double-buffer lifecycle ---
+
+    /// Promotes the write buffer to the read side and resets the write
+    /// buffer to a clean state (all chunks dropped, reads return `default_tile`).
+    pub fn flush(&self) {
+        let write_chunks = self.write.drain_chunks();
+        self.read.replace_chunks(write_chunks);
+    }
+
+    /// Direct access to the read-side [`Hypermap`].
+    pub fn read_map(&self) -> &Hypermap<T> {
+        &self.read
+    }
+
+    /// Direct access to the write-side [`Hypermap`].
+    pub fn write_map(&self) -> &Hypermap<T> {
+        &self.write
+    }
 }
 
 pub fn world_to_chunk_local(world_x: i32, world_y: i32) -> (ChunkCoord, LocalCoord) {
@@ -308,5 +426,48 @@ mod tests {
 
         assert_eq!(map.get(-200, 0), 1);
         assert_eq!(map.get(200, 0), 2);
+    }
+
+    // --- DoubleBufferedHypermap ---
+
+    #[test]
+    fn double_buf_reads_default_before_flush() {
+        let db = DoubleBufferedHypermap::new(0i32);
+        db.set(5, 5, 42);
+        assert_eq!(db.get(5, 5), 0, "read side untouched before flush");
+    }
+
+    #[test]
+    fn double_buf_flush_promotes_writes_to_read() {
+        let db = DoubleBufferedHypermap::new(0i32);
+        db.set(10, 10, 99);
+        db.set_floor(10, 10, 2, 77);
+        db.flush();
+
+        assert_eq!(db.get(10, 10), 99);
+        assert_eq!(db.get_floor(10, 10, 2), 77);
+    }
+
+    #[test]
+    fn double_buf_write_resets_after_flush() {
+        let db = DoubleBufferedHypermap::new(0i32);
+        db.set(1, 1, 5);
+        db.flush();
+        assert_eq!(db.get(1, 1), 5);
+
+        db.flush();
+        assert_eq!(db.get(1, 1), 0, "second flush with no new writes resets read to default");
+    }
+
+    #[test]
+    fn double_buf_loaded_chunks_reflects_read_side() {
+        let db = DoubleBufferedHypermap::new(0i32);
+        assert_eq!(db.loaded_chunk_count(), 0);
+
+        db.set(0, 0, 1);
+        assert_eq!(db.loaded_chunk_count(), 0, "write-side chunk not counted on read");
+
+        db.flush();
+        assert_eq!(db.loaded_chunk_count(), 1);
     }
 }

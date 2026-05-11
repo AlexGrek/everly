@@ -46,6 +46,7 @@ impl Plugin for GamePlugin {
                 map::floor_level::FloorLevelPlugin,
                 map::level::LevelPlugin,
                 map::hypermap_world::HypermapWorldPlugin,
+                map::passability::PassabilityMapPlugin,
                 edit::map_edit::MapEditPlugin,
                 edit::map_selection::MapSelectionPlugin,
             ))

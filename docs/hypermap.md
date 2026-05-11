@@ -43,7 +43,23 @@ shadows the world `Hypermap<CellType>`. Every cell stores the value of
   `src/map/hypermap_pathfind.rs`) reads only from `static_passability_map`. A tile is walkable
   iff its sample is `> 0.0`.
 - "Static" because no runtime obstacles (units, doors, etc.) participate — only the authored /
-  procedural geometry. Future dynamic-passability layers should be a separate hypermap.
+  procedural geometry. Dynamic obstacles use the separate `DynamicPassabilityMap` below.
+
+## Dynamic Passability Map
+
+`DynamicPassabilityMap` (resource, `src/map/passability.rs`) stores a
+**`DoubleBufferedHypermap<SubtilePassability>`** for runtime obstacles.
+
+- Each world tile is subdivided into a **5×5 micro-grid** of booleans
+  (`SubtilePassability`; `true` = passable, `false` = blocked).
+- Default tile is `ALL_PASSABLE` — unallocated chunks are fully walkable.
+- Uses a **double-buffered** hypermap (`DoubleBufferedHypermap` in
+  `src/map/hypermap.rs`): reads hit the **read** buffer; writes hit the
+  **write** buffer. Calling `flush()` atomically promotes write→read and
+  resets the write buffer to clean state (all chunks dropped, default tile
+  returns).
+- **Not yet wired into pathfinding.** The data store is ready for future
+  integration.
 
 ## Visibility Window (Directional)
 
