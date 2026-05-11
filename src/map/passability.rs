@@ -8,7 +8,8 @@
 //!
 //! This map is **not** wired into pathfinding yet — it only provides the data store.
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bevy::prelude::*;
 
@@ -61,6 +62,19 @@ pub struct DynamicPassabilityMap {
     inner: Arc<DoubleBufferedHypermap<SubtilePassability>>,
 }
 
+/// Absolute world-subtile coordinates that an actor currently occupies.
+pub type ActorFootprint = Vec<IVec2>;
+
+/// Error produced when applying a footprint update to the dynamic map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TryUpdateFootprintError {
+    /// The requested circular radius is invalid.
+    InvalidRadius(i32),
+    /// Target footprint intersects an already-blocked subtile that is not in
+    /// the actor's previous footprint.
+    BlockedByOccupancy { world_subtile: IVec2 },
+}
+
 impl DynamicPassabilityMap {
     pub fn new() -> Self {
         Self {
@@ -74,6 +88,57 @@ impl DynamicPassabilityMap {
 
     pub fn flush(&self) {
         self.inner.flush();
+    }
+
+    /// Tries to update actor occupancy and returns the new footprint to store.
+    ///
+    /// This method centralizes movement-collision logic so actor code stays
+    /// simple. It:
+    ///
+    /// 1. Builds the actor's circular shadow at `next_center_subtile`.
+    /// 2. Checks collisions against the passability **read** buffer.
+    /// 3. Ignores collisions with `previous_footprint` (self-overlap).
+    /// 4. On success, writes the new footprint as blocked (`false`) into the
+    ///    passability **write** buffer and returns it.
+    /// 5. On failure, re-stamps `previous_footprint` into the write buffer so
+    ///    the actor keeps occupying its old cells for the next frame.
+    pub fn try_update_footprint(
+        &self,
+        next_center_subtile: IVec2,
+        radius_subtiles: i32,
+        previous_footprint: &[IVec2],
+    ) -> Result<ActorFootprint, TryUpdateFootprintError> {
+        if radius_subtiles < 0 {
+            return Err(TryUpdateFootprintError::InvalidRadius(radius_subtiles));
+        }
+
+        let subtile_map = SubtilePassabilityMap::new(self);
+        let previous_set: HashSet<IVec2> = previous_footprint.iter().copied().collect();
+        let mut new_footprint = Vec::new();
+
+        for offset in baked_circle_shadow(radius_subtiles) {
+            let target = next_center_subtile + *offset;
+            let is_passable = subtile_map.subtile_xy(0, 0, target.x, target.y);
+            let is_self_overlap = previous_set.contains(&target);
+            if !is_passable && !is_self_overlap {
+                self.write_footprint(previous_footprint);
+                return Err(TryUpdateFootprintError::BlockedByOccupancy {
+                    world_subtile: target,
+                });
+            }
+            new_footprint.push(target);
+        }
+
+        self.write_footprint(&new_footprint);
+        Ok(new_footprint)
+    }
+
+    /// Writes a footprint as blocked (`false`) into the passability write buffer.
+    pub fn write_footprint(&self, footprint: &[IVec2]) {
+        let subtile_map = SubtilePassabilityMap::new(self);
+        for sub in footprint {
+            subtile_map.set_subtile_xy(0, 0, sub.x, sub.y, false);
+        }
     }
 }
 
@@ -180,6 +245,34 @@ fn resolve_subtile(tile: i32, shift: i32) -> (i32, usize) {
     let resolved_tile = global.div_euclid(sc);
     let local = global.rem_euclid(sc) as usize;
     (resolved_tile, local)
+}
+
+/// Returns cached integer offsets for a filled circle of `radius_subtiles`.
+///
+/// Includes every `(dx, dy)` where `dx*dx + dy*dy <= r*r`.
+fn baked_circle_shadow(radius_subtiles: i32) -> &'static [IVec2] {
+    static CACHE: OnceLock<Mutex<HashMap<i32, &'static [IVec2]>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    let mut guard = cache.lock().expect("passability shadow cache lock poisoned");
+    if let Some(existing) = guard.get(&radius_subtiles) {
+        return existing;
+    }
+
+    let r = radius_subtiles.max(0);
+    let rr = r * r;
+    let mut offsets = Vec::new();
+    for y in -r..=r {
+        for x in -r..=r {
+            if x * x + y * y <= rr {
+                offsets.push(IVec2::new(x, y));
+            }
+        }
+    }
+
+    let leaked: &'static [IVec2] = Box::leak(offsets.into_boxed_slice());
+    guard.insert(radius_subtiles, leaked);
+    leaked
 }
 
 pub struct PassabilityMapPlugin;
@@ -330,5 +423,52 @@ mod tests {
         assert_eq!(resolve_subtile(0, 5), (1, 0));
         assert_eq!(resolve_subtile(0, -1), (-1, 4));
         assert_eq!(resolve_subtile(3, -6), (1, 4));
+    }
+
+    #[test]
+    fn try_update_footprint_writes_and_returns_shape() {
+        let map = DynamicPassabilityMap::new();
+        let new_fp = map
+            .try_update_footprint(IVec2::new(20, 20), 1, &[])
+            .expect("footprint should be writable");
+        map.flush();
+        let view = SubtilePassabilityMap::new(&map);
+
+        assert!(!new_fp.is_empty());
+        for sub in &new_fp {
+            assert!(
+                !view.subtile_xy(0, 0, sub.x, sub.y),
+                "every returned subtile must be blocked in read buffer"
+            );
+        }
+    }
+
+    #[test]
+    fn try_update_footprint_ignores_previous_self_overlap() {
+        let map = DynamicPassabilityMap::new();
+        let old_fp = map
+            .try_update_footprint(IVec2::new(40, 40), 2, &[])
+            .expect("initial footprint");
+        map.flush();
+
+        // Move by one subtile to force large overlap with previous footprint.
+        let moved = map.try_update_footprint(IVec2::new(41, 40), 2, &old_fp);
+        assert!(moved.is_ok(), "self-overlap should not block movement");
+    }
+
+    #[test]
+    fn try_update_footprint_blocks_on_foreign_occupancy() {
+        let map = DynamicPassabilityMap::new();
+        map.write_footprint(&[IVec2::new(50, 50)]);
+        map.flush();
+
+        let err = map
+            .try_update_footprint(IVec2::new(50, 50), 0, &[])
+            .expect_err("blocked cell should reject footprint");
+        assert!(matches!(
+            err,
+            TryUpdateFootprintError::BlockedByOccupancy { world_subtile }
+                if world_subtile == IVec2::new(50, 50)
+        ));
     }
 }

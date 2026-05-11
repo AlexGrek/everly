@@ -28,6 +28,7 @@ For token format, **world scale** (1 m tiles, 0.2 m wall thickness, 3 m walls, s
 - `docs/hypermap.md`
 - `docs/rendering-pipeline.md`
 - `docs/map-editor.md` — in-game hypermap paint mode (Edit button, palette, preview, remesh)
+- `docs/actor.md` — actor low-level runtime, footprint/collision rules, and examples
 
 ## Project layout
 
@@ -38,6 +39,7 @@ each (where applicable) exposing a single Bevy `Plugin`:
 | ------------------------------- | ----------------------------------------------------------------- |
 | `src/main.rs`                   | App entry point and window setup.                                 |
 | `src/lib.rs`                    | Top-level `GamePlugin` that wires every subsystem.                |
+| `src/actor/mod.rs`              | `ActorPlugin` + trait-based low-level actor loop and movement.    |
 | `src/menu/main_menu.rs`         | `MainMenuPlugin` + `GameState` (MainMenu / InGame), level picker. |
 | `src/scene/camera.rs`           | `StrategyCameraPlugin` — RTS pan/zoom + post-processing stack.    |
 | `src/scene/sun.rs`              | `SunPlugin` — directional sun light.                              |

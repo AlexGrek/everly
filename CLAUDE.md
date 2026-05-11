@@ -32,6 +32,9 @@ wall height vs storey spacing), see `docs/tilemap.md` and `src/map/floor_level.r
 When authoring or refactoring `world_map.txt`, `world_map_floor1.txt`, or map
 encoding, read `.claude/SKILLS/map-creator/SKILL.md` first.
 
+When editing actor runtime code (`src/actor/`) or actor/passability movement
+integration, read `.claude/SKILLS/actor-engineer/SKILL.md` first.
+
 ## Repository layout
 
 ```
@@ -50,7 +53,8 @@ everly/
 │   └── map-editor.md     # in-game tile paint + chunk remesh
 ├── .claude/SKILLS/       # repo-local skills (read these first)
 │   ├── bevy-engineer/
-│   └── map-creator/
+│   ├── map-creator/
+│   └── actor-engineer/
 └── src/
     ├── main.rs                   # window setup + DefaultPlugins + GamePlugin
     ├── lib.rs                    # GamePlugin wires every subsystem

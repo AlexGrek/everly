@@ -6,5 +6,6 @@ Current behavior docs:
 - `docs/hypermap.md` — Hypermap chunk model, multi-floor data, generation, visibility, and water rules.
 - `docs/rendering-pipeline.md` — runtime planning, async prep, 30 FPS render stream, floor vs wall meshes.
 - `docs/map-editor.md` — in-game hypermap edit mode (HUD, preview, placement, variants, remesh).
+- `docs/actor.md` — actor trait runtime loop, movement buffer, footprint collision flow, and usage examples.
 
 Agent skills (repo): `.claude/SKILLS/map-creator/SKILL.md` (tilemaps + scale), `.claude/SKILLS/bevy-engineer/SKILL.md` (Bevy 0.18 + Everly map constants).

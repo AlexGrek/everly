@@ -10,6 +10,7 @@ use bevy::pbr::DefaultOpaqueRendererMethod;
 use bevy::prelude::*;
 use bevy_water::{WaterPlugin, WaterQuality, WaterSettings};
 
+pub mod actor;
 pub mod edit;
 pub mod hud;
 pub mod map;
@@ -47,6 +48,7 @@ impl Plugin for GamePlugin {
                 map::level::LevelPlugin,
                 map::hypermap_world::HypermapWorldPlugin,
                 map::passability::PassabilityMapPlugin,
+                actor::ActorPlugin,
                 edit::map_edit::MapEditPlugin,
                 edit::map_selection::MapSelectionPlugin,
             ))
