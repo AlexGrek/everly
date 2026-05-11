@@ -8,6 +8,7 @@ use crate::scene::camera::{
     StrategyCameraViewMode, STRATEGY_CAMERA_DEFAULT_PITCH, STRATEGY_CAMERA_MAP_PITCH,
 };
 use crate::edit::map_edit::{MapEditToggleButton, MapEditToggleLabel};
+use crate::map::chunk_overlay::OccupancyOverlayEnabled;
 use crate::map::floor_level::{ActiveFloorLevel, HYPERMAP_FLOOR_MAX};
 use crate::menu::main_menu::GameState;
 
@@ -34,6 +35,12 @@ struct AmbientToggleButton;
 #[derive(Component)]
 struct AmbientToggleLabel;
 
+#[derive(Component)]
+struct OccupancyToggleButton;
+
+#[derive(Component)]
+struct OccupancyToggleLabel;
+
 pub struct GameHudPlugin;
 
 impl Plugin for GameHudPlugin {
@@ -52,6 +59,8 @@ impl Plugin for GameHudPlugin {
                 map_button_toggle_views,
                 ambient_fill_toggle_button,
                 sync_ambient_toggle_label,
+                occupancy_toggle_button,
+                sync_occupancy_toggle_label,
                 floor_level_buttons,
                 update_floor_level_readout,
             )
@@ -161,6 +170,33 @@ pub(crate) fn spawn_bottom_hud(mut commands: Commands, camera: Query<Entity, Wit
                     p.spawn((
                         AmbientToggleLabel,
                         Text::new("Ambient: On"),
+                        TextFont::from_font_size(17.0),
+                        TextColor(TEXT_MAIN),
+                    ));
+                });
+
+            parent
+                .spawn((
+                    Name::new("HUD occupancy overlay toggle"),
+                    OccupancyToggleButton,
+                    Button,
+                    Node {
+                        min_width: Val::Px(88.0),
+                        height: Val::Px(36.0),
+                        padding: UiRect::horizontal(Val::Px(12.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(1.0)),
+                        border_radius: BorderRadius::all(Val::Px(6.0)),
+                        ..default()
+                    },
+                    BorderColor::all(BTN_BORDER),
+                    BackgroundColor(BTN_BG),
+                ))
+                .with_children(|p| {
+                    p.spawn((
+                        OccupancyToggleLabel,
+                        Text::new("Occ: Off"),
                         TextFont::from_font_size(17.0),
                         TextColor(TEXT_MAIN),
                     ));
@@ -316,5 +352,30 @@ fn update_floor_level_readout(
     }
     for mut text in &mut texts {
         **text = format!("Floor {}", floor.0);
+    }
+}
+
+fn occupancy_toggle_button(
+    interactions: Query<&Interaction, (With<OccupancyToggleButton>, Changed<Interaction>)>,
+    mut enabled: ResMut<OccupancyOverlayEnabled>,
+) {
+    for interaction in &interactions {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        enabled.0 = !enabled.0;
+    }
+}
+
+fn sync_occupancy_toggle_label(
+    enabled: Res<OccupancyOverlayEnabled>,
+    mut texts: Query<&mut Text, With<OccupancyToggleLabel>>,
+) {
+    if !enabled.is_changed() {
+        return;
+    }
+    let label = if enabled.0 { "Occ: On" } else { "Occ: Off" };
+    for mut text in &mut texts {
+        **text = label.to_string();
     }
 }

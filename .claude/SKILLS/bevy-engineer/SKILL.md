@@ -91,6 +91,53 @@ Authoring reference: **`docs/tilemap.md`**, agent checklist: **`.claude/SKILLS/m
 - **Cargo features:** Prefer Bevy’s high-level feature bundles in `Cargo.toml` (for example 2D, 3D, UI) instead of hand-picking many granular sub-crate features.
 - **Compile times:** If not already configured, suggest `lld` or `mold` (or `zld` on macOS) plus Cranelift in `.cargo/config.toml` for faster debug iteration.
 
+## Chunk overlays (`src/map/chunk_overlay.rs`)
+
+The overlay system provides per-chunk, subtile-resolution RGBA textures (640×640 texels = 128 tiles × 5 subtiles) floating above the floor. Two independent layers exist: a **generic** writable canvas and an **occupancy** debug layer (toggled with F4).
+
+To paint the generic layer from any system:
+
+1. Take `Res<ChunkOverlayState>`, `ResMut<Assets<Image>>`, `ResMut<Assets<StandardMaterial>>`.
+2. Convert world tile `(wx, wy)` → `(ChunkCoord, LocalCoord)` via `world_to_chunk_local(wx, wy)`.
+3. Get the image with `state.image_for(coord)`, write RGBA at byte index `(py * 640 + px) * 4` where `px = local.x * 5 + sx`, `py = local.y * 5 + sy`.
+4. **Must** touch the material via `materials.get_mut(state.material_for(coord))` after writes (Bevy issue #20269).
+5. Use `state.iter_coords()` to iterate all visible chunk coords (useful for per-frame clears).
+
+Full docs: **`docs/chunk-overlay.md`**. Source: **`src/map/chunk_overlay.rs`**.
+
+## Pathfinding (`src/map/hypermap_pathfind.rs`)
+
+A* on the static passability hypermap (`Hypermap<f32>`, tile walkable iff `> 0.0`). 4-neighbor grid, unit step cost, Manhattan heuristic.
+
+Key functions:
+
+- `astar_shortest_world_path(map, start, goal, limits) -> HypermapPathResult` — bounded A* returning `Found { path, expansions }`, `NoPath`, or `LimitExceeded`. Path includes start and goal as `(i32, i32)` world tile coords.
+- `explore_walkable_tiles_limited(map, start, limits) -> HypermapExploreResult` — uniform-cost flood from a tile.
+- `HypermapSearchLimits { max_expanded }` — caps node expansions (default 50 000).
+
+Access the static passability map from ECS via `Res<HypermapRuntime>` → `hypermap.static_passability_map`.
+
+Full docs: see pathfinding tests in source. Source: **`src/map/hypermap_pathfind.rs`**.
+
+## Actors (`src/actor/`)
+
+Trait-based actor system. Each actor type implements `Actor` (state accessors, optional `think_low_level`, `blocked_flags` for traversal). Wrapped in `ActorObject` (a `Component` holding `Box<dyn Actor>`).
+
+Per-frame pipeline (run by `process_actors`): clear error → think → prepare → `try_move` (collision gate) → flush passability.
+
+Movement uses **dual channels**: `tile_delta` (float, smooth rendering) and `subtile_shift` (integer, collision grid). Accumulate float displacement across frames; emit integer steps only on subtile boundary crossings. `1 tile = 5 subtiles`.
+
+Actor classes override `blocked_flags()` to declare traversal rules:
+
+| Class | `blocked_flags` | Crosses void? |
+|---|---|---|
+| Ground walker (default) | `FLAG_BLOCKED \| FLAG_VOID` | No |
+| Flyer (`GlitchBot`) | `FLAG_BLOCKED` | Yes |
+
+To add a new actor: follow the checklist in `docs/actor.md#new-actor-checklist`. Read **`.claude/SKILLS/actor-engineer/SKILL.md`** for invariants, coordinate rules, and common pitfalls.
+
+Full docs: **`docs/actor.md`**. Skill: **`.claude/SKILLS/actor-engineer/SKILL.md`**. Source: **`src/actor/mod.rs`**, **`src/actor/glitch_bot.rs`**, **`src/actor/black_bot.rs`**.
+
 ## Official references
 
 - Release notes: https://bevy.org/news/bevy-0-18/

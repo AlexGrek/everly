@@ -1,62 +1,100 @@
-//! Dynamic passability map — per-tile 5×5 boolean micro-grid stored in a
-//! [`DoubleBufferedHypermap`].
+//! Unified per-subtile passability map — both static geometry (walls, void)
+//! and dynamic obstacles (creature bodies) are stored in one
+//! [`DoubleBufferedHypermap`] whose cells hold `u64` flag bitmasks.
+//!
+//! ## Subtile grid
 //!
 //! Each world tile is subdivided into `SUBTILE_COUNT × SUBTILE_COUNT` (5×5)
-//! sub-cells. A sub-cell value of `true` means passable; `false` means blocked.
-//! The write buffer collects obstacle state each tick; [`flush`](DynamicPassabilityMap::flush)
-//! promotes it to the read side for consumers (future pathfinding, AI queries).
+//! sub-cells. A sub-cell value of `0` means fully passable; non-zero means
+//! some kind of obstacle described by the flag bits below.
 //!
-//! This map is **not** wired into pathfinding yet — it only provides the data store.
+//! ## Flag layout
+//!
+//! | Constant | Bit | Meaning |
+//! |---|---|---|
+//! | [`FLAG_BLOCKED`] | 0 | Hard obstacle — wall slab or creature body. **Impassable for all** actors. |
+//! | [`FLAG_VOID`]    | 1 | Void space (no floor). Passable for flyers, blocked for walkers. |
+//! | [`FLAG_CREATURE`]| 2 | The [`FLAG_BLOCKED`] bit was set by a creature, not static geometry. Enables distinguishing "wall" from "unit" collisions. |
+//!
+//! ## Frame lifecycle
+//!
+//! 1. [`DynamicPassabilityMap::flush`] — promotes the write buffer to read,
+//!    resets write to all-zero.
+//! 2. [`stamp_static_passability`] — iterates all loaded geometry chunks and
+//!    ORs wall / void flags into the write buffer (subtile-accurate).
+//! 3. Actor think systems fill their `move_buffer`.
+//! 4. [`process_actors`](crate::actor::process_actors) — for each actor calls
+//!    [`try_update_footprint`] which reads from **read** (has last frame's
+//!    snapshot), then ORs `FLAG_BLOCKED | FLAG_CREATURE` into **write**.
+//! 5. Next frame begins at step 1.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use bevy::prelude::*;
 
-use crate::map::hypermap::DoubleBufferedHypermap;
+use crate::map::hypermap::{DoubleBufferedHypermap, Hypermap};
+use crate::map::world_map::{CellType, WallCorner, WallMask, MASK_EAST, MASK_NORTH, MASK_SOUTH, MASK_WEST};
 
-/// Number of boolean sub-cells along each axis of a single world tile.
+/// Number of sub-cells along each axis of a single world tile.
 pub const SUBTILE_COUNT: usize = 5;
 
-/// Per-tile micro-grid of passability booleans.
+// ---------------------------------------------------------------------------
+// Passability flag constants
+// ---------------------------------------------------------------------------
+
+/// Hard obstacle — wall geometry or creature body. Impassable for **all** actors.
+pub const FLAG_BLOCKED: u64 = 1 << 0;
+/// Void space — no floor present. Passable for flyers; blocked for ground walkers.
+pub const FLAG_VOID: u64 = 1 << 1;
+/// Creature-body marker. When set together with [`FLAG_BLOCKED`], the block
+/// was placed by a creature rather than static geometry. Callers can use this
+/// to distinguish "wall collision" from "unit collision".
+pub const FLAG_CREATURE: u64 = 1 << 2;
+
+// ---------------------------------------------------------------------------
+// Per-tile subtile grid
+// ---------------------------------------------------------------------------
+
+/// Per-tile micro-grid of `u64` passability flags.
 ///
-/// Indexed `grid[row][col]` where `row` and `col` are in `0..SUBTILE_COUNT`.
+/// Flat layout `cells[row * SUBTILE_COUNT + col]`; all-zero = fully passable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubtilePassability {
-    pub grid: [[bool; SUBTILE_COUNT]; SUBTILE_COUNT],
+    pub cells: [u64; SUBTILE_COUNT * SUBTILE_COUNT],
 }
 
 impl SubtilePassability {
-    pub const ALL_PASSABLE: Self = Self {
-        grid: [[true; SUBTILE_COUNT]; SUBTILE_COUNT],
-    };
-
-    pub const ALL_BLOCKED: Self = Self {
-        grid: [[false; SUBTILE_COUNT]; SUBTILE_COUNT],
-    };
+    pub const EMPTY: Self = Self { cells: [0; SUBTILE_COUNT * SUBTILE_COUNT] };
 
     #[inline]
-    pub fn is_passable(&self, row: usize, col: usize) -> bool {
-        self.grid[row][col]
+    pub fn flags_at(&self, row: usize, col: usize) -> u64 {
+        self.cells[row * SUBTILE_COUNT + col]
     }
 
+    /// ORs `flags` into the cell at `(row, col)`. Multiple writers can safely
+    /// accumulate different flag bits into the same cell.
     #[inline]
-    pub fn set(&mut self, row: usize, col: usize, passable: bool) {
-        self.grid[row][col] = passable;
+    pub fn or_flags(&mut self, row: usize, col: usize, flags: u64) {
+        self.cells[row * SUBTILE_COUNT + col] |= flags;
     }
 }
 
 impl Default for SubtilePassability {
     fn default() -> Self {
-        Self::ALL_PASSABLE
+        Self::EMPTY
     }
 }
 
+// ---------------------------------------------------------------------------
+// DynamicPassabilityMap resource
+// ---------------------------------------------------------------------------
+
 /// Bevy resource wrapping a double-buffered hypermap of [`SubtilePassability`].
 ///
-/// Systems that place dynamic obstacles write into the write buffer via the
-/// delegated `set*` / `update` / `with_chunk_write` methods. At a chosen sync
-/// point, call [`flush`](Self::flush) to promote writes to the read side.
+/// The write side accumulates this frame's obstacle state (static geometry
+/// stamped by [`stamp_static_passability`] plus actor footprints); [`flush`]
+/// then promotes it to the read side for the next frame's collision queries.
 #[derive(Resource)]
 pub struct DynamicPassabilityMap {
     inner: Arc<DoubleBufferedHypermap<SubtilePassability>>,
@@ -68,17 +106,21 @@ pub type ActorFootprint = Vec<IVec2>;
 /// Error produced when applying a footprint update to the dynamic map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TryUpdateFootprintError {
-    /// The requested circular radius is invalid.
+    /// The requested circular radius is invalid (negative).
     InvalidRadius(i32),
-    /// Target footprint intersects an already-blocked subtile that is not in
-    /// the actor's previous footprint.
+    /// Target footprint intersects an already-blocked subtile that is **not**
+    /// in the actor's previous footprint, and the blocking was set by another
+    /// creature (`FLAG_BLOCKED | FLAG_CREATURE` both set).
     BlockedByOccupancy { world_subtile: IVec2 },
+    /// Target footprint intersects a static obstacle (wall slab or void for
+    /// ground walkers — `FLAG_BLOCKED` or `FLAG_VOID` without `FLAG_CREATURE`).
+    BlockedByStatic { world_subtile: IVec2 },
 }
 
 impl DynamicPassabilityMap {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(DoubleBufferedHypermap::new(SubtilePassability::ALL_PASSABLE)),
+            inner: Arc::new(DoubleBufferedHypermap::new(SubtilePassability::EMPTY)),
         }
     }
 
@@ -90,65 +132,135 @@ impl DynamicPassabilityMap {
         self.inner.flush();
     }
 
-    /// Tries to update actor occupancy and returns the new footprint to store.
+    /// Canonical actor-movement entry point: checks the candidate circular
+    /// footprint against the static subtile cache **and** the dynamic **read**
+    /// buffer, then stamps the new footprint into the **write** buffer.
     ///
-    /// This method centralizes movement-collision logic so actor code stays
-    /// simple. It:
+    /// `actor_blocked` is a bitmask of [`FLAG_*`](FLAG_BLOCKED) values that
+    /// this actor considers impassable. Evaluated against both static geometry
+    /// flags (from `static_cache`) and dynamic creature flags (from the read
+    /// buffer). Examples:
+    /// - Ground walker: `FLAG_BLOCKED | FLAG_VOID`
+    /// - Flyer: `FLAG_BLOCKED` (crosses void freely)
     ///
-    /// 1. Builds the actor's circular shadow at `next_center_subtile`.
-    /// 2. Checks collisions against the passability **read** buffer.
-    /// 3. Ignores collisions with `previous_footprint` (self-overlap).
-    /// 4. On success, writes the new footprint as blocked (`false`) into the
-    ///    passability **write** buffer and returns it.
-    /// 5. On failure, re-stamps `previous_footprint` into the write buffer so
-    ///    the actor keeps occupying its old cells for the next frame.
+    /// Self-overlap (the actor's own previous footprint) is always bypassed —
+    /// the actor never blocks itself regardless of `actor_blocked`.
+    ///
+    /// Allocation-free hot path: previous footprint is described compactly as
+    /// `Option<(center_subtile, radius_subtiles)>` and tested via a cached
+    /// [`CircleShadow`] bitmap. No per-frame `Vec`/`HashSet` is allocated.
+    ///
+    /// On failure the **previous** circle is re-stamped so occupancy persists
+    /// into next frame even though this actor didn't move.
     pub fn try_update_footprint(
         &self,
         next_center_subtile: IVec2,
         radius_subtiles: i32,
-        previous_footprint: &[IVec2],
-    ) -> Result<ActorFootprint, TryUpdateFootprintError> {
+        previous: Option<(IVec2, i32)>,
+        actor_blocked: u64,
+        static_cache: &Hypermap<SubtilePassability>,
+    ) -> Result<(), TryUpdateFootprintError> {
         if radius_subtiles < 0 {
             return Err(TryUpdateFootprintError::InvalidRadius(radius_subtiles));
         }
-
-        let subtile_map = SubtilePassabilityMap::new(self);
-        let previous_set: HashSet<IVec2> = previous_footprint.iter().copied().collect();
-        let mut new_footprint = Vec::new();
-
-        for offset in baked_circle_shadow(radius_subtiles) {
-            let target = next_center_subtile + *offset;
-            let is_passable = subtile_map.subtile_xy(0, 0, target.x, target.y);
-            let is_self_overlap = previous_set.contains(&target);
-            if !is_passable && !is_self_overlap {
-                self.write_footprint(previous_footprint);
-                return Err(TryUpdateFootprintError::BlockedByOccupancy {
-                    world_subtile: target,
-                });
+        if let Some((_, prev_r)) = previous {
+            if prev_r < 0 {
+                return Err(TryUpdateFootprintError::InvalidRadius(prev_r));
             }
-            new_footprint.push(target);
         }
 
-        self.write_footprint(&new_footprint);
-        Ok(new_footprint)
+        let new_shadow = baked_circle_shadow(radius_subtiles);
+        let previous_info = previous.map(|(c, r)| (c, baked_circle_shadow(r)));
+        let subtile_map = SubtilePassabilityMap::new(self);
+
+        for offset in new_shadow.offsets {
+            let target = next_center_subtile + *offset;
+
+            let is_self_overlap = match previous_info {
+                Some((prev_center, prev_shadow)) => {
+                    prev_shadow.contains_offset(target - prev_center)
+                }
+                None => false,
+            };
+
+            if !is_self_overlap {
+                // Check static geometry from the persistent cache (walls, void).
+                let static_flags = static_subtile_flags(static_cache, target);
+                if static_flags & actor_blocked != 0 {
+                    if let Some((prev_center, prev_shadow)) = previous_info {
+                        write_circle(&subtile_map, prev_center, prev_shadow);
+                    }
+                    return Err(TryUpdateFootprintError::BlockedByStatic {
+                        world_subtile: target,
+                    });
+                }
+
+                // Check dynamic occupancy (other creatures) from the read buffer.
+                let dynamic_flags = subtile_map.flags_xy(0, 0, target.x, target.y);
+                if dynamic_flags & actor_blocked != 0 {
+                    if let Some((prev_center, prev_shadow)) = previous_info {
+                        write_circle(&subtile_map, prev_center, prev_shadow);
+                    }
+                    return Err(TryUpdateFootprintError::BlockedByOccupancy {
+                        world_subtile: target,
+                    });
+                }
+            }
+        }
+
+        write_circle(&subtile_map, next_center_subtile, new_shadow);
+        Ok(())
     }
 
-    /// Writes a footprint as blocked (`false`) into the passability write buffer.
+    /// Stamps an arbitrary list of world-subtiles as creature-blocked in the
+    /// write buffer (`FLAG_BLOCKED | FLAG_CREATURE`). Low-level escape hatch;
+    /// for circular actor occupancy prefer [`try_update_footprint`].
     pub fn write_footprint(&self, footprint: &[IVec2]) {
         let subtile_map = SubtilePassabilityMap::new(self);
         for sub in footprint {
-            subtile_map.set_subtile_xy(0, 0, sub.x, sub.y, false);
+            subtile_map.or_flags_xy(0, 0, sub.x, sub.y, FLAG_BLOCKED | FLAG_CREATURE);
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// ORs `FLAG_BLOCKED | FLAG_CREATURE` for every subtile in `shadow` centered
+/// at `center` into the write buffer. Used to stamp actor footprints.
+#[inline]
+fn write_circle(map: &SubtilePassabilityMap, center: IVec2, shadow: &CircleShadow) {
+    for offset in shadow.offsets {
+        let cell = center + *offset;
+        map.or_flags_xy(0, 0, cell.x, cell.y, FLAG_BLOCKED | FLAG_CREATURE);
+    }
+}
+
+/// Reads the static passability flags for a world-subtile from the persistent
+/// cache. The cache stores one [`SubtilePassability`] per world tile (pre-baked
+/// on chunk generation / cell edit), so this is a simple tile lookup + array
+/// index — no per-frame iteration.
+#[inline]
+fn static_subtile_flags(cache: &Hypermap<SubtilePassability>, world_subtile: IVec2) -> u64 {
+    let sc = SUBTILE_COUNT as i32;
+    let tile_x = world_subtile.x.div_euclid(sc);
+    let tile_y = world_subtile.y.div_euclid(sc);
+    let local_x = world_subtile.x.rem_euclid(sc) as usize;
+    let local_y = world_subtile.y.rem_euclid(sc) as usize;
+    let tile_data = cache.get(tile_x, tile_y);
+    tile_data.flags_at(local_y, local_x)
+}
+
+// ---------------------------------------------------------------------------
+// SubtilePassabilityMap view
+// ---------------------------------------------------------------------------
+
 /// Subtile-level view over a [`DoubleBufferedHypermap<SubtilePassability>`].
 ///
-/// Addresses individual boolean sub-cells using a **(tile, shift)** scheme:
-/// the caller supplies a reference tile coordinate and an arbitrary signed
-/// subtile offset. The offset is **not** clamped to `0..SUBTILE_COUNT` — it
-/// freely overflows into neighboring tiles, so relative addressing from an
-/// object's center tile works without manual tile arithmetic.
+/// Addresses individual sub-cells using a **(tile, shift)** scheme: the caller
+/// supplies a reference tile coordinate and an arbitrary signed subtile offset.
+/// The offset is **not** clamped — it freely overflows into neighboring tiles.
 ///
 /// # Coordinate resolution
 ///
@@ -160,19 +272,14 @@ impl DynamicPassabilityMap {
 /// resolved_local_x = floor_mod(global_sub_x, SUBTILE_COUNT)   // 0..SUBTILE_COUNT
 /// ```
 ///
-/// Same for the Y axis. This lets `shift = (-3, 12)` transparently reach
-/// a subtile one tile to the left and two tiles down from `(tx, ty)`.
-///
 /// # Example
 ///
 /// ```ignore
 /// let view = SubtilePassabilityMap::new(&dynamic_passability_map);
 ///
-/// // Query 2 subtiles to the right and 1 subtile up from tile (10, 20), center sub-cell.
-/// let passable = view.subtile_xy(10, 20, 4, -1);
-///
-/// // Same query with tuple pairs:
-/// let passable = view.subtile((10, 20), (4, -1));
+/// // Read flags 2 subtiles right and 1 subtile up from tile (10, 20).
+/// let flags = view.flags_xy(10, 20, 4, -1);
+/// let blocked = flags & FLAG_BLOCKED != 0;
 /// ```
 pub struct SubtilePassabilityMap<'a> {
     map: &'a DoubleBufferedHypermap<SubtilePassability>,
@@ -187,54 +294,53 @@ impl<'a> SubtilePassabilityMap<'a> {
         Self { map }
     }
 
-    /// Read a single subtile's passability.
+    /// Read flags for a single subtile from the **read** buffer.
     ///
     /// `tile_index` is the world tile `(x, y)`. `shift` is a signed subtile
-    /// offset `(dx, dy)` relative to that tile's `(0, 0)` sub-cell. The shift
-    /// may exceed `±SUBTILE_COUNT` — it will resolve to whichever tile and
-    /// local sub-cell the global subtile coordinate lands on.
+    /// offset `(dx, dy)` relative to that tile's `(0, 0)` sub-cell.
     #[inline]
-    pub fn subtile(&self, tile_index: (i32, i32), shift: (i32, i32)) -> bool {
-        self.subtile_xy(tile_index.0, tile_index.1, shift.0, shift.1)
+    pub fn flags(&self, tile_index: (i32, i32), shift: (i32, i32)) -> u64 {
+        self.flags_xy(tile_index.0, tile_index.1, shift.0, shift.1)
     }
 
-    /// Scalar-argument form of [`subtile`](Self::subtile).
-    ///
-    /// `tile_x, tile_y` — world tile coordinate.
-    /// `shift_x, shift_y` — signed subtile offset (unbounded).
+    /// Scalar-argument form of [`flags`](Self::flags).
     #[inline]
-    pub fn subtile_xy(&self, tile_x: i32, tile_y: i32, shift_x: i32, shift_y: i32) -> bool {
+    pub fn flags_xy(&self, tile_x: i32, tile_y: i32, shift_x: i32, shift_y: i32) -> u64 {
         let (resolved_tile_x, local_x) = resolve_subtile(tile_x, shift_x);
         let (resolved_tile_y, local_y) = resolve_subtile(tile_y, shift_y);
         let cell = self.map.get(resolved_tile_x, resolved_tile_y);
-        cell.is_passable(local_y, local_x)
+        cell.flags_at(local_y, local_x)
     }
 
-    /// Write a single subtile's passability into the **write** buffer.
+    /// OR `flags` into the **write** buffer for a single subtile.
     ///
-    /// Same addressing rules as [`subtile`](Self::subtile).
+    /// Same addressing rules as [`flags`](Self::flags).
     #[inline]
-    pub fn set_subtile(&self, tile_index: (i32, i32), shift: (i32, i32), passable: bool) {
-        self.set_subtile_xy(tile_index.0, tile_index.1, shift.0, shift.1, passable);
+    pub fn or_flags(&self, tile_index: (i32, i32), shift: (i32, i32), flags: u64) {
+        self.or_flags_xy(tile_index.0, tile_index.1, shift.0, shift.1, flags);
     }
 
-    /// Scalar-argument form of [`set_subtile`](Self::set_subtile).
+    /// Scalar-argument form of [`or_flags`](Self::or_flags).
     #[inline]
-    pub fn set_subtile_xy(
+    pub fn or_flags_xy(
         &self,
         tile_x: i32,
         tile_y: i32,
         shift_x: i32,
         shift_y: i32,
-        passable: bool,
+        flags: u64,
     ) {
         let (resolved_tile_x, local_x) = resolve_subtile(tile_x, shift_x);
         let (resolved_tile_y, local_y) = resolve_subtile(tile_y, shift_y);
         self.map.update(resolved_tile_x, resolved_tile_y, |cell| {
-            cell.set(local_y, local_x, passable);
+            cell.or_flags(local_y, local_x, flags);
         });
     }
 }
+
+// ---------------------------------------------------------------------------
+// Subtile coordinate resolution
+// ---------------------------------------------------------------------------
 
 /// Resolve a tile coordinate + signed subtile shift into the actual tile and
 /// the in-tile local index (`0..SUBTILE_COUNT`).
@@ -247,11 +353,43 @@ fn resolve_subtile(tile: i32, shift: i32) -> (i32, usize) {
     (resolved_tile, local)
 }
 
-/// Returns cached integer offsets for a filled circle of `radius_subtiles`.
+// ---------------------------------------------------------------------------
+// CircleShadow cache
+// ---------------------------------------------------------------------------
+
+/// Baked, immutable representation of a filled integer circle.
 ///
-/// Includes every `(dx, dy)` where `dx*dx + dy*dy <= r*r`.
-fn baked_circle_shadow(radius_subtiles: i32) -> &'static [IVec2] {
-    static CACHE: OnceLock<Mutex<HashMap<i32, &'static [IVec2]>>> = OnceLock::new();
+/// Holds both a flat offset list (`offsets`) for iteration and a dense bitmap
+/// (`bitmap`) for `O(1)` membership checks. One instance per radius is cached
+/// globally and leaked, keeping `&'static` references valid for the process
+/// lifetime.
+pub struct CircleShadow {
+    /// Filled-circle offsets `(dx, dy)` with `dx²+dy² ≤ r²`.
+    /// Iteration order is row-major (`y` outer, `x` inner).
+    pub offsets: &'static [IVec2],
+    radius: i32,
+    /// Dense `(2r+1)²` membership bitmap, row-major.
+    bitmap: &'static [bool],
+}
+
+impl CircleShadow {
+    /// `true` iff `offset` is inside this circle (i.e. is one of `offsets`).
+    #[inline]
+    pub fn contains_offset(&self, offset: IVec2) -> bool {
+        let r = self.radius;
+        if offset.x < -r || offset.x > r || offset.y < -r || offset.y > r {
+            return false;
+        }
+        let stride = (2 * r + 1) as usize;
+        let idx = ((offset.y + r) as usize) * stride + (offset.x + r) as usize;
+        self.bitmap[idx]
+    }
+}
+
+/// Returns the cached [`CircleShadow`] for a given radius. Built once per
+/// distinct radius; subsequent calls are pure hash-lookups under a `Mutex`.
+fn baked_circle_shadow(radius_subtiles: i32) -> &'static CircleShadow {
+    static CACHE: OnceLock<Mutex<HashMap<i32, &'static CircleShadow>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
 
     let mut guard = cache.lock().expect("passability shadow cache lock poisoned");
@@ -261,19 +399,92 @@ fn baked_circle_shadow(radius_subtiles: i32) -> &'static [IVec2] {
 
     let r = radius_subtiles.max(0);
     let rr = r * r;
+    let stride = (2 * r + 1) as usize;
+    let bitmap_len = stride * stride;
+    let mut bitmap_vec = vec![false; bitmap_len];
     let mut offsets = Vec::new();
     for y in -r..=r {
         for x in -r..=r {
             if x * x + y * y <= rr {
                 offsets.push(IVec2::new(x, y));
+                let idx = ((y + r) as usize) * stride + (x + r) as usize;
+                bitmap_vec[idx] = true;
             }
         }
     }
 
-    let leaked: &'static [IVec2] = Box::leak(offsets.into_boxed_slice());
-    guard.insert(radius_subtiles, leaked);
-    leaked
+    let leaked_offsets: &'static [IVec2] = Box::leak(offsets.into_boxed_slice());
+    let leaked_bitmap: &'static [bool] = Box::leak(bitmap_vec.into_boxed_slice());
+    let shadow = Box::leak(Box::new(CircleShadow {
+        offsets: leaked_offsets,
+        radius: r,
+        bitmap: leaked_bitmap,
+    }));
+    guard.insert(radius_subtiles, shadow);
+    shadow
 }
+
+// ---------------------------------------------------------------------------
+// Static geometry helpers — subtile-accurate flags from CellType
+// ---------------------------------------------------------------------------
+
+/// Returns the passability flags for the subtile at `(local_x, local_y)`
+/// within a tile of the given [`CellType`].
+///
+/// - `Road` → `0` (always passable)
+/// - `Void` → [`FLAG_VOID`] for every subtile
+/// - `Wall(mask)` → [`FLAG_BLOCKED`] for the edge-strip subtile(s) matching
+///   the mask; `0` elsewhere
+/// - `Corner(c)` → [`FLAG_BLOCKED`] for the single corner subtile; `0` elsewhere
+///
+/// `local_x` and `local_y` must be in `0..SUBTILE_COUNT`.
+#[inline]
+pub fn cell_subtile_flags(cell: CellType, local_x: usize, local_y: usize) -> u64 {
+    match cell {
+        CellType::Road => 0,
+        CellType::Void => FLAG_VOID,
+        CellType::Wall(mask) => {
+            if wall_mask_blocks_subtile(mask, local_x, local_y) {
+                FLAG_BLOCKED
+            } else {
+                0
+            }
+        }
+        CellType::Corner(corner) => {
+            if corner_blocks_subtile(corner, local_x, local_y) {
+                FLAG_BLOCKED
+            } else {
+                0
+            }
+        }
+    }
+}
+
+#[inline]
+fn wall_mask_blocks_subtile(mask: WallMask, local_x: usize, local_y: usize) -> bool {
+    let bits = mask.bits();
+    let max = SUBTILE_COUNT - 1;
+    ((bits & MASK_NORTH) != 0 && local_y == 0)
+        || ((bits & MASK_SOUTH) != 0 && local_y == max)
+        || ((bits & MASK_EAST) != 0 && local_x == max)
+        || ((bits & MASK_WEST) != 0 && local_x == 0)
+}
+
+#[inline]
+fn corner_blocks_subtile(corner: WallCorner, local_x: usize, local_y: usize) -> bool {
+    let max = SUBTILE_COUNT - 1;
+    match corner {
+        WallCorner::Nw => local_x == 0 && local_y == 0,
+        WallCorner::Ne => local_x == max && local_y == 0,
+        WallCorner::Sw => local_x == 0 && local_y == max,
+        WallCorner::Se => local_x == max && local_y == max,
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Plugin
+// ---------------------------------------------------------------------------
 
 pub struct PassabilityMapPlugin;
 
@@ -282,6 +493,10 @@ impl Plugin for PassabilityMapPlugin {
         app.insert_resource(DynamicPassabilityMap::new());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -292,55 +507,58 @@ mod tests {
         let s = SubtilePassability::default();
         for r in 0..SUBTILE_COUNT {
             for c in 0..SUBTILE_COUNT {
-                assert!(s.is_passable(r, c));
+                assert_eq!(s.flags_at(r, c), 0, "default cell must have zero flags");
             }
         }
     }
 
     #[test]
-    fn subtile_set_and_query() {
-        let mut s = SubtilePassability::ALL_PASSABLE;
-        s.set(2, 3, false);
-        assert!(!s.is_passable(2, 3));
-        assert!(s.is_passable(0, 0));
+    fn subtile_or_flags_and_query() {
+        let mut s = SubtilePassability::EMPTY;
+        s.or_flags(2, 3, FLAG_BLOCKED);
+        assert_eq!(s.flags_at(2, 3), FLAG_BLOCKED);
+        assert_eq!(s.flags_at(0, 0), 0);
+
+        s.or_flags(2, 3, FLAG_CREATURE);
+        assert_eq!(s.flags_at(2, 3), FLAG_BLOCKED | FLAG_CREATURE);
     }
 
     #[test]
     fn dynamic_map_write_read_flush_cycle() {
         let map = DynamicPassabilityMap::new();
+        let view = SubtilePassabilityMap::new(&map);
 
-        let mut blocked = SubtilePassability::ALL_PASSABLE;
-        blocked.set(0, 0, false);
-        blocked.set(4, 4, false);
-        map.inner().set(10, 20, blocked);
+        view.or_flags_xy(10, 20, 0, 0, FLAG_BLOCKED);
+        view.or_flags_xy(10, 20, 4, 4, FLAG_VOID);
 
         assert_eq!(
-            map.inner().get(10, 20),
-            SubtilePassability::ALL_PASSABLE,
+            map.inner().get(10, 20).flags_at(0, 0),
+            0,
             "read side still default before flush"
         );
 
         map.flush();
 
         let read = map.inner().get(10, 20);
-        assert!(!read.is_passable(0, 0));
-        assert!(!read.is_passable(4, 4));
-        assert!(read.is_passable(2, 2));
+        assert_eq!(read.flags_at(0, 0), FLAG_BLOCKED);
+        assert_eq!(read.flags_at(4, 4), FLAG_VOID);
+        assert_eq!(read.flags_at(2, 2), 0);
     }
 
     #[test]
     fn dynamic_map_flush_clears_write() {
         let map = DynamicPassabilityMap::new();
-        map.inner().set(5, 5, SubtilePassability::ALL_BLOCKED);
+        let view = SubtilePassabilityMap::new(&map);
+        view.or_flags_xy(5, 5, 0, 0, FLAG_BLOCKED);
         map.flush();
 
-        assert_eq!(map.inner().get(5, 5), SubtilePassability::ALL_BLOCKED);
+        assert_eq!(map.inner().get(5, 5).flags_at(0, 0), FLAG_BLOCKED);
 
         map.flush();
         assert_eq!(
-            map.inner().get(5, 5),
-            SubtilePassability::ALL_PASSABLE,
-            "second flush with no writes resets to clean"
+            map.inner().get(5, 5).flags_at(0, 0),
+            0,
+            "second flush with no writes must reset to clean"
         );
     }
 
@@ -349,71 +567,60 @@ mod tests {
     #[test]
     fn subtile_map_read_within_tile() {
         let map = DynamicPassabilityMap::new();
-        let mut tile = SubtilePassability::ALL_PASSABLE;
-        tile.set(2, 3, false);
-        map.inner().set(10, 20, tile);
+        let view = SubtilePassabilityMap::new(&map);
+        view.or_flags_xy(10, 20, 3, 2, FLAG_BLOCKED);
         map.flush();
 
-        let view = SubtilePassabilityMap::new(&map);
-        assert!(!view.subtile((10, 20), (3, 2)));
-        assert!(view.subtile((10, 20), (0, 0)));
+        assert_ne!(view.flags_xy(10, 20, 3, 2) & FLAG_BLOCKED, 0);
+        assert_eq!(view.flags_xy(10, 20, 0, 0), 0);
     }
 
     #[test]
     fn subtile_map_positive_overflow_into_neighbor() {
         let map = DynamicPassabilityMap::new();
-        let mut tile = SubtilePassability::ALL_PASSABLE;
-        tile.set(0, 1, false);
-        map.inner().set(11, 20, tile);
-        map.flush();
-
         let view = SubtilePassabilityMap::new(&map);
         // shift_x=6 from tile 10 → tile 11, local_x=1; shift_y=0 → local_y=0
-        assert!(!view.subtile_xy(10, 20, 6, 0));
+        view.or_flags_xy(11, 20, 1, 0, FLAG_BLOCKED);
+        map.flush();
+
+        assert_ne!(view.flags_xy(10, 20, 6, 0) & FLAG_BLOCKED, 0);
     }
 
     #[test]
     fn subtile_map_negative_overflow_into_neighbor() {
         let map = DynamicPassabilityMap::new();
-        let mut tile = SubtilePassability::ALL_PASSABLE;
-        tile.set(4, 4, false);
-        map.inner().set(9, 19, tile);
-        map.flush();
-
         let view = SubtilePassabilityMap::new(&map);
         // shift_x=-1 from tile 10 → tile 9, local_x=4; shift_y=-1 → tile 19, local_y=4
-        assert!(!view.subtile_xy(10, 20, -1, -1));
+        view.or_flags_xy(9, 19, 4, 4, FLAG_BLOCKED);
+        map.flush();
+
+        assert_ne!(view.flags_xy(10, 20, -1, -1) & FLAG_BLOCKED, 0);
     }
 
     #[test]
     fn subtile_map_large_shift_crosses_multiple_tiles() {
         let map = DynamicPassabilityMap::new();
-        let mut tile = SubtilePassability::ALL_PASSABLE;
+        let view = SubtilePassabilityMap::new(&map);
         // shift (12, 2) from tile (10, 20):
         //   x: global = 10*5+12 = 62 → tile 12, local_x 2
         //   y: global = 20*5+2  = 102 → tile 20, local_y 2
-        // → is_passable(row=2, col=2)
-        tile.set(2, 2, false);
-        map.inner().set(12, 20, tile);
+        view.or_flags_xy(12, 20, 2, 2, FLAG_VOID);
         map.flush();
 
-        let view = SubtilePassabilityMap::new(&map);
-        assert!(!view.subtile((10, 20), (12, 2)));
+        assert_ne!(view.flags_xy(10, 20, 12, 2) & FLAG_VOID, 0);
     }
 
     #[test]
-    fn subtile_map_set_via_shifted_address() {
+    fn subtile_map_or_flags_via_shifted_address() {
         let map = DynamicPassabilityMap::new();
         let view = SubtilePassabilityMap::new(&map);
 
-        // Write through the subtile view into the write buffer.
-        view.set_subtile((5, 5), (7, -2), false);
+        // shift_x=7 from tile 5 → tile 6, local_x=2; shift_y=-2 from tile 5 → tile 4, local_y=3
+        view.or_flags_xy(5, 5, 7, -2, FLAG_BLOCKED | FLAG_CREATURE);
         map.flush();
 
-        // shift_x=7 from tile 5 → tile 6, local_x=2
-        // shift_y=-2 from tile 5 → tile 4, local_y=3
         let cell = map.inner().get(6, 4);
-        assert!(!cell.is_passable(3, 2));
+        assert_eq!(cell.flags_at(3, 2), FLAG_BLOCKED | FLAG_CREATURE);
     }
 
     #[test]
@@ -425,20 +632,27 @@ mod tests {
         assert_eq!(resolve_subtile(3, -6), (1, 4));
     }
 
+    fn empty_cache() -> Hypermap<SubtilePassability> {
+        Hypermap::new(SubtilePassability::EMPTY)
+    }
+
     #[test]
-    fn try_update_footprint_writes_and_returns_shape() {
+    fn try_update_footprint_writes_circle_into_buffer() {
         let map = DynamicPassabilityMap::new();
-        let new_fp = map
-            .try_update_footprint(IVec2::new(20, 20), 1, &[])
+        let sc = empty_cache();
+        let center = IVec2::new(20, 20);
+        map.try_update_footprint(center, 1, None, FLAG_BLOCKED | FLAG_CREATURE, &sc)
             .expect("footprint should be writable");
         map.flush();
         let view = SubtilePassabilityMap::new(&map);
+        let shadow = baked_circle_shadow(1);
 
-        assert!(!new_fp.is_empty());
-        for sub in &new_fp {
-            assert!(
-                !view.subtile_xy(0, 0, sub.x, sub.y),
-                "every returned subtile must be blocked in read buffer"
+        for offset in shadow.offsets {
+            let sub = center + *offset;
+            assert_ne!(
+                view.flags_xy(0, 0, sub.x, sub.y) & FLAG_BLOCKED,
+                0,
+                "every subtile in the stamped circle must be blocked in read buffer"
             );
         }
     }
@@ -446,29 +660,211 @@ mod tests {
     #[test]
     fn try_update_footprint_ignores_previous_self_overlap() {
         let map = DynamicPassabilityMap::new();
-        let old_fp = map
-            .try_update_footprint(IVec2::new(40, 40), 2, &[])
+        let sc = empty_cache();
+        let center0 = IVec2::new(40, 40);
+        map.try_update_footprint(center0, 2, None, FLAG_BLOCKED | FLAG_CREATURE, &sc)
             .expect("initial footprint");
         map.flush();
 
-        // Move by one subtile to force large overlap with previous footprint.
-        let moved = map.try_update_footprint(IVec2::new(41, 40), 2, &old_fp);
+        let moved = map.try_update_footprint(
+            IVec2::new(41, 40),
+            2,
+            Some((center0, 2)),
+            FLAG_BLOCKED | FLAG_CREATURE,
+            &sc,
+        );
         assert!(moved.is_ok(), "self-overlap should not block movement");
     }
 
     #[test]
     fn try_update_footprint_blocks_on_foreign_occupancy() {
         let map = DynamicPassabilityMap::new();
+        let sc = empty_cache();
         map.write_footprint(&[IVec2::new(50, 50)]);
         map.flush();
 
         let err = map
-            .try_update_footprint(IVec2::new(50, 50), 0, &[])
+            .try_update_footprint(IVec2::new(50, 50), 0, None, FLAG_BLOCKED | FLAG_CREATURE, &sc)
             .expect_err("blocked cell should reject footprint");
-        assert!(matches!(
-            err,
-            TryUpdateFootprintError::BlockedByOccupancy { world_subtile }
-                if world_subtile == IVec2::new(50, 50)
-        ));
+        assert!(
+            matches!(err, TryUpdateFootprintError::BlockedByOccupancy { world_subtile }
+                if world_subtile == IVec2::new(50, 50)),
+            "creature-blocked cell must produce BlockedByOccupancy, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn try_update_footprint_blocks_on_static_obstacle() {
+        let map = DynamicPassabilityMap::new();
+        // Put a wall flag into the static cache.
+        let sc = empty_cache();
+        let mut tile = SubtilePassability::EMPTY;
+        tile.or_flags(0, 0, FLAG_BLOCKED); // subtile (0,0) of tile (12,12)
+        sc.set(12, 12, tile);
+
+        let err = map
+            .try_update_footprint(IVec2::new(60, 60), 0, None, FLAG_BLOCKED, &sc)
+            .expect_err("static wall must reject footprint");
+        assert!(
+            matches!(err, TryUpdateFootprintError::BlockedByStatic { world_subtile }
+                if world_subtile == IVec2::new(60, 60)),
+            "wall-blocked cell must produce BlockedByStatic, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn try_update_footprint_void_blocks_walker_not_flyer() {
+        let map = DynamicPassabilityMap::new();
+        // Put void into the static cache at subtile (70,70) → tile (14,14), local (0,0).
+        let sc = empty_cache();
+        let mut tile = SubtilePassability::EMPTY;
+        tile.or_flags(0, 0, FLAG_VOID);
+        sc.set(14, 14, tile);
+
+        // Ground walker (blocked by FLAG_VOID) should fail.
+        let err = map
+            .try_update_footprint(IVec2::new(70, 70), 0, None, FLAG_BLOCKED | FLAG_VOID, &sc)
+            .expect_err("walker must be blocked by void");
+        assert!(matches!(err, TryUpdateFootprintError::BlockedByStatic { .. }));
+
+        // Flyer (only blocked by FLAG_BLOCKED) should pass.
+        let ok = map.try_update_footprint(IVec2::new(70, 70), 0, None, FLAG_BLOCKED, &sc);
+        assert!(ok.is_ok(), "flyer must cross void freely");
+    }
+
+    #[test]
+    fn try_update_footprint_with_static_ignores_previous_self_overlap() {
+        let map = DynamicPassabilityMap::new();
+        let sc = empty_cache();
+        let center0 = IVec2::new(70, 70);
+        map.try_update_footprint(center0, 1, None, FLAG_BLOCKED | FLAG_CREATURE, &sc)
+            .expect("initial footprint");
+        map.flush();
+
+        // Actor blocked by everything — movement must still succeed because
+        // every candidate cell is part of the previous circle (self-overlap).
+        let moved =
+            map.try_update_footprint(center0, 1, Some((center0, 1)), FLAG_BLOCKED | FLAG_VOID, &sc);
+        assert!(moved.is_ok(), "self-overlap subtiles must bypass all checks");
+    }
+
+    #[test]
+    fn try_update_footprint_passes_with_empty_map() {
+        let map = DynamicPassabilityMap::new();
+        let sc = empty_cache();
+        let result = map.try_update_footprint(IVec2::new(80, 80), 2, None, FLAG_BLOCKED | FLAG_VOID, &sc);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn try_update_footprint_failure_restamps_previous_circle() {
+        let map = DynamicPassabilityMap::new();
+        let sc = empty_cache();
+        let center0 = IVec2::new(90, 90);
+        map.try_update_footprint(center0, 1, None, FLAG_BLOCKED | FLAG_CREATURE, &sc)
+            .expect("initial circle");
+        map.flush();
+
+        // Block a cell in the candidate circle but NOT in the previous one.
+        let blocker = center0 + IVec2::new(2, 0);
+        map.write_footprint(&[blocker]);
+        map.flush();
+
+        let err = map
+            .try_update_footprint(
+                center0 + IVec2::new(1, 0),
+                1,
+                Some((center0, 1)),
+                FLAG_BLOCKED | FLAG_CREATURE,
+                &sc,
+            )
+            .expect_err("must be blocked by foreign occupancy");
+        assert!(matches!(err, TryUpdateFootprintError::BlockedByOccupancy { .. }));
+
+        // After flush the old circle must still be present (re-stamped on failure).
+        map.flush();
+        let view = SubtilePassabilityMap::new(&map);
+        for offset in baked_circle_shadow(1).offsets {
+            let sub = center0 + *offset;
+            assert_ne!(
+                view.flags_xy(0, 0, sub.x, sub.y) & FLAG_BLOCKED,
+                0,
+                "previous footprint must be preserved on failed movement"
+            );
+        }
+    }
+
+    #[test]
+    fn circle_shadow_contains_offset_matches_offsets_list() {
+        for r in 0..=5 {
+            let shadow = baked_circle_shadow(r);
+            for offset in shadow.offsets {
+                assert!(shadow.contains_offset(*offset), "offset {offset:?} missing for r={r}");
+            }
+            let rr = (r + 2).max(1);
+            for y in -rr..=rr {
+                for x in -rr..=rr {
+                    let offset = IVec2::new(x, y);
+                    let in_list = shadow.offsets.iter().any(|o| *o == offset);
+                    assert_eq!(
+                        shadow.contains_offset(offset),
+                        in_list,
+                        "contains_offset disagrees with offsets list at {offset:?} for r={r}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cell_subtile_flags_road_is_zero() {
+        for ly in 0..SUBTILE_COUNT {
+            for lx in 0..SUBTILE_COUNT {
+                assert_eq!(cell_subtile_flags(CellType::Road, lx, ly), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn cell_subtile_flags_void_all_flag_void() {
+        for ly in 0..SUBTILE_COUNT {
+            for lx in 0..SUBTILE_COUNT {
+                assert_eq!(cell_subtile_flags(CellType::Void, lx, ly), FLAG_VOID);
+            }
+        }
+    }
+
+    #[test]
+    fn cell_subtile_flags_wall_north_blocks_only_top_row() {
+        let mask = WallMask::from_bits(MASK_NORTH).unwrap();
+        for lx in 0..SUBTILE_COUNT {
+            assert_eq!(
+                cell_subtile_flags(CellType::Wall(mask), lx, 0),
+                FLAG_BLOCKED,
+                "top row must be blocked"
+            );
+            for ly in 1..SUBTILE_COUNT {
+                assert_eq!(
+                    cell_subtile_flags(CellType::Wall(mask), lx, ly),
+                    0,
+                    "other rows must be clear"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cell_subtile_flags_corner_blocks_one_subtile() {
+        let max = SUBTILE_COUNT - 1;
+        assert_eq!(
+            cell_subtile_flags(CellType::Corner(WallCorner::Se), max, max),
+            FLAG_BLOCKED
+        );
+        assert_eq!(cell_subtile_flags(CellType::Corner(WallCorner::Se), 0, 0), 0);
+        assert_eq!(
+            cell_subtile_flags(CellType::Corner(WallCorner::Nw), 0, 0),
+            FLAG_BLOCKED
+        );
+        assert_eq!(cell_subtile_flags(CellType::Corner(WallCorner::Nw), 1, 0), 0);
     }
 }

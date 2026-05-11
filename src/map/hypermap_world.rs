@@ -26,6 +26,7 @@ use crate::map::hypermap::{
 };
 use crate::map::level::{chunk_geometry_path, try_load_chunk_geometry_file, LevelName};
 use crate::menu::main_menu::GameState;
+use crate::map::passability::{cell_subtile_flags, SubtilePassability, SUBTILE_COUNT};
 use crate::map::world_map::{
     cell_passability, for_each_wall_segment, CellType, WallMask, WorldMapFloor, WALL_THICKNESS,
     MASK_EAST, MASK_NORTH, MASK_SOUTH, MASK_WEST, WATER_SURFACE_Y, WORLD_MAP_FILE_PATH,
@@ -96,6 +97,11 @@ pub(crate) struct HypermapRuntime {
     /// cell is edited (see [`write_world_cell`] / [`ensure_chunk_generated`]). "Static" because
     /// no runtime obstacles (units, doors) participate — only the authored / procedural geometry.
     pub(crate) static_passability_map: Arc<Hypermap<f32>>,
+    /// Per-subtile flag cache for static geometry. Each world tile stores a
+    /// [`SubtilePassability`] with pre-computed [`cell_subtile_flags`] values.
+    /// Updated only when geometry changes (chunk generation or cell edit) —
+    /// never re-iterated per frame.
+    pub(crate) static_subtile_cache: Arc<Hypermap<SubtilePassability>>,
     desired_chunks: HashSet<ChunkCoord>,
     chunk_roots: HashMap<ChunkCoord, Entity>,
     chunk_upper_meshes: HashMap<ChunkCoord, ChunkUpperMeshEntities>,
@@ -174,6 +180,7 @@ fn setup_hypermap_runtime(mut commands: Commands) {
     commands.insert_resource(HypermapRuntime {
         map: Arc::new(Hypermap::new(CellType::Road)),
         static_passability_map: Arc::new(Hypermap::new(cell_passability(CellType::Road))),
+        static_subtile_cache: Arc::new(Hypermap::new(SubtilePassability::EMPTY)),
         desired_chunks: HashSet::new(),
         chunk_roots: HashMap::new(),
         chunk_upper_meshes: HashMap::new(),
@@ -358,6 +365,7 @@ fn update_visible_hypermap_chunks(
         ensure_chunk_generated(
             &runtime.map,
             &runtime.static_passability_map,
+            &runtime.static_subtile_cache,
             chunk,
             level.0.as_str(),
         );
@@ -399,6 +407,7 @@ fn render_chunks_30fps(
         ensure_chunk_generated(
             &runtime.map,
             &runtime.static_passability_map,
+            &runtime.static_subtile_cache,
             coord,
             level.0.as_str(),
         );
@@ -533,6 +542,7 @@ fn despawn_chunk_entities(
 pub(crate) fn ensure_chunk_generated(
     map: &Hypermap<CellType>,
     passability: &Hypermap<f32>,
+    subtile_cache: &Hypermap<SubtilePassability>,
     coord: ChunkCoord,
     level_name: &str,
 ) {
@@ -559,6 +569,7 @@ pub(crate) fn ensure_chunk_generated(
     });
 
     mirror_chunk_into_passability(map, passability, coord);
+    mirror_chunk_into_subtile_cache(map, subtile_cache, coord);
 }
 
 /// Reads every cell of a freshly written world chunk and writes the corresponding
@@ -585,6 +596,36 @@ fn mirror_chunk_into_passability(
     });
 }
 
+/// Builds the per-subtile flag grid for an entire chunk from its cell types.
+fn mirror_chunk_into_subtile_cache(
+    map: &Hypermap<CellType>,
+    subtile_cache: &Hypermap<SubtilePassability>,
+    coord: ChunkCoord,
+) {
+    let Some(world_handle) = map.get_chunk(coord) else {
+        return;
+    };
+    let world = world_handle.read().expect("chunk lock poisoned");
+    subtile_cache.with_chunk_write(coord, |sc_chunk| {
+        for y in 0..HYPERMAP_CHUNK_SIZE {
+            for x in 0..HYPERMAP_CHUNK_SIZE {
+                let local = LocalCoord::new(x, y);
+                let cell = *world.get_local_floor(local, 0);
+                let mut tile = SubtilePassability::EMPTY;
+                for sy in 0..SUBTILE_COUNT {
+                    for sx in 0..SUBTILE_COUNT {
+                        let flags = cell_subtile_flags(cell, sx, sy);
+                        if flags != 0 {
+                            tile.or_flags(sy, sx, flags);
+                        }
+                    }
+                }
+                sc_chunk.set_local(local, tile);
+            }
+        }
+    });
+}
+
 /// Writes a world cell **and** mirrors its passability in lock-step. Use this from edit
 /// systems instead of touching `runtime.map` directly so the two maps never drift.
 pub(crate) fn write_world_cell(
@@ -598,6 +639,19 @@ pub(crate) fn write_world_cell(
     runtime
         .static_passability_map
         .set_floor(world_x, world_y, floor, cell_passability(cell));
+
+    if floor == 0 {
+        let mut tile = SubtilePassability::EMPTY;
+        for sy in 0..SUBTILE_COUNT {
+            for sx in 0..SUBTILE_COUNT {
+                let flags = cell_subtile_flags(cell, sx, sy);
+                if flags != 0 {
+                    tile.or_flags(sy, sx, flags);
+                }
+            }
+        }
+        runtime.static_subtile_cache.set(world_x, world_y, tile);
+    }
 }
 
 fn fill_chunk_random(chunk: &mut HypermapChunk<CellType>, coord: ChunkCoord) {

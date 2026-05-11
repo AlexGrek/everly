@@ -7,6 +7,7 @@
 //! the active vertical level shared by camera, HUD, and renderer. `level`
 //! stores on-disk geometry under `levels/level_{name}/geometry/`.
 
+pub mod chunk_overlay;
 pub mod floor_level;
 pub mod hypermap;
 pub mod level;

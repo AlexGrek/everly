@@ -47,9 +47,13 @@ impl Plugin for GamePlugin {
                 map::floor_level::FloorLevelPlugin,
                 map::level::LevelPlugin,
                 map::hypermap_world::HypermapWorldPlugin,
+                map::chunk_overlay::ChunkOverlayPlugin,
                 map::passability::PassabilityMapPlugin,
+            ))
+            .add_plugins((
                 actor::ActorPlugin,
                 actor::glitch_bot::GlitchBotPlugin,
+                actor::black_bot::BlackBotPlugin,
                 edit::map_edit::MapEditPlugin,
                 edit::map_selection::MapSelectionPlugin,
             ))
