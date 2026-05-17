@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::actor::{process_actors, Actor, ActorMoveBuffer, ActorObject, ActorState};
+use crate::actor::{is_paused, process_actors, Actor, ActorMoveBuffer, ActorObject, ActorState};
 use crate::map::passability::{FLAG_BLOCKED, SUBTILE_COUNT};
 use crate::menu::main_menu::GameState;
 
@@ -117,7 +117,9 @@ impl Plugin for GlitchBotPlugin {
         app.init_resource::<GlitchBotRng>().add_systems(
             Update,
             (
-                glitch_bot_think.before(process_actors),
+                glitch_bot_think
+                    .before(process_actors)
+                    .run_if(not(is_paused)),
                 sync_glitch_bot_transforms.after(process_actors),
             )
                 .run_if(in_state(GameState::InGame)),

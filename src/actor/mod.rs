@@ -38,6 +38,20 @@ use crate::map::passability::FLAG_CREATURE;
 use crate::menu::main_menu::GameState;
 
 // ---------------------------------------------------------------------------
+// Paused resource
+// ---------------------------------------------------------------------------
+
+/// When `true`, all actor movement systems are suspended.
+/// Toggle with the `Space` key while in-game.
+#[derive(Resource, Default, PartialEq)]
+pub struct Paused(pub bool);
+
+/// Condition: returns `true` when the simulation is paused.
+pub fn is_paused(paused: Res<Paused>) -> bool {
+    paused.0
+}
+
+// ---------------------------------------------------------------------------
 // ActorMoveBuffer
 // ---------------------------------------------------------------------------
 
@@ -305,12 +319,22 @@ pub struct ActorPlugin;
 
 impl Plugin for ActorPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(
+        app.init_resource::<Paused>().add_systems(
             Update,
-            (flush_actor_occupancy, process_actors)
-                .chain()
-                .run_if(in_state(GameState::InGame)),
+            (
+                toggle_pause.run_if(in_state(GameState::InGame)),
+                (flush_actor_occupancy, process_actors)
+                    .chain()
+                    .run_if(in_state(GameState::InGame))
+                    .run_if(not(is_paused)),
+            ),
         );
+    }
+}
+
+fn toggle_pause(keys: Res<ButtonInput<KeyCode>>, mut paused: ResMut<Paused>) {
+    if keys.just_pressed(KeyCode::Space) {
+        paused.0 = !paused.0;
     }
 }
 

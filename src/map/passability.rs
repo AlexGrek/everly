@@ -160,6 +160,51 @@ impl DynamicPassabilityMap {
         actor_blocked: u64,
         static_cache: &Hypermap<SubtilePassability>,
     ) -> Result<(), TryUpdateFootprintError> {
+        let subtile_map = SubtilePassabilityMap::new(self);
+        match self.probe_footprint(
+            next_center_subtile,
+            radius_subtiles,
+            previous,
+            actor_blocked,
+            static_cache,
+        ) {
+            Ok(()) => {
+                let new_shadow = baked_circle_shadow(radius_subtiles);
+                write_circle(&subtile_map, next_center_subtile, new_shadow);
+                Ok(())
+            }
+            Err(e) => {
+                // Persist previous occupancy into write buffer so the actor
+                // still appears at its last accepted footprint next frame.
+                if let Some((prev_center, prev_r)) = previous {
+                    if prev_r >= 0 {
+                        let prev_shadow = baked_circle_shadow(prev_r);
+                        write_circle(&subtile_map, prev_center, prev_shadow);
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Non-writing variant of [`try_update_footprint`]: runs the same static +
+    /// dynamic collision checks against the candidate footprint but never
+    /// touches the write buffer.
+    ///
+    /// Used by callers that need to test multiple candidate placements per
+    /// frame (e.g. axis-decomposed slide collision) and commit at most once.
+    /// Calling [`try_update_footprint`] multiple times in the same frame for
+    /// the same actor leaves stale stamps in the write buffer that would later
+    /// flush into the read buffer and falsely block the actor on the next
+    /// frame — probe + a single final commit avoids that.
+    pub fn probe_footprint(
+        &self,
+        next_center_subtile: IVec2,
+        radius_subtiles: i32,
+        previous: Option<(IVec2, i32)>,
+        actor_blocked: u64,
+        static_cache: &Hypermap<SubtilePassability>,
+    ) -> Result<(), TryUpdateFootprintError> {
         if radius_subtiles < 0 {
             return Err(TryUpdateFootprintError::InvalidRadius(radius_subtiles));
         }
@@ -182,33 +227,24 @@ impl DynamicPassabilityMap {
                 }
                 None => false,
             };
+            if is_self_overlap {
+                continue;
+            }
 
-            if !is_self_overlap {
-                // Check static geometry from the persistent cache (walls, void).
-                let static_flags = static_subtile_flags(static_cache, target);
-                if static_flags & actor_blocked != 0 {
-                    if let Some((prev_center, prev_shadow)) = previous_info {
-                        write_circle(&subtile_map, prev_center, prev_shadow);
-                    }
-                    return Err(TryUpdateFootprintError::BlockedByStatic {
-                        world_subtile: target,
-                    });
-                }
+            let static_flags = static_subtile_flags(static_cache, target);
+            if static_flags & actor_blocked != 0 {
+                return Err(TryUpdateFootprintError::BlockedByStatic {
+                    world_subtile: target,
+                });
+            }
 
-                // Check dynamic occupancy (other creatures) from the read buffer.
-                let dynamic_flags = subtile_map.flags_xy(0, 0, target.x, target.y);
-                if dynamic_flags & actor_blocked != 0 {
-                    if let Some((prev_center, prev_shadow)) = previous_info {
-                        write_circle(&subtile_map, prev_center, prev_shadow);
-                    }
-                    return Err(TryUpdateFootprintError::BlockedByOccupancy {
-                        world_subtile: target,
-                    });
-                }
+            let dynamic_flags = subtile_map.flags_xy(0, 0, target.x, target.y);
+            if dynamic_flags & actor_blocked != 0 {
+                return Err(TryUpdateFootprintError::BlockedByOccupancy {
+                    world_subtile: target,
+                });
             }
         }
-
-        write_circle(&subtile_map, next_center_subtile, new_shadow);
         Ok(())
     }
 

@@ -3,7 +3,19 @@
 //!
 //! World-tile pathfinding consumes a `Hypermap<f32>` of static passability
 //! (see [`crate::map::world_map::cell_passability`]) — a tile is walkable iff
-//! its passability is `> 0.0`. 4-neighbor grid, unit step cost.
+//! its passability is `> 0.0`. 4-neighbor grid (no diagonals), unit step cost.
+//!
+//! The A* heuristic uses a **line-pull tie-breaker**: among nodes with equal
+//! Manhattan distance to the goal, those closest to the straight line from
+//! start to goal are expanded first. This produces a Bresenham-like staircase
+//! through open space rather than the L-shape that pure Manhattan yields.
+//!
+//! [`simplify_path_line_of_sight`] runs a greedy string-pulling pass over the
+//! returned tile path: interior tiles whose neighbours have line-of-sight (the
+//! Bresenham line between them passes only through walkable tiles) are
+//! discarded. The result is a sparse waypoint list where intermediate nodes
+//! exist only where the path must bend around an obstacle.
+//!
 //! [`WorldMapFloor`](crate::map::world_map::WorldMapFloor) tests can encode
 //! start/end with `>A` / `>B` via
 //! [`WorldMapFloor::from_ascii_with_path_markers`](crate::map::world_map::WorldMapFloor::from_ascii_with_path_markers).
@@ -70,6 +82,33 @@ pub fn manhattan(a: (i32, i32), b: (i32, i32)) -> u32 {
     a.0.abs_diff(b.0) + a.1.abs_diff(b.1)
 }
 
+/// Each grid step costs this many scaled units. Leaves headroom for an additive
+/// line-pull tie-breaker below the step cost.
+const STEP_SCALE: u32 = 1024;
+
+/// Twice the signed area of the triangle (start, goal, node), absolute value.
+///
+/// Proportional to the perpendicular distance from `node` to the start→goal
+/// line. Clamped so the bias is strictly less than `STEP_SCALE`, guaranteeing
+/// that adding it to a Manhattan estimate never reorders nodes whose Manhattan
+/// distance to the goal differs by 1.
+#[inline]
+fn line_pull_bias(start: (i32, i32), goal: (i32, i32), node: (i32, i32)) -> u32 {
+    let dx1 = (node.0 - goal.0) as i64;
+    let dy1 = (node.1 - goal.1) as i64;
+    let dx2 = (start.0 - goal.0) as i64;
+    let dy2 = (start.1 - goal.1) as i64;
+    let cross = (dx1 * dy2 - dx2 * dy1).unsigned_abs();
+    cross.min((STEP_SCALE - 1) as u64) as u32
+}
+
+#[inline]
+fn scaled_h(node: (i32, i32), goal: (i32, i32), start: (i32, i32)) -> u32 {
+    manhattan(node, goal)
+        .saturating_mul(STEP_SCALE)
+        .saturating_add(line_pull_bias(start, goal, node))
+}
+
 fn four_neighbors(wx: i32, wy: i32) -> [(i32, i32); 4] {
     [
         (wx + 1, wy),
@@ -85,7 +124,7 @@ fn push_neighbor_if_walkable(
     n: (i32, i32),
 ) {
     if world_tile_walkable(map, n.0, n.1) {
-        acc.push((n, 1));
+        acc.push((n, STEP_SCALE));
     }
 }
 
@@ -136,7 +175,7 @@ pub fn astar_shortest_world_path(
     let mut open = BinaryHeap::new();
     let mut g_best: HashMap<(i32, i32), u32> = HashMap::new();
     let mut parent: HashMap<(i32, i32), (i32, i32)> = HashMap::new();
-    let h0 = manhattan(start, goal);
+    let h0 = scaled_h(start, goal, start);
     open.push(Node {
         pos: start,
         g: 0,
@@ -178,7 +217,7 @@ pub fn astar_shortest_world_path(
             if better {
                 g_best.insert(n, ng);
                 parent.insert(n, pos);
-                let hn = manhattan(n, goal);
+                let hn = scaled_h(n, goal, start);
                 open.push(Node {
                     pos: n,
                     g: ng,
@@ -189,6 +228,92 @@ pub fn astar_shortest_world_path(
     }
 
     HypermapPathResult::NoPath { expansions }
+}
+
+/// Walks the integer Bresenham line from `a` to `b` and returns true iff every
+/// tile on that line (including both endpoints) is walkable per `map`.
+///
+/// Used by [`simplify_path_line_of_sight`] to test whether two waypoints can
+/// be joined by a straight floating-point trajectory without crossing a wall.
+pub fn line_of_sight(map: &Hypermap<f32>, a: (i32, i32), b: (i32, i32)) -> bool {
+    let (mut x, mut y) = a;
+    let (x1, y1) = b;
+    let dx = (x1 - x).abs();
+    let dy = -(y1 - y).abs();
+    let sx = if x < x1 { 1 } else { -1 };
+    let sy = if y < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    loop {
+        if !world_tile_walkable(map, x, y) {
+            return false;
+        }
+        if (x, y) == b {
+            return true;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
+        }
+    }
+}
+
+/// Greedy string-pulling on a 4-neighbor tile path.
+///
+/// Keeps the start, the goal, and only those interior waypoints where the
+/// path must bend around an obstacle (i.e. the previous anchor cannot reach
+/// the next tile by line-of-sight). Tiles in open space are dropped so the
+/// follower moves diagonally in floating-point coordinates rather than
+/// stair-stepping along the grid.
+///
+/// `corner_buffer` keeps that many extra tiles on **each side** of every
+/// detected bend (clamped to the path bounds). The tile-level line-of-sight
+/// test ignores actor radius, so a single bend waypoint can leave a wide
+/// follower hugging a wall too tightly to make the turn; a small buffer
+/// (typically `1` or `2`) gives the follower axis-aligned approach and
+/// departure waypoints around each corner.
+pub fn simplify_path_line_of_sight(
+    map: &Hypermap<f32>,
+    path: &[(i32, i32)],
+    corner_buffer: usize,
+) -> Vec<(i32, i32)> {
+    if path.len() <= 2 {
+        return path.to_vec();
+    }
+
+    let mut bend_indices = Vec::new();
+    let mut anchor = 0;
+    let mut i = 1;
+    while i + 1 < path.len() {
+        if line_of_sight(map, path[anchor], path[i + 1]) {
+            i += 1;
+        } else {
+            bend_indices.push(i);
+            anchor = i;
+            i += 1;
+        }
+    }
+
+    let last = path.len() - 1;
+    let mut keep = vec![false; path.len()];
+    keep[0] = true;
+    keep[last] = true;
+    for &b in &bend_indices {
+        let lo = b.saturating_sub(corner_buffer);
+        let hi = (b + corner_buffer).min(last);
+        for k in lo..=hi {
+            keep[k] = true;
+        }
+    }
+
+    keep.iter()
+        .enumerate()
+        .filter_map(|(idx, k)| if *k { Some(path[idx]) } else { None })
+        .collect()
 }
 
 /// Bounded uniform-cost expansion from `start` (Dijkstra / A* with \(h=0\)).
@@ -403,6 +528,72 @@ mod tests {
             .expect("parse")
             .expect("both markers");
         assert_eq!(path.len(), 4);
+    }
+
+    #[test]
+    fn simplify_collapses_open_space() {
+        let map: Hypermap<f32> = Hypermap::new(0.0);
+        for x in 0..10 {
+            map.set(x, 0, 1.0);
+        }
+        let raw = match astar_shortest_world_path(
+            &map,
+            (0, 0),
+            (9, 0),
+            HypermapSearchLimits::default(),
+        ) {
+            HypermapPathResult::Found { path, .. } => path,
+            other => panic!("expected Found, got {other:?}"),
+        };
+        assert_eq!(raw.len(), 10);
+        let simplified = simplify_path_line_of_sight(&map, &raw, 0);
+        assert_eq!(simplified, vec![(0, 0), (9, 0)]);
+    }
+
+    #[test]
+    fn simplify_keeps_corner_around_wall() {
+        let map: Hypermap<f32> = Hypermap::new(0.0);
+        for x in 0..5 {
+            map.set(x, 0, 1.0);
+        }
+        for y in 0..3 {
+            map.set(4, y, 1.0);
+        }
+        for x in 0..5 {
+            map.set(x, 2, 1.0);
+        }
+        let raw = match astar_shortest_world_path(
+            &map,
+            (0, 0),
+            (0, 2),
+            HypermapSearchLimits::default(),
+        ) {
+            HypermapPathResult::Found { path, .. } => path,
+            other => panic!("expected Found, got {other:?}"),
+        };
+        let simplified = simplify_path_line_of_sight(&map, &raw, 0);
+        assert_eq!(simplified.first().copied(), Some((0, 0)));
+        assert_eq!(simplified.last().copied(), Some((0, 2)));
+        assert!(
+            simplified.len() >= 3,
+            "expected at least one corner waypoint, got {simplified:?}",
+        );
+
+        let buffered = simplify_path_line_of_sight(&map, &raw, 1);
+        assert!(
+            buffered.len() >= simplified.len() + 2,
+            "buffer=1 should keep approach + departure tiles around each bend: {buffered:?}",
+        );
+    }
+
+    #[test]
+    fn line_of_sight_detects_wall() {
+        let map: Hypermap<f32> = Hypermap::new(0.0);
+        map.set(0, 0, 1.0);
+        map.set(2, 0, 1.0);
+        assert!(!line_of_sight(&map, (0, 0), (2, 0)));
+        map.set(1, 0, 1.0);
+        assert!(line_of_sight(&map, (0, 0), (2, 0)));
     }
 
     #[test]
