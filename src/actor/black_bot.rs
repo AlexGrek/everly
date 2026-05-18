@@ -17,7 +17,7 @@ use bevy::prelude::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::actor::snapshot::{BlackBotVisualSnap, MovementStateSnap};
+use crate::actor::snapshot::{BlackBotVisualSnap, MovementStateSnap, SerIVec2, SerVec2};
 use crate::actor::{
     is_paused, process_actors, Actor, ActorMoveBuffer, ActorMovementError, ActorObject, ActorState,
 };
@@ -79,38 +79,58 @@ enum MovementState {
 #[derive(Component)]
 pub struct BlackBotVisual {
     /// Last observed `floor(center)`. `None` forces a think on the first frame.
-    pub(crate) main_tile: Option<IVec2>,
+    main_tile: Option<IVec2>,
     /// Cached unit heading toward `path[path_index]`. Recomputed only on a
     /// main-tile change.
-    pub(crate) direction: Vec2,
-    pub(crate) has_target: bool,
-    pub(crate) path: Vec<(i32, i32)>,
-    pub(crate) path_index: usize,
+    direction: Vec2,
+    has_target: bool,
+    path: Vec<(i32, i32)>,
+    path_index: usize,
     movement_state: MovementState,
-    /// Seed used to construct [`Self::rng`]; persisted in level actor snapshots.
-    pub(crate) rng_seed: u64,
+    /// Seed for [`Self::rng`]; persisted in level actor snapshots only.
+    rng_seed: u64,
     rng: StdRng,
 }
 
 impl BlackBotVisual {
-    pub(crate) fn movement_state_snapshot(&self) -> MovementStateSnap {
-        match self.movement_state {
+    pub(crate) fn to_snapshot(&self) -> BlackBotVisualSnap {
+        let movement_state = match self.movement_state {
             MovementState::Moving => MovementStateSnap::Moving,
             MovementState::Waiting { remaining_s } => {
                 MovementStateSnap::Waiting { remaining_s }
             }
+        };
+        BlackBotVisualSnap {
+            main_tile: self.main_tile.map(|t| SerIVec2 { x: t.x, y: t.y }),
+            direction: SerVec2 {
+                x: self.direction.x,
+                y: self.direction.y,
+            },
+            has_target: self.has_target,
+            path: self.path.clone(),
+            path_index: self.path_index,
+            movement_state,
+            rng_seed: self.rng_seed,
         }
     }
 
-    fn movement_state_from_snapshot(snap: MovementStateSnap) -> MovementState {
-        match snap {
+    fn from_snapshot(snap: BlackBotVisualSnap) -> Self {
+        let movement_state = match snap.movement_state {
             MovementStateSnap::Moving => MovementState::Moving,
             MovementStateSnap::Waiting { remaining_s } => MovementState::Waiting { remaining_s },
+        };
+        Self {
+            main_tile: snap.main_tile.map(|t| IVec2::new(t.x, t.y)),
+            direction: Vec2::new(snap.direction.x, snap.direction.y),
+            has_target: snap.has_target,
+            path: snap.path,
+            path_index: snap.path_index,
+            movement_state,
+            rng_seed: snap.rng_seed,
+            rng: StdRng::seed_from_u64(snap.rng_seed),
         }
     }
-}
 
-impl BlackBotVisual {
     /// Returns the final destination tile the bot is walking toward, or `None`
     /// if it has no active path.
     pub fn target_tile(&self) -> Option<(i32, i32)> {
@@ -611,16 +631,7 @@ pub fn spawn_black_bot_from_snapshot(
                 name.map(str::to_string)
                     .unwrap_or_else(|| "BlackBot".to_string()),
             ),
-            BlackBotVisual {
-                main_tile: visual.main_tile.map(Into::into),
-                direction: visual.direction.into(),
-                has_target: visual.has_target,
-                path: visual.path,
-                path_index: visual.path_index,
-                movement_state: BlackBotVisual::movement_state_from_snapshot(visual.movement_state),
-                rng_seed: visual.rng_seed,
-                rng: StdRng::seed_from_u64(visual.rng_seed),
-            },
+            BlackBotVisual::from_snapshot(visual),
             ActorObject::new(Box::new(bot)),
             Transform::default(),
             Visibility::Inherited,

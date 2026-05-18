@@ -192,19 +192,6 @@ pub struct GlitchBotVisualSnap {
     pub rng_seed: u64,
 }
 
-impl From<&GlitchBotVisual> for GlitchBotVisualSnap {
-    fn from(v: &GlitchBotVisual) -> Self {
-        Self {
-            direction: v.direction.into(),
-            accumulator: v.accumulator.into(),
-            dir_timer: v.dir_timer,
-            dir_interval: v.dir_interval,
-            collision_streak: v.collision_streak,
-            rng_seed: v.rng_seed,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MovementStateSnap {
@@ -221,20 +208,6 @@ pub struct BlackBotVisualSnap {
     pub path_index: usize,
     pub movement_state: MovementStateSnap,
     pub rng_seed: u64,
-}
-
-impl From<&BlackBotVisual> for BlackBotVisualSnap {
-    fn from(v: &BlackBotVisual) -> Self {
-        Self {
-            main_tile: v.main_tile.map(Into::into),
-            direction: v.direction.into(),
-            has_target: v.has_target,
-            path: v.path.clone(),
-            path_index: v.path_index,
-            movement_state: v.movement_state_snapshot(),
-            rng_seed: v.rng_seed,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -270,14 +243,14 @@ impl LevelActorsFile {
             actors.push(SavedActor::GlitchBot {
                 name: name.map(|n| n.to_string()),
                 state: obj.inner.state().into(),
-                visual: vis.into(),
+                visual: vis.to_snapshot(),
             });
         }
         for (obj, vis, name) in black_bots.iter() {
             actors.push(SavedActor::BlackBot {
                 name: name.map(|n| n.to_string()),
                 state: obj.inner.state().into(),
-                visual: vis.into(),
+                visual: vis.to_snapshot(),
             });
         }
         Self {

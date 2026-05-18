@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::actor::snapshot::GlitchBotVisualSnap;
+use crate::actor::snapshot::{GlitchBotVisualSnap, SerVec2};
 use crate::actor::{is_paused, process_actors, Actor, ActorMoveBuffer, ActorObject, ActorState};
 use crate::map::passability::{FLAG_BLOCKED, SUBTILE_COUNT};
 use crate::menu::main_menu::GameState;
@@ -33,17 +33,48 @@ const SPHERE_RADIUS: f32 = 0.5;
 #[derive(Component)]
 pub struct GlitchBotVisual {
     /// Normalized direction the bot is currently heading (subtile-space).
-    pub(crate) direction: Vec2,
+    direction: Vec2,
     /// Fractional subtile displacement accumulated across frames. When any
     /// component reaches ±1.0, the integer part becomes a `subtile_shift`
     /// step and the remainder stays for the next frame.
-    pub(crate) accumulator: Vec2,
-    pub(crate) dir_timer: f32,
-    pub(crate) dir_interval: f32,
-    pub(crate) collision_streak: u32,
-    /// Seed used to construct [`Self::rng`]; persisted in level actor snapshots.
-    pub(crate) rng_seed: u64,
+    accumulator: Vec2,
+    dir_timer: f32,
+    dir_interval: f32,
+    collision_streak: u32,
+    /// Seed for [`Self::rng`]; persisted in level actor snapshots only.
+    rng_seed: u64,
     rng: StdRng,
+}
+
+impl GlitchBotVisual {
+    pub(crate) fn to_snapshot(&self) -> GlitchBotVisualSnap {
+        GlitchBotVisualSnap {
+            direction: SerVec2 {
+                x: self.direction.x,
+                y: self.direction.y,
+            },
+            accumulator: SerVec2 {
+                x: self.accumulator.x,
+                y: self.accumulator.y,
+            },
+            dir_timer: self.dir_timer,
+            dir_interval: self.dir_interval,
+            collision_streak: self.collision_streak,
+            rng_seed: self.rng_seed,
+        }
+    }
+
+    fn from_snapshot(snap: GlitchBotVisualSnap) -> Self {
+        Self {
+            direction: Vec2::new(snap.direction.x, snap.direction.y),
+            accumulator: Vec2::new(snap.accumulator.x, snap.accumulator.y),
+            dir_timer: snap.dir_timer,
+            dir_interval: snap.dir_interval,
+            collision_streak: snap.collision_streak,
+            rng_seed: snap.rng_seed,
+            rng: StdRng::seed_from_u64(snap.rng_seed),
+        }
+    }
 }
 
 /// Seeded RNG resource shared across bot spawns for deterministic colors/seeds.
@@ -261,11 +292,11 @@ pub fn spawn_glitch_bot_from_snapshot(
     state: ActorState,
     visual: GlitchBotVisualSnap,
 ) -> Entity {
-    let direction: Vec2 = visual.direction.into();
-    let accumulator: Vec2 = visual.accumulator.into();
-    let color = direction_color(direction);
     let bot = GlitchBot::from_state(state);
-    let world_pos = glitch_bot_world_position(bot.state(), accumulator);
+    let vis = GlitchBotVisual::from_snapshot(visual);
+    let direction = vis.direction;
+    let color = direction_color(direction);
+    let world_pos = glitch_bot_world_position(bot.state(), vis.accumulator);
 
     let emissive_color = color.to_linear();
     let mat = materials.add(StandardMaterial {
@@ -281,15 +312,7 @@ pub fn spawn_glitch_bot_from_snapshot(
                 name.map(str::to_string)
                     .unwrap_or_else(|| "GlitchBot".to_string()),
             ),
-            GlitchBotVisual {
-                direction,
-                accumulator,
-                dir_timer: visual.dir_timer,
-                dir_interval: visual.dir_interval,
-                collision_streak: visual.collision_streak,
-                rng_seed: visual.rng_seed,
-                rng: StdRng::seed_from_u64(visual.rng_seed),
-            },
+            vis,
             ActorObject::new(Box::new(bot)),
             Transform::default(),
             Visibility::Inherited,
