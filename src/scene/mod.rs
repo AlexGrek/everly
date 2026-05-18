@@ -5,4 +5,5 @@
 //! here so gameplay modules can depend on them without circular reach.
 
 pub mod camera;
+pub mod camera_snapshot;
 pub mod sun;

@@ -17,6 +17,7 @@ use bevy::prelude::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use crate::actor::snapshot::{BlackBotVisualSnap, MovementStateSnap};
 use crate::actor::{
     is_paused, process_actors, Actor, ActorMoveBuffer, ActorMovementError, ActorObject, ActorState,
 };
@@ -75,15 +76,35 @@ enum MovementState {
 #[derive(Component)]
 pub struct BlackBotVisual {
     /// Last observed `floor(center)`. `None` forces a think on the first frame.
-    main_tile: Option<IVec2>,
+    pub(crate) main_tile: Option<IVec2>,
     /// Cached unit heading toward `path[path_index]`. Recomputed only on a
     /// main-tile change.
-    direction: Vec2,
-    has_target: bool,
-    path: Vec<(i32, i32)>,
-    path_index: usize,
+    pub(crate) direction: Vec2,
+    pub(crate) has_target: bool,
+    pub(crate) path: Vec<(i32, i32)>,
+    pub(crate) path_index: usize,
     movement_state: MovementState,
+    /// Seed used to construct [`Self::rng`]; persisted in level actor snapshots.
+    pub(crate) rng_seed: u64,
     rng: StdRng,
+}
+
+impl BlackBotVisual {
+    pub(crate) fn movement_state_snapshot(&self) -> MovementStateSnap {
+        match self.movement_state {
+            MovementState::Moving => MovementStateSnap::Moving,
+            MovementState::Waiting { remaining_s } => {
+                MovementStateSnap::Waiting { remaining_s }
+            }
+        }
+    }
+
+    fn movement_state_from_snapshot(snap: MovementStateSnap) -> MovementState {
+        match snap {
+            MovementStateSnap::Moving => MovementState::Moving,
+            MovementStateSnap::Waiting { remaining_s } => MovementState::Waiting { remaining_s },
+        }
+    }
 }
 
 impl BlackBotVisual {
@@ -108,6 +129,10 @@ pub struct BlackBot {
 }
 
 impl BlackBot {
+    pub fn from_state(state: ActorState) -> Self {
+        Self { state }
+    }
+
     pub fn new(center: Vec2) -> Self {
         let sc = SUBTILE_COUNT as f32;
         let initial_sub = IVec2::new(
@@ -538,6 +563,62 @@ fn paint_black_bot_targets(
     }
 }
 
+/// Spawns a BlackBot from a level snapshot (mesh + restored runtime state).
+pub fn spawn_black_bot_from_snapshot(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    name: Option<&str>,
+    state: ActorState,
+    visual: BlackBotVisualSnap,
+) -> Entity {
+    let center = state.center;
+    let bot = BlackBot::from_state(state);
+
+    let mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.02, 0.02, 0.02),
+        metallic: 1.0,
+        perceptual_roughness: 0.05,
+        reflectance: 1.0,
+        ..default()
+    });
+    let mesh = meshes.add(Sphere::new(SPHERE_RADIUS).mesh().ico(3).unwrap());
+
+    let parent = commands
+        .spawn((
+            Name::new(
+                name.map(str::to_string)
+                    .unwrap_or_else(|| "BlackBot".to_string()),
+            ),
+            BlackBotVisual {
+                main_tile: visual.main_tile.map(Into::into),
+                direction: visual.direction.into(),
+                has_target: visual.has_target,
+                path: visual.path,
+                path_index: visual.path_index,
+                movement_state: BlackBotVisual::movement_state_from_snapshot(visual.movement_state),
+                rng_seed: visual.rng_seed,
+                rng: StdRng::seed_from_u64(visual.rng_seed),
+            },
+            ActorObject::new(Box::new(bot)),
+            Transform::default(),
+            Visibility::Inherited,
+        ))
+        .id();
+
+    let mesh_child = commands
+        .spawn((
+            Name::new("BlackBot mesh"),
+            Mesh3d(mesh),
+            MeshMaterial3d(mat),
+            Transform::from_xyz(center.x, SPHERE_RADIUS, center.y),
+        ))
+        .id();
+
+    commands.entity(parent).add_children(&[mesh_child]);
+    parent
+}
+
 pub fn spawn_black_bot(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -568,6 +649,7 @@ pub fn spawn_black_bot(
                 path: Vec::new(),
                 path_index: 0,
                 movement_state: MovementState::Moving,
+                rng_seed: vis_seed,
                 rng: vis_rng,
             },
             ActorObject::new(Box::new(bot)),

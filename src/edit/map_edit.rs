@@ -14,6 +14,12 @@ use crate::map::hypermap_world::{
     ensure_chunk_generated, queue_hypermap_chunk_remesh, write_world_cell, HypermapChunkRemeshQueue,
     HypermapRuntime,
 };
+use crate::actor::glitch_bot::GlitchBotVisual;
+use crate::actor::black_bot::BlackBotVisual;
+use crate::actor::snapshot::{save_level_actors, LevelActorsFile};
+use crate::scene::camera::{StrategyCamera, StrategyCameraRig};
+use crate::scene::camera_snapshot::{save_level_camera, LevelCameraFile};
+use crate::actor::ActorObject;
 use crate::map::level::{save_level_geometry_for_chunks, LevelName};
 use crate::map::world_map::{
     CellType, WallCorner, WallMask, MASK_EAST, MASK_NORTH, MASK_SOUTH, MASK_WEST,
@@ -21,7 +27,6 @@ use crate::map::world_map::{
 use crate::menu::main_menu::GameState;
 use crate::actor::black_bot::{self, BlackBotRng};
 use crate::actor::glitch_bot::{self, GlitchBotRng};
-use crate::scene::camera::StrategyCameraRig;
 
 /// Pixels from the bottom of the window where raycasting and clicks are suppressed
 /// (covers the 52 px HUD bar + 40 px palette row + a small margin).
@@ -249,6 +254,9 @@ fn map_edit_save_button(
     state: Res<MapEditState>,
     level: Res<LevelName>,
     runtime: Res<HypermapRuntime>,
+    camera: Query<&StrategyCamera, With<StrategyCameraRig>>,
+    glitch_bots: Query<(&ActorObject, &GlitchBotVisual, Option<&Name>)>,
+    black_bots: Query<(&ActorObject, &BlackBotVisual, Option<&Name>)>,
 ) {
     if !state.panel_open {
         return;
@@ -257,12 +265,27 @@ fn map_edit_save_button(
         if *interaction != Interaction::Pressed {
             continue;
         }
-        match save_level_geometry_for_chunks(level.0.as_str(), &runtime.map, runtime.desired_chunk_coords()) {
+        let level_name = level.0.as_str();
+        match save_level_geometry_for_chunks(level_name, &runtime.map, runtime.desired_chunk_coords()) {
             Ok(n) => info!(
-                "saved {n} rendered chunk geometry file(s) under `levels/level_{}/geometry/`",
-                level.0
+                "saved {n} rendered chunk geometry file(s) under `levels/level_{level_name}/geometry/`",
             ),
             Err(e) => warn!("save level geometry failed: {e}"),
+        }
+        let actors_file = LevelActorsFile::collect(&glitch_bots, &black_bots);
+        match save_level_actors(level_name, &actors_file) {
+            Ok(()) => info!(
+                "saved {} actor(s) to `levels/level_{level_name}/actors.json`",
+                actors_file.actors.len()
+            ),
+            Err(e) => warn!("save level actors failed: {e}"),
+        }
+        if let Ok(cam) = camera.single() {
+            let camera_file = LevelCameraFile::from_camera(cam);
+            match save_level_camera(level_name, &camera_file) {
+                Ok(()) => info!("saved strategy camera to `levels/level_{level_name}/camera.json`"),
+                Err(e) => warn!("save level camera failed: {e}"),
+            }
         }
     }
 }

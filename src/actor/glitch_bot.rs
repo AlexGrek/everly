@@ -12,6 +12,7 @@ use bevy::prelude::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use crate::actor::snapshot::GlitchBotVisualSnap;
 use crate::actor::{is_paused, process_actors, Actor, ActorMoveBuffer, ActorObject, ActorState};
 use crate::map::passability::{FLAG_BLOCKED, SUBTILE_COUNT};
 use crate::menu::main_menu::GameState;
@@ -32,14 +33,16 @@ const SPHERE_RADIUS: f32 = 0.5;
 #[derive(Component)]
 pub struct GlitchBotVisual {
     /// Normalized direction the bot is currently heading (subtile-space).
-    direction: Vec2,
+    pub(crate) direction: Vec2,
     /// Fractional subtile displacement accumulated across frames. When any
     /// component reaches ±1.0, the integer part becomes a `subtile_shift`
     /// step and the remainder stays for the next frame.
-    accumulator: Vec2,
-    dir_timer: f32,
-    dir_interval: f32,
-    collision_streak: u32,
+    pub(crate) accumulator: Vec2,
+    pub(crate) dir_timer: f32,
+    pub(crate) dir_interval: f32,
+    pub(crate) collision_streak: u32,
+    /// Seed used to construct [`Self::rng`]; persisted in level actor snapshots.
+    pub(crate) rng_seed: u64,
     rng: StdRng,
 }
 
@@ -58,6 +61,10 @@ pub struct GlitchBot {
 }
 
 impl GlitchBot {
+    pub fn from_state(state: ActorState) -> Self {
+        Self { state }
+    }
+
     pub fn new(center: Vec2) -> Self {
         let sc = SUBTILE_COUNT as f32;
         // Pre-compute the containing subtile so try_move never falls back to
@@ -236,6 +243,86 @@ fn sync_glitch_bot_transforms(
     }
 }
 
+fn glitch_bot_world_position(state: &ActorState, accumulator: Vec2) -> Vec3 {
+    let sub = state
+        .last_accepted_center_subtile
+        .unwrap_or_else(|| state.center_subtile_i32());
+    let sc = SUBTILE_COUNT as f32;
+    let world_pos = (sub.as_vec2() + accumulator) / sc;
+    Vec3::new(world_pos.x, HOVER_HEIGHT, world_pos.y)
+}
+
+/// Spawns a GlitchBot from a level snapshot (mesh + restored runtime state).
+pub fn spawn_glitch_bot_from_snapshot(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    name: Option<&str>,
+    state: ActorState,
+    visual: GlitchBotVisualSnap,
+) -> Entity {
+    let direction: Vec2 = visual.direction.into();
+    let accumulator: Vec2 = visual.accumulator.into();
+    let color = direction_color(direction);
+    let bot = GlitchBot::from_state(state);
+    let world_pos = glitch_bot_world_position(bot.state(), accumulator);
+
+    let emissive_color = color.to_linear();
+    let mat = materials.add(StandardMaterial {
+        base_color: color,
+        emissive: emissive_color * 4.0,
+        ..default()
+    });
+    let mesh = meshes.add(Sphere::new(SPHERE_RADIUS).mesh().ico(3).unwrap());
+
+    let parent = commands
+        .spawn((
+            Name::new(
+                name.map(str::to_string)
+                    .unwrap_or_else(|| "GlitchBot".to_string()),
+            ),
+            GlitchBotVisual {
+                direction,
+                accumulator,
+                dir_timer: visual.dir_timer,
+                dir_interval: visual.dir_interval,
+                collision_streak: visual.collision_streak,
+                rng_seed: visual.rng_seed,
+                rng: StdRng::seed_from_u64(visual.rng_seed),
+            },
+            ActorObject::new(Box::new(bot)),
+            Transform::default(),
+            Visibility::Inherited,
+        ))
+        .id();
+
+    let mesh_child = commands
+        .spawn((
+            Name::new("GlitchBot mesh"),
+            Mesh3d(mesh),
+            MeshMaterial3d(mat),
+            Transform::from_translation(world_pos),
+        ))
+        .id();
+
+    let light_child = commands
+        .spawn((
+            Name::new("GlitchBot light"),
+            PointLight {
+                color,
+                intensity: 3000.0,
+                range: 8.0,
+                shadows_enabled: false,
+                ..default()
+            },
+            Transform::from_translation(world_pos),
+        ))
+        .id();
+
+    commands.entity(parent).add_children(&[mesh_child, light_child]);
+    parent
+}
+
 /// Spawns a GlitchBot entity with a glowing sphere mesh at the given tile.
 pub fn spawn_glitch_bot(
     commands: &mut Commands,
@@ -276,6 +363,7 @@ pub fn spawn_glitch_bot(
                 dir_timer: 0.0,
                 dir_interval: vis_rng.gen_range(DIR_CHANGE_MIN_S..DIR_CHANGE_MAX_S),
                 collision_streak: 0,
+                rng_seed: vis_seed,
                 rng: vis_rng,
             },
             ActorObject::new(Box::new(bot)),

@@ -286,7 +286,7 @@ fn sync_camera_transform(mut cameras: Query<(&StrategyCamera, &mut Transform), C
 
 /// Build a camera `Transform` that places it `distance` units away from
 /// `focus`, tilted by `pitch` and rotated by `yaw`, looking at `focus`.
-fn strategy_transform(cam: &StrategyCamera) -> Transform {
+pub(crate) fn strategy_transform(cam: &StrategyCamera) -> Transform {
     let (sin_yaw, cos_yaw) = cam.yaw.sin_cos();
     let (sin_pitch, cos_pitch) = cam.pitch.sin_cos();
 

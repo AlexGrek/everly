@@ -172,7 +172,7 @@ impl Plugin for HypermapWorldPlugin {
     }
 }
 
-fn setup_hypermap_runtime(mut commands: Commands) {
+pub(crate) fn setup_hypermap_runtime(mut commands: Commands) {
     let water_root = commands
         .spawn((Name::new("Hypermap water"), WaterTiles))
         .id();

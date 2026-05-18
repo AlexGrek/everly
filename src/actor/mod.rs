@@ -24,6 +24,7 @@
 
 pub mod black_bot;
 pub mod glitch_bot;
+pub mod snapshot;
 
 use bevy::prelude::*;
 
@@ -297,6 +298,10 @@ pub trait Actor: Send + Sync + 'static {
 // ---------------------------------------------------------------------------
 // ECS wrapper
 // ---------------------------------------------------------------------------
+
+/// Marker on actor roots spawned from `levels/level_{name}/actors.json`.
+#[derive(Component)]
+pub struct LevelActor;
 
 /// ECS wrapper for heterogeneous actor trait objects.
 #[derive(Component)]

@@ -12,6 +12,8 @@ bevy_water = "0.18.1"
 futures-lite = "2.6.1"
 pathfinding = "4.15"
 rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Opt-in feature for blazing-fast iterative dev builds via Bevy's dynamic linking.
 # Enable with: `cargo run --features dev`

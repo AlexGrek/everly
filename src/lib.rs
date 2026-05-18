@@ -42,6 +42,7 @@ impl Plugin for GamePlugin {
                 MeshPickingPlugin,
                 menu::main_menu::MainMenuPlugin,
                 scene::camera::StrategyCameraPlugin,
+                scene::camera_snapshot::CameraSnapshotPlugin,
                 scene::sun::SunPlugin,
                 hud::game_hud::GameHudPlugin,
                 map::floor_level::FloorLevelPlugin,
@@ -52,6 +53,7 @@ impl Plugin for GamePlugin {
             ))
             .add_plugins((
                 actor::ActorPlugin,
+                actor::snapshot::ActorSnapshotPlugin,
                 actor::glitch_bot::GlitchBotPlugin,
                 actor::black_bot::BlackBotPlugin,
                 edit::map_edit::MapEditPlugin,
