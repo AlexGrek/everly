@@ -24,12 +24,16 @@ use crate::map::hypermap::{
     world_to_chunk_local, ChunkCoord, Hypermap, HypermapChunk, LocalCoord, HYPERMAP_CHUNK_SIZE,
     HYPERMAP_FLOOR_COUNT,
 };
-use crate::map::level::{chunk_geometry_path, try_load_chunk_geometry_file, LevelName};
+use crate::map::level::{
+    chunk_geometry_path, chunk_style_floor_path, chunk_style_wall_path,
+    try_load_chunk_geometry_file, try_load_chunk_style_file_into_map, LevelName,
+};
 use crate::menu::main_menu::GameState;
 use crate::map::passability::{cell_subtile_flags, SubtilePassability, SUBTILE_COUNT};
 use crate::map::world_map::{
-    cell_passability, for_each_wall_segment, CellType, WallMask, WorldMapFloor, WALL_THICKNESS,
-    MASK_EAST, MASK_NORTH, MASK_SOUTH, MASK_WEST, WATER_SURFACE_Y, WORLD_MAP_FILE_PATH,
+    cell_passability, for_each_wall_segment, CellType, WallMask, TileStyle, WorldMapFloor,
+    WALL_THICKNESS, MASK_EAST, MASK_NORTH, MASK_SOUTH, MASK_WEST, WATER_SURFACE_Y,
+    WORLD_MAP_FILE_PATH,
 };
 use crate::scene::camera::StrategyCamera;
 
@@ -67,16 +71,44 @@ struct RenderedChunkFloor0Road;
 struct RenderedChunkFloor0Walls;
 
 #[derive(Component)]
+struct RenderedChunkFloor0GlassWalls;
+
+#[derive(Component)]
+struct RenderedChunkFloor0GlassFloor;
+
+#[derive(Component)]
+struct RenderedChunkFloor0Pavement;
+
+#[derive(Component)]
+struct RenderedChunkFloor0Marble;
+
+#[derive(Component)]
 struct RenderedChunkUpperRoad;
 
 #[derive(Component)]
 struct RenderedChunkUpperWalls;
 
+#[derive(Component)]
+struct RenderedChunkUpperGlassWalls;
+
+#[derive(Component)]
+struct RenderedChunkUpperGlassFloor;
+
+#[derive(Component)]
+struct RenderedChunkUpperPavement;
+
+#[derive(Component)]
+struct RenderedChunkUpperMarble;
+
 /// Upper-layer mesh entities (refreshed when HUD floor changes). Floor 0 meshes stay on the chunk root.
 #[derive(Clone, Copy)]
 struct ChunkUpperMeshEntities {
     road: Entity,
+    road_glass: Entity,
+    road_pavement: Entity,
+    road_marble: Entity,
     walls: Entity,
+    glass_walls: Entity,
 }
 
 /// Chunks that must be re-baked after [`Hypermap`](crate::hypermap::Hypermap) cell edits (drained in [`render_chunks_30fps`]).
@@ -102,6 +134,12 @@ pub(crate) struct HypermapRuntime {
     /// Updated only when geometry changes (chunk generation or cell edit) —
     /// never re-iterated per frame.
     pub(crate) static_subtile_cache: Arc<Hypermap<SubtilePassability>>,
+    /// Per-cell floor quad style. Default is [`TileStyle::DEFAULT`].
+    /// Controls which floor material the quad under any cell uses.
+    pub(crate) style_floor_map: Arc<Hypermap<TileStyle>>,
+    /// Per-cell wall slab style. Default is [`TileStyle::DEFAULT`] (regular).
+    /// Controls whether wall/corner slabs render as glass or regular material.
+    pub(crate) style_wall_map: Arc<Hypermap<TileStyle>>,
     desired_chunks: HashSet<ChunkCoord>,
     chunk_roots: HashMap<ChunkCoord, Entity>,
     chunk_upper_meshes: HashMap<ChunkCoord, ChunkUpperMeshEntities>,
@@ -124,10 +162,21 @@ struct PreparedChunkRender {
     /// True when floor `0` has void **strictly inside** [`WATER_MESH_EDGE_STRIP`]
     /// from each chunk edge — drives an inset water plane (no water in the border band).
     has_void_floor0_water: bool,
-    /// Non-void ground floor tiles (never depends on HUD floor; mesh is baked once per chunk).
-    floor0_cells: Vec<(i32, i32, CellType)>,
-    /// Upper-floor tiles for the active level at **bake** time (`floor > 0 && floor >= active_floor`).
+    // ── Floor-0 floor quad meshes (one per material, keyed by floor_style) ───
+    floor0_road_cells: Vec<(i32, i32, CellType)>,
+    floor0_glass_floor_cells: Vec<(i32, i32, CellType)>,
+    floor0_pavement_cells: Vec<(i32, i32, CellType)>,
+    floor0_marble_cells: Vec<(i32, i32, CellType)>,
+    // ── Floor-0 wall slab meshes (keyed by wall_style) ──────────────────────
+    floor0_wall_cells: Vec<(i32, i32, CellType)>,
+    floor0_glass_cells: Vec<(i32, i32, CellType)>,
+    // ── Upper floor meshes (active_floor at bake time) ───────────────────────
     upper_cells: Vec<(i32, i32, i32, CellType)>,
+    upper_glass_cells: Vec<(i32, i32, i32, CellType)>,
+    upper_road_default_cells: Vec<(i32, i32, i32, CellType)>,
+    upper_road_glass_cells: Vec<(i32, i32, i32, CellType)>,
+    upper_road_pavement_cells: Vec<(i32, i32, i32, CellType)>,
+    upper_road_marble_cells: Vec<(i32, i32, i32, CellType)>,
 }
 
 #[derive(Resource)]
@@ -142,8 +191,14 @@ struct HypermapRenderAssets {
     water_mesh: Handle<Mesh>,
     /// Invisible placeholder mesh for upper layers when empty.
     empty_mesh: Handle<Mesh>,
+    // ── Floor materials ──────────────────────────────────────────────────────
     road_material: Handle<StandardMaterial>,
+    glass_road_material: Handle<StandardMaterial>,
+    pavement_material: Handle<StandardMaterial>,
+    marble_material: Handle<StandardMaterial>,
+    // ── Wall materials ───────────────────────────────────────────────────────
     wall_material: Handle<StandardMaterial>,
+    glass_wall_material: Handle<StandardMaterial>,
     water_material: Handle<StandardWaterMaterial>,
 }
 
@@ -181,6 +236,8 @@ pub(crate) fn setup_hypermap_runtime(mut commands: Commands) {
         map: Arc::new(Hypermap::new(CellType::Road)),
         static_passability_map: Arc::new(Hypermap::new(cell_passability(CellType::Road))),
         static_subtile_cache: Arc::new(Hypermap::new(SubtilePassability::EMPTY)),
+        style_floor_map: Arc::new(Hypermap::new(TileStyle::DEFAULT)),
+        style_wall_map: Arc::new(Hypermap::new(TileStyle::DEFAULT)),
         desired_chunks: HashSet::new(),
         chunk_roots: HashMap::new(),
         chunk_upper_meshes: HashMap::new(),
@@ -208,15 +265,45 @@ fn setup_hypermap_assets(
     let empty_mesh = meshes.add(PlaneMeshBuilder::from_size(Vec2::splat(0.02)));
 
     let road_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.36, 0.36, 0.38),
-        perceptual_roughness: 0.98,
+        base_color: Color::srgb(0.10, 0.10, 0.12),
+        perceptual_roughness: 0.96,
         metallic: 0.0,
+        ..default()
+    });
+    let glass_road_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.04, 0.04, 0.06, 0.90),
+        perceptual_roughness: 0.02,
+        metallic: 0.0,
+        reflectance: 0.95,
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
+    let pavement_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.52, 0.53, 0.55),
+        perceptual_roughness: 0.88,
+        metallic: 0.0,
+        ..default()
+    });
+    let marble_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.95, 0.94, 0.91),
+        perceptual_roughness: 0.12,
+        metallic: 0.0,
+        reflectance: 0.70,
         ..default()
     });
     let wall_material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.78, 0.79, 0.82),
         perceptual_roughness: 0.72,
         metallic: 0.02,
+        cull_mode: None,
+        ..default()
+    });
+    let glass_wall_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.58, 0.80, 0.96, 0.20),
+        perceptual_roughness: 0.04,
+        metallic: 0.0,
+        reflectance: 0.90,
+        alpha_mode: AlphaMode::Blend,
         cull_mode: None,
         ..default()
     });
@@ -250,7 +337,11 @@ fn setup_hypermap_assets(
         water_mesh,
         empty_mesh,
         road_material: road_material.clone(),
+        glass_road_material,
+        pavement_material,
+        marble_material,
         wall_material,
+        glass_wall_material,
         water_material,
     });
     commands.insert_resource(MapSelectionRoadMaterial(road_material));
@@ -275,49 +366,109 @@ fn refresh_chunk_upper_layers_on_floor_change(
     }
 
     let map = runtime.map.clone();
+    let style_floor_map = runtime.style_floor_map.clone();
+    let style_wall_map = runtime.style_wall_map.clone();
     let chunk_list: Vec<(ChunkCoord, ChunkUpperMeshEntities)> =
         runtime.chunk_upper_meshes.iter().map(|(&c, &e)| (c, e)).collect();
 
     for (coord, mesh_ids) in chunk_list {
-        let Some(snapshot) = map.with_chunk_read(coord, clone_chunk_for_render_start) else {
+        let Some(cells) = map.with_chunk_read(coord, clone_chunk_for_render_start) else {
             continue;
         };
-        let (_, _, upper_cells) = partition_chunk_cells_from_vec(snapshot, current);
+        let n = cells.len();
+        let floor_styles = style_floor_map
+            .with_chunk_read(coord, clone_styles_for_render_start)
+            .unwrap_or_else(|| vec![TileStyle::DEFAULT; n]);
+        let wall_styles = style_wall_map
+            .with_chunk_read(coord, clone_styles_for_render_start)
+            .unwrap_or_else(|| vec![TileStyle::DEFAULT; n]);
+        let snapshot: Vec<(CellType, TileStyle, TileStyle)> = cells.into_iter()
+            .zip(floor_styles)
+            .zip(wall_styles)
+            .map(|((c, fs), ws)| (c, fs, ws))
+            .collect();
+        let prepared = partition_chunk_cells_from_vec(snapshot, current);
         let ox = coord.x * HYPERMAP_CHUNK_SIZE;
         let oy = coord.y * HYPERMAP_CHUNK_SIZE;
 
-        if let Some(mesh) = build_upper_road_mesh(&upper_cells, ox, oy) {
+        update_upper_road_entity(
+            &mut commands, &mut meshes, mesh_ids.road,
+            build_upper_road_mesh(&prepared.upper_road_default_cells, ox, oy),
+            assets.road_material.clone(), assets.empty_mesh.clone(),
+        );
+        update_upper_road_entity(
+            &mut commands, &mut meshes, mesh_ids.road_glass,
+            build_upper_road_mesh(&prepared.upper_road_glass_cells, ox, oy),
+            assets.glass_road_material.clone(), assets.empty_mesh.clone(),
+        );
+        update_upper_road_entity(
+            &mut commands, &mut meshes, mesh_ids.road_pavement,
+            build_upper_road_mesh(&prepared.upper_road_pavement_cells, ox, oy),
+            assets.pavement_material.clone(), assets.empty_mesh.clone(),
+        );
+        update_upper_road_entity(
+            &mut commands, &mut meshes, mesh_ids.road_marble,
+            build_upper_road_mesh(&prepared.upper_road_marble_cells, ox, oy),
+            assets.marble_material.clone(), assets.empty_mesh.clone(),
+        );
+
+        if let Some(mesh) = build_upper_wall_mesh(&prepared.upper_cells, ox, oy) {
             let h = meshes.add(mesh);
-            commands.entity(mesh_ids.road).insert((
+            commands.entity(mesh_ids.walls).insert((
                 Mesh3d(h),
-                MeshMaterial3d(assets.road_material.clone()),
+                MeshMaterial3d(assets.wall_material.clone()),
                 Visibility::Inherited,
-                Pickable::default(),
             ));
         } else {
-            commands.entity(mesh_ids.road).insert((
+            commands.entity(mesh_ids.walls).insert((
                 Mesh3d(assets.empty_mesh.clone()),
-                MeshMaterial3d(assets.road_material.clone()),
+                MeshMaterial3d(assets.wall_material.clone()),
                 Visibility::Hidden,
                 Pickable::IGNORE,
             ));
         }
 
-        if let Some(mesh) = build_upper_wall_mesh(&upper_cells, ox, oy) {
+        if let Some(mesh) = build_upper_wall_mesh(&prepared.upper_glass_cells, ox, oy) {
             let h = meshes.add(mesh);
-            commands.entity(mesh_ids.walls).insert((
+            commands.entity(mesh_ids.glass_walls).insert((
                 Mesh3d(h),
-                MeshMaterial3d(assets.wall_material.clone()),
+                MeshMaterial3d(assets.glass_wall_material.clone()),
                 Visibility::Inherited,
             ));
         } else {
-            commands.entity(mesh_ids.walls).insert((
+            commands.entity(mesh_ids.glass_walls).insert((
                 Mesh3d(assets.empty_mesh.clone()),
-                MeshMaterial3d(assets.wall_material.clone()),
+                MeshMaterial3d(assets.glass_wall_material.clone()),
                 Visibility::Hidden,
                 Pickable::IGNORE,
             ));
         }
+    }
+}
+
+fn update_upper_road_entity(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    entity: Entity,
+    mesh: Option<Mesh>,
+    material: Handle<StandardMaterial>,
+    empty_mesh: Handle<Mesh>,
+) {
+    if let Some(m) = mesh {
+        let h = meshes.add(m);
+        commands.entity(entity).insert((
+            Mesh3d(h),
+            MeshMaterial3d(material),
+            Visibility::Inherited,
+            Pickable::default(),
+        ));
+    } else {
+        commands.entity(entity).insert((
+            Mesh3d(empty_mesh),
+            MeshMaterial3d(material),
+            Visibility::Hidden,
+            Pickable::IGNORE,
+        ));
     }
 }
 
@@ -366,18 +517,29 @@ fn update_visible_hypermap_chunks(
             &runtime.map,
             &runtime.static_passability_map,
             &runtime.static_subtile_cache,
+            &runtime.style_floor_map,
+            &runtime.style_wall_map,
             chunk,
             level.0.as_str(),
         );
         if runtime.chunk_roots.contains_key(&chunk) || runtime.pending_renders.contains_key(&chunk) {
             continue;
         }
-        let Some(snapshot) = runtime
-            .map
-            .with_chunk_read(chunk, clone_chunk_for_render_start)
-        else {
+        let Some(cells) = runtime.map.with_chunk_read(chunk, clone_chunk_for_render_start) else {
             continue;
         };
+        let n = cells.len();
+        let floor_styles = runtime.style_floor_map
+            .with_chunk_read(chunk, clone_styles_for_render_start)
+            .unwrap_or_else(|| vec![TileStyle::DEFAULT; n]);
+        let wall_styles = runtime.style_wall_map
+            .with_chunk_read(chunk, clone_styles_for_render_start)
+            .unwrap_or_else(|| vec![TileStyle::DEFAULT; n]);
+        let snapshot: Vec<(CellType, TileStyle, TileStyle)> = cells.into_iter()
+            .zip(floor_styles)
+            .zip(wall_styles)
+            .map(|((c, fs), ws)| (c, fs, ws))
+            .collect();
         let task = task_pool.spawn(async move { build_chunk_render_data(snapshot, floor_for_render) });
         runtime.pending_renders.insert(chunk, task);
     }
@@ -408,6 +570,8 @@ fn render_chunks_30fps(
             &runtime.map,
             &runtime.static_passability_map,
             &runtime.static_subtile_cache,
+            &runtime.style_floor_map,
+            &runtime.style_wall_map,
             coord,
             level.0.as_str(),
         );
@@ -420,10 +584,19 @@ fn render_chunks_30fps(
             .retain(|(c, _)| *c != coord);
         let task_pool = AsyncComputeTaskPool::get();
         let floor_for_render = active_floor.0;
-        if let Some(snapshot) = runtime
-            .map
-            .with_chunk_read(coord, clone_chunk_for_render_start)
-        {
+        if let Some(cells) = runtime.map.with_chunk_read(coord, clone_chunk_for_render_start) {
+            let n = cells.len();
+            let floor_styles = runtime.style_floor_map
+                .with_chunk_read(coord, clone_styles_for_render_start)
+                .unwrap_or_else(|| vec![TileStyle::DEFAULT; n]);
+            let wall_styles = runtime.style_wall_map
+                .with_chunk_read(coord, clone_styles_for_render_start)
+                .unwrap_or_else(|| vec![TileStyle::DEFAULT; n]);
+            let snapshot: Vec<(CellType, TileStyle, TileStyle)> = cells.into_iter()
+                .zip(floor_styles)
+                .zip(wall_styles)
+                .map(|((c, fs), ws)| (c, fs, ws))
+                .collect();
             let task = task_pool.spawn(async move {
                 build_chunk_render_data(snapshot, floor_for_render)
             });
@@ -543,6 +716,8 @@ pub(crate) fn ensure_chunk_generated(
     map: &Hypermap<CellType>,
     passability: &Hypermap<f32>,
     subtile_cache: &Hypermap<SubtilePassability>,
+    style_floor_map: &Hypermap<TileStyle>,
+    style_wall_map: &Hypermap<TileStyle>,
     coord: ChunkCoord,
     level_name: &str,
 ) {
@@ -570,6 +745,19 @@ pub(crate) fn ensure_chunk_generated(
 
     mirror_chunk_into_passability(map, passability, coord);
     mirror_chunk_into_subtile_cache(map, subtile_cache, coord);
+
+    let floor_style_path = chunk_style_floor_path(level_name, coord);
+    if let Err(e) = try_load_chunk_style_file_into_map(&floor_style_path, style_floor_map, coord) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!("chunk floor style `{}`: {e}", floor_style_path.display());
+        }
+    }
+    let wall_style_path = chunk_style_wall_path(level_name, coord);
+    if let Err(e) = try_load_chunk_style_file_into_map(&wall_style_path, style_wall_map, coord) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!("chunk wall style `{}`: {e}", wall_style_path.display());
+        }
+    }
 }
 
 /// Reads every cell of a freshly written world chunk and writes the corresponding
@@ -652,6 +840,28 @@ pub(crate) fn write_world_cell(
         }
         runtime.static_subtile_cache.set(world_x, world_y, tile);
     }
+}
+
+/// Writes the floor quad style for a cell. Call alongside [`write_world_cell`] when painting.
+pub(crate) fn write_world_floor_style(
+    runtime: &HypermapRuntime,
+    world_x: i32,
+    world_y: i32,
+    floor: i32,
+    style: TileStyle,
+) {
+    runtime.style_floor_map.set_floor(world_x, world_y, floor, style);
+}
+
+/// Writes the wall slab style for a cell. Call alongside [`write_world_cell`] when painting walls.
+pub(crate) fn write_world_wall_style(
+    runtime: &HypermapRuntime,
+    world_x: i32,
+    world_y: i32,
+    floor: i32,
+    style: TileStyle,
+) {
+    runtime.style_wall_map.set_floor(world_x, world_y, floor, style);
 }
 
 fn fill_chunk_random(chunk: &mut HypermapChunk<CellType>, coord: ChunkCoord) {
@@ -979,41 +1189,80 @@ fn spawn_chunk_meshes(
     let ox = origin_x;
     let oy = origin_y;
 
+    // ── Floor 0: road (default) ──────────────────────────────────────────────
+    spawn_floor0_road_entity(commands, meshes, chunk_root, &prepared.floor0_road_cells, ox, oy,
+        assets.road_material.clone(), assets.empty_mesh.clone(), "road");
+    // ── Floor 0: glass floor ─────────────────────────────────────────────────
     {
-        let (mesh3d, vis, pick) = if let Some(m) = build_floor0_road_mesh(&prepared.floor0_cells, ox, oy) {
-            (
-                Mesh3d(meshes.add(m)),
-                Visibility::Inherited,
-                Pickable::default(),
-            )
-        } else {
-            (
-                Mesh3d(assets.empty_mesh.clone()),
-                Visibility::Hidden,
-                Pickable::IGNORE,
-            )
-        };
+        let (mesh3d, vis) =
+            if let Some(m) = build_floor0_road_mesh(&prepared.floor0_glass_floor_cells, ox, oy) {
+                (Mesh3d(meshes.add(m)), Visibility::Inherited)
+            } else {
+                (Mesh3d(assets.empty_mesh.clone()), Visibility::Hidden)
+            };
         let id = commands
             .spawn((
-                Name::new(format!("Chunk floor0 road {},{}", ox, oy)),
-                RenderedChunkFloor0Road,
+                Name::new(format!("Chunk floor0 glass floor {},{}", ox, oy)),
+                RenderedChunkFloor0GlassFloor,
                 mesh3d,
-                MeshMaterial3d(assets.road_material.clone()),
+                MeshMaterial3d(assets.glass_road_material.clone()),
                 Transform::default(),
                 vis,
-                pick,
+                Pickable::IGNORE,
             ))
-            .observe(floor_grid_click)
             .id();
         commands.entity(chunk_root).add_child(id);
     }
-
+    // ── Floor 0: pavement ────────────────────────────────────────────────────
     {
-        let (mesh3d, vis) = if let Some(m) = build_floor0_wall_mesh(&prepared.floor0_cells, ox, oy) {
-            (Mesh3d(meshes.add(m)), Visibility::Inherited)
-        } else {
-            (Mesh3d(assets.empty_mesh.clone()), Visibility::Hidden)
-        };
+        let (mesh3d, vis) =
+            if let Some(m) = build_floor0_road_mesh(&prepared.floor0_pavement_cells, ox, oy) {
+                (Mesh3d(meshes.add(m)), Visibility::Inherited)
+            } else {
+                (Mesh3d(assets.empty_mesh.clone()), Visibility::Hidden)
+            };
+        let id = commands
+            .spawn((
+                Name::new(format!("Chunk floor0 pavement {},{}", ox, oy)),
+                RenderedChunkFloor0Pavement,
+                mesh3d,
+                MeshMaterial3d(assets.pavement_material.clone()),
+                Transform::default(),
+                vis,
+                Pickable::IGNORE,
+            ))
+            .id();
+        commands.entity(chunk_root).add_child(id);
+    }
+    // ── Floor 0: marble ──────────────────────────────────────────────────────
+    {
+        let (mesh3d, vis) =
+            if let Some(m) = build_floor0_road_mesh(&prepared.floor0_marble_cells, ox, oy) {
+                (Mesh3d(meshes.add(m)), Visibility::Inherited)
+            } else {
+                (Mesh3d(assets.empty_mesh.clone()), Visibility::Hidden)
+            };
+        let id = commands
+            .spawn((
+                Name::new(format!("Chunk floor0 marble {},{}", ox, oy)),
+                RenderedChunkFloor0Marble,
+                mesh3d,
+                MeshMaterial3d(assets.marble_material.clone()),
+                Transform::default(),
+                vis,
+                Pickable::IGNORE,
+            ))
+            .id();
+        commands.entity(chunk_root).add_child(id);
+    }
+    // ── Floor 0: walls ───────────────────────────────────────────────────────
+    {
+        let (mesh3d, vis) =
+            if let Some(m) = build_floor0_wall_mesh(&prepared.floor0_wall_cells, ox, oy) {
+                (Mesh3d(meshes.add(m)), Visibility::Inherited)
+            } else {
+                (Mesh3d(assets.empty_mesh.clone()), Visibility::Hidden)
+            };
         let id = commands
             .spawn((
                 Name::new(format!("Chunk floor0 walls {},{}", ox, oy)),
@@ -1027,43 +1276,57 @@ fn spawn_chunk_meshes(
             .id();
         commands.entity(chunk_root).add_child(id);
     }
-
-    let upper_road = {
-        let (mesh3d, vis, pick) = if let Some(m) = build_upper_road_mesh(&prepared.upper_cells, ox, oy) {
-            (
-                Mesh3d(meshes.add(m)),
-                Visibility::Inherited,
-                Pickable::default(),
-            )
-        } else {
-            (
-                Mesh3d(assets.empty_mesh.clone()),
-                Visibility::Hidden,
-                Pickable::IGNORE,
-            )
-        };
+    // ── Floor 0: glass walls ─────────────────────────────────────────────────
+    {
+        let (mesh3d, vis) =
+            if let Some(m) = build_floor0_wall_mesh(&prepared.floor0_glass_cells, ox, oy) {
+                (Mesh3d(meshes.add(m)), Visibility::Inherited)
+            } else {
+                (Mesh3d(assets.empty_mesh.clone()), Visibility::Hidden)
+            };
         let id = commands
             .spawn((
-                Name::new(format!("Chunk upper road {},{}", ox, oy)),
-                RenderedChunkUpperRoad,
+                Name::new(format!("Chunk floor0 glass walls {},{}", ox, oy)),
+                RenderedChunkFloor0GlassWalls,
                 mesh3d,
-                MeshMaterial3d(assets.road_material.clone()),
+                MeshMaterial3d(assets.glass_wall_material.clone()),
                 Transform::default(),
                 vis,
-                pick,
+                Pickable::IGNORE,
             ))
-            .observe(floor_grid_click)
             .id();
         commands.entity(chunk_root).add_child(id);
-        id
-    };
+    }
+
+    // ── Upper floors ─────────────────────────────────────────────────────────
+    let upper_road = spawn_upper_road_entity(
+        commands, meshes, chunk_root, &prepared.upper_road_default_cells, ox, oy,
+        assets.road_material.clone(), assets.empty_mesh.clone(),
+        RenderedChunkUpperRoad, "road",
+    );
+    let road_glass = spawn_upper_road_entity_no_pick(
+        commands, meshes, chunk_root, &prepared.upper_road_glass_cells, ox, oy,
+        assets.glass_road_material.clone(), assets.empty_mesh.clone(),
+        RenderedChunkUpperGlassFloor, "glass floor",
+    );
+    let road_pavement = spawn_upper_road_entity_no_pick(
+        commands, meshes, chunk_root, &prepared.upper_road_pavement_cells, ox, oy,
+        assets.pavement_material.clone(), assets.empty_mesh.clone(),
+        RenderedChunkUpperPavement, "pavement",
+    );
+    let road_marble = spawn_upper_road_entity_no_pick(
+        commands, meshes, chunk_root, &prepared.upper_road_marble_cells, ox, oy,
+        assets.marble_material.clone(), assets.empty_mesh.clone(),
+        RenderedChunkUpperMarble, "marble",
+    );
 
     let upper_walls = {
-        let (mesh3d, vis) = if let Some(m) = build_upper_wall_mesh(&prepared.upper_cells, ox, oy) {
-            (Mesh3d(meshes.add(m)), Visibility::Inherited)
-        } else {
-            (Mesh3d(assets.empty_mesh.clone()), Visibility::Hidden)
-        };
+        let (mesh3d, vis) =
+            if let Some(m) = build_upper_wall_mesh(&prepared.upper_cells, ox, oy) {
+                (Mesh3d(meshes.add(m)), Visibility::Inherited)
+            } else {
+                (Mesh3d(assets.empty_mesh.clone()), Visibility::Hidden)
+            };
         let id = commands
             .spawn((
                 Name::new(format!("Chunk upper walls {},{}", ox, oy)),
@@ -1079,10 +1342,135 @@ fn spawn_chunk_meshes(
         id
     };
 
+    let upper_glass_walls = {
+        let (mesh3d, vis) =
+            if let Some(m) = build_upper_wall_mesh(&prepared.upper_glass_cells, ox, oy) {
+                (Mesh3d(meshes.add(m)), Visibility::Inherited)
+            } else {
+                (Mesh3d(assets.empty_mesh.clone()), Visibility::Hidden)
+            };
+        let id = commands
+            .spawn((
+                Name::new(format!("Chunk upper glass walls {},{}", ox, oy)),
+                RenderedChunkUpperGlassWalls,
+                mesh3d,
+                MeshMaterial3d(assets.glass_wall_material.clone()),
+                Transform::default(),
+                vis,
+                Pickable::IGNORE,
+            ))
+            .id();
+        commands.entity(chunk_root).add_child(id);
+        id
+    };
+
     ChunkUpperMeshEntities {
         road: upper_road,
+        road_glass,
+        road_pavement,
+        road_marble,
         walls: upper_walls,
+        glass_walls: upper_glass_walls,
     }
+}
+
+fn spawn_floor0_road_entity(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    chunk_root: Entity,
+    cells: &[(i32, i32, CellType)],
+    ox: i32,
+    oy: i32,
+    material: Handle<StandardMaterial>,
+    empty_mesh: Handle<Mesh>,
+    label: &str,
+) {
+    let (mesh3d, vis, pick) =
+        if let Some(m) = build_floor0_road_mesh(cells, ox, oy) {
+            (Mesh3d(meshes.add(m)), Visibility::Inherited, Pickable::default())
+        } else {
+            (Mesh3d(empty_mesh), Visibility::Hidden, Pickable::IGNORE)
+        };
+    let id = commands
+        .spawn((
+            Name::new(format!("Chunk floor0 {} {},{}", label, ox, oy)),
+            RenderedChunkFloor0Road,
+            mesh3d,
+            MeshMaterial3d(material),
+            Transform::default(),
+            vis,
+            pick,
+        ))
+        .observe(floor_grid_click)
+        .id();
+    commands.entity(chunk_root).add_child(id);
+}
+
+fn spawn_upper_road_entity(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    chunk_root: Entity,
+    cells: &[(i32, i32, i32, CellType)],
+    ox: i32,
+    oy: i32,
+    material: Handle<StandardMaterial>,
+    empty_mesh: Handle<Mesh>,
+    marker: impl Component,
+    label: &str,
+) -> Entity {
+    let (mesh3d, vis, pick) =
+        if let Some(m) = build_upper_road_mesh(cells, ox, oy) {
+            (Mesh3d(meshes.add(m)), Visibility::Inherited, Pickable::default())
+        } else {
+            (Mesh3d(empty_mesh), Visibility::Hidden, Pickable::IGNORE)
+        };
+    let id = commands
+        .spawn((
+            Name::new(format!("Chunk upper {} {},{}", label, ox, oy)),
+            marker,
+            mesh3d,
+            MeshMaterial3d(material),
+            Transform::default(),
+            vis,
+            pick,
+        ))
+        .observe(floor_grid_click)
+        .id();
+    commands.entity(chunk_root).add_child(id);
+    id
+}
+
+fn spawn_upper_road_entity_no_pick(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    chunk_root: Entity,
+    cells: &[(i32, i32, i32, CellType)],
+    ox: i32,
+    oy: i32,
+    material: Handle<StandardMaterial>,
+    empty_mesh: Handle<Mesh>,
+    marker: impl Component,
+    label: &str,
+) -> Entity {
+    let (mesh3d, vis) =
+        if let Some(m) = build_upper_road_mesh(cells, ox, oy) {
+            (Mesh3d(meshes.add(m)), Visibility::Inherited)
+        } else {
+            (Mesh3d(empty_mesh), Visibility::Hidden)
+        };
+    let id = commands
+        .spawn((
+            Name::new(format!("Chunk upper {} {},{}", label, ox, oy)),
+            marker,
+            mesh3d,
+            MeshMaterial3d(material),
+            Transform::default(),
+            vis,
+            Pickable::IGNORE,
+        ))
+        .id();
+    commands.entity(chunk_root).add_child(id);
+    id
 }
 
 pub(crate) fn build_floor0_road_mesh(cells: &[(i32, i32, CellType)], origin_x: i32, origin_y: i32) -> Option<Mesh> {
@@ -1391,7 +1779,8 @@ fn hash_chunk_seed(coord: ChunkCoord) -> u64 {
 }
 
 fn clone_chunk_for_render_start(chunk: &HypermapChunk<CellType>) -> Vec<CellType> {
-    let mut cells = Vec::with_capacity(HYPERMAP_CHUNK_SIZE as usize * HYPERMAP_CHUNK_SIZE as usize * HYPERMAP_FLOOR_COUNT);
+    let mut cells =
+        Vec::with_capacity(HYPERMAP_CHUNK_SIZE as usize * HYPERMAP_CHUNK_SIZE as usize * HYPERMAP_FLOOR_COUNT);
     for y in 0..HYPERMAP_CHUNK_SIZE {
         for x in 0..HYPERMAP_CHUNK_SIZE {
             let local = LocalCoord::new(x, y);
@@ -1403,20 +1792,65 @@ fn clone_chunk_for_render_start(chunk: &HypermapChunk<CellType>) -> Vec<CellType
     cells
 }
 
+fn clone_styles_for_render_start(chunk: &HypermapChunk<TileStyle>) -> Vec<TileStyle> {
+    let mut styles =
+        Vec::with_capacity(HYPERMAP_CHUNK_SIZE as usize * HYPERMAP_CHUNK_SIZE as usize * HYPERMAP_FLOOR_COUNT);
+    for y in 0..HYPERMAP_CHUNK_SIZE {
+        for x in 0..HYPERMAP_CHUNK_SIZE {
+            let local = LocalCoord::new(x, y);
+            for floor in 0..HYPERMAP_FLOOR_COUNT as i32 {
+                styles.push(*chunk.get_local_floor(local, floor));
+            }
+        }
+    }
+    styles
+}
+
+fn wall_is_glass(style: TileStyle) -> bool {
+    style.0 == [b'w', b'g']
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FloorBucket {
+    Road,
+    Glass,
+    Pavement,
+    Marble,
+}
+
+fn floor_bucket(style: TileStyle) -> FloorBucket {
+    match style.0 {
+        [b'f', b'g'] => FloorBucket::Glass,
+        [b'f', b'p'] => FloorBucket::Pavement,
+        [b'f', b'm'] => FloorBucket::Marble,
+        _ => FloorBucket::Road,
+    }
+}
+
 fn partition_chunk_cells_from_vec(
-    cells: Vec<CellType>,
+    snapshot: Vec<(CellType, TileStyle, TileStyle)>,
     active_floor: i32,
-) -> (bool, Vec<(i32, i32, CellType)>, Vec<(i32, i32, i32, CellType)>) {
+) -> PreparedChunkRender {
     let mut has_void_floor0_water = false;
-    let mut floor0_cells = Vec::new();
+    let mut floor0_road_cells = Vec::new();
+    let mut floor0_glass_floor_cells = Vec::new();
+    let mut floor0_pavement_cells = Vec::new();
+    let mut floor0_marble_cells = Vec::new();
+    let mut floor0_wall_cells = Vec::new();
+    let mut floor0_glass_cells = Vec::new();
     let mut upper_cells = Vec::new();
+    let mut upper_glass_cells = Vec::new();
+    let mut upper_road_default_cells = Vec::new();
+    let mut upper_road_glass_cells = Vec::new();
+    let mut upper_road_pavement_cells = Vec::new();
+    let mut upper_road_marble_cells = Vec::new();
     let w = WATER_MESH_EDGE_STRIP;
     let sz = HYPERMAP_CHUNK_SIZE;
     let mut i = 0usize;
     for y in 0..HYPERMAP_CHUNK_SIZE {
         for x in 0..HYPERMAP_CHUNK_SIZE {
             for floor in 0..HYPERMAP_FLOOR_COUNT as i32 {
-                let cell_type = cells[i];
+                let (cell_type, floor_style, wall_style) = snapshot[i];
                 i += 1;
                 if cell_type == CellType::Void {
                     if floor == 0 {
@@ -1428,23 +1862,82 @@ fn partition_chunk_cells_from_vec(
                     continue;
                 }
                 if floor == 0 {
-                    floor0_cells.push((x, y, cell_type));
+                    match cell_type {
+                        CellType::Wall(_) | CellType::Corner(_) => {
+                            // Floor quad uses floor_style (walls can now have any floor material).
+                            match floor_bucket(floor_style) {
+                                FloorBucket::Glass => floor0_glass_floor_cells.push((x, y, cell_type)),
+                                FloorBucket::Pavement => floor0_pavement_cells.push((x, y, cell_type)),
+                                FloorBucket::Marble => floor0_marble_cells.push((x, y, cell_type)),
+                                FloorBucket::Road => floor0_road_cells.push((x, y, cell_type)),
+                            }
+                            // Wall slab uses wall_style.
+                            if wall_is_glass(wall_style) {
+                                floor0_glass_cells.push((x, y, cell_type));
+                            } else {
+                                floor0_wall_cells.push((x, y, cell_type));
+                            }
+                        }
+                        _ => {
+                            // Road cell: floor quad bucketed by floor_style.
+                            match floor_bucket(floor_style) {
+                                FloorBucket::Glass => floor0_glass_floor_cells.push((x, y, cell_type)),
+                                FloorBucket::Pavement => floor0_pavement_cells.push((x, y, cell_type)),
+                                FloorBucket::Marble => floor0_marble_cells.push((x, y, cell_type)),
+                                FloorBucket::Road => floor0_road_cells.push((x, y, cell_type)),
+                            }
+                        }
+                    }
                 } else if floor == active_floor {
-                    upper_cells.push((x, y, floor, cell_type));
+                    match cell_type {
+                        CellType::Wall(_) | CellType::Corner(_) => {
+                            // Floor quad uses floor_style.
+                            match floor_bucket(floor_style) {
+                                FloorBucket::Glass => upper_road_glass_cells.push((x, y, floor, cell_type)),
+                                FloorBucket::Pavement => upper_road_pavement_cells.push((x, y, floor, cell_type)),
+                                FloorBucket::Marble => upper_road_marble_cells.push((x, y, floor, cell_type)),
+                                FloorBucket::Road => upper_road_default_cells.push((x, y, floor, cell_type)),
+                            }
+                            // Wall slab uses wall_style.
+                            if wall_is_glass(wall_style) {
+                                upper_glass_cells.push((x, y, floor, cell_type));
+                            } else {
+                                upper_cells.push((x, y, floor, cell_type));
+                            }
+                        }
+                        _ => {
+                            // Upper road cell: floor quad bucketed by floor_style.
+                            match floor_bucket(floor_style) {
+                                FloorBucket::Glass => upper_road_glass_cells.push((x, y, floor, cell_type)),
+                                FloorBucket::Pavement => upper_road_pavement_cells.push((x, y, floor, cell_type)),
+                                FloorBucket::Marble => upper_road_marble_cells.push((x, y, floor, cell_type)),
+                                FloorBucket::Road => upper_road_default_cells.push((x, y, floor, cell_type)),
+                            }
+                        }
+                    }
                 }
             }
         }
     }
-    (has_void_floor0_water, floor0_cells, upper_cells)
-}
-
-fn build_chunk_render_data(cells: Vec<CellType>, active_floor: i32) -> PreparedChunkRender {
-    let (has_void_floor0_water, floor0_cells, upper_cells) = partition_chunk_cells_from_vec(cells, active_floor);
     PreparedChunkRender {
         has_void_floor0_water,
-        floor0_cells,
+        floor0_road_cells,
+        floor0_glass_floor_cells,
+        floor0_pavement_cells,
+        floor0_marble_cells,
+        floor0_wall_cells,
+        floor0_glass_cells,
         upper_cells,
+        upper_glass_cells,
+        upper_road_default_cells,
+        upper_road_glass_cells,
+        upper_road_pavement_cells,
+        upper_road_marble_cells,
     }
+}
+
+fn build_chunk_render_data(snapshot: Vec<(CellType, TileStyle, TileStyle)>, active_floor: i32) -> PreparedChunkRender {
+    partition_chunk_cells_from_vec(snapshot, active_floor)
 }
 
 fn target_chunks_for(center: ChunkCoord) -> HashSet<ChunkCoord> {

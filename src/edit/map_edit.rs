@@ -11,8 +11,13 @@ use crate::map::floor_level::{ActiveFloorLevel, HYPERMAP_FLOOR_HEIGHT, HYPERMAP_
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord};
 use crate::map::hypermap_world::{
     build_floor0_road_mesh, build_floor0_wall_mesh, build_upper_road_mesh, build_upper_wall_mesh,
-    ensure_chunk_generated, queue_hypermap_chunk_remesh, write_world_cell, HypermapChunkRemeshQueue,
-    HypermapRuntime,
+    ensure_chunk_generated, queue_hypermap_chunk_remesh, write_world_cell,
+    write_world_floor_style, write_world_wall_style,
+    HypermapChunkRemeshQueue, HypermapRuntime,
+};
+use crate::map::level::{
+    save_level_geometry_for_chunks, save_level_floor_style_for_chunks,
+    save_level_wall_style_for_chunks, LevelName,
 };
 use crate::actor::glitch_bot::GlitchBotVisual;
 use crate::actor::black_bot::BlackBotVisual;
@@ -20,9 +25,8 @@ use crate::actor::snapshot::{save_level_actors, LevelActorsFile};
 use crate::scene::camera::{StrategyCamera, StrategyCameraRig};
 use crate::scene::camera_snapshot::{save_level_camera, LevelCameraFile};
 use crate::actor::ActorObject;
-use crate::map::level::{save_level_geometry_for_chunks, LevelName};
 use crate::map::world_map::{
-    CellType, WallCorner, WallMask, MASK_EAST, MASK_NORTH, MASK_SOUTH, MASK_WEST,
+    CellType, TileStyle, WallCorner, WallMask, MASK_EAST, MASK_NORTH, MASK_SOUTH, MASK_WEST,
 };
 use crate::menu::main_menu::GameState;
 use crate::actor::black_bot::{self, BlackBotRng};
@@ -55,6 +59,8 @@ pub enum MapTileKind {
     Void,
     Road,
     Wall,
+    /// Glass wall: same geometry as [`Wall`] but rendered with the glass material.
+    WallGlass,
     /// Drag a rectangle; on mouse up, place walls only on the **border** with masks facing outward (closed loop).
     Room,
     Corner,
@@ -76,6 +82,12 @@ pub struct MapEditState {
 struct MapEditVariantIndex(pub u32);
 
 #[derive(Resource, Default)]
+struct MapEditStyleState {
+    pub floor: u32,
+    pub wall: u32,
+}
+
+#[derive(Resource, Default)]
 struct MapEditHoverCell(pub Option<(i32, i32)>);
 
 /// Active floor cell when the user pressed the left mouse button for a stroke (wall line / floor rect).
@@ -85,12 +97,16 @@ struct MapEditDragAnchor(pub Option<(i32, i32)>);
 #[derive(Component)]
 struct MapEditPreviewRoot;
 
+#[derive(Component)]
+struct MapEditStyleInfoLabel;
+
 pub struct MapEditPlugin;
 
 impl Plugin for MapEditPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<MapEditState>()
             .init_resource::<MapEditVariantIndex>()
+            .init_resource::<MapEditStyleState>()
             .init_resource::<MapEditHoverCell>()
             .init_resource::<MapEditDragAnchor>()
             .add_systems(OnEnter(GameState::InGame), setup_map_edit_preview_material)
@@ -101,6 +117,8 @@ impl Plugin for MapEditPlugin {
                     map_edit_toggle_panel,
                     map_edit_tile_pick_buttons,
                     map_edit_save_button,
+                    map_edit_tab_cycle_style,
+                    map_edit_sync_style_label,
                     (
                         map_edit_hover_under_cursor,
                         map_edit_pointer_stroke,
@@ -147,6 +165,7 @@ pub(crate) fn spawn_map_edit_palette(mut commands: Commands, camera: Query<Entit
                 ("Void", MapTileKind::Void),
                 ("Road", MapTileKind::Road),
                 ("Wall", MapTileKind::Wall),
+                ("WallG", MapTileKind::WallGlass),
                 ("Room", MapTileKind::Room),
                 ("Corner", MapTileKind::Corner),
                 ("Bot", MapTileKind::GlitchBot),
@@ -201,6 +220,19 @@ pub(crate) fn spawn_map_edit_palette(mut commands: Commands, camera: Query<Entit
                     TextColor(TEXT_MAIN),
                 ));
             });
+
+            // Style indicator — updated by `map_edit_sync_style_label`.
+            row.spawn((
+                Name::new("Map edit style info"),
+                MapEditStyleInfoLabel,
+                Node {
+                    margin: UiRect::left(Val::Px(16.0)),
+                    ..default()
+                },
+                Text::new(""),
+                TextFont::from_font_size(14.0),
+                TextColor(Color::srgba(0.70, 0.85, 1.00, 0.80)),
+            ));
         });
 }
 
@@ -287,6 +319,15 @@ fn map_edit_save_button(
                 Err(e) => warn!("save level camera failed: {e}"),
             }
         }
+        let coords = runtime.desired_chunk_coords();
+        match save_level_floor_style_for_chunks(level.0.as_str(), &runtime.style_floor_map, coords.clone()) {
+            Ok(n) => info!("saved {n} chunk floor style file(s) for level `{}`", level.0),
+            Err(e) => warn!("save level floor style failed: {e}"),
+        }
+        match save_level_wall_style_for_chunks(level.0.as_str(), &runtime.style_wall_map, coords) {
+            Ok(n) => info!("saved {n} chunk wall style file(s) for level `{}`", level.0),
+            Err(e) => warn!("save level wall style failed: {e}"),
+        }
     }
 }
 
@@ -297,6 +338,7 @@ fn map_edit_tile_pick_buttons(
     >,
     mut state: ResMut<MapEditState>,
     mut variant: ResMut<MapEditVariantIndex>,
+    mut style: ResMut<MapEditStyleState>,
     mut drag_anchor: ResMut<MapEditDragAnchor>,
 ) {
     if !state.panel_open {
@@ -308,6 +350,8 @@ fn map_edit_tile_pick_buttons(
         }
         state.placement_tile = Some(btn.0);
         variant.0 = 0;
+        style.floor = 0;
+        style.wall = 0;
         drag_anchor.0 = None;
     }
 }
@@ -462,7 +506,7 @@ fn floor_rect_cells(start: (i32, i32), end: (i32, i32)) -> Vec<(i32, i32)> {
 
 fn stroke_world_cells(kind: MapTileKind, start: (i32, i32), end: (i32, i32)) -> Vec<(i32, i32)> {
     match kind {
-        MapTileKind::Wall => wall_line_cells(start, end),
+        MapTileKind::Wall | MapTileKind::WallGlass => wall_line_cells(start, end),
         MapTileKind::Void | MapTileKind::Road => floor_rect_cells(start, end),
         MapTileKind::Room => room_outline_cells(start, end),
         MapTileKind::Corner => vec![end],
@@ -497,7 +541,7 @@ fn resolved_cell(kind: MapTileKind, variant: u32) -> CellType {
     match kind {
         MapTileKind::Void => CellType::Void,
         MapTileKind::Road => CellType::Road,
-        MapTileKind::Wall => {
+        MapTileKind::Wall | MapTileKind::WallGlass => {
             let bits = ((variant % 15) + 1) as u8;
             CellType::Wall(WallMask::from_bits(bits).expect("1..=15 valid"))
         }
@@ -561,7 +605,7 @@ fn map_edit_update_preview(
         }
     });
 
-    let wall_or_corner_cell = matches!(kind, MapTileKind::Wall | MapTileKind::Corner)
+    let wall_or_corner_cell = matches!(kind, MapTileKind::Wall | MapTileKind::WallGlass | MapTileKind::Corner)
         .then(|| resolved_cell(kind, variant.0));
     let mesh_opt = if f == 0 {
         match kind {
@@ -579,7 +623,7 @@ fn map_edit_update_preview(
                     .collect();
                 build_floor0_road_mesh(&rel, min_x, min_z)
             }
-            MapTileKind::Wall => {
+            MapTileKind::Wall | MapTileKind::WallGlass => {
                 let c = wall_or_corner_cell.expect("wall brush");
                 let rel: Vec<_> = strokes
                     .iter()
@@ -621,7 +665,7 @@ fn map_edit_update_preview(
                     .collect();
                 build_upper_road_mesh(&rel, min_x, min_z)
             }
-            MapTileKind::Wall => {
+            MapTileKind::Wall | MapTileKind::WallGlass => {
                 let c = wall_or_corner_cell.expect("wall brush");
                 let rel: Vec<_> = strokes
                     .iter()
@@ -702,6 +746,7 @@ fn map_edit_pointer_stroke(
     state: Res<MapEditState>,
     mut drag: ResMut<MapEditDragAnchor>,
     variant: Res<MapEditVariantIndex>,
+    style: Res<MapEditStyleState>,
     floor: Res<ActiveFloorLevel>,
     level: Res<LevelName>,
     runtime: Res<HypermapRuntime>,
@@ -785,20 +830,32 @@ fn map_edit_pointer_stroke(
             &runtime.map,
             &runtime.static_passability_map,
             &runtime.static_subtile_cache,
+            &runtime.style_floor_map,
+            &runtime.style_wall_map,
             *c,
             level.0.as_str(),
         );
     }
+
+    let floor_styles = floor_styles_for_kind(kind);
+    let floor_paint = floor_styles[(style.floor as usize).min(floor_styles.len().saturating_sub(1))];
+    let wall_styles = wall_styles_for_kind(kind);
+    let wall_paint = wall_styles[(style.wall as usize).min(wall_styles.len().saturating_sub(1))];
+
     if kind == MapTileKind::Room {
         let (bx0, bx1, bz0, bz1) = rect_axis_bounds(start, end);
         for &(ix, iz) in &tiles {
             let mask = perimeter_wall_mask(ix, iz, bx0, bx1, bz0, bz1);
             write_world_cell(&runtime, ix, iz, fl, CellType::Wall(mask));
+            write_world_floor_style(&runtime, ix, iz, fl, floor_paint);
+            write_world_wall_style(&runtime, ix, iz, fl, wall_paint);
         }
     } else {
         let cell = resolved_cell(kind, variant.0);
         for &(ix, iz) in &tiles {
             write_world_cell(&runtime, ix, iz, fl, cell);
+            write_world_floor_style(&runtime, ix, iz, fl, floor_paint);
+            write_world_wall_style(&runtime, ix, iz, fl, wall_paint);
         }
     }
 
@@ -832,7 +889,7 @@ fn map_edit_scroll_variants(
     }
     let kind = state.placement_tile.unwrap();
     let max_v = match kind {
-        MapTileKind::Wall => 15,
+        MapTileKind::Wall | MapTileKind::WallGlass => 15,
         MapTileKind::Corner => 4,
         MapTileKind::Void | MapTileKind::Road | MapTileKind::Room | MapTileKind::GlitchBot | MapTileKind::BlackBot => return,
     };
@@ -851,6 +908,102 @@ fn map_edit_scroll_variants(
     let v = variant.0 as i32 + delta;
     let wrapped = v.rem_euclid(max_v as i32) as u32;
     variant.0 = wrapped;
+}
+
+fn floor_styles_for_kind(kind: MapTileKind) -> &'static [TileStyle] {
+    match kind {
+        MapTileKind::Road | MapTileKind::Room | MapTileKind::Wall
+        | MapTileKind::WallGlass | MapTileKind::Corner => &[
+            TileStyle::DEFAULT,
+            TileStyle([b'f', b'g']),
+            TileStyle([b'f', b'p']),
+            TileStyle([b'f', b'm']),
+        ],
+        _ => &[TileStyle::DEFAULT],
+    }
+}
+
+fn wall_styles_for_kind(kind: MapTileKind) -> &'static [TileStyle] {
+    match kind {
+        MapTileKind::Wall | MapTileKind::Room | MapTileKind::Corner => {
+            &[TileStyle([b'w', b'r']), TileStyle([b'w', b'g'])]
+        }
+        MapTileKind::WallGlass => &[TileStyle([b'w', b'g'])],
+        _ => &[TileStyle::DEFAULT],
+    }
+}
+
+fn floor_style_label(style: TileStyle) -> &'static str {
+    match style.0 {
+        [b'f', b'g'] => "Glass",
+        [b'f', b'p'] => "Pavement",
+        [b'f', b'm'] => "Marble",
+        _ => "Default",
+    }
+}
+
+fn wall_style_label(style: TileStyle) -> &'static str {
+    match style.0 {
+        [b'w', b'g'] => "Glass",
+        _ => "Regular",
+    }
+}
+
+fn map_edit_tab_cycle_style(
+    state: Res<MapEditState>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut style: ResMut<MapEditStyleState>,
+) {
+    if !state.panel_open {
+        return;
+    }
+    if !keys.just_pressed(KeyCode::Tab) {
+        return;
+    }
+    let Some(kind) = state.placement_tile else {
+        return;
+    };
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    if shift {
+        let styles = wall_styles_for_kind(kind);
+        if styles.len() > 1 {
+            style.wall = ((style.wall as usize + 1) % styles.len()) as u32;
+        }
+    } else {
+        let styles = floor_styles_for_kind(kind);
+        style.floor = ((style.floor as usize + 1) % styles.len()) as u32;
+    }
+}
+
+fn map_edit_sync_style_label(
+    state: Res<MapEditState>,
+    style: Res<MapEditStyleState>,
+    mut labels: Query<&mut Text, With<MapEditStyleInfoLabel>>,
+) {
+    let text = match state.placement_tile {
+        Some(kind) => {
+            let floor_styles = floor_styles_for_kind(kind);
+            let fi = (style.floor as usize).min(floor_styles.len().saturating_sub(1));
+            let floor_style = floor_styles[fi];
+
+            let wall_styles = wall_styles_for_kind(kind);
+            let wi = (style.wall as usize).min(wall_styles.len().saturating_sub(1));
+            let wall_style = wall_styles[wi];
+
+            let mut parts = String::new();
+            if floor_styles.len() > 1 {
+                parts.push_str(&format!("[Tab] Floor: {}  ", floor_style_label(floor_style)));
+            }
+            if wall_styles.len() > 1 {
+                parts.push_str(&format!("[Shift+Tab] Wall: {}", wall_style_label(wall_style)));
+            }
+            parts
+        }
+        None => String::new(),
+    };
+    for mut t in &mut labels {
+        **t = text.clone();
+    }
 }
 
 pub(crate) fn setup_map_edit_preview_material(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>) {

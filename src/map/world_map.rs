@@ -441,6 +441,45 @@ pub(crate) fn parse_cell_token(token: &str) -> Option<CellType> {
     }
 }
 
+/// Raw 2-character style token stored per map cell.
+///
+/// The bytes are stored as-is; their **meaning is resolved at render time**
+/// based on the cell's [`CellType`] (wall cells and floor cells interpret the
+/// same token prefix differently). The style layer never parses semantics —
+/// it just persists an opaque pair of ASCII bytes per tile.
+///
+/// Known wall tokens: `"wr"` (regular), `"wg"` (glass).
+/// Known floor tokens: `"fr"` (road / default), `"fg"` (glass), `"fp"` (pavement), `"fm"` (marble).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TileStyle(pub [u8; 2]);
+
+impl TileStyle {
+    /// No explicit style set. Each cell type renders with its default material.
+    pub const DEFAULT: TileStyle = TileStyle([b'.', b'.']);
+
+    /// Raw bytes as a `str`. Always valid UTF-8 (the parser enforces ASCII).
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).unwrap_or("..")
+    }
+}
+
+impl Default for TileStyle {
+    fn default() -> Self {
+        TileStyle::DEFAULT
+    }
+}
+
+/// Parses a 2-character printable-ASCII token into a [`TileStyle`].
+/// Returns `None` for non-ASCII or wrong-length input.
+pub(crate) fn parse_style_token(token: &str) -> Option<TileStyle> {
+    let b = token.as_bytes();
+    if b.len() == 2 && b[0].is_ascii_graphic() && b[1].is_ascii_graphic() {
+        Some(TileStyle([b[0], b[1]]))
+    } else {
+        None
+    }
+}
+
 /// Invokes `f(sx, sz, ox, oz)` for each wall slab in cell space (`append_box`
 /// half-extents and center offsets match `hypermap_world`).
 pub(crate) fn for_each_wall_segment(mask_bits: u8, mut f: impl FnMut(f32, f32, f32, f32)) {

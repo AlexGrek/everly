@@ -112,6 +112,62 @@ see `src/map/world_map.rs` for `WallMask`, `WallCorner`, `MASK_NORTH`, `MASK_SOU
 - Procedural neighborhood terrain is generated first, then the center chunk is
   overwritten where the authored map has cells.
 
+## Style Layer
+
+Each chunk has **two independent style files** stored alongside its geometry:
+
+| File | Controls |
+|------|---------|
+| `levels/level_{name}/style_floor/{x}_{y}.txt` | Floor quad material for every cell |
+| `levels/level_{name}/style_wall/{x}_{y}.txt` | Wall slab material for Wall / Corner cells |
+
+Both files use the same `# floor N` section headers and space-separated 2-char tokens per row.
+Floors that are entirely default are omitted; if a file is absent the chunk uses default materials.
+The editor **Save** button writes both files.
+
+### Floor Style Tokens (`style_floor`)
+
+Applies to the horizontal floor quad rendered under **every** cell type (road and wall).
+
+| Token | Meaning |
+|-------|---------|
+| `..`  | Default road — dark asphalt |
+| `fg`  | Floor **Glass** — reflective dark glass |
+| `fp`  | Floor **Pavement** — grey |
+| `fm`  | Floor **Marble** — white, reflective |
+
+### Wall Style Tokens (`style_wall`)
+
+Applies only to the vertical slab geometry of **Wall** and **Corner** cells.
+
+| Token | Meaning |
+|-------|---------|
+| `..`  | Default (same as `wr`) |
+| `wr`  | Wall **Regular** — default opaque material |
+| `wg`  | Wall **Glass** — semi-transparent blue-tinted glass |
+
+### In-Game Editing
+
+The palette bar shows both active styles. Two independent Tab bindings cycle them:
+
+| Key | Cycles |
+|-----|--------|
+| **Tab** | Floor style: `..` → `fg` → `fp` → `fm` |
+| **Shift+Tab** | Wall style: `wr` → `wg` (only for Wall / Room / Corner brushes) |
+
+Applies per brush:
+
+| Brush | Floor Tab | Wall Shift+Tab |
+|-------|-----------|----------------|
+| Wall  | yes | yes |
+| WallG | yes | fixed `wg` |
+| Room  | yes | yes |
+| Corner | yes | yes |
+| Road  | yes | — |
+| Others | — | — |
+
+Scroll-wheel on the Wall / WallG / Corner brush cycles the wall mask (1–15 bits).
+
 ## Parse Errors
 
 - Row has odd character count (cannot split into 2-char tokens).

@@ -16,7 +16,7 @@ use bevy::prelude::*;
 use crate::map::hypermap::{
     ChunkCoord, Hypermap, HypermapChunk, LocalCoord, HYPERMAP_CHUNK_SIZE, HYPERMAP_FLOOR_COUNT,
 };
-use crate::map::world_map::{cell_to_token, parse_cell_token, CellType};
+use crate::map::world_map::{cell_to_token, parse_cell_token, parse_style_token, CellType, TileStyle};
 
 /// Active level folder name under `levels/level_{name}/`. Currently fixed to `"default"`.
 #[derive(Resource, Debug, Clone)]
@@ -275,6 +275,218 @@ pub fn try_load_chunk_geometry_file(path: &Path, chunk: &mut HypermapChunk<CellT
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e),
     }
+}
+
+// ─── Style layer ────────────────────────────────────────────────────────────
+
+pub fn style_floor_dir(level_name: &str) -> PathBuf {
+    PathBuf::from("levels").join(format!("level_{level_name}")).join("style_floor")
+}
+
+pub fn style_wall_dir(level_name: &str) -> PathBuf {
+    PathBuf::from("levels").join(format!("level_{level_name}")).join("style_wall")
+}
+
+pub fn chunk_style_floor_path(level_name: &str, coord: ChunkCoord) -> PathBuf {
+    style_floor_dir(level_name).join(format!("{}_{}.txt", coord.x, coord.y))
+}
+
+pub fn chunk_style_wall_path(level_name: &str, coord: ChunkCoord) -> PathBuf {
+    style_wall_dir(level_name).join(format!("{}_{}.txt", coord.x, coord.y))
+}
+
+fn floor_all_default(chunk: &HypermapChunk<TileStyle>, floor: i32) -> bool {
+    for y in 0..HYPERMAP_CHUNK_SIZE {
+        for x in 0..HYPERMAP_CHUNK_SIZE {
+            if *chunk.get_local_floor(LocalCoord::new(x, y), floor) != TileStyle::DEFAULT {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Serializes one chunk's style layer to text. Floors where every cell is
+/// [`TileStyle::DEFAULT`] are omitted. Returns an empty string if the whole
+/// chunk is default style.
+pub fn encode_chunk_style(chunk: &HypermapChunk<TileStyle>) -> String {
+    let sz = HYPERMAP_CHUNK_SIZE as usize;
+    let mut out = String::new();
+    for floor in 0..HYPERMAP_FLOOR_COUNT as i32 {
+        if floor_all_default(chunk, floor) {
+            continue;
+        }
+        out.push_str(&format!("# floor {floor}\n"));
+        for y in 0..sz {
+            let mut first = true;
+            for x in 0..sz {
+                let style = *chunk.get_local_floor(LocalCoord::new(x as i32, y as i32), floor);
+                if !first {
+                    out.push(' ');
+                }
+                first = false;
+                out.push_str(style.as_str());
+            }
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn apply_parsed_style_sections(chunk: &mut HypermapChunk<TileStyle>, sections: &[(i32, Vec<Vec<TileStyle>>)]) {
+    for (floor, rows) in sections {
+        for (y, row) in rows.iter().enumerate() {
+            for (x, style) in row.iter().enumerate() {
+                chunk.set_local_floor(LocalCoord::new(x as i32, y as i32), *floor, *style);
+            }
+        }
+    }
+}
+
+/// Parses a style text into `(floor, rows)` sections.
+pub fn parse_level_style_sections(text: &str) -> Result<Vec<(i32, Vec<Vec<TileStyle>>)>, String> {
+    let sz = HYPERMAP_CHUNK_SIZE as usize;
+    let mut sections: Vec<(i32, Vec<Vec<TileStyle>>)> = Vec::new();
+    let mut current_floor: Option<i32> = None;
+    let mut rows: Vec<Vec<TileStyle>> = Vec::new();
+
+    for (line_no, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("# floor ") {
+            if let Some(f) = current_floor {
+                if rows.len() != sz {
+                    return Err(format!(
+                        "line {}: floor {f} had {} rows (expected {sz})",
+                        line_no + 1,
+                        rows.len()
+                    ));
+                }
+                sections.push((f, std::mem::take(&mut rows)));
+            }
+            let n: i32 = rest
+                .trim()
+                .parse()
+                .map_err(|_| format!("line {}: bad floor index `{rest}`", line_no + 1))?;
+            if n < 0 || n >= HYPERMAP_FLOOR_COUNT as i32 {
+                return Err(format!("line {}: floor {n} out of range", line_no + 1));
+            }
+            current_floor = Some(n);
+            continue;
+        }
+
+        let Some(floor) = current_floor else {
+            return Err(format!(
+                "line {}: expected `# floor N` before grid data",
+                line_no + 1
+            ));
+        };
+
+        if rows.len() >= sz {
+            return Err(format!("line {}: too many rows for floor {floor}", line_no + 1));
+        }
+
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.len() != sz {
+            return Err(format!(
+                "line {}: floor {floor} row {} has {} tokens (expected {sz})",
+                line_no + 1,
+                rows.len(),
+                tokens.len()
+            ));
+        }
+        let mut row_styles = Vec::with_capacity(sz);
+        for (x, tok) in tokens.iter().enumerate() {
+            let style = parse_style_token(tok).ok_or_else(|| {
+                format!(
+                    "line {}: invalid style token `{tok}` at floor {floor} row {} col {x}",
+                    line_no + 1,
+                    rows.len()
+                )
+            })?;
+            row_styles.push(style);
+        }
+        rows.push(row_styles);
+    }
+
+    if let Some(f) = current_floor {
+        if rows.len() != sz {
+            return Err(format!(
+                "floor {f}: section ended with {} rows (expected {sz})",
+                rows.len()
+            ));
+        }
+        sections.push((f, rows));
+    }
+
+    Ok(sections)
+}
+
+/// Loads a style file into the given map chunk, creating the chunk lazily.
+/// Returns `Ok(true)` if loaded, `Ok(false)` if the file does not exist.
+pub fn try_load_chunk_style_file_into_map(
+    path: &Path,
+    map: &Hypermap<TileStyle>,
+    coord: ChunkCoord,
+) -> io::Result<bool> {
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let sections = parse_level_style_sections(&text)
+                .map_err(|msg| io::Error::new(io::ErrorKind::InvalidData, msg))?;
+            map.with_chunk_write(coord, |chunk| apply_parsed_style_sections(chunk, &sections));
+            Ok(true)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn save_style_map_to_dir(
+    dir: &std::path::Path,
+    path_fn: impl Fn(ChunkCoord) -> PathBuf,
+    map: &Hypermap<TileStyle>,
+    coords: impl IntoIterator<Item = ChunkCoord>,
+) -> io::Result<usize> {
+    let mut count = 0usize;
+    for coord in coords {
+        if !map.has_chunk(coord) {
+            continue;
+        }
+        let text = map
+            .with_chunk_read(coord, |c| encode_chunk_style(c))
+            .unwrap_or_default();
+        if text.is_empty() {
+            continue;
+        }
+        fs::create_dir_all(dir)?;
+        let path = path_fn(coord);
+        let mut f = fs::File::create(&path)?;
+        f.write_all(text.as_bytes())?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Writes floor style files for the given chunk coordinates.
+pub fn save_level_floor_style_for_chunks(
+    level_name: &str,
+    map: &Hypermap<TileStyle>,
+    coords: impl IntoIterator<Item = ChunkCoord>,
+) -> io::Result<usize> {
+    let dir = style_floor_dir(level_name);
+    save_style_map_to_dir(&dir, |c| chunk_style_floor_path(level_name, c), map, coords)
+}
+
+/// Writes wall style files for the given chunk coordinates.
+pub fn save_level_wall_style_for_chunks(
+    level_name: &str,
+    map: &Hypermap<TileStyle>,
+    coords: impl IntoIterator<Item = ChunkCoord>,
+) -> io::Result<usize> {
+    let dir = style_wall_dir(level_name);
+    save_style_map_to_dir(&dir, |c| chunk_style_wall_path(level_name, c), map, coords)
 }
 
 #[cfg(test)]
