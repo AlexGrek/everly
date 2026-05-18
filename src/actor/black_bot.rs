@@ -23,7 +23,7 @@ use crate::actor::{
 use crate::map::chunk_overlay::{ChunkOverlayState, OVERLAY_RES};
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap};
 use crate::map::hypermap_pathfind::{
-    astar_shortest_world_path, simplify_path_line_of_sight, HypermapPathResult,
+    astar_shortest_world_path, simplify_path_line_of_sight, world_tile_walkable, HypermapPathResult,
     HypermapSearchLimits,
 };
 use crate::map::hypermap_world::HypermapRuntime;
@@ -54,6 +54,9 @@ const WAYPOINT_REACHED_EPSILON: f32 = 0.05;
 /// axis-aligned approach + departure tiles that funnel the actor through the
 /// bend.
 const PATH_CORNER_BUFFER: usize = 2;
+/// Chance per bot-on-bot collision that the blocked bot detours 1–2 tiles in
+/// the opposite direction before resuming its original path.
+const BOT_COLLISION_REROUTE_CHANCE: f32 = 0.20;
 /// Chance per bot-on-bot collision that the blocked bot pauses instead of
 /// continuing to push. Walls never trigger this — only `BlockedByOccupancy`.
 const BOT_COLLISION_WAIT_CHANCE: f32 = 0.25;
@@ -390,18 +393,36 @@ fn black_bot_think(
             }
         }
 
-        // Bot-on-bot bumps only — walls (`BlockedByStatic`) are handled by the
-        // per-axis snap in `try_move` and don't trigger a pause.
+        // Bot-on-bot bumps: roll once for reroute (20%), wait (25%), or ignore.
+        // Walls (`BlockedByStatic`) are handled by per-axis snapping in `try_move`.
         if matches!(
             state.last_movement_error,
             Some(ActorMovementError::BlockedByOccupancy { .. })
-        ) && vis.rng.gen_range(0.0_f32..1.0) < BOT_COLLISION_WAIT_CHANCE
-        {
-            vis.movement_state = MovementState::Waiting {
-                remaining_s: BOT_COLLISION_WAIT_S,
-            };
-            state.move_buffer = ActorMoveBuffer::default();
-            continue;
+        ) {
+            let roll = vis.rng.gen_range(0.0_f32..1.0);
+            if roll < BOT_COLLISION_REROUTE_CHANCE {
+                let distance = vis.rng.gen_range(1..=2) as f32;
+                let escape_dir = -vis.direction;
+                let current_tile = float_tile(state.center);
+                let escape = (
+                    (current_tile.x as f32 + escape_dir.x * distance).round() as i32,
+                    (current_tile.y as f32 + escape_dir.y * distance).round() as i32,
+                );
+                if escape != (current_tile.x, current_tile.y)
+                    && world_tile_walkable(passability, escape.0, escape.1)
+                {
+                    let insert_idx = vis.path_index.min(vis.path.len());
+                    vis.path.insert(insert_idx, escape);
+                    // Force direction recalculation toward the escape tile this frame.
+                    vis.main_tile = None;
+                }
+            } else if roll < BOT_COLLISION_REROUTE_CHANCE + BOT_COLLISION_WAIT_CHANCE {
+                vis.movement_state = MovementState::Waiting {
+                    remaining_s: BOT_COLLISION_WAIT_S,
+                };
+                state.move_buffer = ActorMoveBuffer::default();
+                continue;
+            }
         }
 
         let center = state.center;
