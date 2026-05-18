@@ -13,7 +13,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use crate::actor::snapshot::{GlitchBotVisualSnap, SerVec2};
-use crate::actor::{is_paused, process_actors, Actor, ActorMoveBuffer, ActorObject, ActorState};
+use crate::actor::{is_paused, process_actors, Actor, ActorMoveBuffer, ActorObject, ActorState, OffScreenActor};
 use crate::map::passability::{FLAG_BLOCKED, SUBTILE_COUNT};
 use crate::menu::main_menu::GameState;
 
@@ -115,6 +115,7 @@ impl GlitchBot {
                 last_movement_error: None,
                 last_accepted_center_subtile: Some(initial_sub),
                 last_accepted_radius_subtiles: GLITCH_RADIUS_SUBTILES,
+                next_waypoint_hint: None,
             },
         }
     }
@@ -238,7 +239,7 @@ fn glitch_bot_think(
 /// This makes the visual and the footprint identical sources of truth — the
 /// accumulator is always reset on direction change, so drift is impossible.
 fn sync_glitch_bot_transforms(
-    actors: Query<(&ActorObject, &GlitchBotVisual, &Children)>,
+    actors: Query<(&ActorObject, &GlitchBotVisual, &Children), Without<OffScreenActor>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut children_data: Query<
         (

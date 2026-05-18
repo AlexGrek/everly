@@ -132,6 +132,12 @@ pub struct ActorState {
     /// separately so an actor that resizes between frames still re-stamps the
     /// correct old circle on rejected moves.
     pub last_accepted_radius_subtiles: i32,
+    /// Destination hint for off-screen→on-screen collision resolution.
+    /// Set each frame by the actor's think system (e.g. the current path
+    /// waypoint). When the actor re-enters a rendered chunk and its footprint
+    /// overlaps static geometry, [`resolve_offscreen_collision`] tries this
+    /// tile before falling back to a ring search.
+    pub next_waypoint_hint: Option<Vec2>,
 }
 
 impl ActorState {
@@ -194,6 +200,32 @@ pub trait Actor: Send + Sync + 'static {
     /// Override this method to encode the actor's traversal rules.
     fn blocked_flags(&self) -> u64 {
         FLAG_BLOCKED | FLAG_VOID
+    }
+
+    /// Applies `move_buffer` to position and grid state **without** any
+    /// collision check or footprint stamp.
+    ///
+    /// Used for off-screen actors: they travel freely through static geometry
+    /// and do not participate in the dynamic occupancy map.
+    fn advance_unchecked(&mut self) {
+        let state = self.state_mut();
+        let shift = state.move_buffer.subtile_shift;
+        // Capture the grid position BEFORE center is updated, matching the
+        // same ordering as try_move (which reads last_accepted_center_subtile
+        // before touching center).
+        let grid = state.last_accepted_center_subtile.unwrap_or_else(|| {
+            let sc = SUBTILE_COUNT as f32;
+            IVec2::new(
+                (state.center.x * sc).floor() as i32,
+                (state.center.y * sc).floor() as i32,
+            )
+        });
+        state.center += state.move_buffer.tile_delta;
+        state.rotation += state.move_buffer.rotation_shift;
+        if shift != IVec2::ZERO {
+            state.last_accepted_center_subtile = Some(grid + shift);
+        }
+        state.move_buffer = ActorMoveBuffer::default();
     }
 
     /// Applies the accepted movement transform.
@@ -303,6 +335,15 @@ pub trait Actor: Send + Sync + 'static {
 #[derive(Component)]
 pub struct LevelActor;
 
+/// Marker attached to actors whose containing chunk is not currently rendered.
+///
+/// While present, the actor moves without collision detection and its mesh
+/// transform is not updated. Removed by [`process_actors`] when the chunk
+/// becomes rendered; at that point [`resolve_offscreen_collision`] places the
+/// actor at a valid passable position.
+#[derive(Component)]
+pub struct OffScreenActor;
+
 /// ECS wrapper for heterogeneous actor trait objects.
 #[derive(Component)]
 pub struct ActorObject {
@@ -348,23 +389,127 @@ fn flush_actor_occupancy(passability: Res<DynamicPassabilityMap>) {
     passability.flush();
 }
 
+/// Teleports an actor to a valid passable position after it re-enters a
+/// rendered chunk from off-screen travel.
+///
+/// Tries, in order:
+/// 1. Current subtile position (may be free if static geometry hasn't changed).
+/// 2. [`ActorState::next_waypoint_hint`] (set by the actor's think system).
+/// 3. Centers of tiles in an expanding ring of radius 1–5 around the actor.
+///
+/// If nothing is passable the actor is left in place without stamping a
+/// footprint; it will retry next frame.
+fn resolve_offscreen_collision(
+    actor: &mut dyn Actor,
+    dynamic: &DynamicPassabilityMap,
+    static_cache: &Hypermap<SubtilePassability>,
+) {
+    let radius = actor.state().radius_subtiles;
+    let blocked = actor.blocked_flags();
+    let current_sub = actor
+        .state()
+        .last_accepted_center_subtile
+        .unwrap_or_else(|| actor.state().center_subtile_i32());
+
+    // 1. Try current position (previous=None — off-screen footprint was not stamped).
+    if dynamic
+        .try_update_footprint(current_sub, radius, None, blocked, static_cache)
+        .is_ok()
+    {
+        let s = actor.state_mut();
+        s.last_accepted_center_subtile = Some(current_sub);
+        s.last_accepted_radius_subtiles = radius;
+        return;
+    }
+
+    // 2. Try waypoint hint supplied by the think system.
+    let waypoint_hint = actor.state().next_waypoint_hint;
+    if let Some(wp) = waypoint_hint {
+        let sc = SUBTILE_COUNT as f32;
+        let candidate = IVec2::new((wp.x * sc).floor() as i32, (wp.y * sc).floor() as i32);
+        if dynamic
+            .try_update_footprint(candidate, radius, None, blocked, static_cache)
+            .is_ok()
+        {
+            let s = actor.state_mut();
+            s.center = wp;
+            s.last_accepted_center_subtile = Some(candidate);
+            s.last_accepted_radius_subtiles = radius;
+            return;
+        }
+    }
+
+    // 3. Search expanding tile rings (r = 1..=5), testing tile centers.
+    let current_tile = {
+        let c = actor.state().center;
+        IVec2::new(c.x.floor() as i32, c.y.floor() as i32)
+    };
+    let sc_i = SUBTILE_COUNT as i32;
+    'outer: for r in 1i32..=5 {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx.abs() != r && dy.abs() != r {
+                    continue; // interior — covered by a smaller ring
+                }
+                let tile = current_tile + IVec2::new(dx, dy);
+                let candidate = IVec2::new(tile.x * sc_i + sc_i / 2, tile.y * sc_i + sc_i / 2);
+                if dynamic
+                    .try_update_footprint(candidate, radius, None, blocked, static_cache)
+                    .is_ok()
+                {
+                    let tile_center = Vec2::new(tile.x as f32 + 0.5, tile.y as f32 + 0.5);
+                    let s = actor.state_mut();
+                    s.center = tile_center;
+                    s.last_accepted_center_subtile = Some(candidate);
+                    s.last_accepted_radius_subtiles = radius;
+                    break 'outer;
+                }
+            }
+        }
+    }
+    // If nothing found, leave position unchanged; footprint not stamped.
+}
+
 /// Drives the complete low-level actor pipeline for all registered actors.
 ///
-/// Reads static geometry from the persistent subtile cache in
-/// [`HypermapRuntime`] and dynamic creature occupancy from
-/// [`DynamicPassabilityMap`].
+/// On-screen actors (chunk in `chunk_roots`) use full collision detection via
+/// [`Actor::try_move`]. Off-screen actors advance without collision via
+/// [`Actor::advance_unchecked`] and carry an [`OffScreenActor`] marker.
+/// On the frame a chunk becomes rendered, `resolve_offscreen_collision` places
+/// the actor at the nearest valid passable position before normal movement resumes.
 pub(crate) fn process_actors(
-    mut actors: Query<&mut ActorObject>,
+    mut actors: Query<(Entity, &mut ActorObject, Option<&OffScreenActor>)>,
     dynamic_passability: Res<DynamicPassabilityMap>,
     hypermap: Res<HypermapRuntime>,
+    mut commands: Commands,
 ) {
     let static_cache = hypermap.static_subtile_cache.as_ref();
-    for mut actor in &mut actors {
-        let actor = actor.inner.as_mut();
+    for (entity, mut actor_obj, off_screen) in &mut actors {
+        let actor = actor_obj.inner.as_mut();
         actor.state_mut().last_movement_error = None;
         actor.think_low_level();
         actor.prepare_movement();
-        actor.try_move(&dynamic_passability, static_cache);
+
+        let center = actor.state().center;
+        let is_rendered =
+            hypermap.is_world_pos_rendered(center.x.floor() as i32, center.y.floor() as i32);
+        let was_off_screen = off_screen.is_some();
+
+        if is_rendered {
+            if was_off_screen {
+                // Transition: off-screen → on-screen. Place actor at valid position, then
+                // normal movement resumes next frame once the marker is removed.
+                commands.entity(entity).remove::<OffScreenActor>();
+                resolve_offscreen_collision(actor, &dynamic_passability, static_cache);
+            } else {
+                actor.try_move(&dynamic_passability, static_cache);
+            }
+        } else {
+            if !was_off_screen {
+                commands.entity(entity).insert(OffScreenActor);
+            }
+            actor.advance_unchecked();
+        }
     }
 }
 
@@ -427,6 +572,7 @@ mod tests {
                     last_movement_error: None,
                     last_accepted_center_subtile: None,
                     last_accepted_radius_subtiles: radius_subtiles,
+                    next_waypoint_hint: None,
                 },
             }
         }
@@ -457,6 +603,7 @@ mod tests {
                 last_movement_error: None,
                 last_accepted_center_subtile: None,
                 last_accepted_radius_subtiles: radius_subtiles,
+                next_waypoint_hint: None,
             },
         }
     }
@@ -566,5 +713,122 @@ mod tests {
         actor.state.move_buffer.subtile_shift = IVec2::new(1, 0);
         actor.try_move(&map, &sc);
         assert!(actor.state.last_movement_error.is_none());
+    }
+
+    // --- Off-screen actor optimization ---
+
+    #[test]
+    fn advance_unchecked_moves_through_static_wall() {
+        let sc = static_cache_with_wall(11, 10, WallMask::from_bits(0x0F).unwrap());
+        let _map = DynamicPassabilityMap::new();
+        let mut actor = DummyActor::new(Vec2::new(10.0, 10.0), 0);
+        actor.state.move_buffer.tile_delta = Vec2::new(1.0, 0.0);
+        actor.state.move_buffer.subtile_shift = IVec2::new(5, 0);
+        // advance_unchecked does not consult sc or map — wall is ignored.
+        // Center (10,10) → initial subtile (50,50) + shift (5,0) = (55,50).
+        actor.advance_unchecked();
+        let _ = sc;
+        assert_eq!(actor.state.center, Vec2::new(11.0, 10.0), "must pass through wall");
+        assert!(actor.state.last_movement_error.is_none());
+        assert_eq!(actor.state.last_accepted_center_subtile, Some(IVec2::new(55, 50)));
+    }
+
+    #[test]
+    fn advance_unchecked_updates_grid_position() {
+        let mut actor = DummyActor::new(Vec2::new(0.0, 0.0), 0);
+        actor.state.last_accepted_center_subtile = Some(IVec2::new(10, 10));
+        actor.state.move_buffer.tile_delta = Vec2::new(0.2, 0.4);
+        actor.state.move_buffer.subtile_shift = IVec2::new(1, 2);
+        actor.advance_unchecked();
+        assert_eq!(actor.state.center, Vec2::new(0.2, 0.4));
+        assert_eq!(actor.state.last_accepted_center_subtile, Some(IVec2::new(11, 12)));
+        assert_eq!(actor.state.move_buffer, ActorMoveBuffer::default());
+    }
+
+    #[test]
+    fn advance_unchecked_zero_shift_leaves_grid_unchanged() {
+        let mut actor = DummyActor::new(Vec2::new(5.0, 5.0), 0);
+        actor.state.last_accepted_center_subtile = Some(IVec2::new(25, 25));
+        actor.state.move_buffer.tile_delta = Vec2::new(0.05, 0.0);
+        actor.state.move_buffer.subtile_shift = IVec2::ZERO;
+        actor.advance_unchecked();
+        assert_eq!(actor.state.last_accepted_center_subtile, Some(IVec2::new(25, 25)));
+    }
+
+    #[test]
+    fn resolve_offscreen_stays_at_clear_position() {
+        let map = DynamicPassabilityMap::new();
+        let sc = empty_static_cache();
+        let mut actor = DummyActor::new(Vec2::new(5.0, 5.0), 1);
+        actor.state.last_accepted_center_subtile = Some(IVec2::new(25, 25));
+
+        super::resolve_offscreen_collision(&mut actor, &map, &sc);
+        map.flush();
+        let view = SubtilePassabilityMap::new(&map);
+
+        assert_eq!(actor.state.last_accepted_center_subtile, Some(IVec2::new(25, 25)),
+            "clear position: must keep current subtile");
+        assert_ne!(view.flags_xy(0, 0, 25, 25) & FLAG_BLOCKED, 0,
+            "footprint must be stamped into write buffer");
+    }
+
+    #[test]
+    fn resolve_offscreen_uses_waypoint_when_current_blocked() {
+        let map = DynamicPassabilityMap::new();
+        let sc = empty_static_cache();
+
+        // Block the current subtile with a creature footprint.
+        map.write_footprint(&[IVec2::new(25, 25)]);
+        map.flush();
+
+        let mut actor = DummyActor::new(Vec2::new(5.0, 5.0), 0);
+        actor.state.last_accepted_center_subtile = Some(IVec2::new(25, 25));
+        actor.state.next_waypoint_hint = Some(Vec2::new(10.0, 5.0));
+
+        super::resolve_offscreen_collision(&mut actor, &map, &sc);
+
+        assert_eq!(actor.state.center, Vec2::new(10.0, 5.0),
+            "must teleport to waypoint hint");
+        assert_eq!(actor.state.last_accepted_center_subtile, Some(IVec2::new(50, 25)));
+    }
+
+    #[test]
+    fn resolve_offscreen_searches_ring_when_no_waypoint() {
+        let map = DynamicPassabilityMap::new();
+        let sc = empty_static_cache();
+
+        // Block all subtiles of tile (0, 0) in the static cache.
+        let mut blocked_tile = SubtilePassability::EMPTY;
+        for sy in 0..SUBTILE_COUNT {
+            for sx in 0..SUBTILE_COUNT {
+                blocked_tile.or_flags(sy, sx, FLAG_BLOCKED);
+            }
+        }
+        sc.set(0, 0, blocked_tile);
+
+        let mut actor = DummyActor::new(Vec2::new(0.5, 0.5), 0);
+        actor.state.last_accepted_center_subtile = Some(IVec2::new(2, 2));
+        actor.state.next_waypoint_hint = None;
+
+        super::resolve_offscreen_collision(&mut actor, &map, &sc);
+
+        let final_sub = actor.state.last_accepted_center_subtile.unwrap();
+        assert_ne!(final_sub, IVec2::new(2, 2),
+            "must escape blocked tile via ring search");
+    }
+
+    #[test]
+    fn resolve_offscreen_flyer_ignores_void() {
+        let sc = static_cache_all_void();
+        let map = DynamicPassabilityMap::new();
+
+        let mut actor = fresh_flying(Vec2::new(5.0, 5.0), 0);
+        actor.state.last_accepted_center_subtile = Some(IVec2::new(25, 25));
+
+        super::resolve_offscreen_collision(&mut actor, &map, &sc);
+
+        // Flyer only blocks on FLAG_BLOCKED; void alone must not prevent placement.
+        assert_eq!(actor.state.last_accepted_center_subtile, Some(IVec2::new(25, 25)),
+            "flyer must stay at void position");
     }
 }

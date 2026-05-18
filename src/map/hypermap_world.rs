@@ -156,6 +156,13 @@ impl HypermapRuntime {
     pub fn desired_chunk_coords(&self) -> Vec<ChunkCoord> {
         self.desired_chunks.iter().copied().collect()
     }
+
+    /// Returns `true` when the chunk that contains world tile `(world_x, world_z)` has a
+    /// spawned mesh entity — i.e. the tile is currently visible on screen.
+    pub fn is_world_pos_rendered(&self, world_x: i32, world_z: i32) -> bool {
+        let (coord, _) = world_to_chunk_local(world_x, world_z);
+        self.chunk_roots.contains_key(&coord)
+    }
 }
 
 struct PreparedChunkRender {

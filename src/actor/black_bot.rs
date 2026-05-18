@@ -20,6 +20,7 @@ use rand::{Rng, SeedableRng};
 use crate::actor::snapshot::{BlackBotVisualSnap, MovementStateSnap, SerIVec2, SerVec2};
 use crate::actor::{
     is_paused, process_actors, Actor, ActorMoveBuffer, ActorMovementError, ActorObject, ActorState,
+    OffScreenActor,
 };
 use crate::map::chunk_overlay::{ChunkOverlayState, OVERLAY_RES};
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap};
@@ -171,6 +172,7 @@ impl BlackBot {
                 last_movement_error: None,
                 last_accepted_center_subtile: Some(initial_sub),
                 last_accepted_radius_subtiles: BLACK_RADIUS_SUBTILES,
+                next_waypoint_hint: None,
             },
         }
     }
@@ -440,6 +442,11 @@ fn black_bot_think(
             if *remaining_s <= 0.0 {
                 vis.movement_state = MovementState::Moving;
             } else {
+                state.next_waypoint_hint = if vis.path_index < vis.path.len() {
+                    Some(waypoint_center(vis.path[vis.path_index]))
+                } else {
+                    None
+                };
                 state.move_buffer = ActorMoveBuffer::default();
                 continue;
             }
@@ -487,6 +494,7 @@ fn black_bot_think(
         }
 
         if !vis.has_target {
+            state.next_waypoint_hint = None;
             state.move_buffer = ActorMoveBuffer::default();
             continue;
         }
@@ -499,11 +507,16 @@ fn black_bot_think(
         state.move_buffer.tile_delta = delta;
         state.move_buffer.subtile_shift = new_sub - old_sub;
         state.move_buffer.rotation_shift = 0.0;
+        state.next_waypoint_hint = if vis.path_index < vis.path.len() {
+            Some(waypoint_center(vis.path[vis.path_index]))
+        } else {
+            None
+        };
     }
 }
 
 fn sync_black_bot_transforms(
-    actors: Query<(&ActorObject, &Children), With<BlackBotVisual>>,
+    actors: Query<(&ActorObject, &Children), (With<BlackBotVisual>, Without<OffScreenActor>)>,
     mut children_data: Query<Option<&mut Transform>, Without<ActorObject>>,
 ) {
     for (obj, children) in &actors {

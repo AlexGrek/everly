@@ -178,6 +178,7 @@ impl From<ActorStateSnap> for ActorState {
             last_movement_error: s.last_movement_error.map(Into::into),
             last_accepted_center_subtile: s.last_accepted_center_subtile.map(Into::into),
             last_accepted_radius_subtiles: s.last_accepted_radius_subtiles,
+            next_waypoint_hint: None,
         }
     }
 }
@@ -414,6 +415,7 @@ mod tests {
             }),
             last_accepted_center_subtile: Some(IVec2::new(50, 60)),
             last_accepted_radius_subtiles: 2,
+            next_waypoint_hint: None,
         };
         let snap: ActorStateSnap = (&state).into();
         let back: ActorState = snap.into();
