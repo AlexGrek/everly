@@ -1,6 +1,6 @@
 //! In-game tile edit mode: pick a tile type, preview strokes, paint on mouse up.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::light::{NotShadowCaster, NotShadowReceiver};
@@ -35,6 +35,7 @@ use crate::actor::glitch_bot::{self, GlitchBotRng};
 /// Pixels from the bottom of the window where raycasting and clicks are suppressed
 /// (covers the 52 px HUD bar + 40 px palette row + a small margin).
 const HUD_DEAD_ZONE_PX: f32 = 120.0;
+const FILL_CELL_LIMIT: usize = 50 * 50;
 
 const PALETTE_BG: Color = Color::srgba(0.05, 0.06, 0.09, 0.78);
 const BTN_BG: Color = Color::srgba(0.16, 0.18, 0.22, 0.75);
@@ -68,6 +69,9 @@ pub enum MapTileKind {
     GlitchBot,
     /// Places a BlackBot actor at the clicked tile (single-click, no drag).
     BlackBot,
+    /// Flood-fills the floor style of an enclosed space from the clicked tile.
+    /// Bridges 1–2-tile wall gaps (doors) and refuses if the region exceeds 50×50 tiles.
+    Fill,
 }
 
 #[derive(Resource, Default)]
@@ -170,6 +174,7 @@ pub(crate) fn spawn_map_edit_palette(mut commands: Commands, camera: Query<Entit
                 ("Corner", MapTileKind::Corner),
                 ("Bot", MapTileKind::GlitchBot),
                 ("Black", MapTileKind::BlackBot),
+                ("Fill", MapTileKind::Fill),
             ] {
                 row.spawn((
                     Name::new(format!("Map edit pick {label}")),
@@ -510,7 +515,7 @@ fn stroke_world_cells(kind: MapTileKind, start: (i32, i32), end: (i32, i32)) -> 
         MapTileKind::Void | MapTileKind::Road => floor_rect_cells(start, end),
         MapTileKind::Room => room_outline_cells(start, end),
         MapTileKind::Corner => vec![end],
-        MapTileKind::GlitchBot | MapTileKind::BlackBot => vec![end],
+        MapTileKind::GlitchBot | MapTileKind::BlackBot | MapTileKind::Fill => vec![end],
     }
 }
 
@@ -555,7 +560,7 @@ fn resolved_cell(kind: MapTileKind, variant: u32) -> CellType {
             };
             CellType::Corner(c)
         }
-        MapTileKind::GlitchBot | MapTileKind::BlackBot => CellType::Road,
+        MapTileKind::GlitchBot | MapTileKind::BlackBot | MapTileKind::Fill => CellType::Road,
     }
 }
 
@@ -647,7 +652,7 @@ fn map_edit_update_preview(
                 let (ix, iz) = strokes[0];
                 build_floor0_wall_mesh(&[(0, 0, c)], ix, iz).or_else(void_preview_plane)
             }
-            MapTileKind::GlitchBot | MapTileKind::BlackBot => void_preview_plane(),
+            MapTileKind::GlitchBot | MapTileKind::BlackBot | MapTileKind::Fill => void_preview_plane(),
         }
     } else {
         match kind {
@@ -689,7 +694,7 @@ fn map_edit_update_preview(
                 let (ix, iz) = strokes[0];
                 build_upper_wall_mesh(&[(0, 0, f, c)], ix, iz).or_else(void_preview_plane)
             }
-            MapTileKind::GlitchBot | MapTileKind::BlackBot => void_preview_plane(),
+            MapTileKind::GlitchBot | MapTileKind::BlackBot | MapTileKind::Fill => void_preview_plane(),
         }
     };
 
@@ -816,6 +821,76 @@ fn map_edit_pointer_stroke(
         return;
     }
 
+    if kind == MapTileKind::Fill {
+        let (ix, iz) = end;
+        let chunk_coord = world_to_chunk_local(ix, iz).0;
+        ensure_chunk_generated(
+            &runtime.map,
+            &runtime.static_passability_map,
+            &runtime.static_subtile_cache,
+            &runtime.style_floor_map,
+            &runtime.style_wall_map,
+            chunk_coord,
+            level.0.as_str(),
+        );
+        match flood_fill_enclosed(&runtime.map, ix, iz, fl) {
+            None => {
+                warn!("Fill: space is not enclosed or exceeds {}×{} tiles — not painting", 50, 50);
+            }
+            Some(floor_cells) => {
+                let floor_set: HashSet<(i32, i32)> = floor_cells.iter().copied().collect();
+                let mut wall_cells: HashSet<(i32, i32)> = HashSet::new();
+                for &(x, z) in &floor_cells {
+                    for (nx, nz) in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
+                        if !floor_set.contains(&(nx, nz))
+                            && matches!(
+                                runtime.map.get_floor(nx, nz, fl),
+                                CellType::Wall(_) | CellType::Corner(_)
+                            )
+                        {
+                            wall_cells.insert((nx, nz));
+                        }
+                    }
+                }
+                let total = floor_cells.len() + wall_cells.len();
+                if total > FILL_CELL_LIMIT {
+                    warn!("Fill: region has {total} tiles (including boundary walls) — not painting");
+                    return;
+                }
+                let floor_styles = floor_styles_for_kind(kind);
+                let floor_paint =
+                    floor_styles[(style.floor as usize).min(floor_styles.len().saturating_sub(1))];
+                let mut all_chunks = HashSet::<ChunkCoord>::new();
+                for &(x, z) in floor_cells.iter().chain(wall_cells.iter()) {
+                    all_chunks.insert(world_to_chunk_local(x, z).0);
+                }
+                for c in &all_chunks {
+                    ensure_chunk_generated(
+                        &runtime.map,
+                        &runtime.static_passability_map,
+                        &runtime.static_subtile_cache,
+                        &runtime.style_floor_map,
+                        &runtime.style_wall_map,
+                        *c,
+                        level.0.as_str(),
+                    );
+                }
+                for (x, z) in floor_cells.iter().chain(wall_cells.iter()) {
+                    write_world_floor_style(&runtime, *x, *z, fl, floor_paint);
+                }
+                let mut remeshed = HashSet::<ChunkCoord>::new();
+                for (x, z) in floor_cells.iter().chain(wall_cells.iter()) {
+                    let cc = world_to_chunk_local(*x, *z).0;
+                    if remeshed.insert(cc) {
+                        queue_hypermap_chunk_remesh(&mut remesh, *x, *z);
+                    }
+                }
+                info!("Fill: painted {} floor + {} wall-floor tiles", floor_cells.len(), wall_cells.len());
+            }
+        }
+        return;
+    }
+
     let tiles = stroke_world_cells(kind, start, end);
     if tiles.is_empty() {
         return;
@@ -891,7 +966,8 @@ fn map_edit_scroll_variants(
     let max_v = match kind {
         MapTileKind::Wall | MapTileKind::WallGlass => 15,
         MapTileKind::Corner => 4,
-        MapTileKind::Void | MapTileKind::Road | MapTileKind::Room | MapTileKind::GlitchBot | MapTileKind::BlackBot => return,
+        MapTileKind::Void | MapTileKind::Road | MapTileKind::Room
+        | MapTileKind::GlitchBot | MapTileKind::BlackBot | MapTileKind::Fill => return,
     };
 
     let mut scroll = 0.0f32;
@@ -910,10 +986,83 @@ fn map_edit_scroll_variants(
     variant.0 = wrapped;
 }
 
+/// Flood-fills from `(seed_x, seed_z)` on `floor` through non-wall cells.
+///
+/// Door gaps of 1–2 tiles are bridged: non-wall cells flanked by walls within 2 steps on the
+/// same axis are treated as virtual walls so the fill stays inside a room even with an open
+/// doorway. Returns the set of reachable non-wall floor cells, or `None` when the region
+/// exceeds [`FILL_CELL_LIMIT`] (open space / detection failure).
+fn flood_fill_enclosed(
+    map: &crate::map::hypermap::Hypermap<CellType>,
+    seed_x: i32,
+    seed_z: i32,
+    floor: i32,
+) -> Option<Vec<(i32, i32)>> {
+    let is_wall_cell = |x: i32, z: i32| -> bool {
+        matches!(map.get_floor(x, z, floor), CellType::Wall(_) | CellType::Corner(_))
+    };
+
+    // True when a non-wall cell is a narrow gap between walls on the same axis (door).
+    let is_gap_cell = |x: i32, z: i32| -> bool {
+        // 1-tile X gap
+        if is_wall_cell(x - 1, z) && is_wall_cell(x + 1, z) {
+            return true;
+        }
+        // 2-tile X gap — this cell is the left one of the pair
+        if is_wall_cell(x - 1, z) && !is_wall_cell(x + 1, z) && is_wall_cell(x + 2, z) {
+            return true;
+        }
+        // 2-tile X gap — this cell is the right one of the pair
+        if is_wall_cell(x + 1, z) && !is_wall_cell(x - 1, z) && is_wall_cell(x - 2, z) {
+            return true;
+        }
+        // 1-tile Z gap
+        if is_wall_cell(x, z - 1) && is_wall_cell(x, z + 1) {
+            return true;
+        }
+        // 2-tile Z gap — top cell of pair
+        if is_wall_cell(x, z - 1) && !is_wall_cell(x, z + 1) && is_wall_cell(x, z + 2) {
+            return true;
+        }
+        // 2-tile Z gap — bottom cell of pair
+        if is_wall_cell(x, z + 1) && !is_wall_cell(x, z - 1) && is_wall_cell(x, z - 2) {
+            return true;
+        }
+        false
+    };
+
+    if is_wall_cell(seed_x, seed_z) || is_gap_cell(seed_x, seed_z) {
+        return None;
+    }
+
+    let mut visited: HashSet<(i32, i32)> = HashSet::new();
+    let mut queue: VecDeque<(i32, i32)> = VecDeque::new();
+    visited.insert((seed_x, seed_z));
+    queue.push_back((seed_x, seed_z));
+
+    while let Some((x, z)) = queue.pop_front() {
+        for (nx, nz) in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
+            if visited.contains(&(nx, nz)) {
+                continue;
+            }
+            if is_wall_cell(nx, nz) || is_gap_cell(nx, nz) {
+                continue;
+            }
+            visited.insert((nx, nz));
+            if visited.len() > FILL_CELL_LIMIT {
+                return None;
+            }
+            queue.push_back((nx, nz));
+        }
+    }
+
+    Some(visited.into_iter().collect())
+}
+
 fn floor_styles_for_kind(kind: MapTileKind) -> &'static [TileStyle] {
     match kind {
         MapTileKind::Road | MapTileKind::Room | MapTileKind::Wall
-        | MapTileKind::WallGlass | MapTileKind::Corner => &[
+        | MapTileKind::WallGlass | MapTileKind::Corner | MapTileKind::Fill => &[
             TileStyle::DEFAULT,
             TileStyle([b'f', b'g']),
             TileStyle([b'f', b'p']),

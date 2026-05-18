@@ -219,9 +219,13 @@ fn glitch_bot_think(
         vis.accumulator.x -= step_x as f32;
         vis.accumulator.y -= step_y as f32;
 
-        // tile_delta is zero: center is never updated via the old float path.
-        // The visual position is derived in sync_glitch_bot_transforms instead.
-        state.move_buffer.tile_delta = Vec2::ZERO;
+        // Advance center by the integer subtile amount so the field stays roughly
+        // synchronized with last_accepted_center_subtile. sync_glitch_bot_transforms
+        // uses last_accepted_center_subtile + accumulator for sub-subtile smooth
+        // rendering and does not read center, but other systems (snapshots, future
+        // queries) may read it and must not see a permanently stale spawn position.
+        let sc = SUBTILE_COUNT as f32;
+        state.move_buffer.tile_delta = Vec2::new(step_x as f32 / sc, step_y as f32 / sc);
         state.move_buffer.subtile_shift = IVec2::new(step_x, step_y);
         state.move_buffer.rotation_shift = 0.0;
     }

@@ -257,6 +257,11 @@ impl Actor for BlackBot {
             } else {
                 origin.x as f32 / sc_f + SUBTILE_SNAP_EPSILON
             };
+            // First blocked axis sets the error; the second does not overwrite it.
+            // Preserving the first error matters when X is blocked by a static wall
+            // and Y by occupancy (or vice-versa): the think loop branches specifically
+            // on BlockedByOccupancy, so reporting the wrong variant triggers the
+            // wrong recovery strategy.
             if let Err(e) = x_probe {
                 self.state.last_movement_error = Some(translate_err(e));
             }
@@ -269,8 +274,10 @@ impl Actor for BlackBot {
             } else {
                 origin.y as f32 / sc_f + SUBTILE_SNAP_EPSILON
             };
-            if let Err(e) = y_probe {
-                self.state.last_movement_error = Some(translate_err(e));
+            if self.state.last_movement_error.is_none() {
+                if let Err(e) = y_probe {
+                    self.state.last_movement_error = Some(translate_err(e));
+                }
             }
         }
     }
