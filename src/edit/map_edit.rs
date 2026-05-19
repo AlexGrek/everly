@@ -839,15 +839,34 @@ fn map_edit_pointer_stroke(
             }
             Some(floor_cells) => {
                 let floor_set: HashSet<(i32, i32)> = floor_cells.iter().copied().collect();
+                let is_wall_like = |x: i32, z: i32| -> bool {
+                    matches!(
+                        runtime.map.get_floor(x, z, fl),
+                        CellType::Wall(_) | CellType::Corner(_)
+                    )
+                };
                 let mut wall_cells: HashSet<(i32, i32)> = HashSet::new();
                 for &(x, z) in &floor_cells {
                     for (nx, nz) in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
-                        if !floor_set.contains(&(nx, nz))
-                            && matches!(
-                                runtime.map.get_floor(nx, nz, fl),
-                                CellType::Wall(_) | CellType::Corner(_)
-                            )
-                        {
+                        if !floor_set.contains(&(nx, nz)) && is_wall_like(nx, nz) {
+                            wall_cells.insert((nx, nz));
+                        }
+                    }
+                    // Corner-pillar tiles and inner-corner wall tiles (a single cell with
+                    // walls on two adjacent edges) sit diagonally to the interior floor and
+                    // are missed by the orthogonal scan. Pick them up here, but only when
+                    // both connecting orthogonal cells are also wall-like — otherwise the
+                    // diagonal belongs to an unrelated structure that just touches the room.
+                    for (nx, nz) in [
+                        (x - 1, z - 1),
+                        (x + 1, z - 1),
+                        (x - 1, z + 1),
+                        (x + 1, z + 1),
+                    ] {
+                        if floor_set.contains(&(nx, nz)) || !is_wall_like(nx, nz) {
+                            continue;
+                        }
+                        if is_wall_like(nx, z) && is_wall_like(x, nz) {
                             wall_cells.insert((nx, nz));
                         }
                     }
