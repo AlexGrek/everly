@@ -8,25 +8,25 @@ use bevy::prelude::*;
 use bevy::ui::widget::Button;
 
 use crate::map::floor_level::{ActiveFloorLevel, HYPERMAP_FLOOR_HEIGHT, HYPERMAP_FLOOR_MAX};
-use crate::map::hypermap::{world_to_chunk_local, ChunkCoord};
+use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, HYPERMAP_CHUNK_SIZE};
 use crate::map::hypermap_world::{
     build_floor0_road_mesh, build_floor0_wall_mesh, build_upper_road_mesh, build_upper_wall_mesh,
-    ensure_chunk_generated, queue_hypermap_chunk_remesh, write_world_cell,
-    write_world_floor_style, write_world_wall_style,
-    HypermapChunkRemeshQueue, HypermapRuntime,
+ queue_hypermap_chunk_remesh, regenerate_procedural_chunk,
+    write_world_cell, write_world_floor_style, write_world_wall_style, HypermapChunkRemeshQueue,
+    HypermapRuntime,
 };
-use crate::map::level::{
-    save_level_geometry_for_chunks, save_level_floor_style_for_chunks,
-    save_level_wall_style_for_chunks, LevelName,
-};
+use crate::map::passability::DynamicPassabilityMap;
+use crate::map::dirt::DirtMap;
+use crate::map::level::{save_full_generated_level, LevelName};
+use crate::map::temperature::TemperatureMap;
 use crate::actor::glitch_bot::GlitchBotVisual;
 use crate::actor::black_bot::BlackBotVisual;
 use crate::actor::snapshot::{save_level_actors, LevelActorsFile};
 use crate::scene::camera::{StrategyCamera, StrategyCameraRig};
 use crate::scene::camera_snapshot::{save_level_camera, LevelCameraFile};
-use crate::actor::ActorObject;
+use crate::actor::{actor_main_tile, ActorObject};
 use crate::map::world_map::{
-    CellType, TileStyle, WallCorner, WallMask, MASK_EAST, MASK_NORTH, MASK_SOUTH, MASK_WEST,
+    CellType, TileStyle, WallCorner, WallMask, perimeter_wall_mask,
 };
 use crate::menu::main_menu::GameState;
 use crate::actor::black_bot::{self, BlackBotRng};
@@ -54,6 +54,9 @@ struct MapEditTilePickButton(MapTileKind);
 
 #[derive(Component)]
 struct MapEditSaveButton;
+
+#[derive(Component)]
+struct MapEditRegenerateButton;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MapTileKind {
@@ -121,6 +124,7 @@ impl Plugin for MapEditPlugin {
                     map_edit_toggle_panel,
                     map_edit_tile_pick_buttons,
                     map_edit_save_button,
+                    map_edit_regenerate_button,
                     map_edit_tab_cycle_style,
                     map_edit_sync_style_label,
                     (
@@ -225,6 +229,30 @@ pub(crate) fn spawn_map_edit_palette(mut commands: Commands, camera: Query<Entit
                     TextColor(TEXT_MAIN),
                 ));
             });
+            row.spawn((
+                Name::new("Map edit regenerate"),
+                MapEditRegenerateButton,
+                Button,
+                Node {
+                    min_width: Val::Px(88.0),
+                    height: Val::Px(32.0),
+                    padding: UiRect::horizontal(Val::Px(12.0)),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    border: UiRect::all(Val::Px(1.0)),
+                    border_radius: BorderRadius::all(Val::Px(5.0)),
+                    ..default()
+                },
+                BorderColor::all(BTN_BORDER),
+                BackgroundColor(BTN_BG),
+            ))
+            .with_children(|p| {
+                p.spawn((
+                    Text::new("Re-gen"),
+                    TextFont::from_font_size(15.0),
+                    TextColor(TEXT_MAIN),
+                ));
+            });
 
             // Style indicator — updated by `map_edit_sync_style_label`.
             row.spawn((
@@ -286,11 +314,74 @@ fn map_edit_toggle_panel(
     }
 }
 
+fn map_edit_regenerate_button(
+    interactions: Query<&Interaction, (With<MapEditRegenerateButton>, Changed<Interaction>)>,
+    state: Res<MapEditState>,
+    level: Res<LevelName>,
+    camera: Query<&StrategyCamera, With<StrategyCameraRig>>,
+    mut runtime: ResMut<HypermapRuntime>,
+    mut remesh: ResMut<HypermapChunkRemeshQueue>,
+    dirt: Res<DirtMap>,
+    temperature: Res<TemperatureMap>,
+    dynamic_passability: Res<DynamicPassabilityMap>,
+    mut commands: Commands,
+    actors: Query<(Entity, &ActorObject)>,
+) {
+    if !state.panel_open {
+        return;
+    }
+    for interaction in &interactions {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        let Ok(cam) = camera.single() else {
+            return;
+        };
+        let (coord, _) = world_to_chunk_local(
+            cam.focus.x.floor() as i32,
+            cam.focus.z.floor() as i32,
+        );
+
+        runtime.ensure_chunk_generated(coord, level.0.as_str());
+
+        let mut killed = 0u32;
+        for (entity, obj) in &actors {
+            let state = obj.inner.state();
+            let main = actor_main_tile(state.center);
+            let (actor_chunk, _) = world_to_chunk_local(main.x, main.y);
+            if actor_chunk != coord {
+                continue;
+            }
+            if let Some(center) = state.last_accepted_center_subtile {
+                dynamic_passability.clear_creature_footprint(
+                    center,
+                    state.last_accepted_radius_subtiles,
+                );
+            }
+            commands.entity(entity).despawn();
+            killed += 1;
+        }
+
+        regenerate_procedural_chunk(&mut runtime, coord, level.0.as_str(), &dirt, &temperature);
+
+        let origin_x = coord.x * HYPERMAP_CHUNK_SIZE;
+        let origin_z = coord.y * HYPERMAP_CHUNK_SIZE;
+        queue_hypermap_chunk_remesh(&mut remesh, origin_x, origin_z);
+
+        info!(
+            "regenerated procedural chunk ({}, {}); removed {killed} actor(s) on that chunk",
+            coord.x, coord.y
+        );
+    }
+}
+
 fn map_edit_save_button(
     interactions: Query<&Interaction, (With<MapEditSaveButton>, Changed<Interaction>)>,
     state: Res<MapEditState>,
     level: Res<LevelName>,
     runtime: Res<HypermapRuntime>,
+    dirt: Res<DirtMap>,
+    temperature: Res<TemperatureMap>,
     camera: Query<&StrategyCamera, With<StrategyCameraRig>>,
     glitch_bots: Query<(&ActorObject, &GlitchBotVisual, Option<&Name>)>,
     black_bots: Query<(&ActorObject, &BlackBotVisual, Option<&Name>)>,
@@ -303,11 +394,29 @@ fn map_edit_save_button(
             continue;
         }
         let level_name = level.0.as_str();
-        match save_level_geometry_for_chunks(level_name, &runtime.map, runtime.desired_chunk_coords()) {
-            Ok(n) => info!(
-                "saved {n} rendered chunk geometry file(s) under `levels/level_{level_name}/geometry/`",
+        dirt.field().flush_if_pending();
+        temperature.field().flush_if_pending();
+        match save_full_generated_level(
+            level_name,
+            &runtime.map,
+            &runtime.style_floor_map,
+            &runtime.style_wall_map,
+            dirt.read_map(),
+            temperature.read_map(),
+            &runtime.procedural_metadata,
+        ) {
+            Ok(report) => info!(
+                "saved level `{level_name}`: {} geometry chunk(s), {} floor style, {} wall style, \
+                 {} dirt chunk(s) in dirt.bin, {} temperature chunk(s) in temperature.bin, \
+                 {} metadata chunk(s)",
+                report.geometry_chunks,
+                report.floor_style_chunks,
+                report.wall_style_chunks,
+                report.dirt_chunks,
+                report.temperature_chunks,
+                report.metadata_chunks,
             ),
-            Err(e) => warn!("save level geometry failed: {e}"),
+            Err(e) => warn!("save full level failed: {e}"),
         }
         let actors_file = LevelActorsFile::collect(&glitch_bots, &black_bots);
         match save_level_actors(level_name, &actors_file) {
@@ -323,15 +432,6 @@ fn map_edit_save_button(
                 Ok(()) => info!("saved strategy camera to `levels/level_{level_name}/camera.json`"),
                 Err(e) => warn!("save level camera failed: {e}"),
             }
-        }
-        let coords = runtime.desired_chunk_coords();
-        match save_level_floor_style_for_chunks(level.0.as_str(), &runtime.style_floor_map, coords.clone()) {
-            Ok(n) => info!("saved {n} chunk floor style file(s) for level `{}`", level.0),
-            Err(e) => warn!("save level floor style failed: {e}"),
-        }
-        match save_level_wall_style_for_chunks(level.0.as_str(), &runtime.style_wall_map, coords) {
-            Ok(n) => info!("saved {n} chunk wall style file(s) for level `{}`", level.0),
-            Err(e) => warn!("save level wall style failed: {e}"),
         }
     }
 }
@@ -469,28 +569,6 @@ fn room_outline_cells(start: (i32, i32), end: (i32, i32)) -> Vec<(i32, i32)> {
         out.push((max_x, z));
     }
     out
-}
-
-/// Wall mask for a cell on the rectangle border: each edge of the cell that lies on the outer boundary of the selection.
-///
-/// Must match [`for_each_wall_segment`](crate::map::world_map::for_each_wall_segment): **north** bit draws
-/// toward **-world Z** (`oz = -inset`), **south** toward **+world Z** — so the +Z side of the loop uses
-/// [`MASK_SOUTH`] and the -Z side uses [`MASK_NORTH`].
-fn perimeter_wall_mask(cx: i32, cz: i32, min_x: i32, max_x: i32, min_z: i32, max_z: i32) -> WallMask {
-    let mut bits = 0u8;
-    if cz == max_z {
-        bits |= MASK_SOUTH;
-    }
-    if cz == min_z {
-        bits |= MASK_NORTH;
-    }
-    if cx == max_x {
-        bits |= MASK_EAST;
-    }
-    if cx == min_x {
-        bits |= MASK_WEST;
-    }
-    WallMask::from_bits(bits).expect("border cell has at least one outer edge")
 }
 
 fn floor_rect_cells(start: (i32, i32), end: (i32, i32)) -> Vec<(i32, i32)> {
@@ -754,7 +832,7 @@ fn map_edit_pointer_stroke(
     style: Res<MapEditStyleState>,
     floor: Res<ActiveFloorLevel>,
     level: Res<LevelName>,
-    runtime: Res<HypermapRuntime>,
+    mut runtime: ResMut<HypermapRuntime>,
     mut remesh: ResMut<HypermapChunkRemeshQueue>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -824,15 +902,7 @@ fn map_edit_pointer_stroke(
     if kind == MapTileKind::Fill {
         let (ix, iz) = end;
         let chunk_coord = world_to_chunk_local(ix, iz).0;
-        ensure_chunk_generated(
-            &runtime.map,
-            &runtime.static_passability_map,
-            &runtime.static_subtile_cache,
-            &runtime.style_floor_map,
-            &runtime.style_wall_map,
-            chunk_coord,
-            level.0.as_str(),
-        );
+        runtime.ensure_chunk_generated(chunk_coord, level.0.as_str());
         match flood_fill_enclosed(&runtime.map, ix, iz, fl) {
             None => {
                 warn!("Fill: space is not enclosed or exceeds {}×{} tiles — not painting", 50, 50);
@@ -884,15 +954,7 @@ fn map_edit_pointer_stroke(
                     all_chunks.insert(world_to_chunk_local(x, z).0);
                 }
                 for c in &all_chunks {
-                    ensure_chunk_generated(
-                        &runtime.map,
-                        &runtime.static_passability_map,
-                        &runtime.static_subtile_cache,
-                        &runtime.style_floor_map,
-                        &runtime.style_wall_map,
-                        *c,
-                        level.0.as_str(),
-                    );
+                    runtime.ensure_chunk_generated(*c, level.0.as_str());
                 }
                 for (x, z) in floor_cells.iter().chain(wall_cells.iter()) {
                     write_world_floor_style(&runtime, *x, *z, fl, floor_paint);
@@ -920,15 +982,7 @@ fn map_edit_pointer_stroke(
         chunk_coords.insert(world_to_chunk_local(ix, iz).0);
     }
     for c in &chunk_coords {
-        ensure_chunk_generated(
-            &runtime.map,
-            &runtime.static_passability_map,
-            &runtime.static_subtile_cache,
-            &runtime.style_floor_map,
-            &runtime.style_wall_map,
-            *c,
-            level.0.as_str(),
-        );
+        runtime.ensure_chunk_generated(*c, level.0.as_str());
     }
 
     let floor_styles = floor_styles_for_kind(kind);

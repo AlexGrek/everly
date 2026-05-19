@@ -9,8 +9,8 @@ floating above the floor mesh. Layers are driven from the CPU.
 
 | Layer | Y offset | Purpose |
 |---|---|---|
-| Temperature | 0.0004 m | Warm tint from [`TemperatureMap`](../src/map/temperature.rs) |
-| Dirt | 0.0005 m | Black stains from [`DirtMap`](../src/map/dirt.rs) |
+| Temperature | 0.0004 m | Warm tint from [`TemperatureMap`](../src/map/temperature.rs) (`temperature.bin` on Save) |
+| Dirt | 0.0005 m | Black stains from [`DirtMap`](../src/map/dirt.rs) (persisted in `dirt.bin` on Save — [`level-persistence.md`](level-persistence.md)) |
 | Generic | 0.001 m | Writable canvas for any system |
 | Occupancy | 0.002 m | Debug: subtile passability flags |
 

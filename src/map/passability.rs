@@ -132,6 +132,29 @@ impl DynamicPassabilityMap {
         self.inner.flush();
     }
 
+    /// Clears dynamic actor occupancy (`FLAG_BLOCKED | FLAG_CREATURE`) for a circular
+    /// footprint on both buffers — use before despawning an actor (e.g. chunk regen).
+    pub fn clear_creature_footprint(&self, center_subtile: IVec2, radius_subtiles: i32) {
+        if radius_subtiles < 0 {
+            return;
+        }
+        let shadow = baked_circle_shadow(radius_subtiles);
+        let clear = FLAG_BLOCKED | FLAG_CREATURE;
+        let sc = SUBTILE_COUNT as i32;
+        for map in [self.inner.read_map(), self.inner.write_map()] {
+            for offset in shadow.offsets {
+                let target = center_subtile + *offset;
+                let tile_x = target.x.div_euclid(sc);
+                let tile_y = target.y.div_euclid(sc);
+                let local_x = target.x.rem_euclid(sc) as usize;
+                let local_y = target.y.rem_euclid(sc) as usize;
+                map.update(tile_x, tile_y, |tile| {
+                    tile.cells[local_y * SUBTILE_COUNT + local_x] &= !clear;
+                });
+            }
+        }
+    }
+
     /// Canonical actor-movement entry point: checks the candidate circular
     /// footprint against the static subtile cache **and** the dynamic **read**
     /// buffer, then stamps the new footprint into the **write** buffer.

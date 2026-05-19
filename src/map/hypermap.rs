@@ -26,6 +26,13 @@ impl ChunkCoord {
     }
 }
 
+/// Random `u64` for [`rand::SeedableRng::seed_from_u64`] when a chunk is first filled procedurally.
+///
+/// Not derived from chunk coordinates — each first-time generation pass gets a fresh layout.
+pub fn random_rng_seed() -> u64 {
+    rand::random()
+}
+
 /// Local coordinate inside one 128x128 chunk. Components are `i32` so
 /// callers can do unrestricted arithmetic; values must be in
 /// `0..HYPERMAP_CHUNK_SIZE` when used to index a chunk.

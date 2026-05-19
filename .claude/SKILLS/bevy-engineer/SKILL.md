@@ -9,6 +9,9 @@ paths:
   - "**/*.rs"
   - "**/Cargo.toml"
   - "**/*.wgsl"
+  - "docs/corners.md"
+  - "docs/tilemap.md"
+  - "docs/map-generator.md"
 ---
 
 # Bevy engineer (v0.18)
@@ -16,6 +19,10 @@ paths:
 ## Context
 
 This project targets **Bevy v0.18**. When generating, editing, or refactoring Rust for this repo, follow the v0.18 API, a data-driven ECS architecture, and current Bevy practices.
+
+## Important!
+
+**Always read documentation files before reading any code and write documentation to keep it up to date with all code changes!**
 
 ## Observers and events
 
@@ -84,6 +91,10 @@ When touching **`src/map/hypermap_world.rs`**, **`src/map/world_map.rs`**, **`sr
 - **Chunk floor meshes** include **every non-void cell** (road **and** wall): a shared floor quad plus separate wall geometry (see `docs/rendering-pipeline.md`).
 
 Authoring reference: **`docs/tilemap.md`**, agent checklist: **`.claude/SKILLS/map-creator/SKILL.md`**.
+
+Procedural chunk generation (`src/map/map_generator/`, `fill_procedural_chunk`): **`.claude/SKILLS/map-generator/SKILL.md`**, **`docs/map-generator.md`**.
+
+Inner union corner pillars (`c*`, concave elbows, `corner_pillars.rs`): **`docs/corners.md`** (with map-generator skill for pipeline step 8).
 
 ## Project workflow
 

@@ -77,6 +77,7 @@ The callback is built fresh inside `try_move` from `self`, so it always reflects
 
 ## Preferred workflow
 
+0. Always read documentation before reading any code, for whatever system you need!
 1. Read `docs/actor.md` and `src/actor/mod.rs`.
 2. If movement/collision changes, read `src/map/passability.rs` too.
 3. Keep actor-side code thin; push shared occupancy rules into passability methods.

@@ -7,9 +7,10 @@
 //! It then follows those waypoints in straight floating-point segments — the
 //! float `center` is the canonical position, never snapped to the grid.
 //!
-//! Path-following "thinking" (waypoint advance, repath, heading update) runs
-//! only when the actor's **main tile** — [`actor_main_tile`] — changes between
-//! frames. On every other frame the bot simply integrates the cached heading.
+//! Path-following advances when the float `center` reaches each waypoint's
+//! tile center ([`waypoint_center`]), within [`WAYPOINT_REACHED_EPSILON`].
+//! Heading is recomputed every frame toward the active waypoint. A new wander
+//! path is picked only when the current path is exhausted.
 //! Ground walker traversal rules (blocked by walls and void) are inherited
 //! from the default [`Actor`] impl.
 
@@ -58,7 +59,7 @@ const WAYPOINT_REACHED_EPSILON: f32 = 0.05;
 /// waypoint can leave a wide follower clipping the wall; a small buffer adds
 /// axis-aligned approach + departure tiles that funnel the actor through the
 /// bend.
-const PATH_CORNER_BUFFER: usize = 2;
+const PATH_CORNER_BUFFER: usize = 1;
 /// Chance per bot-on-bot collision that the blocked bot detours 1–2 tiles in
 /// the opposite direction before resuming its original path.
 const BOT_COLLISION_REROUTE_CHANCE: f32 = 0.20;
@@ -82,10 +83,9 @@ enum MovementState {
 
 #[derive(Component)]
 pub struct BlackBotVisual {
-    /// Last observed main tile ([`actor_main_tile`]). `None` forces think on first frame.
+    /// Last observed main tile ([`actor_main_tile`]); inspector/debug only.
     main_tile: Option<IVec2>,
-    /// Cached unit heading toward `path[path_index]`. Recomputed only on a
-    /// main-tile change.
+    /// Unit heading toward `path[path_index]`; updated every movement frame.
     direction: Vec2,
     has_target: bool,
     path: Vec<(i32, i32)>,
@@ -173,12 +173,10 @@ impl BlackBotVisual {
         if let Some(path) = pick_random_target(&mut self.rng, here, passability) {
             self.path = path;
             self.path_index = 0;
-            while self.path_index < self.path.len() && self.path[self.path_index] == here {
-                self.path_index += 1;
-            }
+            advance_past_reached_waypoints(self, center);
         }
 
-        think(self, center, current_tile, passability);
+        update_path_following(self, center, here, passability);
 
         state.last_movement_error = None;
         state.move_buffer = ActorMoveBuffer::default();
@@ -417,33 +415,39 @@ fn waypoint_center(tile: (i32, i32)) -> Vec2 {
 }
 
 #[inline]
+fn reached_waypoint(center: Vec2, tile: (i32, i32)) -> bool {
+    let wp = waypoint_center(tile);
+    (wp - center).length_squared() <= WAYPOINT_REACHED_EPSILON * WAYPOINT_REACHED_EPSILON
+}
+
+fn advance_past_reached_waypoints(vis: &mut BlackBotVisual, center: Vec2) {
+    while vis.path_index < vis.path.len() && reached_waypoint(center, vis.path[vis.path_index]) {
+        vis.path_index += 1;
+    }
+}
+
+#[inline]
 fn float_subtile(pos: Vec2) -> IVec2 {
     let sc = SUBTILE_COUNT as f32;
     IVec2::new((pos.x * sc).floor() as i32, (pos.y * sc).floor() as i32)
 }
 
-/// Decides direction and waypoint progression. Called only when the actor's
-/// main tile changes (or on first frame).
-fn think(
+/// Advances past reached waypoints, picks a new path when needed, and aims at
+/// the next waypoint center.
+fn update_path_following(
     vis: &mut BlackBotVisual,
     center: Vec2,
-    current_tile: IVec2,
+    here: (i32, i32),
     passability: &Hypermap<f32>,
 ) {
-    let here = (current_tile.x, current_tile.y);
-
-    while vis.path_index < vis.path.len() && vis.path[vis.path_index] == here {
-        vis.path_index += 1;
-    }
+    advance_past_reached_waypoints(vis, center);
 
     if vis.path.is_empty() || vis.path_index >= vis.path.len() {
         match pick_random_target(&mut vis.rng, here, passability) {
             Some(path) => {
                 vis.path = path;
                 vis.path_index = 0;
-                while vis.path_index < vis.path.len() && vis.path[vis.path_index] == here {
-                    vis.path_index += 1;
-                }
+                advance_past_reached_waypoints(vis, center);
             }
             None => {
                 vis.path.clear();
@@ -461,11 +465,10 @@ fn think(
 
     let wp = waypoint_center(vis.path[vis.path_index]);
     let to_wp = wp - center;
-    if to_wp.length_squared() > WAYPOINT_REACHED_EPSILON * WAYPOINT_REACHED_EPSILON {
+    if to_wp.length_squared() > 1e-12 {
         vis.direction = to_wp.normalize();
         vis.has_target = true;
     } else {
-        vis.path_index += 1;
         vis.has_target = false;
     }
 }
@@ -533,12 +536,9 @@ fn black_bot_think(
 
         let center = state.center;
         let current_tile = actor_main_tile(center);
-
-        let tile_changed = vis.main_tile != Some(current_tile);
-        if tile_changed {
-            vis.main_tile = Some(current_tile);
-            think(&mut vis, center, current_tile, passability);
-        }
+        vis.main_tile = Some(current_tile);
+        let here = (current_tile.x, current_tile.y);
+        update_path_following(&mut vis, center, here, passability);
 
         if !vis.has_target {
             state.next_waypoint_hint = None;
@@ -771,4 +771,41 @@ pub fn spawn_black_bot(
 
     commands.entity(parent).add_children(&[mesh_child]);
     parent
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reached_waypoint_uses_center_not_tile_membership() {
+        let tile = (3, 4);
+        let wp = waypoint_center(tile);
+        assert!(!reached_waypoint(wp + Vec2::new(0.2, 0.0), tile));
+        assert!(reached_waypoint(wp, tile));
+        assert!(reached_waypoint(
+            wp + Vec2::splat(WAYPOINT_REACHED_EPSILON * 0.5),
+            tile
+        ));
+    }
+
+    #[test]
+    fn advance_past_reached_skips_only_when_center_at_waypoint() {
+        let mut vis = BlackBotVisual {
+            main_tile: None,
+            direction: Vec2::X,
+            has_target: false,
+            path: vec![(0, 0), (1, 0)],
+            path_index: 0,
+            movement_state: MovementState::Moving,
+            rng_seed: 0,
+            rng: StdRng::seed_from_u64(0),
+        };
+        let near_start = Vec2::new(0.2, 0.5);
+        advance_past_reached_waypoints(&mut vis, near_start);
+        assert_eq!(vis.path_index, 0, "must not skip while center is off waypoint");
+
+        advance_past_reached_waypoints(&mut vis, waypoint_center((0, 0)));
+        assert_eq!(vis.path_index, 1);
+    }
 }

@@ -12,7 +12,7 @@ Defined in `docs/actor.md` § [Main tile](actor.md#main-tile). Summary:
 main_tile = (round(center.x), round(center.y))   // via actor_main_tile(center)
 ```
 
-All gameplay that asks “which tile is the actor in?” shares [`actor_main_tile`](../src/actor/mod.rs) — including [`BlackBot`](../src/actor/black_bot.rs) path think (`BlackBotVisual.main_tile`) and field deposits (`ActorState::field_main_tile`). Collision subtiles still use `floor(center × SUBTILE_COUNT)`; do not mix the two.
+All gameplay that asks “which tile is the actor in?” shares [`actor_main_tile`](../src/actor/mod.rs) — including field deposits (`ActorState::field_main_tile`). [`BlackBot`](../src/actor/black_bot.rs) path following uses float `center` distance to each waypoint's tile center, not main-tile equality. Collision subtiles still use `floor(center × SUBTILE_COUNT)`; do not mix the two.
 
 [`ActorState::field_main_tile`](../src/actor/mod.rs) is updated only in field interaction systems **after** [`process_actors`](../src/actor/mod.rs) so `center` reflects the completed movement step (including off-screen [`advance_unchecked`] travel).
 
@@ -48,6 +48,10 @@ the **left** tile's scalar dirt value (clamped to `1.0`). Void tiles are skipped
 
 Dirt is stored in a **tile-only** [`DoubleBufferedHypermap<f32>`](../src/map/tile_field.rs)
 (one value per world tile), not per subtile.
+
+**Persistence:** deposits and procedural seeds stay in memory until the player uses
+map editor **Save**, which writes `levels/level_{name}/dirt.bin` (all loaded dirt chunks).
+See [`level-persistence.md`](level-persistence.md).
 
 ## Adding a new field
 

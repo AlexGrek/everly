@@ -34,3 +34,9 @@ temperature.add_tile_c(wx, wy, delta_c);
 ```
 
 Actor dirt deposits: `docs/field-interactions.md`.
+
+## Persistence
+
+Dirt and temperature are saved together under `levels/level_{name}/` as single binary
+files (`dirt.bin`, `temperature.bin`), not per-chunk text. Format, load order, and
+Save-button behavior: [`level-persistence.md`](level-persistence.md).

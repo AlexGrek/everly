@@ -1,6 +1,6 @@
 //! Serializable actor snapshots for level save/load.
 //!
-//! Written to `levels/level_{name}/actors.json` when the map editor saves geometry.
+//! Written to `levels/level_{name}/actors.json` when the map editor Save button runs.
 
 use std::fs;
 use std::io;

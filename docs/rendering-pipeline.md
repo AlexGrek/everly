@@ -6,13 +6,12 @@ This is the current chunk rendering flow in `src/map/hypermap_world.rs`.
 
 - Read strategy camera focus.
 - Resolve current chunk and local position.
-- Compute directional target set (4 chunks).
+- Compute three-chunk target set (current + one X neighbor + one Y neighbor; see `hypermap.md`).
 - Queue despawns for chunks leaving visibility.
 - For new targets:
-  - Ensure chunk is generated (sync): new chunks start as a full road carpet
-    plus **procedural houses** inset by `PROCEDURAL_VOID_MARGIN` (perimeter,
-    interior partitions, door gaps); chunk `(0,0)` then receives the
-    `world_map.txt` overlay when present.
+  - Ensure chunk is generated (sync): new chunks use [`map_generator`](map-generator.md)
+    (seed rooms, walls, doors on a draft grid, then tile dump); chunk `(0,0)` then
+    receives the `world_map.txt` overlay when present.
   - Clone chunk cells for rendering.
   - Spawn async task to build render payload.
 

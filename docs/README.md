@@ -6,9 +6,12 @@ Current behavior docs:
 - `docs/hypermap.md` — Hypermap chunk model, multi-floor data, generation, visibility, and water rules.
 - `docs/rendering-pipeline.md` — runtime planning, async prep, 30 FPS render stream, floor vs wall meshes.
 - `docs/map-editor.md` — in-game hypermap edit mode (HUD, preview, placement, variants, remesh).
+- `docs/level-persistence.md` — **save/load**: level folder layout, Save button, binaries, actors, camera, load order.
+- `docs/map-generator.md` — procedural chunk geometry (`src/map/map_generator/`).
+- `docs/corners.md` — inner `c*` corner pillars (concave union elbows, detection algorithm).
 - `docs/actor.md` — actor trait runtime loop, movement buffer, footprint collision flow, **main tile** (`round(center)`), and usage examples.
 - `docs/chunk-overlay.md` — per-chunk RGBA overlays: temperature heatmap (F5), dirt, generic layer, occupancy debug (F4).
 - `docs/tile-fields.md` — tile-resolution scalar fields (dirt, temperature) and shared `TileFieldMap`.
 - `docs/field-interactions.md` — actor main-tile tracking and dirt deposits on tiles actors leave.
 
-Agent skills (repo): `.claude/SKILLS/map-creator/SKILL.md` (tilemaps + scale), `.claude/SKILLS/bevy-engineer/SKILL.md` (Bevy 0.18 + Everly map constants).
+Agent skills (repo): `.claude/SKILLS/map-creator/SKILL.md` (tilemaps + scale), `.claude/SKILLS/map-generator/SKILL.md` (procedural chunks + room walls), `.claude/SKILLS/bevy-engineer/SKILL.md` (Bevy 0.18 + Everly map constants).

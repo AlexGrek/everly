@@ -7,6 +7,7 @@
 //!   space-separated two-character tokens (same encoding as `world_map.txt`).
 //! - Floors omitted from the file are treated as all [`CellType::Void`].
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,7 @@ use bevy::prelude::*;
 use crate::map::hypermap::{
     ChunkCoord, Hypermap, HypermapChunk, LocalCoord, HYPERMAP_CHUNK_SIZE, HYPERMAP_FLOOR_COUNT,
 };
+use crate::map::tile_field_level::{save_dirt_bin, save_temperature_bin};
 use crate::map::world_map::{cell_to_token, parse_cell_token, parse_style_token, CellType, TileStyle};
 
 /// Active level folder name under `levels/level_{name}/`. Currently fixed to `"default"`.
@@ -220,6 +222,87 @@ pub fn save_level_geometry_for_chunks(
 /// Writes every in-memory chunk (any chunk ever generated) to disk.
 pub fn save_all_loaded_level_geometry(level_name: &str, map: &Hypermap<CellType>) -> io::Result<usize> {
     save_level_geometry_for_chunks(level_name, map, map.loaded_chunks())
+}
+
+/// Counts written by [`save_full_generated_level`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LevelSaveReport {
+    pub geometry_chunks: usize,
+    pub floor_style_chunks: usize,
+    pub wall_style_chunks: usize,
+    pub dirt_chunks: usize,
+    pub temperature_chunks: usize,
+    pub metadata_chunks: usize,
+}
+
+/// Union of every chunk coordinate currently allocated in the level hypermaps.
+pub fn loaded_chunk_coord_union(
+    cell_map: &Hypermap<CellType>,
+    dirt_map: &Hypermap<f32>,
+    temperature_map: &Hypermap<f32>,
+    style_floor_map: &Hypermap<TileStyle>,
+    style_wall_map: &Hypermap<TileStyle>,
+) -> Vec<ChunkCoord> {
+    let mut set = HashSet::new();
+    for coord in cell_map.loaded_chunks() {
+        set.insert(coord);
+    }
+    for coord in dirt_map.loaded_chunks() {
+        set.insert(coord);
+    }
+    for coord in temperature_map.loaded_chunks() {
+        set.insert(coord);
+    }
+    for coord in style_floor_map.loaded_chunks() {
+        set.insert(coord);
+    }
+    for coord in style_wall_map.loaded_chunks() {
+        set.insert(coord);
+    }
+    set.into_iter().collect()
+}
+
+/// Persists all in-memory generated chunks: geometry, styles, dirt, temperature, and metadata.
+pub fn save_full_generated_level(
+    level_name: &str,
+    cell_map: &Hypermap<CellType>,
+    style_floor_map: &Hypermap<TileStyle>,
+    style_wall_map: &Hypermap<TileStyle>,
+    dirt_map: &Hypermap<f32>,
+    temperature_map: &Hypermap<f32>,
+    chunk_metadata: &crate::map::chunk_metadata::ChunkGeneratorMetadata,
+) -> io::Result<LevelSaveReport> {
+    let coords = loaded_chunk_coord_union(
+        cell_map,
+        dirt_map,
+        temperature_map,
+        style_floor_map,
+        style_wall_map,
+    );
+    Ok(LevelSaveReport {
+        geometry_chunks: save_level_geometry_for_chunks(
+            level_name,
+            cell_map,
+            coords.iter().copied(),
+        )?,
+        floor_style_chunks: save_level_floor_style_for_chunks(
+            level_name,
+            style_floor_map,
+            coords.iter().copied(),
+        )?,
+        wall_style_chunks: save_level_wall_style_for_chunks(
+            level_name,
+            style_wall_map,
+            coords.iter().copied(),
+        )?,
+        dirt_chunks: save_dirt_bin(level_name, dirt_map, coords.iter().copied())?,
+        temperature_chunks: save_temperature_bin(level_name, temperature_map, coords.iter().copied())?,
+        metadata_chunks: crate::map::chunk_metadata::save_level_chunk_metadata(
+            level_name,
+            chunk_metadata,
+            cell_map,
+        )?,
+    })
 }
 
 /// Picks the next free `new_N` level name not already in `existing` (case-insensitive).

@@ -17,16 +17,17 @@ The starter scene gives you:
 
 On launch the player lands on a **main menu** that lists every folder
 under `levels/level_*/`. Picking one sets the active level and drops
-you into the world. Levels are stored as one text file per chunk under
-`levels/level_{name}/geometry/{x}_{y}.txt`; chunks not present on disk
-fall back to procedural generation (and the center chunk overlays
-`world_map.txt` if it exists).
+you into the world. Levels live under `levels/level_{name}/` (geometry per chunk, binary dirt/temperature,
+actors, camera). Chunks missing on disk are generated procedurally in memory; use the
+map editor **Save** button to persist (no autosave). The center chunk overlays
+`world_map.txt` only when it has no saved geometry file.
 
 For token format, **world scale** (1 m tiles, 0.2 m wall thickness, 3 m walls, storey spacing slightly above 3 m), and rendering semantics, see:
 
 - `docs/tilemap.md`
 - `docs/hypermap.md`
 - `docs/rendering-pipeline.md`
+- `docs/level-persistence.md` — save/load layout, load order, binary field format
 - `docs/map-editor.md` — in-game hypermap paint mode (Edit button, palette, preview, remesh)
 - `docs/actor.md` — actor low-level runtime, footprint/collision rules, and examples
 

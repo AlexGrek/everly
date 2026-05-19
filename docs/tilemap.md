@@ -98,6 +98,8 @@ in the chosen **corner** of the 1 m cell (same inset as slab centers in
 Other `c*` combinations are invalid. Parsed as `CellType::Corner` in
 `src/map/world_map.rs`; passability matches walls (blocked).
 
+Procedural placement at concave union elbows: **`docs/corners.md`**.
+
 ## Wall Types At Runtime
 
 Parsed cells use `CellType::Wall(WallMask)` or `CellType::Corner(WallCorner)`;

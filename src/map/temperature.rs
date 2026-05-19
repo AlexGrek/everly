@@ -7,7 +7,9 @@ use bevy::prelude::*;
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 
-use crate::map::hypermap::{ChunkCoord, Hypermap, LocalCoord, HYPERMAP_CHUNK_SIZE};
+use crate::map::hypermap::{random_rng_seed, ChunkCoord, Hypermap, LocalCoord, HYPERMAP_CHUNK_SIZE};
+use crate::map::level::LevelName;
+use crate::map::tile_field_level::{load_tile_field_bin, temperature_bin_path};
 use crate::map::hypermap_world::HypermapRuntime;
 use crate::map::tile_field::TileFieldMap;
 use crate::map::world_map::CellType;
@@ -24,7 +26,6 @@ pub const TEMP_MAX_C: f32 = 30.0;
 
 const COLD_PATCH_CHANCE: f32 = 0.04;
 const WARM_PATCH_CHANCE: f32 = 0.04;
-
 /// Maps stored °C to heatmap RGBA: blue (−30) → white (0) → yellow → red (+30).
 pub fn temperature_celsius_to_rgba(celsius: f32) -> [u8; 4] {
     let c = celsius.clamp(TEMP_MIN_C, TEMP_MAX_C);
@@ -56,6 +57,7 @@ fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> (f32, f32, f32) {
 pub struct TemperatureMap {
     field: TileFieldMap,
     seeded_chunks: Mutex<HashSet<ChunkCoord>>,
+    hydrated_level: Mutex<Option<String>>,
 }
 
 impl TemperatureMap {
@@ -87,7 +89,30 @@ impl TemperatureMap {
         self.field.take_dirty_chunks()
     }
 
-    pub fn ensure_chunk_seeded(&self, world: &Hypermap<CellType>, coord: ChunkCoord) {
+    fn hydrate_level_bin(&self, level_name: &str) {
+        let mut slot = self
+            .hydrated_level
+            .lock()
+            .expect("temperature hydrated_level lock poisoned");
+        if slot.as_deref() == Some(level_name) {
+            return;
+        }
+        *slot = Some(level_name.to_string());
+        drop(slot);
+
+        let path = temperature_bin_path(level_name);
+        if let Err(e) = load_tile_field_bin(&path, self.field.inner().write_map()) {
+            warn!("failed to load `{}`: {e}", path.display());
+        }
+        self.field.flush_if_pending();
+    }
+
+    pub fn ensure_chunk_seeded(
+        &self,
+        world: &Hypermap<CellType>,
+        coord: ChunkCoord,
+        level_name: &str,
+    ) {
         {
             let seeded = self
                 .seeded_chunks
@@ -102,37 +127,52 @@ impl TemperatureMap {
             return;
         };
 
-        let seed = temperature_chunk_seed(coord);
-        let mut rng = StdRng::seed_from_u64(seed);
+        self.hydrate_level_bin(level_name);
+        let from_bin = self.field.read_map().has_chunk(coord);
 
-        world.with_chunk_read(coord, |wchunk| {
-            self.field.inner().with_chunk_write(coord, |tchunk| {
-                for ly in 0..HYPERMAP_CHUNK_SIZE {
-                    for lx in 0..HYPERMAP_CHUNK_SIZE {
-                        let local = LocalCoord::new(lx, ly);
-                        let cell = *wchunk.get_local_floor(local, 0);
-                        if matches!(cell, CellType::Void) {
-                            continue;
+        if !from_bin {
+            let seed = temperature_chunk_seed(coord);
+            let mut rng = StdRng::seed_from_u64(seed);
+
+            world.with_chunk_read(coord, |wchunk| {
+                self.field.inner().with_chunk_write(coord, |tchunk| {
+                    for ly in 0..HYPERMAP_CHUNK_SIZE {
+                        for lx in 0..HYPERMAP_CHUNK_SIZE {
+                            let local = LocalCoord::new(lx, ly);
+                            let cell = *wchunk.get_local_floor(local, 0);
+                            if matches!(cell, CellType::Void) {
+                                continue;
+                            }
+                            let roll = rng.gen_range(0.0..1.0);
+                            let celsius = if roll < COLD_PATCH_CHANCE {
+                                rng.gen_range(-26.0..-6.0)
+                            } else if roll < COLD_PATCH_CHANCE + WARM_PATCH_CHANCE {
+                                rng.gen_range(6.0..26.0)
+                            } else {
+                                TEMP_ZERO_C
+                            };
+                            tchunk.set_local(local, celsius);
                         }
-                        let roll = rng.gen_range(0.0..1.0);
-                        let celsius = if roll < COLD_PATCH_CHANCE {
-                            rng.gen_range(-26.0..-6.0)
-                        } else if roll < COLD_PATCH_CHANCE + WARM_PATCH_CHANCE {
-                            rng.gen_range(6.0..26.0)
-                        } else {
-                            TEMP_ZERO_C
-                        };
-                        tchunk.set_local(local, celsius);
                     }
-                }
+                });
             });
-        });
+            self.field.flush_if_pending();
+        }
 
         self.seeded_chunks
             .lock()
             .expect("temperature seeded_chunks lock poisoned")
             .insert(coord);
         self.mark_dirty(coord);
+    }
+
+    /// Clears procedural temperature for `coord` so [`Self::ensure_chunk_seeded`] can run again.
+    pub fn reset_chunk_for_regeneration(&self, coord: ChunkCoord) {
+        self.seeded_chunks
+            .lock()
+            .expect("temperature seeded_chunks lock poisoned")
+            .remove(&coord);
+        self.field.reset_chunk(coord);
     }
 }
 
@@ -143,6 +183,7 @@ impl Plugin for TemperatureMapPlugin {
         app.insert_resource(TemperatureMap {
             field: TileFieldMap::new_ranged(TEMP_ZERO_C, TEMP_MIN_C, TEMP_MAX_C),
             seeded_chunks: Mutex::new(HashSet::new()),
+            hydrated_level: Mutex::new(None),
         })
         .add_systems(
             Update,
@@ -160,18 +201,15 @@ pub(crate) fn flush_temperature_map(temperature: Res<TemperatureMap>) {
 pub(crate) fn seed_temperature_for_visible_chunks(
     runtime: Res<HypermapRuntime>,
     temperature: Res<TemperatureMap>,
+    level: Res<LevelName>,
 ) {
     for coord in runtime.desired_chunk_coords() {
-        temperature.ensure_chunk_seeded(&runtime.map, coord);
+        temperature.ensure_chunk_seeded(&runtime.map, coord, level.0.as_str());
     }
 }
 
-fn temperature_chunk_seed(coord: ChunkCoord) -> u64 {
-    let x = coord.x as u64;
-    let y = coord.y as u64;
-    x.wrapping_mul(0x9E37_79B9_85F3_7D87)
-        ^ y.wrapping_mul(0xC2B2_AE3D_27D4_F4F5)
-        ^ 0x7E4D_0000_0002
+fn temperature_chunk_seed(_coord: ChunkCoord) -> u64 {
+    random_rng_seed()
 }
 
 #[cfg(test)]

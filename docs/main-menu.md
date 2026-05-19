@@ -67,11 +67,16 @@ The text after the prefix becomes the level name displayed on a button.
 
 On the next frame, every plugin's `OnEnter(GameState::InGame)` setup
 runs in order, including `setup_hypermap_runtime` →
-`setup_hypermap_assets`. As chunks come into view, `ensure_chunk_generated`
+`setup_hypermap_assets`. Actors and camera load from disk when their JSON
+files exist; geometry and tile fields load lazily per chunk. See
+[`level-persistence.md`](level-persistence.md) for the full timeline and file
+layout.
+
+As chunks come into view, `ensure_chunk_generated`
 in `src/map/hypermap_world.rs` looks for
 `levels/level_{name}/geometry/{x}_{y}.txt` first; missing chunks fall
 back to procedural generation (with `world_map.txt` overlaying only the
-center chunk).
+center chunk when that chunk has no geometry file).
 
 ## Creating a new level
 

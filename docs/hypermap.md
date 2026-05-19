@@ -13,19 +13,19 @@ This document describes the current runtime behavior of `HypermapWorldPlugin`.
 
 ## Generation
 
-- New chunks are generated synchronously.
-- Tiles are deterministic random (`ROAD` + directional `WALL`) by chunk seed.
-- Chunk `(0,0)` receives an overlay from `world_map.txt` after random fill (floor **0**).
-- When **`world_map_floor1.txt`** exists, the same center chunk’s **floor 1** is overwritten from that file (same rectangular size as floor 0 is recommended).
+- New chunks are generated synchronously when the camera needs them (see **Visibility** below).
+- If `levels/level_{name}/geometry/{x}_{y}.txt` is missing or invalid, the chunk is filled
+  with the procedural map generator ([`map-generator.md`](map-generator.md)) using a fresh
+  random seed (in memory only until the map editor **Save** button).
+- Chunk `(0,0)` receives `world_map.txt` / `world_map_floor1.txt` overlays **only when**
+  procedurally generated (no geometry file on disk yet).
 
 ## Level geometry on disk
 
-Before procedural fill, `ensure_chunk_generated` looks for
-`levels/level_{name}/geometry/{chunk_x}_{chunk_y}.txt` (see `src/map/level.rs` and
-`LevelName`, default `default`). If the file exists and parses, that chunk is filled from
-disk only — **no** `world_map.txt` / `world_map_floor1.txt` overlay for that chunk. If the
-file is missing or invalid, generation falls back to the procedural neighborhood plus the
-center-chunk overlays described above.
+`ensure_chunk_generated` tries `levels/level_{name}/geometry/{chunk_x}_{chunk_y}.txt` first.
+If the file exists and parses, the chunk is loaded from disk. Otherwise the procedural
+generator runs (random seed). Persist geometry, styles, dirt, temperature, actors, and
+camera with the map editor **Save** button — see [`level-persistence.md`](level-persistence.md).
 
 ## Static Passability Mirror
 
@@ -61,35 +61,34 @@ shadows the world `Hypermap<CellType>`. Every cell stores the value of
 - **Not yet wired into pathfinding.** The data store is ready for future
   integration.
 
-## Visibility Window (Directional)
+## Visibility window (3 chunks)
 
-Exactly 4 chunks are targeted for rendering:
+Exactly **three** chunks are targeted for rendering at any time:
 
-1. Camera current chunk
-2. North of current chunk
-3. West or east chunk (based on camera local X proximity)
-4. North of that side chunk
+1. The chunk under the camera focus
+2. One neighbor on the **X** axis — east if focus local `x ≥ 64`, else west
+3. One neighbor on the **Y** axis — north if focus local `y ≥ 64`, else south
 
-South is intentionally excluded.
+(World `x` / `z` map to chunk `x` / `y` via `world_to_chunk_local`.)
 
-## Dead Zone
+## Dead zone
 
-- A `20x20` center area inside the current chunk acts as a change-free zone.
-- While camera remains in this area (and chunk unchanged), target chunk set is
-  not recomputed.
+- A `20×20` cell region centered in the current chunk acts as a change-free zone.
+- While the camera stays inside it **and** the center chunk is unchanged, the
+  three-chunk target set is not recomputed (avoids flicker when crossing the
+  chunk midline).
+- Leaving the dead zone toward a border updates which side chunk is prefetched.
 
 ## Water Rule
 
 - A water plane is spawned only when floor `0` contains at least one `VOID` cell
   **strictly inside** an inset of `WATER_MESH_EDGE_STRIP` cells from each chunk
-  edge (`2`, same as `PROCEDURAL_VOID_MARGIN` in `src/map/hypermap_world.rs`).
-  Procedural chunks no longer have a void ring at all — the border band is
-  always road — so chunks only get water when something authored or a
-  procedural pond places interior void.
+  edge (`2`, same as [`CHUNK_VOID_MARGIN`](../../src/map/map_generator/types.rs) /
+  `WATER_MESH_EDGE_STRIP` in `src/map/hypermap_world.rs`). Procedural fill uses a
+  **void** margin ring; only interior `Open` / room tiles are road — so water
+  appears only when authored geometry or future generator steps place interior void.
 - The water mesh is sized to that **interior** square only, so water never covers
   the chunk border band even when interior void triggers it.
-- Rare interior ponds (`PROCEDURAL_POND_CHUNK_CHANCE`) carve void on roads and
-  still qualify for water when the void lies inside the strip inset.
 
 ## Concurrency and Locking
 

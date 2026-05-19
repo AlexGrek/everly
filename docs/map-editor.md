@@ -7,7 +7,7 @@ This editor updates the **live hypermap** chunk data (see `hypermap.md`) and tri
 ## Enabling the palette
 
 1. Press **Edit** in the bottom HUD (next to **Map**). The label toggles between `Edit` and `Edit ✓`.
-2. A **palette strip** appears just above the 52 px bottom bar: buttons **Void**, **Road**, **Wall**, **Room**, **Corner**, and **Save**.
+2. A **palette strip** appears just above the 52 px bottom bar: tile brushes, **Save**, and **Re-gen**.
 3. Press **Edit** again to close the palette. Closing also clears any active placement brush.
 
 HUD wiring for the toggle lives in `src/hud/game_hud.rs`; the palette root is spawned by `spawn_map_edit_palette` in `src/edit/map_edit.rs` (scheduled after `spawn_bottom_hud` in `GamePlugin`).
@@ -46,27 +46,28 @@ Hover and **stroke start / end** (mouse down / up over the map) are ignored when
 
 Hover uses a ray from the **strategy camera** through the cursor, intersected with a horizontal plane at the active floor’s `y`. Floor indices match the hypermap: world `x` / `z` integer floors are the tile column / row used by `world_to_chunk_local` in `src/map/hypermap.rs` and chunk rendering (see `hypermap.md`).
 
-## Level geometry save / load
+## Re-generate
 
-- **Save** (palette button): writes each chunk in the **current render window**
-  (`HypermapRuntime::desired_chunks` — same set `ensure_chunk_generated` keeps meshed) to
-  `levels/level_{name}/geometry/{chunk_x}_{chunk_y}.txt` (relative to the process working directory).
-  `name` comes from the `LevelName` resource in `src/map/level.rs` (default **`default`**).
-  Chunks that are not yet loaded in the hypermap are skipped.
-- **Format:** `# floor N` sections (`N` in `0..=9`), each followed by `HYPERMAP_CHUNK_SIZE`
-  lines of space-separated two-character tokens (same encoding as `tilemap.md`).
-  Floors that are entirely void are omitted from the file; missing floors load as void.
-- **Load:** when a chunk is first generated, `ensure_chunk_generated` tries that path
-  before procedural fill. If a file exists and parses, `world_map.txt` / `world_map_floor1.txt`
-  overlays are **not** applied for that chunk (the level file is authoritative). If the file
-  is missing or invalid, behavior falls back to procedural generation plus center-chunk overlays.
-- **Level name:** the `LevelName` resource in `src/map/level.rs` (default `default`) picks the folder under `levels/`. The active value is set by the **main menu** (see [`main-menu.md`](main-menu.md)) when the player picks a level, before the world is generated.
+The palette **Re-gen** button targets the **camera’s current chunk** (same chunk index as
+`StrategyCamera` focus → `world_to_chunk_local`):
 
-- **In memory** while playing: edited cells live in `HypermapRuntime` (`Arc<Hypermap<CellType>>` plus the mirrored passability map in `src/map/hypermap_world.rs`).
-- **On disk** via **Save** and the `levels/level_{name}/geometry/` layout above.
-- **Startup overlay:** `world_map.txt` / `world_map_floor1.txt` still apply only when
-  generating the center chunk **from** procedural defaults (no level geometry file for that chunk).
-- **Remesh** applies to whichever **chunk** contains `(x, z)`; the visible set is still driven by the strategy camera and chunk visibility rules in `hypermap_world`.
+1. Despawns every actor whose main tile lies on that chunk (clears dynamic footprints first).
+2. Overwrites the chunk with a **fresh procedural** layout (`fill_procedural_chunk` via
+   [`regenerate_procedural_chunk`](../src/map/hypermap_world.rs)) — no reload from
+   `levels/.../geometry/`, no `world_map.txt` overlay.
+3. Resets floor/wall styles, dirt, and temperature for that chunk, then re-seeds dirt/temperature.
+4. Queues a chunk remesh.
+
+Does **not** write to disk; use **Save** to persist.
+
+## Save
+
+The palette **Save** button is the **only** persistence path (no autosave). It flushes
+dirt/temperature write buffers, calls `save_full_generated_level` in `src/map/level.rs`,
+then writes `actors.json` and `camera.json`.
+
+Full layout, load order, binary `EVTF` format, chunk union rules, and what is *not*
+saved are documented in [`level-persistence.md`](level-persistence.md).
 
 ## Related code
 

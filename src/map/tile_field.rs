@@ -82,6 +82,23 @@ impl TileFieldMap {
             .insert(coord);
     }
 
+    /// Resets every tile in `coord` to [`Self::default_value`] and drops write-buffer
+    /// data so the next [`DoubleBufferedHypermap::flush_if_pending`] promotes clean state.
+    pub fn reset_chunk(&self, coord: ChunkCoord) {
+        let default = self.default_value;
+        if self.inner.write_map().has_chunk(coord) {
+            self.inner.write_map().with_chunk_write(coord, |chunk| {
+                for ly in 0..HYPERMAP_CHUNK_SIZE {
+                    for lx in 0..HYPERMAP_CHUNK_SIZE {
+                        chunk.set_local(LocalCoord::new(lx, ly), default);
+                    }
+                }
+            });
+        }
+        self.mark_dirty(coord);
+        self.flush_if_pending();
+    }
+
     pub fn take_dirty_chunks(&self) -> HashSet<ChunkCoord> {
         std::mem::take(
             &mut *self

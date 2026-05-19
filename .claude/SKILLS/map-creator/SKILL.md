@@ -12,6 +12,7 @@ paths:
   - "world_map_floor1.txt"
   - "docs/tilemap.md"
   - "docs/hypermap.md"
+  - "docs/level-persistence.md"
   - "docs/rendering-pipeline.md"
   - "scripts/generate_world_map.py"
   - "src/map/floor_level.rs"
@@ -33,9 +34,10 @@ Add new **`scripts/*.py`** helpers here (validators, exporters, other generators
 
 1. Read **`docs/tilemap.md`** — canonical encoding (void, road, wall bitmask → world **XZ** via `for_each_wall_segment`, token rules) and **world units**.
 2. For multi-floor overlays and chunk visibility, skim **`docs/hypermap.md`** and **`docs/rendering-pipeline.md`**.
-3. Parser lives in **`src/map/world_map.rs`** (`parse_cell_token`, `WallMask`, `MASK_*`). Runtime must stay aligned with docs.
-4. Vertical spacing and camera floor height live in **`src/map/floor_level.rs`** (`HYPERMAP_WALL_HEIGHT`, `HYPERMAP_FLOOR_HEIGHT`).
-5. If the task is **regenerate or refactor the default map layout**, read **`scripts/generate_world_map.py`** first (or run it and diff `world_map.txt`).
+3. For **`levels/level_{name}/`** save/load (geometry, `dirt.bin`, actors, no autosave), read **`docs/level-persistence.md`**.
+4. Parser lives in **`src/map/world_map.rs`** (`parse_cell_token`, `WallMask`, `MASK_*`). Runtime must stay aligned with docs.
+5. Vertical spacing and camera floor height live in **`src/map/floor_level.rs`** (`HYPERMAP_WALL_HEIGHT`, `HYPERMAP_FLOOR_HEIGHT`).
+6. If the task is **regenerate or refactor the default map layout**, read **`scripts/generate_world_map.py`** first (or run it and diff `world_map.txt`).
 
 ## World scale (authoring mental model)
 
@@ -99,3 +101,5 @@ python3 scripts/generate_world_map.py --output path/to/world_map.txt
 ## When Rust or scripts change
 
 If you add tokens or change bitmask rules, update **`docs/tilemap.md`**, **`parse_cell_token`**, and any procedural stampers in **`src/map/hypermap_world.rs`**. If you change **vertical scale** (wall height, storey spacing, clearance), update **`src/map/floor_level.rs`**, **`docs/tilemap.md`**, **`docs/rendering-pipeline.md`**, and this skill’s **World scale** table so they stay aligned. If the **Python generator** encodes walls or tokens, keep **`scripts/generate_world_map.py`** in sync with the same bitmask rules, then re-run it so **`world_map.txt`** matches.
+
+**Procedural chunk rooms** (`src/map/map_generator/`) are a separate path — use **`.claude/SKILLS/map-generator/SKILL.md`**, not this skill’s corner-pillar layout for rectangular room outlines.

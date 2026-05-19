@@ -13,6 +13,15 @@ The actor subsystem provides:
 
 The low-level pipeline is deterministic and synchronous. High-level planning is expected to run separately (for example, in async systems), then feed intent into `move_buffer`.
 
+## Level persistence
+
+On `InGame` enter, [`ActorSnapshotPlugin`](../src/actor/snapshot.rs) loads
+`levels/level_{name}/actors.json` when present and spawns saved glitch/black bots
+with [`LevelActor`](../src/actor/snapshot.rs). Dynamic passability footprints are
+restored immediately after spawn. Positions and state are written only when the
+player presses map editor **Save** (same action as geometry). Full format and load
+order: [`level-persistence.md`](level-persistence.md).
+
 ## Per-frame lifecycle
 
 For each `ActorObject`, the actor system runs:
@@ -73,7 +82,7 @@ Canonical API: [`actor_main_tile`](../src/actor/mod.rs) and [`ActorState::main_t
 
 | API | Quantization | Used for |
 |-----|----------------|----------|
-| `actor_main_tile(center)` | **round** | Field interactions (`field_main_tile`), [`BlackBot`](../src/actor/black_bot.rs) path think (`BlackBotVisual.main_tile`) |
+| `actor_main_tile(center)` | **round** | Field interactions (`field_main_tile`), [`BlackBot`](../src/actor/black_bot.rs) inspector (`BlackBotVisual.main_tile`) |
 | `center_subtile_i32()` | **floor**(`center × 5`) | Passability grid, footprints, collision (first frame only) |
 | `center_tile_i32()` | **floor**(`center`) | Legacy helper; prefer `actor_main_tile` for tile identity |
 

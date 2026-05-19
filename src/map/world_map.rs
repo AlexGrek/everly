@@ -52,6 +52,34 @@ impl WallMask {
     }
 }
 
+/// Wall mask for a cell on an axis-aligned rectangle border (one bit per outer edge).
+///
+/// Matches the map editor **Room** brush and [`for_each_wall_segment`]: north toward
+/// **−Z**, south toward **+Z**.
+pub(crate) fn perimeter_wall_mask(
+    cx: i32,
+    cz: i32,
+    min_x: i32,
+    max_x: i32,
+    min_z: i32,
+    max_z: i32,
+) -> WallMask {
+    let mut bits = 0u8;
+    if cz == max_z {
+        bits |= MASK_SOUTH;
+    }
+    if cz == min_z {
+        bits |= MASK_NORTH;
+    }
+    if cx == max_x {
+        bits |= MASK_EAST;
+    }
+    if cx == min_x {
+        bits |= MASK_WEST;
+    }
+    WallMask::from_bits(bits).expect("border cell lies on at least one outer edge")
+}
+
 /// Which corner of a 1 m × 1 m cell holds a [`CellType::Corner`] pillar (same
 /// thickness as wall slabs: [`WALL_THICKNESS`]). Numpad on a north-up map row:
 /// `7` NW, `9` NE, `1` SW, `3` SE.
@@ -456,6 +484,11 @@ pub struct TileStyle(pub [u8; 2]);
 impl TileStyle {
     /// No explicit style set. Each cell type renders with its default material.
     pub const DEFAULT: TileStyle = TileStyle([b'.', b'.']);
+    /// Default road floor (`fr`).
+    pub const FLOOR_ROAD: TileStyle = TileStyle([b'f', b'r']);
+    pub const FLOOR_GLASS: TileStyle = TileStyle([b'f', b'g']);
+    pub const FLOOR_PAVEMENT: TileStyle = TileStyle([b'f', b'p']);
+    pub const FLOOR_MARBLE: TileStyle = TileStyle([b'f', b'm']);
 
     /// Raw bytes as a `str`. Always valid UTF-8 (the parser enforces ASCII).
     pub fn as_str(&self) -> &str {

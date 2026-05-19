@@ -13,6 +13,7 @@ paths:
   - "src/map/temperature.rs"
   - "src/map/temperature_overlay.rs"
   - "docs/field-interactions.md"
+  - "docs/level-persistence.md"
   - "docs/actor.md"
   - "src/actor/mod.rs"
   - "src/actor/black_bot.rs"
@@ -48,10 +49,11 @@ paths:
 ## Preferred workflow
 
 1. Read `docs/field-interactions.md`.
-2. For movement/tracking changes, read `docs/actor.md` and actor-engineer skill.
-3. Add field-specific logic beside shared helpers in `field_interactions.rs`.
-4. Keep hot path allocation-free after the transition `Vec` (reuse later if needed).
-5. `cargo check` and `cargo test field_interactions`.
+2. For save/load of `dirt.bin` / `temperature.bin`, read `docs/level-persistence.md`.
+3. For movement/tracking changes, read `docs/actor.md` and actor-engineer skill.
+4. Add field-specific logic beside shared helpers in `field_interactions.rs`.
+5. Keep hot path allocation-free after the transition `Vec` (reuse later if needed).
+6. `cargo check` and `cargo test field_interactions`.
 
 ## Adding another tile field (e.g. temperature actor coupling)
 

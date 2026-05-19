@@ -274,9 +274,24 @@ pub fn line_of_sight(map: &Hypermap<f32>, a: (i32, i32), b: (i32, i32)) -> bool 
 /// detected bend (clamped to the path bounds). The tile-level line-of-sight
 /// test ignores actor radius, so a single bend waypoint can leave a wide
 /// follower hugging a wall too tightly to make the turn; a small buffer
-/// (typically `1` or `2`) gives the follower axis-aligned approach and
-/// departure waypoints around each corner.
+/// (typically `1`) gives the follower axis-aligned approach and departure
+/// tiles around each corner. When `corner_buffer > 0`, a second string-pull
+/// pass with zero buffer collapses redundant buffered tiles while keeping
+/// bends that still require a detour.
 pub fn simplify_path_line_of_sight(
+    map: &Hypermap<f32>,
+    path: &[(i32, i32)],
+    corner_buffer: usize,
+) -> Vec<(i32, i32)> {
+    let buffered = simplify_path_line_of_sight_pass(map, path, corner_buffer);
+    if corner_buffer == 0 || buffered.len() <= 2 {
+        buffered
+    } else {
+        simplify_path_line_of_sight_pass(map, &buffered, 0)
+    }
+}
+
+fn simplify_path_line_of_sight_pass(
     map: &Hypermap<f32>,
     path: &[(i32, i32)],
     corner_buffer: usize,
@@ -581,8 +596,16 @@ mod tests {
 
         let buffered = simplify_path_line_of_sight(&map, &raw, 1);
         assert!(
-            buffered.len() >= simplified.len() + 2,
-            "buffer=1 should keep approach + departure tiles around each bend: {buffered:?}",
+            simplified.len() >= 3,
+            "corner path must keep at least one bend: {simplified:?}",
+        );
+        assert!(
+            buffered.len() <= simplified.len() + 2,
+            "buffered path should not grow much after the second string-pull: {buffered:?}",
+        );
+        assert!(
+            buffered.len() >= 3,
+            "buffered path must still bend around the wall: {buffered:?}",
         );
     }
 

@@ -32,6 +32,11 @@ wall height vs storey spacing), see `docs/tilemap.md` and `src/map/floor_level.r
 When authoring or refactoring `world_map.txt`, `world_map_floor1.txt`, or map
 encoding, read `.claude/SKILLS/map-creator/SKILL.md` first.
 
+When editing procedural chunk generation (`src/map/map_generator/`), room
+outlines, or `fill_procedural_chunk`, read `.claude/SKILLS/map-generator/SKILL.md`
+and `docs/map-generator.md` first. For inner corner pillars (`c*`,
+`corner_pillars.rs`), also read `docs/corners.md`.
+
 When editing actor runtime code (`src/actor/`) or actor/passability movement
 integration, read `.claude/SKILLS/actor-engineer/SKILL.md` first.
 
@@ -57,6 +62,7 @@ everly/
 ├── .claude/SKILLS/       # repo-local skills (read these first)
 │   ├── bevy-engineer/
 │   ├── map-creator/
+│   ├── map-generator/
 │   └── actor-engineer/
 └── src/
     ├── main.rs                   # window setup + DefaultPlugins + GamePlugin
@@ -72,7 +78,7 @@ everly/
     │   ├── hypermap.rs           #   chunked, concurrent tile store
     │   ├── floor_level.rs        #   ActiveFloorLevel + storey-height constants
     │   ├── world_map.rs          #   `.txt` parser, CellType, wall masks
-    │   ├── level.rs              #   LevelPlugin + `levels/level_{name}/geometry/{x}_{y}.txt`
+    │   ├── level.rs              #   LevelPlugin + level save/load (`docs/level-persistence.md`)
     │   ├── hypermap_world.rs     #   HypermapWorldPlugin (chunk meshing + water)
     │   └── hypermap_pathfind.rs  #   A* over hypermap floors
     └── edit/                     # in-game editing tools
