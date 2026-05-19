@@ -22,6 +22,7 @@ For each `ActorObject`, the actor system runs:
 3. `prepare_movement()`
 4. `try_move(passability)`
 5. After all actors, flush passability write buffer into read buffer.
+6. Field interactions (e.g. dirt) — after movement; see `docs/field-interactions.md`.
 
 This means movement for frame `N` writes occupancy into passability write buffer, and that occupancy becomes visible from read buffer after flush at end of frame.
 
@@ -39,6 +40,7 @@ This means movement for frame `N` writes occupancy into passability write buffer
 - `last_movement_error: Option<ActorMovementError>` — cleared every low-level step.
 - `last_accepted_center_subtile: Option<IVec2>` — integer subtile center of the last accepted occupancy update; `None` for a brand-new actor.
 - `last_accepted_radius_subtiles: i32` — radius (in subtiles) of that last accepted footprint; tracked separately from `radius_subtiles` so an actor that resizes still re-stamps the correct old circle on rejection.
+- `field_main_tile: Option<IVec2>` — last observed **main tile** for hypermap field coupling (dirt, etc.); see [Main tile](#main-tile) and `docs/field-interactions.md`.
 
 > **Previous-footprint encoding.** The previous frame's occupied cells are described compactly by the `(last_accepted_center_subtile, last_accepted_radius_subtiles)` pair and the baked `CircleShadow` for that radius — *not* by storing a `Vec<IVec2>`. This keeps the per-actor hot path allocation-free; self-overlap is an `O(1)` bitmap test against the previous shadow.
 
@@ -58,6 +60,26 @@ A typical continuous-movement actor (like `GlitchBot`) computes velocity in subt
 - `1 tile = 5 subtiles` (`SUBTILE_COUNT`).
 - Collision and occupancy tests are performed in **integer subtiles** via `subtile_shift`.
 - `center` is always float tile coordinates; it advances by `tile_delta` every frame, never quantized to the subtile grid.
+
+### Main tile
+
+**Main tile** = which world tile an actor is nearest to, derived from float `center`:
+
+```text
+main_tile = (round(center.x), round(center.y))   // tile units, 1 unit = 1 m
+```
+
+Canonical API: [`actor_main_tile`](../src/actor/mod.rs) and [`ActorState::main_tile_i32`](../src/actor/mod.rs).
+
+| API | Quantization | Used for |
+|-----|----------------|----------|
+| `actor_main_tile(center)` | **round** | Field interactions (`field_main_tile`), [`BlackBot`](../src/actor/black_bot.rs) path think (`BlackBotVisual.main_tile`) |
+| `center_subtile_i32()` | **floor**(`center × 5`) | Passability grid, footprints, collision (first frame only) |
+| `center_tile_i32()` | **floor**(`center`) | Legacy helper; prefer `actor_main_tile` for tile identity |
+
+Do **not** use `floor(center)` for main-tile or field logic — an actor spawned at tile center `(0.5, 0.5)` would be assigned the wrong tile. Subtile collision intentionally keeps `floor` so the footprint stays inside the subtile that contains the float position.
+
+After [`process_actors`](../src/actor/mod.rs), [`dirt_actor_interaction`](../src/map/field_interactions.rs) updates `field_main_tile` and applies field rules to the tile the actor **left** when main tile changes. See `docs/field-interactions.md`.
 
 ## Movement and collision
 

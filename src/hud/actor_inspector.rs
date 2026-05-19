@@ -422,19 +422,16 @@ fn sync_actor_hover_tooltip(
         return;
     };
 
-    let Ok(window) = window.single() else {
-        return;
-    };
     let Ok((camera, cam_gt)) = cameras.single() else {
         return;
     };
 
     let anchor = world_tf.translation() + Vec3::Y * 0.75;
-    let Ok(mut screen) = camera.world_to_viewport(cam_gt, anchor) else {
+    let Ok(screen) = camera.world_to_viewport(cam_gt, anchor) else {
         *vis = Visibility::Hidden;
         return;
     };
-    screen.y = window.height() - screen.y;
+    // `world_to_viewport` already returns top-left viewport pixels (same as UI `top`).
 
     for mut text in &mut tooltip_text {
         **text = display_actor_name(name.as_str());

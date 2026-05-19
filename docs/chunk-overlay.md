@@ -4,25 +4,23 @@
 
 ## What it does
 
-The overlay system maintains two transparent RGBA planes per visible chunk,
-floating above the floor mesh.  Both are driven entirely from the CPU.
+The overlay system maintains transparent RGBA planes per visible chunk,
+floating above the floor mesh. Layers are driven from the CPU.
 
 | Layer | Y offset | Purpose |
 |---|---|---|
-| Dirt | 0.0005 m | Transparent black stains from [`DirtMap`](../src/map/dirt.rs) (10×10 / tile) |
+| Temperature | 0.0004 m | Warm tint from [`TemperatureMap`](../src/map/temperature.rs) |
+| Dirt | 0.0005 m | Black stains from [`DirtMap`](../src/map/dirt.rs) |
 | Generic | 0.001 m | Writable canvas for any system |
 | Occupancy | 0.002 m | Debug: subtile passability flags |
 
-## Texture layout
-
-Both layers share the same geometry and texture format:
+## Subtile overlays (generic + occupancy)
 
 | Property | Value |
 |---|---|
 | Resolution | `OVERLAY_RES × OVERLAY_RES` = 640 × 640 (`CHUNK_SIZE=128 × SUBTILE_COUNT=5`) |
 | Texel footprint | 0.2 m × 0.2 m (one subtile) |
 | Format | `Rgba8UnormSrgb` |
-| Default state | All texels transparent (`alpha = 0`) |
 | Material | `unlit`, `AlphaMode::Blend`, `cull_mode: None` |
 
 Pixel address for subtile `(sx, sy)` inside chunk-local tile `(tx, ty)`:
@@ -35,18 +33,24 @@ idx = (py * OVERLAY_RES as usize + px) * 4
 
 ---
 
-## Dirt layer
+## Tile field overlays (dirt, temperature)
 
-`DirtOverlayPlugin` + `DirtMapPlugin` (`src/map/dirt.rs`, `src/map/dirt_overlay.rs`).
+Shared layout via [`tile_field`](../src/map/tile_field.rs) — **one texel per world tile**:
 
 | Property | Value |
 |---|---|
-| Resolution | `DIRT_OVERLAY_RES` = 1280 × 1280 (`DIRT_SUBDIV` = 10 per tile) |
-| Texel footprint | 0.1 m × 0.1 m |
-| Data | `DoubleBufferedHypermap<DirtTile>` — writes to back buffer, overlay reads front after [`flush_merge`](../src/map/hypermap.rs) |
-| Appearance | RGB black; alpha = dirt × 255 |
-| Seeding | On first visit: ~6% of non-void ground tiles get uniform dirt `0.1..=0.3` (chunk-seeded RNG) |
-| Actor tracks | +`0.01` per dirt sample on tiles actors **leave** — see `docs/field-interactions.md` |
+| Resolution | `TILE_FIELD_OVERLAY_RES` = 128 × 128 per chunk |
+| Texel footprint | 1 m × 1 m |
+| Storage | `DoubleBufferedHypermap<f32>` — one scalar per tile (floor `0`) |
+| Flush | [`flush_merge`](../src/map/hypermap.rs) when write buffer non-empty |
+
+### Dirt
+
+`DirtOverlayPlugin` + `DirtMapPlugin` — black RGB, alpha = dirt × 255. Seeding ~6% of non-void tiles at `0.1..=0.3`; actors add [`DIRT_TRACK_DEPOSIT`](../src/map/dirt.rs) on tiles they leave (`docs/field-interactions.md`).
+
+### Temperature
+
+`TemperatureOverlayPlugin` + `TemperatureMapPlugin` — warm RGB `(220, 70, 40)`, alpha ∝ temperature. Seeding ~5% of non-void tiles at `0.15..=0.4` (chunk-seeded RNG). No actor coupling yet.
 
 ---
 
@@ -85,8 +89,6 @@ fn my_overlay_system(
     }
 
     // Required: touch the material after every image write.
-    // MeshMaterial3d does not re-upload the texture unless the material is
-    // also marked dirty (Bevy bug #20269).
     materials.get_mut(mat_h);
 }
 ```
@@ -100,9 +102,7 @@ use crate::map::hypermap::{world_to_chunk_local, HYPERMAP_CHUNK_SIZE};
 use crate::map::passability::SUBTILE_COUNT;
 
 let (coord, local) = world_to_chunk_local(world_x, world_y);
-// local.x / local.y are in 0..HYPERMAP_CHUNK_SIZE
 
-// To shade the whole tile, iterate its 5×5 subtile block:
 for sy in 0..SUBTILE_COUNT {
     for sx in 0..SUBTILE_COUNT {
         let px = local.x as usize * SUBTILE_COUNT + sx;
@@ -112,6 +112,9 @@ for sy in 0..SUBTILE_COUNT {
     }
 }
 ```
+
+For **tile fields** (dirt / temperature), `px = local.x`, `py = local.y` at
+`TILE_FIELD_OVERLAY_RES` (128).
 
 ### Lifetime
 
@@ -138,34 +141,19 @@ snapshot of static geometry + actor footprints) and colours each of the
 ### Toggle
 
 Click **"Occ"** in the HUD bar, or press **F4**.  Off by default.
-The resource can also be set from code:
-
-```rust
-fn enable(mut enabled: ResMut<OccupancyOverlayEnabled>) {
-    enabled.0 = true;
-}
-```
 
 ### Update cadence and locking
 
-Refreshed at **~15 Hz** to limit GPU upload bandwidth
-(~14 MB/tick across 9 visible chunks).
+Refreshed at **~15 Hz** to limit GPU upload bandwidth.
 
 One `DoubleBufferedHypermap::with_chunk_read` call snapshots an entire
 128 × 128 tile block under a single `RwLock::read`, then the inner loop
-is pure array access — no per-subtile lock overhead.  If a passability
-chunk is absent (area never touched), the overlay is cleared to
-transparent, which correctly represents an all-passable area.
+is pure array access.
 
 ---
 
 ## Known limitation — Bevy #20269
 
 `MeshMaterial3d` does not listen for `AssetEvent<Image>` and will not
-re-upload a texture to the GPU when only the image asset changes.  The
-workaround applied throughout this module is to call
-`materials.get_mut(mat_handle)` after each image write, which marks the
-material dirty and forces a re-upload.  Both `image_for` and `material_for`
-on `ChunkOverlayState` exist precisely so external painters can apply the
-same workaround.  When the upstream bug is fixed, the `materials.get_mut`
-calls can be removed.
+re-upload a texture to the GPU when only the image asset changes.  Call
+`materials.get_mut(mat_handle)` after each image write.

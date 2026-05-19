@@ -85,6 +85,8 @@ use crate::menu::main_menu::GameState;
 // Constants
 // ---------------------------------------------------------------------------
 
+/// Temperature overlay (see `temperature_overlay`) — lowest field layer.
+pub const TEMPERATURE_OVERLAY_Y: f32 = 0.0004;
 /// Dirt overlay (see `dirt_overlay`) sits just below the generic layer.
 pub const DIRT_OVERLAY_Y: f32 = 0.0005;
 /// Generic overlay sits directly on the floor surface.

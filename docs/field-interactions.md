@@ -6,19 +6,15 @@ cross **main tile** boundaries after movement. Implementation lives in
 
 ## Main tile
 
-An actor's **main tile** is the nearest integer world tile to its tile-space center
-([`actor_main_tile`](../src/actor/mod.rs)):
+Defined in `docs/actor.md` § [Main tile](actor.md#main-tile). Summary:
 
 ```text
-main_tile = (round(center.x), round(center.y))
+main_tile = (round(center.x), round(center.y))   // via actor_main_tile(center)
 ```
 
-`center` is in **tile units** (1 unit = 1 m; see `docs/actor.md`). This is intentionally
-**not** the same as collision subtiles, which use `floor(center * SUBTILE_COUNT)`.
+All gameplay that asks “which tile is the actor in?” shares [`actor_main_tile`](../src/actor/mod.rs) — including [`BlackBot`](../src/actor/black_bot.rs) path think (`BlackBotVisual.main_tile`) and field deposits (`ActorState::field_main_tile`). Collision subtiles still use `floor(center × SUBTILE_COUNT)`; do not mix the two.
 
-Tracked in [`ActorState::field_main_tile`](../src/actor/mod.rs). Updated only in field
-interaction systems **after** [`process_actors`](../src/actor/mod.rs) so `center` reflects
-the completed movement step (including off-screen [`advance_unchecked`] travel).
+[`ActorState::field_main_tile`](../src/actor/mod.rs) is updated only in field interaction systems **after** [`process_actors`](../src/actor/mod.rs) so `center` reflects the completed movement step (including off-screen [`advance_unchecked`] travel).
 
 When `field_main_tile` was `Some(prev)` and `prev != current`, the actor **left**
 `prev` — field rules apply to **`prev`**, not the destination tile.
@@ -48,7 +44,10 @@ flush_actor_occupancy → process_actors → dirt_actor_interaction → seed_dir
 ## Dirt rule
 
 On each main-tile transition, add [`DIRT_TRACK_DEPOSIT`](../src/map/dirt.rs) (`0.01`) to
-every dirt sample in the **left** tile (clamped to `1.0`). Void tiles are skipped.
+the **left** tile's scalar dirt value (clamped to `1.0`). Void tiles are skipped.
+
+Dirt is stored in a **tile-only** [`DoubleBufferedHypermap<f32>`](../src/map/tile_field.rs)
+(one value per world tile), not per subtile.
 
 ## Adding a new field
 

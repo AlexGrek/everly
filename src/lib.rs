@@ -55,6 +55,8 @@ impl Plugin for GamePlugin {
                 map::passability::PassabilityMapPlugin,
             ))
             .add_plugins((
+                map::temperature::TemperatureMapPlugin,
+                map::temperature_overlay::TemperatureOverlayPlugin,
                 map::field_interactions::FieldInteractionsPlugin,
                 actor::ActorPlugin,
                 actor::snapshot::ActorSnapshotPlugin,

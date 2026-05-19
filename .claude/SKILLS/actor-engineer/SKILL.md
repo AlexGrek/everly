@@ -8,7 +8,9 @@ description: >-
 paths:
   - "src/actor/**/*.rs"
   - "src/map/passability.rs"
+  - "src/map/field_interactions.rs"
   - "docs/actor.md"
+  - "docs/field-interactions.md"
   - "src/lib.rs"
 ---
 
@@ -51,6 +53,8 @@ For generic Bevy API usage, still read `.claude/SKILLS/bevy-engineer/SKILL.md` f
 - Continuous-movement actors accumulate `direction * speed * dt` in a float accumulator; the integer part becomes `subtile_shift`, the fractional part carries forward.
 - Radius is integer subtiles; occupied shape is a baked integer circle.
 - The **world-subtile** coordinate (`IVec2`) passed into `is_static_subtile_passable` is absolute, not local; convert to a tile with `world_subtile.div_euclid(SUBTILE_COUNT as i32)`.
+- **Main tile** (which world tile the actor is in): always [`actor_main_tile`](../../src/actor/mod.rs) = `round(center)` in tile space. Used by field interactions and `BlackBot` think. Never `floor(center)` for this — see `docs/actor.md` § Main tile.
+- **Subtile grid** (collision): `floor(center * SUBTILE_COUNT)` via `center_subtile_i32` / `last_accepted_center_subtile` — separate from main tile.
 
 ## Per-actor static passability
 

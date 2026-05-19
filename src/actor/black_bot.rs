@@ -8,7 +8,7 @@
 //! float `center` is the canonical position, never snapped to the grid.
 //!
 //! Path-following "thinking" (waypoint advance, repath, heading update) runs
-//! only when the actor's **main tile** — `center.floor()` — changes between
+//! only when the actor's **main tile** — [`actor_main_tile`] — changes between
 //! frames. On every other frame the bot simply integrates the cached heading.
 //! Ground walker traversal rules (blocked by walls and void) are inherited
 //! from the default [`Actor`] impl.
@@ -22,8 +22,8 @@ use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
 use bevy::picking::prelude::Pickable;
 use crate::actor::snapshot::{BlackBotVisualSnap, MovementStateSnap, SerIVec2, SerVec2};
 use crate::actor::{
-    is_paused, process_actors, Actor, ActorMoveBuffer, ActorMovementError, ActorObject, ActorState,
-    OffScreenActor,
+    actor_main_tile, is_paused, process_actors, Actor, ActorMoveBuffer, ActorMovementError,
+    ActorObject, ActorState, OffScreenActor,
 };
 use crate::map::chunk_overlay::{ChunkOverlayState, OVERLAY_RES};
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap};
@@ -82,7 +82,7 @@ enum MovementState {
 
 #[derive(Component)]
 pub struct BlackBotVisual {
-    /// Last observed `floor(center)`. `None` forces a think on the first frame.
+    /// Last observed main tile ([`actor_main_tile`]). `None` forces think on first frame.
     main_tile: Option<IVec2>,
     /// Cached unit heading toward `path[path_index]`. Recomputed only on a
     /// main-tile change.
@@ -167,7 +167,7 @@ impl BlackBotVisual {
         self.main_tile = None;
 
         let center = state.center;
-        let current_tile = float_tile(center);
+        let current_tile = actor_main_tile(center);
         let here = (current_tile.x, current_tile.y);
 
         if let Some(path) = pick_random_target(&mut self.rng, here, passability) {
@@ -422,11 +422,6 @@ fn float_subtile(pos: Vec2) -> IVec2 {
     IVec2::new((pos.x * sc).floor() as i32, (pos.y * sc).floor() as i32)
 }
 
-#[inline]
-fn float_tile(pos: Vec2) -> IVec2 {
-    IVec2::new(pos.x.floor() as i32, pos.y.floor() as i32)
-}
-
 /// Decides direction and waypoint progression. Called only when the actor's
 /// main tile changes (or on first frame).
 fn think(
@@ -514,7 +509,7 @@ fn black_bot_think(
             if roll < BOT_COLLISION_REROUTE_CHANCE {
                 let distance = vis.rng.gen_range(1..=2) as f32;
                 let escape_dir = -vis.direction;
-                let current_tile = float_tile(state.center);
+                let current_tile = actor_main_tile(state.center);
                 let escape = (
                     (current_tile.x as f32 + escape_dir.x * distance).round() as i32,
                     (current_tile.y as f32 + escape_dir.y * distance).round() as i32,
@@ -537,7 +532,7 @@ fn black_bot_think(
         }
 
         let center = state.center;
-        let current_tile = float_tile(center);
+        let current_tile = actor_main_tile(center);
 
         let tile_changed = vis.main_tile != Some(current_tile);
         if tile_changed {
