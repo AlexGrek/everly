@@ -82,6 +82,7 @@ The callback is built fresh inside `try_move` from `self`, so it always reflects
    - prepare movement
    - try move
    - flush passability
+   - field interactions (e.g. dirt) — see `.claude/SKILLS/field-interactions/SKILL.md`
 5. Add/update unit tests in touched modules.
 6. Run `cargo check` and targeted tests:
    - `cargo test -p everly -- actor`

@@ -312,6 +312,23 @@ where
         self.read.replace_chunks(write_chunks);
     }
 
+    /// Copies every write-buffer chunk into the matching read-buffer chunk, then
+    /// clears the write buffer. Unchanged read chunks are preserved (unlike [`flush`]).
+    pub fn flush_merge(&self) {
+        let write_chunks = self.write.drain_chunks();
+        for (coord, handle) in write_chunks {
+            let src = handle.read().expect("chunk lock poisoned");
+            self.read.with_chunk_write(coord, |dst| {
+                for y in 0..HYPERMAP_CHUNK_SIZE {
+                    for x in 0..HYPERMAP_CHUNK_SIZE {
+                        let local = LocalCoord::new(x, y);
+                        dst.set_local(local, src.get_local(local).clone());
+                    }
+                }
+            });
+        }
+    }
+
     /// Direct access to the read-side [`Hypermap`].
     pub fn read_map(&self) -> &Hypermap<T> {
         &self.read
@@ -469,5 +486,17 @@ mod tests {
 
         db.flush();
         assert_eq!(db.loaded_chunk_count(), 1);
+    }
+
+    #[test]
+    fn double_buf_flush_merge_preserves_untouched_read_chunks() {
+        let db = DoubleBufferedHypermap::new(0i32);
+        db.read_map().set(0, 0, 11);
+        db.write_map().set(200, 0, 22);
+        db.flush_merge();
+
+        assert_eq!(db.get(0, 0), 11);
+        assert_eq!(db.get(200, 0), 22);
+        assert_eq!(db.write_map().loaded_chunk_count(), 0);
     }
 }

@@ -7,6 +7,7 @@ use bevy::ui::widget::Button;
 use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
 use crate::actor::black_bot::BlackBotVisual;
 use crate::actor::glitch_bot::GlitchBotVisual;
+use crate::map::hypermap_world::HypermapRuntime;
 use crate::actor::inspect::{collect_inspect_rows, display_actor_name};
 use crate::actor::ActorObject;
 use crate::menu::main_menu::GameState;
@@ -35,6 +36,8 @@ struct HoveredActor {
 struct ActorInspectorModal {
     open: bool,
     actor: Option<Entity>,
+    /// Bumped when modal body (rows/actions) should rebuild while staying open.
+    content_stamp: u32,
 }
 
 #[derive(Component)]
@@ -67,6 +70,15 @@ struct ActorInspectorRowsHost;
 #[derive(Component)]
 struct ActorInspectorRow;
 
+#[derive(Component)]
+struct ActorInspectorActionsHost;
+
+#[derive(Component)]
+struct ActorInspectorActionBtn;
+
+#[derive(Component)]
+struct BlackBotResetButton;
+
 pub struct ActorInspectorPlugin;
 
 impl Plugin for ActorInspectorPlugin {
@@ -86,6 +98,7 @@ impl Plugin for ActorInspectorPlugin {
                     sync_actor_hover_tooltip,
                     sync_actor_inspector_modal,
                     actor_inspector_close_input,
+                    black_bot_reset_button,
                 )
                     .run_if(in_state(GameState::InGame)),
             );
@@ -324,6 +337,16 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                         ));
 
                         card.spawn((
+                            ActorInspectorActionsHost,
+                            Node {
+                                width: Val::Percent(100.0),
+                                flex_direction: FlexDirection::Row,
+                                column_gap: Val::Px(8.0),
+                                ..default()
+                            },
+                        ));
+
+                        card.spawn((
                             ActorInspectorRowsHost,
                             Node {
                                 width: Val::Percent(100.0),
@@ -432,36 +455,98 @@ fn cursor_in_playfield(window: &Query<&Window>) -> bool {
     pos.y >= PLAYFIELD_BOTTOM_MARGIN_PX
 }
 
+fn spawn_black_bot_reset_button(parent: &mut ChildSpawnerCommands) {
+    parent
+        .spawn((
+            Name::new("BlackBot reset route"),
+            ActorInspectorActionBtn,
+            BlackBotResetButton,
+            Pickable::default(),
+            Button,
+            Node {
+                min_width: Val::Px(72.0),
+                height: Val::Px(32.0),
+                padding: UiRect::horizontal(Val::Px(14.0)),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(6.0)),
+                ..default()
+            },
+            BorderColor::all(CARD_BORDER),
+            BackgroundColor(Color::srgba(0.14, 0.16, 0.22, 0.9)),
+        ))
+        .with_children(|btn| {
+            btn.spawn((
+                Text::new("Reset"),
+                TextFont::from_font_size(14.0),
+                TextColor(TEXT_BRIGHT),
+            ));
+        });
+}
+
+fn black_bot_reset_button(
+    interactions: Query<&Interaction, (With<BlackBotResetButton>, Changed<Interaction>)>,
+    mut modal: ResMut<ActorInspectorModal>,
+    hypermap: Res<HypermapRuntime>,
+    mut actors: Query<(&mut ActorObject, &mut BlackBotVisual), With<ActorInspectable>>,
+) {
+    for interaction in &interactions {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        let Some(actor) = modal.actor else {
+            continue;
+        };
+        let Ok((mut obj, mut vis)) = actors.get_mut(actor) else {
+            continue;
+        };
+        vis.reset_route(
+            obj.inner.state_mut(),
+            &hypermap.static_passability_map,
+        );
+        modal.content_stamp = modal.content_stamp.wrapping_add(1);
+    }
+}
+
 fn sync_actor_inspector_modal(
     mut commands: Commands,
     modal: Res<ActorInspectorModal>,
     mut overlay: Query<&mut Visibility, With<ActorInspectorOverlay>>,
     mut title: Query<&mut Text, With<ActorInspectorTitle>>,
     mut badge: Query<&mut Text, (With<ActorInspectorKindBadge>, Without<ActorInspectorTitle>)>,
+    actions_host: Query<Entity, With<ActorInspectorActionsHost>>,
     rows_host: Query<Entity, With<ActorInspectorRowsHost>>,
     existing_rows: Query<Entity, With<ActorInspectorRow>>,
+    existing_actions: Query<Entity, With<ActorInspectorActionBtn>>,
     actor_names: Query<&Name, With<ActorInspectable>>,
     actors: Query<&ActorObject, With<ActorInspectable>>,
     black: Query<&BlackBotVisual>,
     glitch: Query<&GlitchBotVisual>,
+    mut last_content_stamp: Local<u32>,
 ) {
     let Ok(mut overlay_vis) = overlay.single_mut() else {
         return;
     };
 
-    if !modal.is_changed() && !modal.open {
-        return;
-    }
-
     if !modal.open {
         *overlay_vis = Visibility::Hidden;
+        *last_content_stamp = 0;
         for row in &existing_rows {
             commands.entity(row).despawn();
+        }
+        for action in &existing_actions {
+            commands.entity(action).despawn();
         }
         return;
     }
 
     *overlay_vis = Visibility::Inherited;
+
+    if !modal.is_changed() && *last_content_stamp == modal.content_stamp {
+        return;
+    }
+    *last_content_stamp = modal.content_stamp;
 
     let Some(actor) = modal.actor else {
         return;
@@ -469,6 +554,7 @@ fn sync_actor_inspector_modal(
 
     let kind_label;
     let rows;
+    let is_black_bot = black.get(actor).is_ok();
     if let Ok(vis) = black.get(actor) {
         kind_label = "BlackBot";
         let Ok(obj) = actors.get(actor) else {
@@ -497,11 +583,23 @@ fn sync_actor_inspector_modal(
         **text = display_name.clone();
     }
 
+    let Ok(actions_entity) = actions_host.single() else {
+        return;
+    };
     let Ok(host) = rows_host.single() else {
         return;
     };
     for row in &existing_rows {
         commands.entity(row).despawn();
+    }
+    for action in &existing_actions {
+        commands.entity(action).despawn();
+    }
+
+    if is_black_bot {
+        commands
+            .entity(actions_entity)
+            .with_children(spawn_black_bot_reset_button);
     }
 
     for (i, row) in rows.iter().enumerate() {

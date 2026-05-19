@@ -141,13 +141,34 @@ pub struct ActorState {
     /// overlaps static geometry, [`resolve_offscreen_collision`] tries this
     /// tile before falling back to a ring search.
     pub next_waypoint_hint: Option<Vec2>,
+    /// Last committed main world tile for [`crate::map::field_interactions`].
+    /// Updated after movement each frame; not serialized in actor snapshots.
+    pub field_main_tile: Option<IVec2>,
+}
+
+/// Nearest world tile to a tile-space [`Vec2`] center (`round`, not `floor`).
+///
+/// `ActorState::center` lives in **tile units** (1 unit = 1 m world tile). Field
+/// interactions and “which tile am I in?” semantics use this; passability still
+/// floors to subtiles via [`ActorState::center_subtile_i32`].
+#[inline]
+pub fn actor_main_tile(center: Vec2) -> IVec2 {
+    IVec2::new(center.x.round() as i32, center.y.round() as i32)
 }
 
 impl ActorState {
     /// Tile-space center converted to integer tile coordinates (floor).
+    ///
+    /// For field deposits / main-tile tracking, prefer [`actor_main_tile`].
     #[inline]
     pub fn center_tile_i32(&self) -> IVec2 {
         IVec2::new(self.center.x.floor() as i32, self.center.y.floor() as i32)
+    }
+
+    /// Nearest world tile to [`Self::center`] — same as [`actor_main_tile`].
+    #[inline]
+    pub fn main_tile_i32(&self) -> IVec2 {
+        actor_main_tile(self.center)
     }
 
     /// Center converted to integer subtile coordinates by flooring.
@@ -576,6 +597,7 @@ mod tests {
                     last_accepted_center_subtile: None,
                     last_accepted_radius_subtiles: radius_subtiles,
                     next_waypoint_hint: None,
+                    field_main_tile: None,
                 },
             }
         }
@@ -607,6 +629,7 @@ mod tests {
                 last_accepted_center_subtile: None,
                 last_accepted_radius_subtiles: radius_subtiles,
                 next_waypoint_hint: None,
+                field_main_tile: None,
             },
         }
     }

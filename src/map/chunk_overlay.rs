@@ -85,10 +85,12 @@ use crate::menu::main_menu::GameState;
 // Constants
 // ---------------------------------------------------------------------------
 
+/// Dirt overlay (see `dirt_overlay`) sits just below the generic layer.
+pub const DIRT_OVERLAY_Y: f32 = 0.0005;
 /// Generic overlay sits directly on the floor surface.
-const GENERIC_OVERLAY_Y: f32 = 0.001;
+pub const GENERIC_OVERLAY_Y: f32 = 0.001;
 /// Occupancy overlay floats one step higher to avoid z-fighting with the generic layer.
-const OCCUPANCY_OVERLAY_Y: f32 = 0.002;
+pub const OCCUPANCY_OVERLAY_Y: f32 = 0.002;
 /// Texels per axis: `CHUNK_SIZE × SUBTILE_COUNT = 640`.
 pub const OVERLAY_RES: u32 = HYPERMAP_CHUNK_SIZE as u32 * SUBTILE_COUNT as u32;
 

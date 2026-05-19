@@ -35,6 +35,9 @@ encoding, read `.claude/SKILLS/map-creator/SKILL.md` first.
 When editing actor runtime code (`src/actor/`) or actor/passability movement
 integration, read `.claude/SKILLS/actor-engineer/SKILL.md` first.
 
+When editing hypermap fields (dirt, actor deposits, field overlays), read
+`.claude/SKILLS/field-interactions/SKILL.md` and `docs/field-interactions.md` first.
+
 ## Repository layout
 
 ```

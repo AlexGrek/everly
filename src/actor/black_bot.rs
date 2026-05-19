@@ -157,6 +157,37 @@ impl BlackBotVisual {
             }
         }
     }
+
+    /// Marks the current wander task complete and picks a new path from the actor's tile.
+    pub fn reset_route(&mut self, state: &mut ActorState, passability: &Hypermap<f32>) {
+        self.movement_state = MovementState::Moving;
+        self.path.clear();
+        self.path_index = 0;
+        self.has_target = false;
+        self.main_tile = None;
+
+        let center = state.center;
+        let current_tile = float_tile(center);
+        let here = (current_tile.x, current_tile.y);
+
+        if let Some(path) = pick_random_target(&mut self.rng, here, passability) {
+            self.path = path;
+            self.path_index = 0;
+            while self.path_index < self.path.len() && self.path[self.path_index] == here {
+                self.path_index += 1;
+            }
+        }
+
+        think(self, center, current_tile, passability);
+
+        state.last_movement_error = None;
+        state.move_buffer = ActorMoveBuffer::default();
+        state.next_waypoint_hint = if self.path_index < self.path.len() {
+            Some(waypoint_center(self.path[self.path_index]))
+        } else {
+            None
+        };
+    }
 }
 
 #[derive(Resource)]
@@ -193,6 +224,7 @@ impl BlackBot {
                 last_accepted_center_subtile: Some(initial_sub),
                 last_accepted_radius_subtiles: BLACK_RADIUS_SUBTILES,
                 next_waypoint_hint: None,
+                field_main_tile: None,
             },
         }
     }

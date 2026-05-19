@@ -50,9 +50,12 @@ impl Plugin for GamePlugin {
                 map::level::LevelPlugin,
                 map::hypermap_world::HypermapWorldPlugin,
                 map::chunk_overlay::ChunkOverlayPlugin,
+                map::dirt::DirtMapPlugin,
+                map::dirt_overlay::DirtOverlayPlugin,
                 map::passability::PassabilityMapPlugin,
             ))
             .add_plugins((
+                map::field_interactions::FieldInteractionsPlugin,
                 actor::ActorPlugin,
                 actor::snapshot::ActorSnapshotPlugin,
                 actor::glitch_bot::GlitchBotPlugin,

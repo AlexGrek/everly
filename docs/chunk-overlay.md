@@ -9,6 +9,7 @@ floating above the floor mesh.  Both are driven entirely from the CPU.
 
 | Layer | Y offset | Purpose |
 |---|---|---|
+| Dirt | 0.0005 m | Transparent black stains from [`DirtMap`](../src/map/dirt.rs) (10×10 / tile) |
 | Generic | 0.001 m | Writable canvas for any system |
 | Occupancy | 0.002 m | Debug: subtile passability flags |
 
@@ -31,6 +32,21 @@ px  = tx * SUBTILE_COUNT + sx   (0..OVERLAY_RES)
 py  = ty * SUBTILE_COUNT + sy   (0..OVERLAY_RES)
 idx = (py * OVERLAY_RES as usize + px) * 4
 ```
+
+---
+
+## Dirt layer
+
+`DirtOverlayPlugin` + `DirtMapPlugin` (`src/map/dirt.rs`, `src/map/dirt_overlay.rs`).
+
+| Property | Value |
+|---|---|
+| Resolution | `DIRT_OVERLAY_RES` = 1280 × 1280 (`DIRT_SUBDIV` = 10 per tile) |
+| Texel footprint | 0.1 m × 0.1 m |
+| Data | `DoubleBufferedHypermap<DirtTile>` — writes to back buffer, overlay reads front after [`flush_merge`](../src/map/hypermap.rs) |
+| Appearance | RGB black; alpha = dirt × 255 |
+| Seeding | On first visit: ~6% of non-void ground tiles get uniform dirt `0.1..=0.3` (chunk-seeded RNG) |
+| Actor tracks | +`0.01` per dirt sample on tiles actors **leave** — see `docs/field-interactions.md` |
 
 ---
 
