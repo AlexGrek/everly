@@ -45,6 +45,7 @@ impl Plugin for GamePlugin {
                 scene::camera_snapshot::CameraSnapshotPlugin,
                 scene::sun::SunPlugin,
                 hud::game_hud::GameHudPlugin,
+                hud::actor_inspector::ActorInspectorPlugin,
                 map::floor_level::FloorLevelPlugin,
                 map::level::LevelPlugin,
                 map::hypermap_world::HypermapWorldPlugin,

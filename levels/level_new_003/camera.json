@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "camera": {
+    "focus": {
+      "x": 31.549139,
+      "y": 0.0,
+      "z": -3.5794015
+    },
+    "pan_velocity": {
+      "x": 0.0,
+      "y": 0.0,
+      "z": 0.0
+    },
+    "distance": 32.8,
+    "yaw": 0.0,
+    "pitch": 0.9599311,
+    "view_mode": "strategy"
+  }
+}

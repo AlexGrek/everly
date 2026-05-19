@@ -17,6 +17,9 @@ use bevy::prelude::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use crate::actor::actor_name::random_actor_name;
+use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
+use bevy::picking::prelude::Pickable;
 use crate::actor::snapshot::{BlackBotVisualSnap, MovementStateSnap, SerIVec2, SerVec2};
 use crate::actor::{
     is_paused, process_actors, Actor, ActorMoveBuffer, ActorMovementError, ActorObject, ActorState,
@@ -136,6 +139,23 @@ impl BlackBotVisual {
     /// if it has no active path.
     pub fn target_tile(&self) -> Option<(i32, i32)> {
         self.path.last().copied()
+    }
+
+    pub fn main_tile(&self) -> Option<IVec2> {
+        self.main_tile
+    }
+
+    pub fn has_target(&self) -> bool {
+        self.has_target
+    }
+
+    pub fn movement_state_label(&self) -> String {
+        match self.movement_state {
+            MovementState::Moving => "Moving".to_string(),
+            MovementState::Waiting { remaining_s } => {
+                format!("Waiting ({remaining_s:.2}s)")
+            }
+        }
     }
 }
 
@@ -629,7 +649,7 @@ pub fn spawn_black_bot_from_snapshot(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
-    name: Option<&str>,
+    name: &str,
     state: ActorState,
     visual: BlackBotVisualSnap,
 ) -> Entity {
@@ -647,10 +667,8 @@ pub fn spawn_black_bot_from_snapshot(
 
     let parent = commands
         .spawn((
-            Name::new(
-                name.map(str::to_string)
-                    .unwrap_or_else(|| "BlackBot".to_string()),
-            ),
+            Name::new(name.to_string()),
+            ActorInspectable,
             BlackBotVisual::from_snapshot(visual),
             ActorObject::new(Box::new(bot)),
             Transform::default(),
@@ -661,6 +679,8 @@ pub fn spawn_black_bot_from_snapshot(
     let mesh_child = commands
         .spawn((
             Name::new("BlackBot mesh"),
+            ActorPickMesh,
+            Pickable::default(),
             Mesh3d(mesh),
             MeshMaterial3d(mat),
             Transform::from_xyz(center.x, SPHERE_RADIUS, center.y),
@@ -693,7 +713,8 @@ pub fn spawn_black_bot(
 
     let parent = commands
         .spawn((
-            Name::new("BlackBot"),
+            Name::new(random_actor_name()),
+            ActorInspectable,
             BlackBotVisual {
                 main_tile: None,
                 direction: Vec2::X,
@@ -713,6 +734,8 @@ pub fn spawn_black_bot(
     let mesh_child = commands
         .spawn((
             Name::new("BlackBot mesh"),
+            ActorPickMesh,
+            Pickable::default(),
             Mesh3d(mesh),
             MeshMaterial3d(mat),
             Transform::from_xyz(center.x, SPHERE_RADIUS, center.y),

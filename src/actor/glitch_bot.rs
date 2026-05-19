@@ -12,6 +12,9 @@ use bevy::prelude::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use crate::actor::actor_name::random_actor_name;
+use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
+use bevy::picking::prelude::Pickable;
 use crate::actor::snapshot::{GlitchBotVisualSnap, SerVec2};
 use crate::actor::{is_paused, process_actors, Actor, ActorMoveBuffer, ActorObject, ActorState, OffScreenActor};
 use crate::map::passability::{FLAG_BLOCKED, SUBTILE_COUNT};
@@ -74,6 +77,14 @@ impl GlitchBotVisual {
             rng_seed: snap.rng_seed,
             rng: StdRng::seed_from_u64(snap.rng_seed),
         }
+    }
+
+    pub fn direction(&self) -> Vec2 {
+        self.direction
+    }
+
+    pub fn collision_streak(&self) -> u32 {
+        self.collision_streak
     }
 }
 
@@ -293,7 +304,7 @@ pub fn spawn_glitch_bot_from_snapshot(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
-    name: Option<&str>,
+    name: &str,
     state: ActorState,
     visual: GlitchBotVisualSnap,
 ) -> Entity {
@@ -313,10 +324,8 @@ pub fn spawn_glitch_bot_from_snapshot(
 
     let parent = commands
         .spawn((
-            Name::new(
-                name.map(str::to_string)
-                    .unwrap_or_else(|| "GlitchBot".to_string()),
-            ),
+            Name::new(name.to_string()),
+            ActorInspectable,
             vis,
             ActorObject::new(Box::new(bot)),
             Transform::default(),
@@ -327,6 +336,8 @@ pub fn spawn_glitch_bot_from_snapshot(
     let mesh_child = commands
         .spawn((
             Name::new("GlitchBot mesh"),
+            ActorPickMesh,
+            Pickable::default(),
             Mesh3d(mesh),
             MeshMaterial3d(mat),
             Transform::from_translation(world_pos),
@@ -384,7 +395,8 @@ pub fn spawn_glitch_bot(
 
     let parent = commands
         .spawn((
-            Name::new("GlitchBot"),
+            Name::new(random_actor_name()),
+            ActorInspectable,
             GlitchBotVisual {
                 direction: initial_dir,
                 accumulator,
@@ -403,6 +415,8 @@ pub fn spawn_glitch_bot(
     let mesh_child = commands
         .spawn((
             Name::new("GlitchBot mesh"),
+            ActorPickMesh,
+            Pickable::default(),
             Mesh3d(mesh),
             MeshMaterial3d(mat),
             Transform::from_xyz(center.x, HOVER_HEIGHT, center.y),

@@ -57,6 +57,7 @@ impl Plugin for GameHudPlugin {
             Update,
             (
                 map_button_toggle_views,
+                map_key_toggle_views,
                 ambient_fill_toggle_button,
                 sync_ambient_toggle_label,
                 occupancy_toggle_button,
@@ -303,6 +304,19 @@ fn sync_ambient_toggle_label(
     }
 }
 
+fn toggle_strategy_camera_view(cam: &mut StrategyCamera) {
+    match cam.view_mode {
+        StrategyCameraViewMode::Strategy => {
+            cam.view_mode = StrategyCameraViewMode::Map;
+            cam.pitch = STRATEGY_CAMERA_MAP_PITCH;
+        }
+        StrategyCameraViewMode::Map => {
+            cam.view_mode = StrategyCameraViewMode::Strategy;
+            cam.pitch = STRATEGY_CAMERA_DEFAULT_PITCH;
+        }
+    }
+}
+
 fn map_button_toggle_views(
     interactions: Query<&Interaction, (With<MapViewToggleButton>, Changed<Interaction>)>,
     mut cameras: Query<&mut StrategyCamera>,
@@ -312,17 +326,20 @@ fn map_button_toggle_views(
             continue;
         }
         for mut cam in &mut cameras {
-            match cam.view_mode {
-                StrategyCameraViewMode::Strategy => {
-                    cam.view_mode = StrategyCameraViewMode::Map;
-                    cam.pitch = STRATEGY_CAMERA_MAP_PITCH;
-                }
-                StrategyCameraViewMode::Map => {
-                    cam.view_mode = StrategyCameraViewMode::Strategy;
-                    cam.pitch = STRATEGY_CAMERA_DEFAULT_PITCH;
-                }
-            }
+            toggle_strategy_camera_view(&mut cam);
         }
+    }
+}
+
+fn map_key_toggle_views(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut cameras: Query<&mut StrategyCamera>,
+) {
+    if !keys.just_pressed(KeyCode::KeyM) {
+        return;
+    }
+    for mut cam in &mut cameras {
+        toggle_strategy_camera_view(&mut cam);
     }
 }
 

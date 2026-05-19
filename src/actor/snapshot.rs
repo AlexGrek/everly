@@ -215,14 +215,14 @@ pub struct BlackBotVisualSnap {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SavedActor {
     GlitchBot {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        name: String,
         state: ActorStateSnap,
         visual: GlitchBotVisualSnap,
     },
     BlackBot {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        name: String,
         state: ActorStateSnap,
         visual: BlackBotVisualSnap,
     },
@@ -234,6 +234,10 @@ pub struct LevelActorsFile {
     pub actors: Vec<SavedActor>,
 }
 
+fn saved_name_from_entity(name: Option<&Name>) -> String {
+    name.map(|n| n.to_string()).unwrap_or_default()
+}
+
 impl LevelActorsFile {
     pub fn collect(
         glitch_bots: &Query<(&ActorObject, &GlitchBotVisual, Option<&Name>)>,
@@ -242,14 +246,14 @@ impl LevelActorsFile {
         let mut actors = Vec::new();
         for (obj, vis, name) in glitch_bots.iter() {
             actors.push(SavedActor::GlitchBot {
-                name: name.map(|n| n.to_string()),
+                name: saved_name_from_entity(name),
                 state: obj.inner.state().into(),
                 visual: vis.to_snapshot(),
             });
         }
         for (obj, vis, name) in black_bots.iter() {
             actors.push(SavedActor::BlackBot {
-                name: name.map(|n| n.to_string()),
+                name: saved_name_from_entity(name),
                 state: obj.inner.state().into(),
                 visual: vis.to_snapshot(),
             });
@@ -304,7 +308,7 @@ pub fn spawn_level_actors(
                     commands,
                     meshes,
                     materials,
-                    name.as_deref(),
+                    name,
                     state.clone().into(),
                     visual.clone(),
                 );
@@ -315,7 +319,7 @@ pub fn spawn_level_actors(
                     commands,
                     meshes,
                     materials,
-                    name.as_deref(),
+                    name,
                     state.clone().into(),
                     visual.clone(),
                 );
@@ -431,12 +435,46 @@ mod tests {
     }
 
     #[test]
+    fn saved_actor_deserializes_missing_name_as_empty() {
+        let json = r#"{
+            "type": "black_bot",
+            "state": {
+                "center": { "x": 0.0, "y": 0.0 },
+                "radius_subtiles": 2,
+                "rotation": 0.0,
+                "move_buffer": {
+                    "tile_delta": { "x": 0.0, "y": 0.0 },
+                    "subtile_shift": { "x": 0, "y": 0 },
+                    "rotation_shift": 0.0
+                },
+                "last_movement_error": null,
+                "last_accepted_center_subtile": null,
+                "last_accepted_radius_subtiles": 2
+            },
+            "visual": {
+                "main_tile": null,
+                "direction": { "x": 1.0, "y": 0.0 },
+                "has_target": false,
+                "path": [],
+                "path_index": 0,
+                "movement_state": { "kind": "moving" },
+                "rng_seed": 1
+            }
+        }"#;
+        let actor: SavedActor = serde_json::from_str(json).unwrap();
+        match actor {
+            SavedActor::BlackBot { name, .. } => assert_eq!(name, ""),
+            _ => panic!("expected black_bot"),
+        }
+    }
+
+    #[test]
     fn level_actors_file_json_round_trip() {
         let file = LevelActorsFile {
             version: ACTOR_SNAPSHOT_VERSION,
             actors: vec![
                 SavedActor::GlitchBot {
-                    name: Some("GlitchBot".to_string()),
+                    name: "curious-otter".to_string(),
                     state: ActorStateSnap {
                         center: SerVec2 { x: 1.0, y: 2.0 },
                         radius_subtiles: 2,
@@ -460,7 +498,7 @@ mod tests {
                     },
                 },
                 SavedActor::BlackBot {
-                    name: None,
+                    name: String::new(),
                     state: ActorStateSnap {
                         center: SerVec2 { x: 3.0, y: 4.0 },
                         radius_subtiles: 2,
