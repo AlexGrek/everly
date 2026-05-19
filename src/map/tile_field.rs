@@ -20,17 +20,28 @@ pub struct TileFieldMap {
     inner: Arc<DoubleBufferedHypermap<f32>>,
     dirty_chunks: Mutex<HashSet<ChunkCoord>>,
     default_value: f32,
+    clamp_min: f32,
     clamp_max: f32,
 }
 
 impl TileFieldMap {
     pub fn new(default_value: f32, clamp_max: f32) -> Self {
+        Self::new_ranged(default_value, 0.0, clamp_max)
+    }
+
+    pub fn new_ranged(default_value: f32, clamp_min: f32, clamp_max: f32) -> Self {
         Self {
             inner: Arc::new(DoubleBufferedHypermap::new(default_value)),
             dirty_chunks: Mutex::new(HashSet::new()),
             default_value,
+            clamp_min,
             clamp_max,
         }
+    }
+
+    #[inline]
+    fn clamp_value(&self, value: f32) -> f32 {
+        value.clamp(self.clamp_min, self.clamp_max)
     }
 
     pub fn inner(&self) -> &DoubleBufferedHypermap<f32> {
@@ -51,7 +62,7 @@ impl TileFieldMap {
 
     pub fn set_tile(&self, world_x: i32, world_y: i32, value: f32) {
         let (coord, _) = world_to_chunk_local(world_x, world_y);
-        let v = value.clamp(0.0, self.clamp_max);
+        let v = self.clamp_value(value);
         self.inner.set(world_x, world_y, v);
         self.mark_dirty(coord);
     }
@@ -59,7 +70,7 @@ impl TileFieldMap {
     pub fn add_tile(&self, world_x: i32, world_y: i32, delta: f32) {
         let (coord, _) = world_to_chunk_local(world_x, world_y);
         self.inner.update(world_x, world_y, |v| {
-            *v = (*v + delta).clamp(0.0, self.clamp_max);
+            *v = self.clamp_value(*v + delta);
         });
         self.mark_dirty(coord);
     }

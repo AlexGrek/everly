@@ -1,4 +1,4 @@
-//! Ground-floor **tile-resolution** temperature (`f32` per world tile, `0.0..=1.0`).
+//! Ground-floor **tile-resolution** temperature in degrees Celsius.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -15,12 +15,43 @@ use crate::menu::main_menu::GameState;
 
 pub use crate::map::tile_field::TILE_FIELD_OVERLAY_RES as TEMPERATURE_OVERLAY_RES;
 
-const TEMPERATURE_CLAMP_MAX: f32 = 1.0;
+/// Colormap cold end (°C) — rendered blue.
+pub const TEMP_MIN_C: f32 = -30.0;
+/// Neutral (°C) — rendered white.
+pub const TEMP_ZERO_C: f32 = 0.0;
+/// Colormap hot end (°C) — rendered red (via yellow).
+pub const TEMP_MAX_C: f32 = 30.0;
 
-/// Probability that a non-void ground tile receives a warm patch when its chunk is first seeded.
-const WARM_TILE_CHANCE: f32 = 0.05;
+const COLD_PATCH_CHANCE: f32 = 0.04;
+const WARM_PATCH_CHANCE: f32 = 0.04;
 
-/// Tile-resolution temperature hypermap (double-buffered).
+/// Maps stored °C to heatmap RGBA: blue (−30) → white (0) → yellow → red (+30).
+pub fn temperature_celsius_to_rgba(celsius: f32) -> [u8; 4] {
+    let c = celsius.clamp(TEMP_MIN_C, TEMP_MAX_C);
+    let (r, g, b) = if c <= TEMP_ZERO_C {
+        let t = (c - TEMP_MIN_C) / (TEMP_ZERO_C - TEMP_MIN_C);
+        lerp3([40.0, 80.0, 255.0], [255.0, 255.0, 255.0], t)
+    } else {
+        let t = c / TEMP_MAX_C;
+        if t <= 0.5 {
+            lerp3([255.0, 255.0, 255.0], [255.0, 230.0, 40.0], t * 2.0)
+        } else {
+            lerp3([255.0, 230.0, 40.0], [255.0, 40.0, 30.0], (t - 0.5) * 2.0)
+        }
+    };
+    [r.round() as u8, g.round() as u8, b.round() as u8, 235]
+}
+
+fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> (f32, f32, f32) {
+    let t = t.clamp(0.0, 1.0);
+    (
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+    )
+}
+
+/// Tile-resolution temperature hypermap (double-buffered), values in °C.
 #[derive(Resource)]
 pub struct TemperatureMap {
     field: TileFieldMap,
@@ -36,16 +67,16 @@ impl TemperatureMap {
         self.field.read_map()
     }
 
-    pub fn get_tile(&self, world_x: i32, world_y: i32) -> f32 {
+    pub fn get_tile_c(&self, world_x: i32, world_y: i32) -> f32 {
         self.field.get_tile(world_x, world_y)
     }
 
-    pub fn set_tile(&self, world_x: i32, world_y: i32, value: f32) {
-        self.field.set_tile(world_x, world_y, value);
+    pub fn set_tile_c(&self, world_x: i32, world_y: i32, celsius: f32) {
+        self.field.set_tile(world_x, world_y, celsius);
     }
 
-    pub fn add_tile(&self, world_x: i32, world_y: i32, delta: f32) {
-        self.field.add_tile(world_x, world_y, delta);
+    pub fn add_tile_c(&self, world_x: i32, world_y: i32, delta_c: f32) {
+        self.field.add_tile(world_x, world_y, delta_c);
     }
 
     pub fn mark_dirty(&self, coord: ChunkCoord) {
@@ -83,11 +114,15 @@ impl TemperatureMap {
                         if matches!(cell, CellType::Void) {
                             continue;
                         }
-                        if rng.gen_range(0.0..1.0) >= WARM_TILE_CHANCE {
-                            continue;
-                        }
-                        let level = rng.gen_range(0.15..=0.4);
-                        tchunk.set_local(local, level);
+                        let roll = rng.gen_range(0.0..1.0);
+                        let celsius = if roll < COLD_PATCH_CHANCE {
+                            rng.gen_range(-26.0..-6.0)
+                        } else if roll < COLD_PATCH_CHANCE + WARM_PATCH_CHANCE {
+                            rng.gen_range(6.0..26.0)
+                        } else {
+                            TEMP_ZERO_C
+                        };
+                        tchunk.set_local(local, celsius);
                     }
                 }
             });
@@ -106,7 +141,7 @@ pub struct TemperatureMapPlugin;
 impl Plugin for TemperatureMapPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(TemperatureMap {
-            field: TileFieldMap::new(0.0, TEMPERATURE_CLAMP_MAX),
+            field: TileFieldMap::new_ranged(TEMP_ZERO_C, TEMP_MIN_C, TEMP_MAX_C),
             seeded_chunks: Mutex::new(HashSet::new()),
         })
         .add_systems(
@@ -137,4 +172,21 @@ fn temperature_chunk_seed(coord: ChunkCoord) -> u64 {
     x.wrapping_mul(0x9E37_79B9_85F3_7D87)
         ^ y.wrapping_mul(0xC2B2_AE3D_27D4_F4F5)
         ^ 0x7E4D_0000_0002
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn colormap_endpoints() {
+        assert_eq!(
+            temperature_celsius_to_rgba(TEMP_MIN_C)[..3],
+            temperature_celsius_to_rgba(-30.0)[..3]
+        );
+        let white = temperature_celsius_to_rgba(0.0);
+        assert!(white[0] > 240 && white[1] > 240 && white[2] > 240);
+        let red = temperature_celsius_to_rgba(TEMP_MAX_C);
+        assert!(red[0] > 240 && red[2] < 80);
+    }
 }

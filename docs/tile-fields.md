@@ -8,7 +8,7 @@ implementation: [`src/map/tile_field.rs`](../src/map/tile_field.rs).
 | Map | Resource | Default | Range | Seeding |
 |-----|----------|---------|-------|---------|
 | Dirt | `DirtMap` | `0.0` | `0..=1` | ~6% tiles → `0.1..=0.3` |
-| Temperature | `TemperatureMap` | `0.0` | `0..=1` | ~5% tiles → `0.15..=0.4` |
+| Temperature | `TemperatureMap` | `0` °C | `−30..=+30` °C | ~4% cold / ~4% warm patches |
 
 Both use `DoubleBufferedHypermap<f32>`:
 
@@ -28,9 +28,9 @@ dirt.get_tile(wx, wy);
 dirt.set_tile(wx, wy, value);
 dirt.add_tile_dirt(wx, wy, delta);
 
-temperature.get_tile(wx, wy);
-temperature.set_tile(wx, wy, value);
-temperature.add_tile(wx, wy, delta);
+temperature.get_tile_c(wx, wy);
+temperature.set_tile_c(wx, wy, celsius);
+temperature.add_tile_c(wx, wy, delta_c);
 ```
 
 Actor dirt deposits: `docs/field-interactions.md`.

@@ -9,6 +9,7 @@ use crate::scene::camera::{
 };
 use crate::edit::map_edit::{MapEditToggleButton, MapEditToggleLabel};
 use crate::map::chunk_overlay::OccupancyOverlayEnabled;
+use crate::map::temperature_overlay::TemperatureOverlayEnabled;
 use crate::map::floor_level::{ActiveFloorLevel, HYPERMAP_FLOOR_MAX};
 use crate::menu::main_menu::GameState;
 
@@ -41,6 +42,12 @@ struct OccupancyToggleButton;
 #[derive(Component)]
 struct OccupancyToggleLabel;
 
+#[derive(Component)]
+struct HeatmapToggleButton;
+
+#[derive(Component)]
+struct HeatmapToggleLabel;
+
 pub struct GameHudPlugin;
 
 impl Plugin for GameHudPlugin {
@@ -62,6 +69,8 @@ impl Plugin for GameHudPlugin {
                 sync_ambient_toggle_label,
                 occupancy_toggle_button,
                 sync_occupancy_toggle_label,
+                heatmap_toggle_button,
+                sync_heatmap_toggle_label,
                 floor_level_buttons,
                 update_floor_level_readout,
             )
@@ -198,6 +207,33 @@ pub(crate) fn spawn_bottom_hud(mut commands: Commands, camera: Query<Entity, Wit
                     p.spawn((
                         OccupancyToggleLabel,
                         Text::new("Occ: Off"),
+                        TextFont::from_font_size(17.0),
+                        TextColor(TEXT_MAIN),
+                    ));
+                });
+
+            parent
+                .spawn((
+                    Name::new("HUD heatmap toggle"),
+                    HeatmapToggleButton,
+                    Button,
+                    Node {
+                        min_width: Val::Px(108.0),
+                        height: Val::Px(36.0),
+                        padding: UiRect::horizontal(Val::Px(12.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(1.0)),
+                        border_radius: BorderRadius::all(Val::Px(6.0)),
+                        ..default()
+                    },
+                    BorderColor::all(BTN_BORDER),
+                    BackgroundColor(BTN_BG),
+                ))
+                .with_children(|p| {
+                    p.spawn((
+                        HeatmapToggleLabel,
+                        Text::new("Heat: Off"),
                         TextFont::from_font_size(17.0),
                         TextColor(TEXT_MAIN),
                     ));
@@ -392,6 +428,31 @@ fn sync_occupancy_toggle_label(
         return;
     }
     let label = if enabled.0 { "Occ: On" } else { "Occ: Off" };
+    for mut text in &mut texts {
+        **text = label.to_string();
+    }
+}
+
+fn heatmap_toggle_button(
+    interactions: Query<&Interaction, (With<HeatmapToggleButton>, Changed<Interaction>)>,
+    mut enabled: ResMut<TemperatureOverlayEnabled>,
+) {
+    for interaction in &interactions {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        enabled.0 = !enabled.0;
+    }
+}
+
+fn sync_heatmap_toggle_label(
+    enabled: Res<TemperatureOverlayEnabled>,
+    mut texts: Query<&mut Text, With<HeatmapToggleLabel>>,
+) {
+    if !enabled.is_changed() {
+        return;
+    }
+    let label = if enabled.0 { "Heat: On" } else { "Heat: Off" };
     for mut text in &mut texts {
         **text = label.to_string();
     }

@@ -48,9 +48,9 @@ Shared layout via [`tile_field`](../src/map/tile_field.rs) — **one texel per w
 
 `DirtOverlayPlugin` + `DirtMapPlugin` — black RGB, alpha = dirt × 255. Seeding ~6% of non-void tiles at `0.1..=0.3`; actors add [`DIRT_TRACK_DEPOSIT`](../src/map/dirt.rs) on tiles they leave (`docs/field-interactions.md`).
 
-### Temperature
+### Temperature (heatmap)
 
-`TemperatureOverlayPlugin` + `TemperatureMapPlugin` — warm RGB `(220, 70, 40)`, alpha ∝ temperature. Seeding ~5% of non-void tiles at `0.15..=0.4` (chunk-seeded RNG). No actor coupling yet.
+`TemperatureOverlayPlugin` + `TemperatureMapPlugin` — values in **°C** on [−30, +30]. Colormap: **blue** (cold) → **white** (0) → **yellow** → **red** (hot). Off by default; HUD **Heat** button or **F5**. Seeding: ~4% cold patches (−26..−6 °C), ~4% warm (6..26 °C), rest 0 °C.
 
 ---
 

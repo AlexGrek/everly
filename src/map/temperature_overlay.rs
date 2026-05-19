@@ -1,4 +1,4 @@
-//! Transparent temperature overlay — one RGBA texel per world tile (warm tint).
+//! Temperature heatmap overlay — one RGBA texel per world tile (°C colormap).
 
 use std::collections::HashMap;
 
@@ -11,9 +11,19 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use crate::map::chunk_overlay::TEMPERATURE_OVERLAY_Y;
 use crate::map::hypermap::{ChunkCoord, HYPERMAP_CHUNK_SIZE};
 use crate::map::hypermap_world::HypermapRuntime;
-use crate::map::temperature::TemperatureMap;
+use crate::map::temperature::{temperature_celsius_to_rgba, TemperatureMap};
 use crate::map::tile_field::{TileFieldMap, TILE_FIELD_OVERLAY_RES};
 use crate::menu::main_menu::GameState;
+
+/// HUD / **F5** toggle for the temperature heatmap overlay (off by default).
+#[derive(Resource, Clone, Copy)]
+pub struct TemperatureOverlayEnabled(pub bool);
+
+impl Default for TemperatureOverlayEnabled {
+    fn default() -> Self {
+        Self(false)
+    }
+}
 
 #[derive(Resource, Default)]
 pub struct TemperatureOverlayState {
@@ -32,11 +42,19 @@ pub struct TemperatureOverlayPlugin;
 
 impl Plugin for TemperatureOverlayPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<TemperatureOverlayState>()
-            .add_systems(OnEnter(GameState::InGame), setup_temperature_overlay)
+        app.insert_resource(TemperatureOverlayEnabled::default())
+            .init_resource::<TemperatureOverlayState>()
+            .add_systems(
+                OnEnter(GameState::InGame),
+                (reset_temperature_overlay_on_enter, setup_temperature_overlay).chain(),
+            )
             .add_systems(
                 Update,
-                (sync_temperature_overlays, update_temperature_overlay_textures)
+                (
+                    toggle_temperature_overlay,
+                    sync_temperature_overlays,
+                    update_temperature_overlay_textures,
+                )
                     .chain()
                     .after(crate::map::temperature::flush_temperature_map)
                     .run_if(in_state(GameState::InGame)),
@@ -44,10 +62,32 @@ impl Plugin for TemperatureOverlayPlugin {
     }
 }
 
+fn reset_temperature_overlay_on_enter(
+    mut enabled: ResMut<TemperatureOverlayEnabled>,
+    mut state: ResMut<TemperatureOverlayState>,
+    mut commands: Commands,
+    planes: Query<Entity, With<TemperatureOverlayPlane>>,
+) {
+    enabled.0 = false;
+    for entity in planes.iter() {
+        commands.entity(entity).despawn();
+    }
+    state.overlays.clear();
+}
+
 fn setup_temperature_overlay(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     let size = HYPERMAP_CHUNK_SIZE as f32;
     let plane_mesh = meshes.add(PlaneMeshBuilder::from_size(Vec2::splat(size)));
     commands.insert_resource(TemperatureOverlayAssets { plane_mesh });
+}
+
+fn toggle_temperature_overlay(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut enabled: ResMut<TemperatureOverlayEnabled>,
+) {
+    if keys.just_pressed(KeyCode::F5) {
+        enabled.0 = !enabled.0;
+    }
 }
 
 fn new_tile_field_image() -> Image {
@@ -75,18 +115,10 @@ fn overlay_material(
     })
 }
 
-fn temperature_to_rgba(temp: f32) -> [u8; 4] {
-    if temp <= 0.0 {
-        return [0, 0, 0, 0];
-    }
-    let t = temp.clamp(0.0, 1.0);
-    let a = (t * 200.0).round() as u8;
-    [220, 70, 40, a]
-}
-
 fn sync_temperature_overlays(
     mut commands: Commands,
     runtime: Res<HypermapRuntime>,
+    enabled: Res<TemperatureOverlayEnabled>,
     temperature: Res<TemperatureMap>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -94,8 +126,11 @@ fn sync_temperature_overlays(
     mut state: ResMut<TemperatureOverlayState>,
     planes: Query<Entity, With<TemperatureOverlayPlane>>,
 ) {
-    let desired: std::collections::HashSet<ChunkCoord> =
-        runtime.desired_chunk_coords().into_iter().collect();
+    let desired: std::collections::HashSet<ChunkCoord> = if enabled.0 {
+        runtime.desired_chunk_coords().into_iter().collect()
+    } else {
+        std::collections::HashSet::new()
+    };
 
     let to_remove: Vec<ChunkCoord> = state
         .overlays
@@ -136,11 +171,15 @@ fn sync_temperature_overlays(
 }
 
 fn update_temperature_overlay_textures(
+    enabled: Res<TemperatureOverlayEnabled>,
     temperature: Res<TemperatureMap>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     state: Res<TemperatureOverlayState>,
 ) {
+    if !enabled.0 {
+        return;
+    }
     let dirty = temperature.take_dirty_chunks();
     if dirty.is_empty() {
         return;
@@ -158,7 +197,7 @@ fn update_temperature_overlay_textures(
         let Some(data) = image.data.as_mut() else { continue; };
 
         let chunk_existed = temperature.read_map().with_chunk_read(coord, |chunk| {
-            TileFieldMap::paint_chunk_to_rgba(data, chunk, temperature_to_rgba);
+            TileFieldMap::paint_chunk_to_rgba(data, chunk, temperature_celsius_to_rgba);
         }).is_some();
 
         if !chunk_existed {
