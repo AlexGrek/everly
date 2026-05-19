@@ -21,17 +21,17 @@ Generation runs on a [`MapDraft`](../../src/map/map_generator/draft.rs) grid (`D
 4. **Outer shell** — union perimeter wall bitmasks (same rules as the editor **Room** brush).
 5. **Inner corner pillars** — [`corner_pillars.rs`](../src/map/map_generator/corner_pillars.rs) + [`step_corners.rs`](../src/map/map_generator/step_corners.rs). See **[`corners.md`](corners.md)**.
 6. **One door per house** — [`step_place_house_doors`](../../src/map/map_generator/step_door.rs) picks a validated site per house: exterior tile must be road (not inside any house footprint), interior must be open floor, single-bit wall slab (no L-corner traps), and the doorway must not face another house’s wall.
-7. **Home crawlers** — one BFS **wave** per house from that house's **main entry**, propagating to a random Manhattan distance of 3–5 tiles on open floor. Marble (`fm`) on [`DraftTile::Open`](../../src/map/map_generator/draft.rs) only; walls, corners, and doors are not styled.
+7. **Home crawlers** — **marble** (`fm`) BFS wave from the main entry (Manhattan radius 3–5, rng) on all houses. **Glass** (`fg`) center wave only when footprint area ≥ 30 cells ([`grid_fill::count_region_area`](../../src/map/map_generator/grid_fill.rs) at cluster time). Walls, corners, and doors are unchanged for small houses.
 
 Do **not** stamp per-rectangle [`perimeter_wall_mask`](../../src/map/world_map.rs) loops on overlapping rects (that recreates inner walls). Convex outer corners stay multi-bit wall cells only (no separate pillars there).
 
-## Metadata (`GeneratedChunkMetadata`, version 2)
+## Metadata (`GeneratedChunkMetadata`, version 3)
 
 After generation, reference data is stored in [`HypermapRuntime::procedural_metadata`](../../src/map/hypermap_world.rs) (chunk-local tile coords) and saved as `levels/level_{name}/metadata/{x}_{y}.json` on **Save**.
 
 | Field | Meaning |
 |-------|---------|
-| `houses[]` | Each merged building: bounds (`x0`…`z1`), `center_x`/`center_z`, `entry` (walk / wall / outward edge) |
+| `houses[]` | Each merged building: bounds, `center_x`/`center_z`, `area` (footprint cell count), `entry` |
 
 World tiles: `runtime.procedural_metadata.get(coord)` then [`house_entry_world`](../../src/map/chunk_metadata.rs) / [`house_center_world`](../../src/map/chunk_metadata.rs).
 

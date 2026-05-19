@@ -7,7 +7,9 @@ use crate::map::world_map::{TileStyle, WallCorner};
 use super::corner_pillars::detect_corner_pillars;
 use super::draft::{DraftTile, Room, RoomRecord};
 use super::step_door::entrypoint_walk_tile;
-use super::step_home_crawler::{house_entry_interior_tile, HOME_CRAWLER_WAVE_MAX};
+use super::step_home_crawler::{
+    house_center_floor_tile, house_entry_interior_tile, HOME_CRAWLER_WAVE_MAX,
+};
 use super::step_seeds::manhattan;
 use super::union::union_contains;
 
@@ -221,6 +223,7 @@ fn metadata_has_houses_with_entries() {
     for house in &meta.houses {
         assert!(house.x0 <= house.center_x && house.center_x <= house.x1);
         assert!(house.z0 <= house.center_z && house.center_z <= house.z1);
+        assert!(house.area >= 4, "footprint area should be stored on each house");
         assert_eq!(
             entrypoint_walk_tile(house.entry.wall_x, house.entry.wall_z, house.entry.outward_edge),
             (house.entry.walk_x, house.entry.walk_z)
@@ -373,6 +376,86 @@ fn home_crawler_wave_stays_within_manhattan_radius() {
 }
 
 #[test]
+fn small_house_skips_center_glass_wave() {
+    let mut draft = MapDraft::new(MapGeneratorConfig {
+        seed: 1,
+        size: 16,
+        margin: 1,
+    });
+    draft.houses = vec![super::house::House {
+        rects: vec![Room {
+            x0: 5,
+            z0: 5,
+            x1: 7,
+            z1: 7,
+        }],
+        x0: 5,
+        z0: 5,
+        x1: 7,
+        z1: 7,
+        footprint_area: 9,
+        entry: None,
+    }];
+    assert!(!draft.houses[0].supports_center_glass_wave());
+    draft.step_init_carpet();
+    draft.step_paint_union_interior();
+    draft.step_build_union_outer_walls();
+    draft.step_place_house_doors();
+    draft.step_home_crawlers();
+    for z in 5..=7 {
+        for x in 5..=7 {
+            assert_ne!(
+                draft.floor_styles[z as usize][x as usize],
+                TileStyle::FLOOR_GLASS,
+                "small house should not get center glass wave"
+            );
+        }
+    }
+}
+
+#[test]
+fn home_crawler_glass_wave_from_house_center() {
+    let mut draft = MapDraft::new(MapGeneratorConfig {
+        seed: 88,
+        ..Default::default()
+    });
+    draft.step_init_carpet();
+    draft.step_place_primary_seeds();
+    draft.step_separate_primary_seeds();
+    draft.step_spawn_subseeds();
+    draft.step_grow_rooms();
+    draft.step_cluster_houses();
+    draft.step_paint_union_interior();
+    draft.step_build_union_outer_walls();
+    draft.step_stamp_union_inner_corner_pillars();
+    draft.step_place_house_doors();
+    draft.step_home_crawlers();
+    let mut glass_found = false;
+    for house in draft
+        .houses
+        .iter()
+        .filter(|h| h.supports_center_glass_wave())
+    {
+        let Some(center) = house_center_floor_tile(&draft, house) else {
+            continue;
+        };
+        for z in house.z0..=house.z1 {
+            for x in house.x0..=house.x1 {
+                if draft.floor_styles[z as usize][x as usize] != TileStyle::FLOOR_GLASS {
+                    continue;
+                }
+                glass_found = true;
+                assert!(
+                    manhattan((x, z), center) <= HOME_CRAWLER_WAVE_MAX,
+                    "glass at ({x},{z}) exceeds max wave radius from center"
+                );
+            }
+        }
+    }
+    assert!(glass_found, "expected glass wave from at least one house center");
+}
+
+#[test]
 fn home_crawler_stamps_marble_from_main_entry_only() {
     let mut draft = MapDraft::new(MapGeneratorConfig {
         seed: 99,
@@ -405,10 +488,11 @@ fn home_crawler_stamps_marble_from_main_entry_only() {
     let sz = draft.size as usize;
     for z in 0..sz {
         for x in 0..sz {
+            let style = draft.floor_styles[z][x];
             if draft.cells[z][x] != DraftTile::Open
-                && draft.floor_styles[z][x] == TileStyle::FLOOR_MARBLE
+                && (style == TileStyle::FLOOR_MARBLE || style == TileStyle::FLOOR_GLASS)
             {
-                panic!("marble style on non-open tile ({x}, {z})");
+                panic!("crawler floor style on non-open tile ({x}, {z})");
             }
         }
     }

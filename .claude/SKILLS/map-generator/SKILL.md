@@ -82,7 +82,7 @@ Order in `MapDraft::generate` / `run_into_chunk` — **do not reorder** without 
 8. `step_build_union_outer_walls` — **`union_perimeter_wall_mask`** on the combined outer shell only
 9. `step_stamp_union_inner_corner_pillars` — [`detect_corner_pillars`](../../src/map/map_generator/corner_pillars.rs) (see **`docs/corners.md`**)
 10. `step_place_house_doors` — **one door per house** (`clear_wall_edge` / fallback carve)
-11. `step_home_crawlers` — per-house BFS wave from main entry (Manhattan radius 3–5, rng); marble (`fm`) on open floor only
+11. `step_home_crawlers` — marble wave from main entry; glass center wave only if `footprint_area >= MIN_HOUSE_AREA_FOR_CENTER_WAVE` (30)
 12. `finish` / `write_chunk_floor0_and_styles` — `DraftTile` → `CellType` + `TileStyle` chunk
 13. `build_metadata` → [`GeneratedChunkMetadata`](../../src/map/chunk_metadata.rs) v2 (`houses[]` with embedded `entry`)
 
@@ -90,7 +90,8 @@ Order in `MapDraft::generate` / `run_into_chunk` — **do not reorder** without 
 
 ### Metadata fields (chunk-local tiles)
 
-- **`houses[]`**: one entry per merged building — bounds, `center_x`/`center_z`, `entry` (`walk_*`, `wall_*`, `outward_edge`).
+- **`houses[]`**: one entry per merged building — bounds, `center_x`/`center_z`, `area`, `entry`.
+- **Area utils**: [`grid_fill.rs`](../../src/map/map_generator/grid_fill.rs) — `flood_fill_area` (connected), `count_region_area` (box); house footprint uses the latter at cluster time.
 - World coords: `meta.house_entry_world(i, chunk)`, `meta.house_center_world(i, chunk)`; `entrypoint_world` = first house entry.
 
 ## Room outlines — critical pitfall (corner gaps)

@@ -1,4 +1,4 @@
-//! Step 10: per-house marble wave (BFS) from main entry up to a random Manhattan radius.
+//! Step 10: per-house floor waves — marble from main entry, glass from house center.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -8,6 +8,7 @@ use super::draft::{DraftTile, MapDraft};
 use super::house::house_contains;
 use super::house::House;
 use super::step_door::{entrypoint_inward_tile, entrypoint_walk_tile};
+use super::step_seeds::manhattan;
 use super::types::HouseEntrypoint;
 use crate::map::world_map::TileStyle;
 
@@ -19,20 +20,22 @@ pub const HOME_CRAWLER_WAVE_MAX: i32 = 5;
 const CARDINAL: [(i32, i32); 4] = [(0, -1), (0, 1), (1, 0), (-1, 0)];
 
 impl MapDraft {
-    /// One flood-fill per house from its main entry; only styles open floor inside the footprint.
+    /// Marble wave from main entry, then glass wave from virtual house center.
     pub fn step_home_crawlers(&mut self) {
         let houses: Vec<House> = self.houses.clone();
         for house in houses {
-            let Some(ref ep) = house.entry else {
-                continue;
-            };
-            let Some(start) = house_entry_interior_tile(self, ep) else {
-                continue;
-            };
-            if !house.contains(start.0, start.1) {
-                continue;
+            if let Some(ref ep) = house.entry {
+                if let Some(start) = house_entry_interior_tile(self, ep) {
+                    if house.contains(start.0, start.1) {
+                        wave_house(self, &house, start, TileStyle::FLOOR_MARBLE);
+                    }
+                }
             }
-            wave_house(self, &house, start);
+            if house.supports_center_glass_wave() {
+                if let Some(center) = house_center_floor_tile(self, &house) {
+                    wave_house(self, &house, center, TileStyle::FLOOR_GLASS);
+                }
+            }
         }
     }
 }
@@ -67,7 +70,36 @@ pub(crate) fn house_entry_interior_tile(
     None
 }
 
-fn wave_house(draft: &mut MapDraft, house: &House, start: (i32, i32)) {
+/// Open floor at the integer center of the house bounds (or closest open tile to it).
+pub(crate) fn house_center_floor_tile(draft: &MapDraft, house: &House) -> Option<(i32, i32)> {
+    let center = house.center();
+    if house.contains(center.0, center.1) && draft.get(center.0, center.1) == DraftTile::Open {
+        return Some(center);
+    }
+    closest_open_in_house(draft, house, center)
+}
+
+fn closest_open_in_house(
+    draft: &MapDraft,
+    house: &House,
+    target: (i32, i32),
+) -> Option<(i32, i32)> {
+    let mut best: Option<((i32, i32), i32)> = None;
+    for z in house.z0..=house.z1 {
+        for x in house.x0..=house.x1 {
+            if !house.contains(x, z) || draft.get(x, z) != DraftTile::Open {
+                continue;
+            }
+            let d = manhattan((x, z), target);
+            if best.is_none_or(|(_, best_d)| d < best_d) {
+                best = Some(((x, z), d));
+            }
+        }
+    }
+    best.map(|(tile, _)| tile)
+}
+
+fn wave_house(draft: &mut MapDraft, house: &House, start: (i32, i32), style: TileStyle) {
     if draft.get(start.0, start.1) != DraftTile::Open {
         return;
     }
@@ -78,7 +110,7 @@ fn wave_house(draft: &mut MapDraft, house: &House, start: (i32, i32)) {
     let mut visited = HashSet::from([start]);
 
     while let Some((x, z, dist)) = queue.pop_front() {
-        stamp_marble_floor(draft, x, z);
+        stamp_floor_style(draft, x, z, style);
         if dist >= max_dist {
             continue;
         }
@@ -98,8 +130,8 @@ fn wave_house(draft: &mut MapDraft, house: &House, start: (i32, i32)) {
     }
 }
 
-fn stamp_marble_floor(draft: &mut MapDraft, x: i32, z: i32) {
+fn stamp_floor_style(draft: &mut MapDraft, x: i32, z: i32, style: TileStyle) {
     if draft.get(x, z) == DraftTile::Open {
-        draft.set_floor_style(x, z, TileStyle::FLOOR_MARBLE);
+        draft.set_floor_style(x, z, style);
     }
 }

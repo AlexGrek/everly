@@ -6,6 +6,7 @@
 
 mod corner_pillars;
 mod draft;
+pub mod grid_fill;
 mod house;
 mod step_carpet;
 mod step_corners;
@@ -23,6 +24,7 @@ mod tests;
 
 pub use corner_pillars::{detect_corner_pillars, CornerPillarPlacement, WallField};
 pub use draft::MapDraft;
+pub use grid_fill::{count_region_area, flood_fill_area};
 pub use types::{
     GeneratedChunkMetadata, GeneratedHouse, HouseEntrypoint, MapGeneratorConfig,
     BORDER_CLEARANCE, CHUNK_VOID_MARGIN, GENERATED_CHUNK_METADATA_VERSION, MIN_SEED_DISTANCE,

@@ -14,8 +14,10 @@ pub const PRIMARY_SEED_COUNT_MAX: i32 = 8;
 /// Subseed room sprouts per primary (inclusive range).
 pub const SUBSEEDS_PER_PRIMARY_MIN: i32 = 2;
 pub const SUBSEEDS_PER_PRIMARY_MAX: i32 = 4;
+/// Minimum house footprint (1 m² cells) for the center glass floor wave.
+pub const MIN_HOUSE_AREA_FOR_CENTER_WAVE: i32 = 30;
 
-pub const GENERATED_CHUNK_METADATA_VERSION: u32 = 2;
+pub const GENERATED_CHUNK_METADATA_VERSION: u32 = 3;
 
 /// Main doorway for one house (chunk-local tiles).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -39,6 +41,8 @@ pub struct GeneratedHouse {
     pub z1: i32,
     pub center_x: i32,
     pub center_z: i32,
+    /// Footprint size in 1×1 m cells (union of rects, no connectivity).
+    pub area: i32,
     pub entry: HouseEntrypoint,
 }
 

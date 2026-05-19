@@ -1,7 +1,8 @@
 //! Houses: merged subseed room footprints (subseed data discarded after clustering).
 
 use super::draft::{MapDraft, Room, RoomRecord};
-use super::types::HouseEntrypoint;
+use super::grid_fill::count_region_area;
+use super::types::{HouseEntrypoint, MIN_HOUSE_AREA_FOR_CENTER_WAVE};
 
 /// One building footprint — possibly several merged axis-aligned rects.
 #[derive(Debug, Clone)]
@@ -11,6 +12,8 @@ pub(crate) struct House {
     pub z0: i32,
     pub x1: i32,
     pub z1: i32,
+    /// Union of rect cells in the bounding box (1 m² per cell); not connectivity-based.
+    pub footprint_area: i32,
     pub entry: Option<HouseEntrypoint>,
 }
 
@@ -23,6 +26,11 @@ impl House {
         ((self.x0 + self.x1) / 2, (self.z0 + self.z1) / 2)
     }
 
+    /// Center glass wave runs only on houses large enough for it to be meaningful.
+    pub fn supports_center_glass_wave(&self) -> bool {
+        self.footprint_area >= MIN_HOUSE_AREA_FOR_CENTER_WAVE
+    }
+
     pub fn to_generated(&self) -> super::types::GeneratedHouse {
         let (center_x, center_z) = self.center();
         super::types::GeneratedHouse {
@@ -32,12 +40,18 @@ impl House {
             z1: self.z1,
             center_x,
             center_z,
+            area: self.footprint_area,
             entry: self.entry.clone().expect("house must have entry before metadata"),
         }
     }
 }
 
-/// Group touching / overlapping subseed rects into whole houses.
+/// Footprint cell count for a house (union of rects inside its bounding box).
+pub(crate) fn footprint_cell_area(house: &House) -> i32 {
+    count_region_area(house.x0, house.z0, house.x1, house.z1, |x, z| house.contains(x, z))
+}
+
+/// Group overlapping subseed rects into whole houses.
 pub(crate) fn cluster_houses(room_records: &[RoomRecord]) -> Vec<House> {
     let n = room_records.len();
     if n == 0 {
@@ -66,13 +80,18 @@ pub(crate) fn cluster_houses(room_records: &[RoomRecord]) -> Vec<House> {
             let z0 = rects.iter().map(|r| r.z0).min().unwrap();
             let x1 = rects.iter().map(|r| r.x1).max().unwrap();
             let z1 = rects.iter().map(|r| r.z1).max().unwrap();
-            House {
+            let house = House {
                 rects,
                 x0,
                 z0,
                 x1,
                 z1,
+                footprint_area: 0,
                 entry: None,
+            };
+            House {
+                footprint_area: footprint_cell_area(&house),
+                ..house
             }
         })
         .collect()
