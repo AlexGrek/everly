@@ -14,7 +14,9 @@
 //! returned tile path: interior tiles whose neighbours have line-of-sight (the
 //! Bresenham line between them passes only through walkable tiles) are
 //! discarded. The result is a sparse waypoint list where intermediate nodes
-//! exist only where the path must bend around an obstacle.
+//! exist only where the path must bend around an obstacle. A final pass keeps
+//! the straight approach/exit tiles on either side of every one-tile doorway so
+//! a wide follower threads the gap head-on instead of clipping the frame.
 //!
 //! [`WorldMapFloor`](crate::map::world_map::WorldMapFloor) tests can encode
 //! start/end with `>A` / `>B` via
@@ -278,17 +280,88 @@ pub fn line_of_sight(map: &Hypermap<f32>, a: (i32, i32), b: (i32, i32)) -> bool 
 /// tiles around each corner. When `corner_buffer > 0`, a second string-pull
 /// pass with zero buffer collapses redundant buffered tiles while keeping
 /// bends that still require a detour.
+///
+/// A final pass re-inserts the tile on each side of every **doorway** the path
+/// threads (a one-tile gap in a wall, see [`is_doorway_tile`]). A door is not a
+/// bend, so string-pulling would otherwise collapse the straight approach and
+/// let the follower cross the gap on a diagonal — clipping the doorframe. The
+/// extra approach/exit tiles funnel a wide actor through the opening head-on.
 pub fn simplify_path_line_of_sight(
     map: &Hypermap<f32>,
     path: &[(i32, i32)],
     corner_buffer: usize,
 ) -> Vec<(i32, i32)> {
     let buffered = simplify_path_line_of_sight_pass(map, path, corner_buffer);
-    if corner_buffer == 0 || buffered.len() <= 2 {
+    let simplified = if corner_buffer == 0 || buffered.len() <= 2 {
         buffered
     } else {
         simplify_path_line_of_sight_pass(map, &buffered, 0)
+    };
+    reinsert_doorway_approaches(map, path, simplified)
+}
+
+/// True when `(x, y)` is a walkable one-tile gap in an otherwise solid wall: it
+/// is pinched by walls on one axis and open on the other, *and* both open-axis
+/// neighbours widen out (are not pinched the same way). The widen test keeps
+/// genuine doorways — which open into roomier space and let a follower drift in
+/// diagonally — distinct from straight one-wide corridors, where every tile is
+/// pinched and a follower is already funnelled to the centre.
+fn is_doorway_tile(map: &Hypermap<f32>, x: i32, y: i32) -> bool {
+    if !world_tile_walkable(map, x, y) {
+        return false;
     }
+    let walk = |dx: i32, dy: i32| world_tile_walkable(map, x + dx, y + dy);
+    // Walls run north-south here, so the gap is crossed east-west.
+    let ns_walls = !walk(0, 1) && !walk(0, -1);
+    let ew_open = walk(1, 0) && walk(-1, 0);
+    if ns_walls && ew_open {
+        let widens = |nx: i32| world_tile_walkable(map, nx, y + 1) || world_tile_walkable(map, nx, y - 1);
+        return widens(x + 1) && widens(x - 1);
+    }
+    // Walls run east-west, gap crossed north-south.
+    let ew_walls = !walk(1, 0) && !walk(-1, 0);
+    let ns_open = walk(0, 1) && walk(0, -1);
+    if ew_walls && ns_open {
+        let widens = |ny: i32| world_tile_walkable(map, x + 1, ny) || world_tile_walkable(map, x - 1, ny);
+        return widens(y + 1) && widens(y - 1);
+    }
+    false
+}
+
+/// Adds back the immediate predecessor and successor of every doorway tile on
+/// the raw `path` to the `simplified` waypoint list, preserving path order.
+/// A door's only walkable neighbours lie on its open axis, so those two tiles
+/// are collinear with it — keeping them forces an axis-aligned passage through
+/// the gap. The output is still a subsequence of `path`.
+fn reinsert_doorway_approaches(
+    map: &Hypermap<f32>,
+    path: &[(i32, i32)],
+    simplified: Vec<(i32, i32)>,
+) -> Vec<(i32, i32)> {
+    if path.len() <= 2 {
+        return simplified;
+    }
+    let index_of: HashMap<(i32, i32), usize> =
+        path.iter().enumerate().map(|(i, &t)| (t, i)).collect();
+    let mut keep = vec![false; path.len()];
+    for w in &simplified {
+        if let Some(&i) = index_of.get(w) {
+            keep[i] = true;
+        }
+    }
+    let last = path.len() - 1;
+    for i in 1..last {
+        let (x, y) = path[i];
+        if is_doorway_tile(map, x, y) {
+            keep[i - 1] = true;
+            keep[i] = true;
+            keep[i + 1] = true;
+        }
+    }
+    keep.iter()
+        .enumerate()
+        .filter_map(|(i, &k)| k.then_some(path[i]))
+        .collect()
 }
 
 fn simplify_path_line_of_sight_pass(
@@ -607,6 +680,65 @@ mod tests {
             buffered.len() >= 3,
             "buffered path must still bend around the wall: {buffered:?}",
         );
+    }
+
+    #[test]
+    fn simplify_keeps_straight_approach_through_doorway() {
+        // Two open rooms separated by a vertical wall at x = 3 with a single
+        // one-tile doorway at (3, 2). Crossing the gap on a diagonal would clip
+        // the doorframe, so the straight approach/exit tiles must survive.
+        let map: Hypermap<f32> = Hypermap::new(0.0);
+        for x in 0..7 {
+            for y in 0..5 {
+                if x != 3 {
+                    map.set(x, y, 1.0);
+                }
+            }
+        }
+        map.set(3, 2, 1.0); // the doorway
+
+        assert!(is_doorway_tile(&map, 3, 2));
+        assert!(!is_doorway_tile(&map, 1, 2), "open-room tile is not a doorway");
+
+        let raw = match astar_shortest_world_path(
+            &map,
+            (0, 0),
+            (6, 4),
+            HypermapSearchLimits::default(),
+        ) {
+            HypermapPathResult::Found { path, .. } => path,
+            other => panic!("expected Found, got {other:?}"),
+        };
+        let simplified = simplify_path_line_of_sight(&map, &raw, 1);
+        assert!(
+            simplified.contains(&(3, 2)),
+            "doorway tile must be a waypoint: {simplified:?}",
+        );
+        assert!(
+            simplified.contains(&(2, 2)) && simplified.contains(&(4, 2)),
+            "straight approach/exit tiles around the doorway must survive: {simplified:?}",
+        );
+    }
+
+    #[test]
+    fn simplify_does_not_treat_corridor_as_doorway() {
+        // A straight one-wide horizontal corridor: every tile is pinched, but
+        // none is a doorway, so open space still collapses to its endpoints.
+        let map: Hypermap<f32> = Hypermap::new(0.0);
+        for x in 0..10 {
+            map.set(x, 0, 1.0);
+        }
+        assert!(!is_doorway_tile(&map, 5, 0));
+        let raw = match astar_shortest_world_path(
+            &map,
+            (0, 0),
+            (9, 0),
+            HypermapSearchLimits::default(),
+        ) {
+            HypermapPathResult::Found { path, .. } => path,
+            other => panic!("expected Found, got {other:?}"),
+        };
+        assert_eq!(simplify_path_line_of_sight(&map, &raw, 1), vec![(0, 0), (9, 0)]);
     }
 
     #[test]
