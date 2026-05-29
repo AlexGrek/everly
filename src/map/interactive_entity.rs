@@ -28,13 +28,16 @@
 //! removal. [`InteractiveEntityMap::insert`] / [`InteractiveEntityMap::remove_all_at`]
 //! enforce that; do not hand-edit the inner map.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use bevy::prelude::*;
 use serde::de::Deserializer;
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
+use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap, HypermapChunkHandle};
+use crate::map::hypermap_pathfind::passability_walkable;
+use crate::map::hypermap_world::rendered_chunks_around;
 use crate::map::world_map::ChargerFacing;
 
 /// Property key whose presence marks an entity as "in use" (occupied/active).
@@ -454,6 +457,161 @@ impl InteractiveEntityMap {
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut InteractiveEntityEntry> {
         self.tiles.values_mut().flat_map(|list| list.iter_mut())
     }
+
+    // --- Locators -----------------------------------------------------------
+    //
+    // Three flavors of "find nearby entities", each with a different notion of
+    // "near". All optionally filter by `kind` (`None` = any kind) and borrow the
+    // matching entries. Because the store is sparse, every variant iterates the
+    // whole map and filters — cheap relative to the dense tile grid, and there is
+    // no per-tile index to maintain.
+
+    /// **Radius-local.** Entities within `radius` tiles (Euclidean) of `center`,
+    /// on the *same floor* as `center`. A `radius` of `0` matches only entities on
+    /// exactly `center`'s tile. Distance is compared squared, so no floats.
+    pub fn find_within_radius(
+        &self,
+        center: EntityCoordinates,
+        radius: i32,
+        kind: Option<EntityType>,
+    ) -> Vec<&InteractiveEntityEntry> {
+        let radius_sq = (radius as i64) * (radius as i64);
+        self.iter()
+            .filter(|entry| entry.coordinates.floor == center.floor)
+            .filter(|entry| kind.is_none_or(|k| entry.entity_type == k))
+            .filter(|entry| {
+                let dx = (entry.coordinates.x - center.x) as i64;
+                let dy = (entry.coordinates.y - center.y) as i64;
+                dx * dx + dy * dy <= radius_sq
+            })
+            .collect()
+    }
+
+    /// **Hypermap-local.** Entities sitting on the chunks the renderer would keep
+    /// meshed around `center` — the camera's chunk plus the prefetch neighbor on
+    /// each axis, via [`rendered_chunks_around`]. This deliberately reuses the
+    /// renderer's footprint so "what the camera covers" and "what this query
+    /// returns" never diverge. Chunk selection is XY-only (a chunk spans every
+    /// floor), so this does **not** filter by floor; combine with
+    /// [`find_within_radius`](Self::find_within_radius) or a manual floor check if
+    /// you need a single level.
+    pub fn find_in_rendered_chunks(
+        &self,
+        center: EntityCoordinates,
+        kind: Option<EntityType>,
+    ) -> Vec<&InteractiveEntityEntry> {
+        let chunks = rendered_chunks_around(center.x, center.y);
+        self.iter()
+            .filter(|entry| kind.is_none_or(|k| entry.entity_type == k))
+            .filter(|entry| {
+                let (coord, _) = world_to_chunk_local(entry.coordinates.x, entry.coordinates.y);
+                chunks.contains(&coord)
+            })
+            .collect()
+    }
+
+    /// **Accessible.** Entities reachable from `start` within `max_steps` 4-neighbor
+    /// moves over the `passability` map (`> 0.0` walkable; see
+    /// [`passability_walkable`]), restricted to `floor`. An entity counts as
+    /// accessible if its own tile or any 4-neighbor of it lies in the reachable set
+    /// — interactive entities such as chargers back onto a wall, so their tile is
+    /// often itself blocked while an actor stands on the adjacent walkable tile.
+    ///
+    /// `passability` is the single-floor static-passability hypermap for `floor`
+    /// (the caller supplies the layer matching the level being searched).
+    pub fn find_accessible_within(
+        &self,
+        passability: &Hypermap<f32>,
+        start: (i32, i32),
+        floor: i32,
+        max_steps: u32,
+        kind: Option<EntityType>,
+    ) -> Vec<&InteractiveEntityEntry> {
+        let reachable = reachable_tiles_within(passability, start, max_steps);
+        self.iter()
+            .filter(|entry| entry.coordinates.floor == floor)
+            .filter(|entry| kind.is_none_or(|k| entry.entity_type == k))
+            .filter(|entry| {
+                tile_or_neighbor_reachable(&reachable, (entry.coordinates.x, entry.coordinates.y))
+            })
+            .collect()
+    }
+}
+
+/// Reads passability cells while holding the current chunk's `Arc` handle locally
+/// between accesses. A spatially coherent scan (the BFS below) therefore takes the
+/// map-wide `chunks` lock only when it crosses a chunk boundary — not on every
+/// cell as bare [`Hypermap::get`] would. The per-chunk lock is still taken per
+/// read, held only long enough to copy one cell, so every lock scope stays tight.
+struct ChunkReadCache<'a> {
+    map: &'a Hypermap<f32>,
+    /// `(chunk coord, handle if loaded)`. A cached `None` handle remembers a miss
+    /// so repeated reads in an unloaded chunk don't re-lock the map either.
+    cached: Option<(ChunkCoord, Option<HypermapChunkHandle<f32>>)>,
+}
+
+impl<'a> ChunkReadCache<'a> {
+    fn new(map: &'a Hypermap<f32>) -> Self {
+        Self { map, cached: None }
+    }
+
+    fn walkable(&mut self, x: i32, y: i32) -> bool {
+        let (coord, local) = world_to_chunk_local(x, y);
+        if !matches!(&self.cached, Some((c, _)) if *c == coord) {
+            self.cached = Some((coord, self.map.get_chunk(coord)));
+        }
+        let Some((_, Some(handle))) = &self.cached else {
+            return false; // unloaded chunk reads as the void default (not walkable)
+        };
+        let guard = handle.read().expect("chunk lock poisoned");
+        passability_walkable(*guard.get_local_floor(local, 0))
+    }
+}
+
+/// Bounded BFS: every walkable tile reachable from `start` in at most `max_steps`
+/// 4-neighbor moves. Returns the empty set if `start` itself is not walkable.
+/// Distance-bounded (not expansion-bounded like
+/// [`explore_walkable_tiles_limited`](crate::map::hypermap_pathfind::explore_walkable_tiles_limited)),
+/// which is what "reachable within n steps" means here. Cell reads go through a
+/// [`ChunkReadCache`] to keep hypermap lock traffic local to chunk crossings.
+fn reachable_tiles_within(
+    passability: &Hypermap<f32>,
+    start: (i32, i32),
+    max_steps: u32,
+) -> HashSet<(i32, i32)> {
+    let mut reader = ChunkReadCache::new(passability);
+    let mut visited = HashSet::new();
+    if !reader.walkable(start.0, start.1) {
+        return visited;
+    }
+    visited.insert(start);
+    let mut frontier = VecDeque::from([(start, 0u32)]);
+    while let Some((pos, dist)) = frontier.pop_front() {
+        if dist == max_steps {
+            continue;
+        }
+        let neighbors = [
+            (pos.0 + 1, pos.1),
+            (pos.0 - 1, pos.1),
+            (pos.0, pos.1 + 1),
+            (pos.0, pos.1 - 1),
+        ];
+        for n in neighbors {
+            if !visited.contains(&n) && reader.walkable(n.0, n.1) {
+                visited.insert(n);
+                frontier.push_back((n, dist + 1));
+            }
+        }
+    }
+    visited
+}
+
+/// `true` if `tile` or any of its 4 neighbors is in `reachable`.
+fn tile_or_neighbor_reachable(reachable: &HashSet<(i32, i32)>, tile: (i32, i32)) -> bool {
+    reachable.contains(&tile)
+        || [(1, 0), (-1, 0), (0, 1), (0, -1)]
+            .iter()
+            .any(|(dx, dy)| reachable.contains(&(tile.0 + dx, tile.1 + dy)))
 }
 
 impl Serialize for InteractiveEntityMap {
@@ -582,5 +740,51 @@ mod tests {
         assert_eq!(charger.facing(), ChargerFacing::South);
         assert_eq!(charger.get_prop("label").as_deref(), Some("dock-7"));
         assert_eq!(charger.occupant(), None, "runtime occupant not persisted");
+    }
+
+    #[test]
+    fn radius_locator_is_circular_and_floor_scoped() {
+        let mut map = InteractiveEntityMap::new();
+        map.insert(charger_at(0, 0, ChargerFacing::North)); // center
+        map.insert(charger_at(2, 0, ChargerFacing::North)); // dist 2
+        map.insert(charger_at(2, 2, ChargerFacing::North)); // dist ~2.83 > 2
+        // Same x/y as center but a different floor must be excluded.
+        map.insert(InteractiveEntity::Charger(ChargerEntity::new(
+            EntityCoordinates::new(0, 0, 1),
+            ChargerFacing::North,
+        )));
+
+        let found = map.find_within_radius(EntityCoordinates::ground(0, 0), 2, None);
+        assert_eq!(found.len(), 2, "only the two within radius 2 on floor 0");
+
+        let only_center = map.find_within_radius(EntityCoordinates::ground(0, 0), 0, None);
+        assert_eq!(only_center.len(), 1);
+    }
+
+    #[test]
+    fn rendered_chunk_locator_matches_render_footprint() {
+        let mut map = InteractiveEntityMap::new();
+        // Around world (0,0) the renderer keeps chunks (0,0), (-1,0), (0,-1).
+        map.insert(charger_at(1, 1, ChargerFacing::North)); // chunk (0,0)  — in
+        map.insert(charger_at(-1, 1, ChargerFacing::North)); // chunk (-1,0) — in
+        map.insert(charger_at(300, 300, ChargerFacing::North)); // far chunk  — out
+
+        let found = map.find_in_rendered_chunks(EntityCoordinates::ground(0, 0), None);
+        assert_eq!(found.len(), 2);
+    }
+
+    #[test]
+    fn accessible_locator_uses_pathfinding_and_adjacency() {
+        let passability: Hypermap<f32> = Hypermap::new(0.0);
+        for x in 0..9 {
+            passability.set(x, 0, 1.0); // straight walkable corridor along y = 0
+        }
+        let mut map = InteractiveEntityMap::new();
+        map.insert(charger_at(2, 0, ChargerFacing::North)); // dist 2 — reachable directly
+        map.insert(charger_at(4, 0, ChargerFacing::North)); // dist 4, neighbor (3,0) reachable
+        map.insert(charger_at(7, 0, ChargerFacing::North)); // too far, no reachable neighbor
+
+        let found = map.find_accessible_within(&passability, (0, 0), 0, 3, None);
+        assert_eq!(found.len(), 2, "direct hit plus adjacency, far one excluded");
     }
 }

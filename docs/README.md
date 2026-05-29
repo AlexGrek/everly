@@ -16,5 +16,6 @@ Current behavior docs:
 - `docs/chunk-overlay.md` — per-chunk RGBA overlays: temperature heatmap (F5), dirt, generic layer, occupancy debug (F4).
 - `docs/tile-fields.md` — tile-resolution scalar fields (dirt, temperature) and shared `TileFieldMap`.
 - `docs/field-interactions.md` — actor main-tile tracking and dirt deposits on tiles actors leave.
+- `docs/test-world.md` — **shared `TestWorld` fixture** (6×6-chunk generated world) that every game-logic unit test should load.
 
 Agent skills (repo): `.claude/SKILLS/map-creator/SKILL.md` (tilemaps + scale), `.claude/SKILLS/map-generator/SKILL.md` (procedural chunks + room walls), `.claude/SKILLS/bevy-engineer/SKILL.md` (Bevy 0.18 + Everly map constants).

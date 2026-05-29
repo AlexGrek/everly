@@ -2163,6 +2163,18 @@ fn build_chunk_render_data(snapshot: Vec<(CellType, TileStyle, TileStyle)>, acti
     partition_chunk_cells_from_vec(snapshot, active_floor)
 }
 
+/// Chunk coordinates the renderer would target around world tile `(world_x, world_y)`:
+/// the chunk containing the tile plus the prefetch neighbor on each axis toward the
+/// nearer border (the same set [`update_visible_hypermap_chunks`] keeps meshed).
+///
+/// Exposed so off-screen subsystems can reuse the *exact* visible footprint instead
+/// of re-deriving it. Used by
+/// [`InteractiveEntityMap::find_in_rendered_chunks`](crate::map::interactive_entity::InteractiveEntityMap::find_in_rendered_chunks).
+pub fn rendered_chunks_around(world_x: i32, world_y: i32) -> HashSet<ChunkCoord> {
+    let (center, local) = world_to_chunk_local(world_x, world_y);
+    target_chunks_for(center, local)
+}
+
 /// Exactly three chunks: camera chunk plus one neighbor on each axis toward the
 /// nearer chunk border (prefetch ahead of panning).
 fn target_chunks_for(center: ChunkCoord, local: LocalCoord) -> HashSet<ChunkCoord> {

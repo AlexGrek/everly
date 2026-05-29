@@ -190,10 +190,30 @@ cargo run --release          # smoothest playback
 cargo run --features dev     # iterative dev with bevy/dynamic_linking
 ```
 
-There are no tests yet. If you add gameplay logic that warrants them,
-prefer pure-function unit tests in the same module under
+Prefer pure-function unit tests in the same module under
 `#[cfg(test)] mod tests { ... }`. Avoid headless `App` tests unless
 strictly necessary — they're slow.
+
+**Game-logic tests must use the shared world fixture.** When a test needs a
+realistic world (pathfinding, interactive entities, fields, actor movement,
+etc.), load `crate::map::test_world::TestWorld::load()` instead of hand-building
+tiles — see `docs/test-world.md`. It is a committed, procedurally generated
+6×6-chunk world exposing `cells` / `passability` / `entities`. Only hand-build
+tiles for a narrow unit the fixture cannot express, and never add a second
+parallel world fixture.
+
+**Golden tests against the fixture are mandatory-paired.** Any test that asserts
+exact values from `TestWorld` (coordinate sets, counts, snapshots) is fragile by
+design and WILL break as the world grows. Before writing or changing one, follow
+the **verification protocol in `docs/test-world.md`** — non-negotiable:
+(1) write it as a pair — a storing test plus an independent-verification test that
+re-derives the same literal *without calling the function under test* (e.g. A* to
+cross-check the BFS-based accessibility locator); (2) when a golden fails, first
+decide regression vs. intended fixture change (`git status` on
+`test_fixtures/level_test_world/`) and never edit a literal to silence a
+regression; (3) re-bake only via `dump_locator_truth`, verifying each set by hand
+before pasting it into *both* literals. Never bake a value by copying locator/dump
+output alone.
 
 ## Workflow expectations
 
