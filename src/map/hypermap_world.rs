@@ -49,6 +49,16 @@ const CHARGER_CUBE_HEIGHT: f32 = 0.9;
 const CHARGER_CUBE_DEPTH: f32 = 0.22;
 /// Vertical center of the glowing cube above the storey floor (mounted high on the wall).
 const CHARGER_CUBE_CENTER_Y: f32 = 1.3;
+/// Connector: a chunky black "transformer" box, **larger** than the glowing cube,
+/// that bridges the gap to the backing wall. The wall slab sits on the *outer* edge
+/// of the neighboring cell, so its inner face is one cell minus one slab thickness
+/// (`1.0 - WALL_THICKNESS = 0.8 m`, four subtiles) from the charger cell boundary.
+const CHARGER_CONNECTOR_DEPTH: f32 = 1.0 - WALL_THICKNESS;
+const CHARGER_CONNECTOR_WIDTH: f32 = 0.74;
+const CHARGER_CONNECTOR_HEIGHT: f32 = 1.3;
+/// Vertical center of the transformer box (a touch lower than the cube so the glowing
+/// cube reads as mounted on its front face).
+const CHARGER_CONNECTOR_CENTER_Y: f32 = 1.2;
 /// Floor-0 void must fall inside this inset (local cell coords) before a water
 /// plane is spawned; the water mesh is also shrunk by this strip so nothing
 /// renders in the chunk border band.
@@ -91,6 +101,9 @@ struct RenderedChunkFloor0ChargerMetal;
 struct RenderedChunkFloor0ChargerGlow;
 
 #[derive(Component)]
+struct RenderedChunkFloor0ChargerConnector;
+
+#[derive(Component)]
 struct RenderedChunkUpperRoad;
 
 #[derive(Component)]
@@ -114,6 +127,9 @@ struct RenderedChunkUpperChargerMetal;
 #[derive(Component)]
 struct RenderedChunkUpperChargerGlow;
 
+#[derive(Component)]
+struct RenderedChunkUpperChargerConnector;
+
 /// Upper-layer mesh entities (refreshed when HUD floor changes). Floor 0 meshes stay on the chunk root.
 #[derive(Clone, Copy)]
 struct ChunkUpperMeshEntities {
@@ -125,6 +141,7 @@ struct ChunkUpperMeshEntities {
     glass_walls: Entity,
     charger_metal: Entity,
     charger_glow: Entity,
+    charger_connector: Entity,
 }
 
 /// Chunks that must be re-baked after [`Hypermap`](crate::hypermap::Hypermap) cell edits (drained in [`render_chunks_30fps`]).
@@ -248,6 +265,7 @@ struct HypermapRenderAssets {
     // ── Charging-station materials ─────────────────────────────────────────────
     charger_metal_material: Handle<StandardMaterial>,
     charger_glow_material: Handle<StandardMaterial>,
+    charger_connector_material: Handle<StandardMaterial>,
     water_material: Handle<StandardWaterMaterial>,
 }
 
@@ -357,11 +375,14 @@ fn setup_hypermap_assets(
         cull_mode: None,
         ..default()
     });
+    // `cull_mode: None` matches the wall materials: `append_box` winds its ±Z faces
+    // inward, so backface culling would otherwise drop them and the boxes look flipped.
     let charger_metal_material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.55, 0.57, 0.60),
         perceptual_roughness: 0.25,
         metallic: 0.95,
         reflectance: 0.60,
+        cull_mode: None,
         ..default()
     });
     // Emissive HDR blue — the camera's Bloom + Hdr stack make this read as a glow.
@@ -370,6 +391,15 @@ fn setup_hypermap_assets(
         emissive: LinearRgba::rgb(0.15, 0.85, 3.2),
         perceptual_roughness: 0.30,
         metallic: 0.0,
+        cull_mode: None,
+        ..default()
+    });
+    // Bulky matte-black transformer box that anchors the charger to the wall.
+    let charger_connector_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.03, 0.03, 0.04),
+        perceptual_roughness: 0.80,
+        metallic: 0.20,
+        cull_mode: None,
         ..default()
     });
     let normalized_dir = settings.wave_direction.normalize_or_zero();
@@ -409,6 +439,7 @@ fn setup_hypermap_assets(
         glass_wall_material,
         charger_metal_material,
         charger_glow_material,
+        charger_connector_material,
         water_material,
     });
     commands.insert_resource(MapSelectionRoadMaterial(road_material));
@@ -520,6 +551,11 @@ fn refresh_chunk_upper_layers_on_floor_change(
             &mut commands, &mut meshes, mesh_ids.charger_glow,
             build_upper_charger_glow_mesh(&prepared.upper_charger_cells, ox, oy),
             assets.charger_glow_material.clone(), assets.empty_mesh.clone(),
+        );
+        update_upper_charger_entity(
+            &mut commands, &mut meshes, mesh_ids.charger_connector,
+            build_upper_charger_connector_mesh(&prepared.upper_charger_cells, ox, oy),
+            assets.charger_connector_material.clone(), assets.empty_mesh.clone(),
         );
     }
 }
@@ -1196,6 +1232,27 @@ fn spawn_chunk_meshes(
             .id();
         commands.entity(chunk_root).add_child(id);
     }
+    // ── Floor 0: charging stations (transformer connector) ───────────────────
+    {
+        let (mesh3d, vis) =
+            if let Some(m) = build_floor0_charger_connector_mesh(&prepared.floor0_charger_cells, ox, oy) {
+                (Mesh3d(meshes.add(m)), Visibility::Inherited)
+            } else {
+                (Mesh3d(assets.empty_mesh.clone()), Visibility::Hidden)
+            };
+        let id = commands
+            .spawn((
+                Name::new(format!("Chunk floor0 charger connector {},{}", ox, oy)),
+                RenderedChunkFloor0ChargerConnector,
+                mesh3d,
+                MeshMaterial3d(assets.charger_connector_material.clone()),
+                Transform::default(),
+                vis,
+                Pickable::IGNORE,
+            ))
+            .id();
+        commands.entity(chunk_root).add_child(id);
+    }
 
     // ── Upper floors ─────────────────────────────────────────────────────────
     let upper_road = spawn_upper_road_entity(
@@ -1307,6 +1364,28 @@ fn spawn_chunk_meshes(
         id
     };
 
+    let upper_charger_connector = {
+        let (mesh3d, vis) =
+            if let Some(m) = build_upper_charger_connector_mesh(&prepared.upper_charger_cells, ox, oy) {
+                (Mesh3d(meshes.add(m)), Visibility::Inherited)
+            } else {
+                (Mesh3d(assets.empty_mesh.clone()), Visibility::Hidden)
+            };
+        let id = commands
+            .spawn((
+                Name::new(format!("Chunk upper charger connector {},{}", ox, oy)),
+                RenderedChunkUpperChargerConnector,
+                mesh3d,
+                MeshMaterial3d(assets.charger_connector_material.clone()),
+                Transform::default(),
+                vis,
+                Pickable::IGNORE,
+            ))
+            .id();
+        commands.entity(chunk_root).add_child(id);
+        id
+    };
+
     ChunkUpperMeshEntities {
         road: upper_road,
         road_glass,
@@ -1316,6 +1395,7 @@ fn spawn_chunk_meshes(
         glass_walls: upper_glass_walls,
         charger_metal: upper_charger_metal,
         charger_glow: upper_charger_glow,
+        charger_connector: upper_charger_connector,
     }
 }
 
@@ -1615,7 +1695,7 @@ fn append_charger_metal(
 }
 
 /// Glowing cube hanging on the [`ChargerFacing`] wall of a charging-station cell.
-fn append_charger_glow(
+fn append_charger_cube(
     positions: &mut Vec<[f32; 3]>,
     normals: &mut Vec<[f32; 3]>,
     uvs: &mut Vec<[f32; 2]>,
@@ -1647,6 +1727,39 @@ fn append_charger_glow(
     );
 }
 
+/// Bulky transformer box that bridges the charger cell boundary (0.5 from center) to
+/// the backing wall slab's inner face (0.5 + [`CHARGER_CONNECTOR_DEPTH`]).
+fn append_charger_connector(
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    uvs: &mut Vec<[f32; 2]>,
+    indices: &mut Vec<u32>,
+    cx: f32,
+    cz: f32,
+    y_base: f32,
+    facing: ChargerFacing,
+) {
+    let (dx, dz) = facing.wall_dir();
+    let center = 0.5 + CHARGER_CONNECTOR_DEPTH * 0.5;
+    let (sx, sz) = if dx != 0.0 {
+        (CHARGER_CONNECTOR_DEPTH, CHARGER_CONNECTOR_WIDTH)
+    } else {
+        (CHARGER_CONNECTOR_WIDTH, CHARGER_CONNECTOR_DEPTH)
+    };
+    append_box(
+        positions,
+        normals,
+        uvs,
+        indices,
+        cx + dx * center,
+        y_base + CHARGER_CONNECTOR_CENTER_Y,
+        cz + dz * center,
+        sx,
+        CHARGER_CONNECTOR_HEIGHT,
+        sz,
+    );
+}
+
 pub(crate) fn build_floor0_charger_metal_mesh(cells: &[(i32, i32, CellType)], origin_x: i32, origin_y: i32) -> Option<Mesh> {
     let mut positions = Vec::new();
     let mut normals = Vec::new();
@@ -1669,7 +1782,21 @@ pub(crate) fn build_floor0_charger_glow_mesh(cells: &[(i32, i32, CellType)], ori
         let CellType::Charger(facing) = cell_type else { continue };
         let cx = origin_x as f32 + x as f32 + 0.5;
         let cz = origin_y as f32 + y as f32 + 0.5;
-        append_charger_glow(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, 0.0, facing);
+        append_charger_cube(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, 0.0, facing);
+    }
+    finalize_mesh_from_buffers(positions, normals, uvs, indices)
+}
+
+pub(crate) fn build_floor0_charger_connector_mesh(cells: &[(i32, i32, CellType)], origin_x: i32, origin_y: i32) -> Option<Mesh> {
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut uvs = Vec::new();
+    let mut indices = Vec::new();
+    for &(x, y, cell_type) in cells {
+        let CellType::Charger(facing) = cell_type else { continue };
+        let cx = origin_x as f32 + x as f32 + 0.5;
+        let cz = origin_y as f32 + y as f32 + 0.5;
+        append_charger_connector(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, 0.0, facing);
     }
     finalize_mesh_from_buffers(positions, normals, uvs, indices)
 }
@@ -1698,7 +1825,22 @@ pub(crate) fn build_upper_charger_glow_mesh(cells: &[(i32, i32, i32, CellType)],
         let cx = origin_x as f32 + x as f32 + 0.5;
         let cz = origin_y as f32 + y as f32 + 0.5;
         let y_base = floor as f32 * HYPERMAP_FLOOR_HEIGHT;
-        append_charger_glow(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, y_base, facing);
+        append_charger_cube(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, y_base, facing);
+    }
+    finalize_mesh_from_buffers(positions, normals, uvs, indices)
+}
+
+pub(crate) fn build_upper_charger_connector_mesh(cells: &[(i32, i32, i32, CellType)], origin_x: i32, origin_y: i32) -> Option<Mesh> {
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut uvs = Vec::new();
+    let mut indices = Vec::new();
+    for &(x, y, floor, cell_type) in cells {
+        let CellType::Charger(facing) = cell_type else { continue };
+        let cx = origin_x as f32 + x as f32 + 0.5;
+        let cz = origin_y as f32 + y as f32 + 0.5;
+        let y_base = floor as f32 * HYPERMAP_FLOOR_HEIGHT;
+        append_charger_connector(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, y_base, facing);
     }
     finalize_mesh_from_buffers(positions, normals, uvs, indices)
 }
@@ -1714,7 +1856,8 @@ pub(crate) fn build_charger_preview_mesh(cell: CellType, ix: i32, iz: i32, y_bas
     let cx = ix as f32 + 0.5;
     let cz = iz as f32 + 0.5;
     append_charger_metal(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, y_base);
-    append_charger_glow(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, y_base, facing);
+    append_charger_connector(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, y_base, facing);
+    append_charger_cube(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, y_base, facing);
     finalize_mesh_from_buffers(positions, normals, uvs, indices)
 }
 

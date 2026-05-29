@@ -103,10 +103,12 @@ Procedural placement at concave union elbows: **`docs/corners.md`**.
 ### Charging station (`cn` / `cs` / `ce` / `cw`)
 
 A **charging station** is a **walkable** cell (passable like `__` road) that renders
-two extra shapes on top of the normal floor quad: an **elevated metal pad** (inset,
-raised ~0.08 m) and a **glowing-blue cube** mounted on the backing wall. The second
-letter is the **facing** — which wall edge the cube hangs on (its back). The cube faces
-into the room.
+extra shapes on top of the normal floor quad: an **elevated metal pad** (inset,
+raised ~0.08 m), a **glowing-blue cube**, and a bulky **matte-black transformer box**
+(larger than the cube) that bridges the 4-subtile (0.8 m) gap to the backing wall's
+slab — which sits on the *outer* edge of the neighboring wall cell — so the unit reads
+as bolted to the wall, with the glowing cube mounted on its front. The second letter is
+the **facing** — which wall edge the charger backs onto; the cube faces into the room.
 
 | Token | Backing wall (cube edge) in **XZ** |
 |-------|-------------------------------------|

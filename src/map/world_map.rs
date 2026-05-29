@@ -111,7 +111,7 @@ impl WallCorner {
 /// the named edge facing into the room. Cardinal directions match the wall
 /// bitmask edges (north toward **−Z**, south toward **+Z**, east toward **+X**,
 /// west toward **−X**).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ChargerFacing {
     North,
     South,

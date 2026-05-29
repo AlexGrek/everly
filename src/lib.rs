@@ -58,6 +58,7 @@ impl Plugin for GamePlugin {
                 map::temperature::TemperatureMapPlugin,
                 map::temperature_overlay::TemperatureOverlayPlugin,
                 map::field_interactions::FieldInteractionsPlugin,
+                map::interactive_entity::InteractiveEntityPlugin,
                 actor::ActorPlugin,
                 actor::snapshot::ActorSnapshotPlugin,
                 actor::glitch_bot::GlitchBotPlugin,

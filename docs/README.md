@@ -9,6 +9,8 @@ Current behavior docs:
 - `docs/actor-spawner.md` — in-game actor spawner (Bot/Black palette, own HUD toggle, click-to-spawn).
 - `docs/level-persistence.md` — **save/load**: level folder layout, Save button, binaries, actors, camera, load order.
 - `docs/map-generator.md` — procedural chunk geometry (`src/map/map_generator/`).
+- `docs/add_new_tile.md` — end-to-end checklist for adding a new `CellType` (encoding, passability, generation, editor, rendering).
+- `docs/interactive-entities.md` — sparse per-tile store of stateful reference-type objects (chargers), the `InteractiveEntity` trait/enum, and the `InteractiveEntityMap` resource.
 - `docs/corners.md` — inner `c*` corner pillars (concave union elbows, detection algorithm).
 - `docs/actor.md` — actor trait runtime loop, movement buffer, footprint collision flow, **main tile** (`round(center)`), and usage examples.
 - `docs/chunk-overlay.md` — per-chunk RGBA overlays: temperature heatmap (F5), dirt, generic layer, occupancy debug (F4).

@@ -18,6 +18,7 @@ pub mod tile_field;
 pub mod tile_field_level;
 pub mod floor_level;
 pub mod hypermap;
+pub mod interactive_entity;
 pub mod level;
 pub mod map_generator;
 pub mod hypermap_pathfind;

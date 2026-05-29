@@ -31,10 +31,15 @@ Each visible chunk is rendered with batched meshes (see `src/map/hypermap_world.
 - **Road / floor quads:** one batched mesh for **all non-void cells** — both **`ROAD`** and **`WALL`** get a horizontal floor quad at the storey base so open parts of wall tiles match road material (wall tops alone would backface-cull from above when slabs are thin).
 - **Wall mesh:** vertical slabs from wall bitmask edges only.
 - **Charging-station meshes:** `Charger` cells keep their normal floor quad and add
-  two extra batched meshes — a **metal pad** (elevated, inset; `charger_metal_material`)
-  and a **glowing-blue cube** on the backing wall (`charger_glow_material`, emissive HDR
-  so the camera Bloom makes it glow). Floor 0 and the active upper floor each get their
-  own pad + glow entity (`build_*_charger_metal_mesh` / `build_*_charger_glow_mesh`).
+  **three** batched meshes, each with its own material: a **metal pad** (elevated,
+  inset; `charger_metal_material`), a **glowing-blue cube** (`charger_glow_material`,
+  emissive HDR so the camera Bloom makes it glow), and a bulky **matte-black
+  transformer connector** (`charger_connector_material`) that is larger than the cube
+  and `CHARGER_CONNECTOR_DEPTH` deep (`1.0 - WALL_THICKNESS` = 0.8 m, four subtiles),
+  reaching across the neighboring wall cell to the slab's inner face. Floor 0 and the
+  active upper floor each get their own pad + glow + connector entity
+  (`build_*_charger_metal_mesh` / `build_*_charger_glow_mesh` /
+  `build_*_charger_connector_mesh`).
 - Optional **water** tile mesh when floor `0` has interior void; the plane is
   inset from chunk edges so border cells stay dry — see `hypermap.md`.
 
@@ -52,5 +57,15 @@ This avoids per-tile entity churn and reduces frame spikes.
 
 ## Notes
 
-- Wall material currently uses `cull_mode: None` for robustness with custom
-  mesh winding.
+- **`append_box` winding quirk — box meshes must use `cull_mode: None`.** The
+  shared `append_box` helper (`src/map/hypermap_world.rs`) winds its **±X and ±Y**
+  faces outward but its **±Z** faces *inward* (the +Z/−Z triangle front faces point
+  opposite their stored normals). Stored normals are correct, so **lighting** is
+  fine, but the default backface culling drops the two Z faces and the box reads as
+  inside-out. Any material applied to box geometry — `wall_material`,
+  `glass_wall_material`, and the charger `charger_metal_material` /
+  `charger_glow_material` — therefore sets **`cull_mode: None`**. Floor quads
+  (`append_quad`, used for road/floor meshes) only emit the +Y face, which *is*
+  wound correctly, so they keep default culling. If you add a new box-based mesh,
+  set `cull_mode: None` on its material (or fix the Z-face winding in `append_box`,
+  which is shared by walls).
