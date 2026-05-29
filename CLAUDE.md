@@ -83,6 +83,7 @@ everly/
     │   └── hypermap_pathfind.rs  #   A* over hypermap floors
     └── edit/                     # in-game editing tools
         ├── map_edit.rs           #   MapEditPlugin (HUD palette, paint, remesh queue)
+        ├── actor_spawn.rs        #   ActorSpawnPlugin (Actors palette, click-to-spawn bots)
         └── map_selection.rs      #   MapSelectionPlugin (click-to-select + highlight)
 ```
 

@@ -7,6 +7,7 @@ use crate::scene::camera::{
     spawn_camera, AmbientFillEnabled, StrategyCamera, StrategyCameraRig,
     StrategyCameraViewMode, STRATEGY_CAMERA_DEFAULT_PITCH, STRATEGY_CAMERA_MAP_PITCH,
 };
+use crate::edit::actor_spawn::{ActorSpawnToggleButton, ActorSpawnToggleLabel};
 use crate::edit::map_edit::{MapEditToggleButton, MapEditToggleLabel};
 use crate::map::chunk_overlay::OccupancyOverlayEnabled;
 use crate::map::temperature_overlay::TemperatureOverlayEnabled;
@@ -153,6 +154,33 @@ pub(crate) fn spawn_bottom_hud(mut commands: Commands, camera: Query<Entity, Wit
                     p.spawn((
                         MapEditToggleLabel,
                         Text::new("Edit"),
+                        TextFont::from_font_size(17.0),
+                        TextColor(TEXT_MAIN),
+                    ));
+                });
+
+            parent
+                .spawn((
+                    Name::new("HUD actor spawn toggle"),
+                    ActorSpawnToggleButton,
+                    Button,
+                    Node {
+                        min_width: Val::Px(86.0),
+                        height: Val::Px(36.0),
+                        padding: UiRect::horizontal(Val::Px(12.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(1.0)),
+                        border_radius: BorderRadius::all(Val::Px(6.0)),
+                        ..default()
+                    },
+                    BorderColor::all(BTN_BORDER),
+                    BackgroundColor(BTN_BG),
+                ))
+                .with_children(|p| {
+                    p.spawn((
+                        ActorSpawnToggleLabel,
+                        Text::new("Actors"),
                         TextFont::from_font_size(17.0),
                         TextColor(TEXT_MAIN),
                     ));

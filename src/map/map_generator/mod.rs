@@ -13,6 +13,8 @@ mod step_corners;
 mod step_door;
 mod step_home_crawler;
 mod step_houses;
+mod step_inner_doors;
+mod step_inner_walls;
 mod step_rooms;
 mod step_seeds;
 mod step_shell;
@@ -53,6 +55,8 @@ impl MapDraft {
         self.step_build_union_outer_walls();
         self.step_stamp_union_inner_corner_pillars();
         self.step_place_house_doors();
+        self.step_split_houses_into_rooms();
+        self.step_place_inner_doors();
         self.step_home_crawlers();
     }
 

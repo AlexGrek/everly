@@ -25,12 +25,11 @@ use crate::actor::snapshot::{save_level_actors, LevelActorsFile};
 use crate::scene::camera::{StrategyCamera, StrategyCameraRig};
 use crate::scene::camera_snapshot::{save_level_camera, LevelCameraFile};
 use crate::actor::{actor_main_tile, ActorObject};
+use crate::edit::actor_spawn::ActorSpawnState;
 use crate::map::world_map::{
     CellType, TileStyle, WallCorner, WallMask, perimeter_wall_mask,
 };
 use crate::menu::main_menu::GameState;
-use crate::actor::black_bot::{self, BlackBotRng};
-use crate::actor::glitch_bot::{self, GlitchBotRng};
 
 /// Pixels from the bottom of the window where raycasting and clicks are suppressed
 /// (covers the 52 px HUD bar + 40 px palette row + a small margin).
@@ -68,10 +67,6 @@ pub enum MapTileKind {
     /// Drag a rectangle; on mouse up, place walls only on the **border** with masks facing outward (closed loop).
     Room,
     Corner,
-    /// Places a GlitchBot actor at the clicked tile (single-click, no drag).
-    GlitchBot,
-    /// Places a BlackBot actor at the clicked tile (single-click, no drag).
-    BlackBot,
     /// Flood-fills the floor style of an enclosed space from the clicked tile.
     /// Bridges 1–2-tile wall gaps (doors) and refuses if the region exceeds 50×50 tiles.
     Fill,
@@ -176,8 +171,6 @@ pub(crate) fn spawn_map_edit_palette(mut commands: Commands, camera: Query<Entit
                 ("WallG", MapTileKind::WallGlass),
                 ("Room", MapTileKind::Room),
                 ("Corner", MapTileKind::Corner),
-                ("Bot", MapTileKind::GlitchBot),
-                ("Black", MapTileKind::BlackBot),
                 ("Fill", MapTileKind::Fill),
             ] {
                 row.spawn((
@@ -445,6 +438,7 @@ fn map_edit_tile_pick_buttons(
     mut variant: ResMut<MapEditVariantIndex>,
     mut style: ResMut<MapEditStyleState>,
     mut drag_anchor: ResMut<MapEditDragAnchor>,
+    mut actor_spawn: ResMut<ActorSpawnState>,
 ) {
     if !state.panel_open {
         return;
@@ -458,6 +452,9 @@ fn map_edit_tile_pick_buttons(
         style.floor = 0;
         style.wall = 0;
         drag_anchor.0 = None;
+        // The map-edit tile brush and the actor-spawn brush are mutually exclusive
+        // so a single click never both paints a tile and spawns an actor.
+        actor_spawn.placement = None;
     }
 }
 
@@ -592,8 +589,7 @@ fn stroke_world_cells(kind: MapTileKind, start: (i32, i32), end: (i32, i32)) -> 
         MapTileKind::Wall | MapTileKind::WallGlass => wall_line_cells(start, end),
         MapTileKind::Void | MapTileKind::Road => floor_rect_cells(start, end),
         MapTileKind::Room => room_outline_cells(start, end),
-        MapTileKind::Corner => vec![end],
-        MapTileKind::GlitchBot | MapTileKind::BlackBot | MapTileKind::Fill => vec![end],
+        MapTileKind::Corner | MapTileKind::Fill => vec![end],
     }
 }
 
@@ -606,7 +602,7 @@ fn preview_stroke_cells(kind: MapTileKind, anchor: Option<(i32, i32)>, hover: Op
     }
 }
 
-fn ray_intersect_horizontal_plane(ray: Ray3d, plane_y: f32) -> Option<Vec3> {
+pub(crate) fn ray_intersect_horizontal_plane(ray: Ray3d, plane_y: f32) -> Option<Vec3> {
     let n = Vec3::Y;
     let dir = Vec3::from(*ray.direction);
     let denom = dir.dot(n);
@@ -638,7 +634,7 @@ fn resolved_cell(kind: MapTileKind, variant: u32) -> CellType {
             };
             CellType::Corner(c)
         }
-        MapTileKind::GlitchBot | MapTileKind::BlackBot | MapTileKind::Fill => CellType::Road,
+        MapTileKind::Fill => CellType::Road,
     }
 }
 
@@ -730,7 +726,7 @@ fn map_edit_update_preview(
                 let (ix, iz) = strokes[0];
                 build_floor0_wall_mesh(&[(0, 0, c)], ix, iz).or_else(void_preview_plane)
             }
-            MapTileKind::GlitchBot | MapTileKind::BlackBot | MapTileKind::Fill => void_preview_plane(),
+            MapTileKind::Fill => void_preview_plane(),
         }
     } else {
         match kind {
@@ -772,7 +768,7 @@ fn map_edit_update_preview(
                 let (ix, iz) = strokes[0];
                 build_upper_wall_mesh(&[(0, 0, f, c)], ix, iz).or_else(void_preview_plane)
             }
-            MapTileKind::GlitchBot | MapTileKind::BlackBot | MapTileKind::Fill => void_preview_plane(),
+            MapTileKind::Fill => void_preview_plane(),
         }
     };
 
@@ -814,15 +810,14 @@ fn map_edit_update_preview(
     }
 }
 
-fn void_preview_plane() -> Option<Mesh> {
+pub(crate) fn void_preview_plane() -> Option<Mesh> {
     Some(Plane3d::default().mesh().size(0.96, 0.96).into())
 }
 
 #[derive(Resource, Clone)]
-struct MapEditPreviewMaterial(Handle<StandardMaterial>);
+pub(crate) struct MapEditPreviewMaterial(pub(crate) Handle<StandardMaterial>);
 
 fn map_edit_pointer_stroke(
-    mut commands: Commands,
     mouse: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window>,
     cameras: Query<(&Camera, &GlobalTransform), With<StrategyCameraRig>>,
@@ -834,10 +829,6 @@ fn map_edit_pointer_stroke(
     level: Res<LevelName>,
     mut runtime: ResMut<HypermapRuntime>,
     mut remesh: ResMut<HypermapChunkRemeshQueue>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut bot_rng: ResMut<GlitchBotRng>,
-    mut black_rng: ResMut<BlackBotRng>,
 ) {
     let Some(kind) = state.placement_tile else {
         drag.0 = None;
@@ -874,30 +865,6 @@ fn map_edit_pointer_stroke(
     let Some(end) = map_edit_plane_cell(&window, &cam, &cam_gt, floor.0) else {
         return;
     };
-
-    if kind == MapTileKind::GlitchBot {
-        let center = Vec2::new(end.0 as f32 + 0.5, end.1 as f32 + 0.5);
-        glitch_bot::spawn_glitch_bot(
-            &mut commands,
-            &mut meshes,
-            &mut materials,
-            &mut bot_rng.0,
-            center,
-        );
-        return;
-    }
-
-    if kind == MapTileKind::BlackBot {
-        let center = Vec2::new(end.0 as f32 + 0.5, end.1 as f32 + 0.5);
-        black_bot::spawn_black_bot(
-            &mut commands,
-            &mut meshes,
-            &mut materials,
-            &mut black_rng.0,
-            center,
-        );
-        return;
-    }
 
     if kind == MapTileKind::Fill {
         let (ix, iz) = end;
@@ -1039,8 +1006,7 @@ fn map_edit_scroll_variants(
     let max_v = match kind {
         MapTileKind::Wall | MapTileKind::WallGlass => 15,
         MapTileKind::Corner => 4,
-        MapTileKind::Void | MapTileKind::Road | MapTileKind::Room
-        | MapTileKind::GlitchBot | MapTileKind::BlackBot | MapTileKind::Fill => return,
+        MapTileKind::Void | MapTileKind::Road | MapTileKind::Room | MapTileKind::Fill => return,
     };
 
     let mut scroll = 0.0f32;

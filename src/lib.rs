@@ -63,11 +63,16 @@ impl Plugin for GamePlugin {
                 actor::glitch_bot::GlitchBotPlugin,
                 actor::black_bot::BlackBotPlugin,
                 edit::map_edit::MapEditPlugin,
+                edit::actor_spawn::ActorSpawnPlugin,
                 edit::map_selection::MapSelectionPlugin,
             ))
             .add_systems(
                 OnEnter(menu::main_menu::GameState::InGame),
-                edit::map_edit::spawn_map_edit_palette.after(hud::game_hud::spawn_bottom_hud),
+                (
+                    edit::map_edit::spawn_map_edit_palette,
+                    edit::actor_spawn::spawn_actor_spawn_palette,
+                )
+                    .after(hud::game_hud::spawn_bottom_hud),
             );
     }
 }

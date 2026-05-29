@@ -6,6 +6,7 @@ Current behavior docs:
 - `docs/hypermap.md` — Hypermap chunk model, multi-floor data, generation, visibility, and water rules.
 - `docs/rendering-pipeline.md` — runtime planning, async prep, 30 FPS render stream, floor vs wall meshes.
 - `docs/map-editor.md` — in-game hypermap edit mode (HUD, preview, placement, variants, remesh).
+- `docs/actor-spawner.md` — in-game actor spawner (Bot/Black palette, own HUD toggle, click-to-spawn).
 - `docs/level-persistence.md` — **save/load**: level folder layout, Save button, binaries, actors, camera, load order.
 - `docs/map-generator.md` — procedural chunk geometry (`src/map/map_generator/`).
 - `docs/corners.md` — inner `c*` corner pillars (concave union elbows, detection algorithm).

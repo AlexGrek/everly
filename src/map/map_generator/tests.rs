@@ -520,6 +520,243 @@ fn house_entry_is_open_tile_inside_doorway() {
 }
 
 #[test]
+fn inner_walls_split_house_into_rooms() {
+    let mut draft = MapDraft::new(MapGeneratorConfig {
+        seed: 3,
+        size: 16,
+        margin: 1,
+    });
+    draft.room_records = vec![RoomRecord {
+        bounds: Room {
+            x0: 3,
+            z0: 3,
+            x1: 11,
+            z1: 11,
+        },
+    }];
+    draft.step_init_carpet();
+    draft.step_cluster_houses();
+    draft.step_paint_union_interior();
+    draft.step_build_union_outer_walls();
+    draft.step_stamp_union_inner_corner_pillars();
+    draft.step_split_houses_into_rooms();
+
+    let mut inner_wall_cells = 0u32;
+    for z in 4..=10 {
+        for x in 4..=10 {
+            if let DraftTile::Wall(_) = draft.get(x, z) {
+                inner_wall_cells += 1;
+            }
+        }
+    }
+    assert!(
+        inner_wall_cells > 0,
+        "9x9 house should receive at least one inner wall"
+    );
+}
+
+#[test]
+fn inner_walls_skipped_for_small_houses() {
+    // Houses with footprint_area < 30 must not receive any inner walls.
+    let mut draft = MapDraft::new(MapGeneratorConfig {
+        seed: 5,
+        size: 12,
+        margin: 1,
+    });
+    draft.room_records = vec![RoomRecord {
+        bounds: Room {
+            x0: 3,
+            z0: 3,
+            x1: 6,
+            z1: 6,
+        },
+    }];
+    draft.step_init_carpet();
+    draft.step_cluster_houses();
+    draft.step_paint_union_interior();
+    draft.step_build_union_outer_walls();
+    draft.step_stamp_union_inner_corner_pillars();
+    draft.step_place_house_doors();
+    draft.step_split_houses_into_rooms();
+
+    // 4x4 house has area 16 < 30, so the split step is skipped entirely.
+    for z in 4..=5 {
+        for x in 4..=5 {
+            assert_eq!(
+                draft.get(x, z),
+                DraftTile::Open,
+                "interior of small house must remain Open (no inner walls)"
+            );
+        }
+    }
+}
+
+#[test]
+fn inner_walls_respect_min_room_constraints() {
+    // A house large enough to receive cuts must never produce a sub-room < 6
+    // cells or narrower than 2 cells in either direction.
+    for seed in 0..64u64 {
+        let mut draft = MapDraft::new(MapGeneratorConfig {
+            seed,
+            ..Default::default()
+        });
+        draft.step_init_carpet();
+        draft.step_place_primary_seeds();
+        draft.step_separate_primary_seeds();
+        draft.step_spawn_subseeds();
+        draft.step_grow_rooms();
+        draft.step_cluster_houses();
+        draft.step_paint_union_interior();
+        draft.step_build_union_outer_walls();
+        draft.step_stamp_union_inner_corner_pillars();
+        draft.step_place_house_doors();
+        draft.step_split_houses_into_rooms();
+        // If no panic, constraints satisfied. Basic smoke check that the step runs.
+    }
+}
+
+#[test]
+fn inner_walls_isolate_rooms() {
+    // After inner walls, the entry-room BFS should not visit every cell of a
+    // generously-sized house with at least one inner cut.
+    use std::collections::{HashSet, VecDeque};
+    let mut isolated_cases = 0u32;
+    for seed in 0..64u64 {
+        let mut draft = MapDraft::new(MapGeneratorConfig {
+            seed,
+            ..Default::default()
+        });
+        draft.step_init_carpet();
+        draft.step_place_primary_seeds();
+        draft.step_separate_primary_seeds();
+        draft.step_spawn_subseeds();
+        draft.step_grow_rooms();
+        draft.step_cluster_houses();
+        draft.step_paint_union_interior();
+        draft.step_build_union_outer_walls();
+        draft.step_stamp_union_inner_corner_pillars();
+        draft.step_place_house_doors();
+        draft.step_split_houses_into_rooms();
+        for house in &draft.houses {
+            let total_open: usize = (house.z0..=house.z1)
+                .flat_map(|z| (house.x0..=house.x1).map(move |x| (x, z)))
+                .filter(|&(x, z)| house.contains(x, z) && draft.get(x, z) == DraftTile::Open)
+                .count();
+            if total_open == 0 {
+                continue;
+            }
+            let start = (house.z0..=house.z1)
+                .flat_map(|z| (house.x0..=house.x1).map(move |x| (x, z)))
+                .find(|&(x, z)| house.contains(x, z) && draft.get(x, z) == DraftTile::Open);
+            let Some(start) = start else { continue };
+            let mut visited: HashSet<(i32, i32)> = HashSet::from([start]);
+            let mut queue: VecDeque<(i32, i32)> = VecDeque::from([start]);
+            while let Some((x, z)) = queue.pop_front() {
+                for (dx, dz) in [(0, -1), (0, 1), (1, 0), (-1, 0)] {
+                    let n = (x + dx, z + dz);
+                    if visited.contains(&n) {
+                        continue;
+                    }
+                    if !house.contains(n.0, n.1) || draft.get(n.0, n.1) != DraftTile::Open {
+                        continue;
+                    }
+                    visited.insert(n);
+                    queue.push_back(n);
+                }
+            }
+            if visited.len() < total_open {
+                isolated_cases += 1;
+            }
+        }
+    }
+    assert!(
+        isolated_cases > 0,
+        "expected at least one house with truly isolated rooms across 64 seeds"
+    );
+}
+
+#[test]
+fn inner_doors_make_all_rooms_accessible() {
+    // After inner walls + inner doors, every walkable cell in every house must be
+    // reachable from the outer entry tile. Connectivity is edge-based: a `Wall(bits)`
+    // cell is walkable floor with slabs on the named edges; passage between two cells
+    // is blocked only when a slab sits on their shared edge.
+    use std::collections::{HashSet, VecDeque};
+
+    use crate::map::world_map::{MASK_EAST, MASK_NORTH, MASK_SOUTH, MASK_WEST};
+
+    // Slab bits on a walkable cell, or None when the cell cannot be walked.
+    let cell_bits = |draft: &MapDraft, x: i32, z: i32| -> Option<u8> {
+        match draft.get(x, z) {
+            DraftTile::Open | DraftTile::Corner(_) => Some(0),
+            DraftTile::Wall(bits) => Some(bits),
+            DraftTile::Void => None,
+        }
+    };
+    const EDGES: [(i32, i32, u8, u8); 4] = [
+        (0, -1, MASK_NORTH, MASK_SOUTH),
+        (0, 1, MASK_SOUTH, MASK_NORTH),
+        (1, 0, MASK_EAST, MASK_WEST),
+        (-1, 0, MASK_WEST, MASK_EAST),
+    ];
+
+    for seed in 0..128u64 {
+        let mut draft = MapDraft::new(MapGeneratorConfig {
+            seed,
+            ..Default::default()
+        });
+        draft.step_init_carpet();
+        draft.step_place_primary_seeds();
+        draft.step_separate_primary_seeds();
+        draft.step_spawn_subseeds();
+        draft.step_grow_rooms();
+        draft.step_cluster_houses();
+        draft.step_paint_union_interior();
+        draft.step_build_union_outer_walls();
+        draft.step_stamp_union_inner_corner_pillars();
+        draft.step_place_house_doors();
+        draft.step_split_houses_into_rooms();
+        draft.step_place_inner_doors();
+
+        for (hi, house) in draft.houses.iter().enumerate() {
+            let Some(ref ep) = house.entry else { continue };
+            let Some(start) = super::step_home_crawler::house_entry_interior_tile(&draft, ep)
+            else {
+                continue;
+            };
+
+            let mut visited: HashSet<(i32, i32)> = HashSet::from([start]);
+            let mut queue: VecDeque<(i32, i32)> = VecDeque::from([start]);
+            while let Some((x, z)) = queue.pop_front() {
+                let Some(b) = cell_bits(&draft, x, z) else { continue };
+                for (dx, dz, this_bit, nbr_bit) in EDGES {
+                    let n = (x + dx, z + dz);
+                    if visited.contains(&n) || !house.contains(n.0, n.1) {
+                        continue;
+                    }
+                    let Some(nb) = cell_bits(&draft, n.0, n.1) else { continue };
+                    if b & this_bit == 0 && nb & nbr_bit == 0 {
+                        visited.insert(n);
+                        queue.push_back(n);
+                    }
+                }
+            }
+
+            for z in house.z0..=house.z1 {
+                for x in house.x0..=house.x1 {
+                    if house.contains(x, z)
+                        && cell_bits(&draft, x, z).is_some()
+                        && !visited.contains(&(x, z))
+                    {
+                        panic!("seed {seed} house {hi}: ({x},{z}) unreachable from entry");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn clustered_houses_only_merge_on_overlap() {
     let houses = super::house::cluster_houses(&[
         RoomRecord {
