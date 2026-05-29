@@ -235,7 +235,7 @@ fn zoom_camera(
     if map_edit.as_ref().is_some_and(|s| {
         matches!(
             s.placement_tile,
-            Some(MapTileKind::Wall | MapTileKind::Corner)
+            Some(MapTileKind::Wall | MapTileKind::Corner | MapTileKind::Charger)
         )
     }) {
         return;

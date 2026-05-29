@@ -30,6 +30,11 @@ Each visible chunk is rendered with batched meshes (see `src/map/hypermap_world.
 - **Floor 0:** separate road mesh (non-void cells) and wall mesh; upper floors split similarly so HUD floor changes do not rebake floor 0.
 - **Road / floor quads:** one batched mesh for **all non-void cells** — both **`ROAD`** and **`WALL`** get a horizontal floor quad at the storey base so open parts of wall tiles match road material (wall tops alone would backface-cull from above when slabs are thin).
 - **Wall mesh:** vertical slabs from wall bitmask edges only.
+- **Charging-station meshes:** `Charger` cells keep their normal floor quad and add
+  two extra batched meshes — a **metal pad** (elevated, inset; `charger_metal_material`)
+  and a **glowing-blue cube** on the backing wall (`charger_glow_material`, emissive HDR
+  so the camera Bloom makes it glow). Floor 0 and the active upper floor each get their
+  own pad + glow entity (`build_*_charger_metal_mesh` / `build_*_charger_glow_mesh`).
 - Optional **water** tile mesh when floor `0` has interior void; the plane is
   inset from chunk edges so border cells stay dry — see `hypermap.md`.
 

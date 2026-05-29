@@ -25,6 +25,7 @@ Stroke rules (world grid `(x, z)`):
 - **Void / Road:** axis-aligned **rectangle** (filled) between start and end on mouse up. New “floor” palette kinds should extend `MapTileKind`, `stroke_world_cells`, and `map_edit_update_preview` in `map_edit.rs` the same way.
 - **Room:** same drag as void/road, but only the **rectangle border** is written. Each border cell gets a [`WallMask`](tilemap.md) on the **outer** sides of the selection (`perimeter_wall_mask` in `map_edit.rs`), consistent with the world-space rules in `tilemap.md` § Wall bitmask. The interior is left unchanged.
 - **Corner:** single pillar at the **mouse-up** cell (variant still from the wheel).
+- **Charger:** single walkable charging station at the **mouse-up** cell — an elevated metal pad plus a glowing-blue cube on the backing wall (variant = facing, from the wheel). See [`tilemap.md`](tilemap.md) § Charging station.
 
 Releasing over the HUD dead zone or with no valid ray cancels the stroke (nothing written). The preview entity does not modify picking or existing meshes until mouse up.
 
@@ -34,9 +35,10 @@ Releasing over the HUD dead zone or with no valid ray cancels the stroke (nothin
 |--------------|----------------|
 | **Wall** | Cycles bitmask **1 … 15** (same numeric masks as hex `w1`…`wF` in [`tilemap.md`](tilemap.md)). Order is variant index modulo 15, mapped to `bits = (index % 15) + 1`. |
 | **Corner** | Cycles pillar corners **NW → NE → SW → SE** (same semantics as `c7` / `c9` / `c1` / `c3`). |
+| **Charger** | Cycles facing **N → E → S → W** (which wall the cube backs onto; `cn` / `ce` / `cs` / `cw`). |
 | **Void**, **Road**, **Room** | No variants. The wheel does **not** reserve placement input for these types. |
 
-While placing **Wall** or **Corner**, the **strategy camera zoom** is disabled so the wheel only changes the variant (`zoom_camera` in `src/scene/camera.rs` checks `MapEditState`). With **Void**, **Road**, or **Room** selected, zoom behaves normally.
+While placing **Wall**, **Corner**, or **Charger**, the **strategy camera zoom** is disabled so the wheel only changes the variant (`zoom_camera` in `src/scene/camera.rs` checks `MapEditState`). With **Void**, **Road**, or **Room** selected, zoom behaves normally.
 
 ## UI chrome guard
 

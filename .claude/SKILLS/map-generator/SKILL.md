@@ -41,7 +41,7 @@ paths:
 | Config + persisted metadata types | `src/map/map_generator/types.rs` |
 | Union shell helpers | `src/map/map_generator/union.rs` |
 | Concave corner pillar detection (walls only) | `corner_pillars.rs` — see **`docs/corners.md`** |
-| Pipeline steps | `step_carpet.rs`, `step_seeds.rs`, `step_rooms.rs`, `step_shell.rs`, `step_corners.rs`, `step_inner_walls.rs`, `step_inner_doors.rs`, `step_door.rs` |
+| Pipeline steps | `step_carpet.rs`, `step_seeds.rs`, `step_rooms.rs`, `step_shell.rs`, `step_corners.rs`, `step_inner_walls.rs`, `step_inner_doors.rs`, `step_door.rs`, `step_charging_stations.rs` |
 | `perimeter_wall_mask`, `CellType`, `WallMask`, `for_each_wall_segment` | `src/map/world_map.rs` |
 | Runtime chunk fill hook | `src/map/hypermap_world.rs` → `ensure_chunk_generated` → `fill_procedural_chunk` |
 | Editor Room brush (must match generator walls) | `src/edit/map_edit.rs` |
@@ -85,10 +85,11 @@ Order in `MapDraft::generate` / `run_into_chunk` — **do not reorder** without 
 11. `step_split_houses_into_rooms` — skipped when `footprint_area < 30`. Budget `floor(area / 80)` cuts (ceiling-to-H, floor-to-V, ≤3 each) per house (`step_inner_walls.rs`). Rule: min sub-room area 6, min dim 2, min distance 2 to any parallel wall (outer **and** inner). Stamps `MASK_NORTH` / `MASK_WEST`; skips Corner pillars, concave voids, and the outer door cell. Rooms isolated, no inner doors.
 12. `step_place_inner_doors` — opens one inner-wall slab edge at a time until every walkable house cell is reachable from the entry (`step_inner_doors.rs`). **Edge-based** connectivity: `Wall(bits)` is walkable floor with edge slabs, so a door is a single shared edge with its slab bits cleared (not a whole cell opened). Only interior edges (both cells in-house) are opened — outer shell stays intact.
 13. `step_home_crawlers` — marble wave from main entry; glass center wave only if `footprint_area >= MIN_HOUSE_AREA_FOR_CENTER_WAVE` (30)
-14. `finish` / `write_chunk_floor0_and_styles` — `DraftTile` → `CellType` + `TileStyle` chunk
-15. `build_metadata` → [`GeneratedChunkMetadata`](../../src/map/chunk_metadata.rs) v2 (`houses[]` with embedded `entry`)
+14. `step_place_charging_stations` — **one** `Charger` per house (`step_charging_stations.rs`). Picks an interior `Open` cell with **exactly one** orthogonal wall neighbor (back to wall, not a corner), skipping the door cell + its inner tile; the lone wall side sets the `ChargerFacing`. Runs **after** crawlers (waves only touch `Open`) and chargers stay passable.
+15. `finish` / `write_chunk_floor0_and_styles` — `DraftTile` → `CellType` + `TileStyle` chunk
+16. `build_metadata` → [`GeneratedChunkMetadata`](../../src/map/chunk_metadata.rs) v2 (`houses[]` with embedded `entry`)
 
-`DraftTile` is **not** `CellType`: `Void`, `Open`, `Wall(u8)`, `Corner(WallCorner)` during generation.
+`DraftTile` is **not** `CellType`: `Void`, `Open`, `Wall(u8)`, `Corner(WallCorner)`, `Charger(ChargerFacing)` during generation.
 
 ### Metadata fields (chunk-local tiles)
 

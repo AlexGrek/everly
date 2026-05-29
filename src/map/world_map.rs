@@ -12,6 +12,8 @@
 //!   `w4`, `w8`). `w0` is invalid.
 //! - Corner pillars `c7` / `c9` / `c1` / `c3` = one 0.2×0.2 m wall column in
 //!   that cell corner (numpad layout; see [`WallCorner`]).
+//! - Charging stations `cn` / `cs` / `ce` / `cw` = a walkable metal pad with a
+//!   glowing-blue cube on the named (back) wall (see [`ChargerFacing`]).
 
 use std::fmt::{Display, Formatter};
 use std::num::NonZeroU8;
@@ -104,6 +106,41 @@ impl WallCorner {
     }
 }
 
+/// Which cell edge a [`CellType::Charger`] backs against — the wall its
+/// glowing cube hangs on. The metal floor pad fills the cell; the cube sits on
+/// the named edge facing into the room. Cardinal directions match the wall
+/// bitmask edges (north toward **−Z**, south toward **+Z**, east toward **+X**,
+/// west toward **−X**).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChargerFacing {
+    North,
+    South,
+    East,
+    West,
+}
+
+impl ChargerFacing {
+    /// Unit direction (XZ) from the cell center toward the backing wall.
+    pub fn wall_dir(self) -> (f32, f32) {
+        match self {
+            ChargerFacing::North => (0.0, -1.0),
+            ChargerFacing::South => (0.0, 1.0),
+            ChargerFacing::East => (1.0, 0.0),
+            ChargerFacing::West => (-1.0, 0.0),
+        }
+    }
+
+    /// Integer neighbor delta toward the backing wall cell.
+    pub fn wall_delta(self) -> (i32, i32) {
+        match self {
+            ChargerFacing::North => (0, -1),
+            ChargerFacing::South => (0, 1),
+            ChargerFacing::East => (1, 0),
+            ChargerFacing::West => (-1, 0),
+        }
+    }
+}
+
 /// High-level map cell type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CellType {
@@ -112,6 +149,9 @@ pub enum CellType {
     Wall(WallMask),
     /// Single corner column (footprint [`WALL_THICKNESS`]²) to plug gaps between wall slabs.
     Corner(WallCorner),
+    /// Walkable charging station: an elevated metal floor pad plus a glowing-blue
+    /// cube mounted on the [`ChargerFacing`] wall. Passable like [`Road`](Self::Road).
+    Charger(ChargerFacing),
 }
 
 /// Static (geometry-only) passability of a [`CellType`]: `1.0` for [`CellType::Road`],
@@ -120,7 +160,7 @@ pub enum CellType {
 #[inline]
 pub fn cell_passability(cell: CellType) -> f32 {
     match cell {
-        CellType::Road => 1.0,
+        CellType::Road | CellType::Charger(_) => 1.0,
         CellType::Void | CellType::Wall(_) | CellType::Corner(_) => 0.0,
     }
 }
@@ -442,6 +482,10 @@ pub(crate) fn cell_to_token(cell: CellType) -> &'static str {
         CellType::Corner(WallCorner::Ne) => "c9",
         CellType::Corner(WallCorner::Sw) => "c1",
         CellType::Corner(WallCorner::Se) => "c3",
+        CellType::Charger(ChargerFacing::North) => "cn",
+        CellType::Charger(ChargerFacing::South) => "cs",
+        CellType::Charger(ChargerFacing::East) => "ce",
+        CellType::Charger(ChargerFacing::West) => "cw",
     }
 }
 
@@ -461,6 +505,10 @@ pub(crate) fn parse_cell_token(token: &str) -> Option<CellType> {
         "c9" | "C9" => Some(CellType::Corner(WallCorner::Ne)),
         "c1" | "C1" => Some(CellType::Corner(WallCorner::Sw)),
         "c3" | "C3" => Some(CellType::Corner(WallCorner::Se)),
+        "cn" | "CN" => Some(CellType::Charger(ChargerFacing::North)),
+        "cs" | "CS" => Some(CellType::Charger(ChargerFacing::South)),
+        "ce" | "CE" => Some(CellType::Charger(ChargerFacing::East)),
+        "cw" | "CW" => Some(CellType::Charger(ChargerFacing::West)),
         _ if bytes[0] == b'w' || bytes[0] == b'W' => {
             let v = ascii_hex_value(bytes[1])?;
             WallMask::from_bits(v).map(CellType::Wall)
@@ -652,5 +700,32 @@ mod tests {
             upper[(0, 0)].get_cell_type(),
             CellType::Corner(WallCorner::Nw)
         );
+    }
+
+    #[test]
+    fn parses_charger_tokens() {
+        let map = WorldMapFloor::from_ascii("cnce\ncscw\n").expect("parse");
+        assert_eq!(map[(0, 0)].get_cell_type(), CellType::Charger(ChargerFacing::North));
+        assert_eq!(map[(1, 0)].get_cell_type(), CellType::Charger(ChargerFacing::East));
+        assert_eq!(map[(0, 1)].get_cell_type(), CellType::Charger(ChargerFacing::South));
+        assert_eq!(map[(1, 1)].get_cell_type(), CellType::Charger(ChargerFacing::West));
+    }
+
+    #[test]
+    fn charger_token_roundtrips() {
+        for facing in [
+            ChargerFacing::North,
+            ChargerFacing::South,
+            ChargerFacing::East,
+            ChargerFacing::West,
+        ] {
+            let cell = CellType::Charger(facing);
+            assert_eq!(parse_cell_token(cell_to_token(cell)), Some(cell));
+        }
+    }
+
+    #[test]
+    fn charger_is_passable() {
+        assert_eq!(cell_passability(CellType::Charger(ChargerFacing::North)), 1.0);
     }
 }

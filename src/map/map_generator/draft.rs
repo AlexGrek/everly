@@ -4,7 +4,7 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use crate::map::hypermap::{HypermapChunk, LocalCoord};
-use crate::map::world_map::{CellType, TileStyle, WallCorner, WallMask};
+use crate::map::world_map::{CellType, ChargerFacing, TileStyle, WallCorner, WallMask};
 
 use super::house::House;
 use super::types::{GeneratedChunkMetadata, MapGeneratorConfig};
@@ -61,6 +61,8 @@ pub(crate) enum DraftTile {
     Open,
     Wall(u8),
     Corner(WallCorner),
+    /// Walkable charging station backing onto the named wall (see [`ChargerFacing`]).
+    Charger(ChargerFacing),
 }
 
 /// Working map: all pipeline steps read and write this structure.
@@ -181,5 +183,6 @@ pub(crate) fn draft_tile_to_cell(tile: DraftTile) -> CellType {
         DraftTile::Open => CellType::Road,
         DraftTile::Wall(bits) => CellType::Wall(WallMask::from_bits(bits).expect("wall mask")),
         DraftTile::Corner(c) => CellType::Corner(c),
+        DraftTile::Charger(facing) => CellType::Charger(facing),
     }
 }

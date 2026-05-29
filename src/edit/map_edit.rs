@@ -10,7 +10,8 @@ use bevy::ui::widget::Button;
 use crate::map::floor_level::{ActiveFloorLevel, HYPERMAP_FLOOR_HEIGHT, HYPERMAP_FLOOR_MAX};
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, HYPERMAP_CHUNK_SIZE};
 use crate::map::hypermap_world::{
-    build_floor0_road_mesh, build_floor0_wall_mesh, build_upper_road_mesh, build_upper_wall_mesh,
+    build_charger_preview_mesh, build_floor0_road_mesh, build_floor0_wall_mesh,
+    build_upper_road_mesh, build_upper_wall_mesh,
  queue_hypermap_chunk_remesh, regenerate_procedural_chunk,
     write_world_cell, write_world_floor_style, write_world_wall_style, HypermapChunkRemeshQueue,
     HypermapRuntime,
@@ -27,7 +28,7 @@ use crate::scene::camera_snapshot::{save_level_camera, LevelCameraFile};
 use crate::actor::{actor_main_tile, ActorObject};
 use crate::edit::actor_spawn::ActorSpawnState;
 use crate::map::world_map::{
-    CellType, TileStyle, WallCorner, WallMask, perimeter_wall_mask,
+    CellType, ChargerFacing, TileStyle, WallCorner, WallMask, perimeter_wall_mask,
 };
 use crate::menu::main_menu::GameState;
 
@@ -67,6 +68,9 @@ pub enum MapTileKind {
     /// Drag a rectangle; on mouse up, place walls only on the **border** with masks facing outward (closed loop).
     Room,
     Corner,
+    /// Charging station: a walkable metal pad with a glowing-blue cube on the
+    /// backing wall. Scroll cycles the facing (which wall the cube hangs on).
+    Charger,
     /// Flood-fills the floor style of an enclosed space from the clicked tile.
     /// Bridges 1–2-tile wall gaps (doors) and refuses if the region exceeds 50×50 tiles.
     Fill,
@@ -171,6 +175,7 @@ pub(crate) fn spawn_map_edit_palette(mut commands: Commands, camera: Query<Entit
                 ("WallG", MapTileKind::WallGlass),
                 ("Room", MapTileKind::Room),
                 ("Corner", MapTileKind::Corner),
+                ("Charger", MapTileKind::Charger),
                 ("Fill", MapTileKind::Fill),
             ] {
                 row.spawn((
@@ -589,7 +594,7 @@ fn stroke_world_cells(kind: MapTileKind, start: (i32, i32), end: (i32, i32)) -> 
         MapTileKind::Wall | MapTileKind::WallGlass => wall_line_cells(start, end),
         MapTileKind::Void | MapTileKind::Road => floor_rect_cells(start, end),
         MapTileKind::Room => room_outline_cells(start, end),
-        MapTileKind::Corner | MapTileKind::Fill => vec![end],
+        MapTileKind::Corner | MapTileKind::Charger | MapTileKind::Fill => vec![end],
     }
 }
 
@@ -633,6 +638,15 @@ fn resolved_cell(kind: MapTileKind, variant: u32) -> CellType {
                 _ => WallCorner::Se,
             };
             CellType::Corner(c)
+        }
+        MapTileKind::Charger => {
+            let facing = match variant % 4 {
+                0 => ChargerFacing::North,
+                1 => ChargerFacing::East,
+                2 => ChargerFacing::South,
+                _ => ChargerFacing::West,
+            };
+            CellType::Charger(facing)
         }
         MapTileKind::Fill => CellType::Road,
     }
@@ -726,6 +740,11 @@ fn map_edit_update_preview(
                 let (ix, iz) = strokes[0];
                 build_floor0_wall_mesh(&[(0, 0, c)], ix, iz).or_else(void_preview_plane)
             }
+            MapTileKind::Charger => {
+                let (ix, iz) = strokes[0];
+                build_charger_preview_mesh(resolved_cell(kind, variant.0), ix, iz, 0.0)
+                    .or_else(void_preview_plane)
+            }
             MapTileKind::Fill => void_preview_plane(),
         }
     } else {
@@ -767,6 +786,12 @@ fn map_edit_update_preview(
                 let c = wall_or_corner_cell.expect("corner brush");
                 let (ix, iz) = strokes[0];
                 build_upper_wall_mesh(&[(0, 0, f, c)], ix, iz).or_else(void_preview_plane)
+            }
+            MapTileKind::Charger => {
+                let (ix, iz) = strokes[0];
+                let y_base = f as f32 * HYPERMAP_FLOOR_HEIGHT;
+                build_charger_preview_mesh(resolved_cell(kind, variant.0), ix, iz, y_base)
+                    .or_else(void_preview_plane)
             }
             MapTileKind::Fill => void_preview_plane(),
         }
@@ -1005,7 +1030,7 @@ fn map_edit_scroll_variants(
     let kind = state.placement_tile.unwrap();
     let max_v = match kind {
         MapTileKind::Wall | MapTileKind::WallGlass => 15,
-        MapTileKind::Corner => 4,
+        MapTileKind::Corner | MapTileKind::Charger => 4,
         MapTileKind::Void | MapTileKind::Road | MapTileKind::Room | MapTileKind::Fill => return,
     };
 

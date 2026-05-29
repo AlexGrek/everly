@@ -59,15 +59,14 @@ Treat **one world unit as one meter** in Everly’s map space:
 
 ## Tokens
 
-| Token | Meaning |
-|-------|---------|
-| `..` | Void (water where applicable) |
-| `__` | Road / walkable floor |
-| `w` + **uppercase** hex digit | Wall mask `1`–`15` (`w1`…`w9`, `wA`…`wF`). Lowercase letters (`wa`…`wf`) are **rejected**: `we` is always the east-edge alias, never mask 14. |
-| `wn` `ws` `we` `ww` | Shortcuts for single north / south / east / west edge (same as `w1` `w2` `w4` `w8`) |
-| `c7` `c9` `c1` `c3` | Corner pillar: one 0.2×0.2 m wall column in NW / NE / SW / SE of the cell (numpad; `C7` etc. allowed) |
+The **full token table** (void/road, wall hex masks + `wn`/`ws`/`we`/`ww` aliases,
+corner pillars `c7`/`c9`/`c1`/`c3`, charging stations `cn`/`cs`/`ce`/`cw`) is the
+canonical encoding section in **[`docs/tilemap.md`](../../../docs/tilemap.md) § Encoding**.
+Read it there — do not duplicate the table here.
 
-**Invalid:** `w0` (mask zero). **`we` is never hex 14** — use **`wE`** for mask 14. Other `c*` tokens (e.g. `c2`) are invalid.
+Key invariants to remember: **`we` is the east-edge alias, never hex 14** (use `wE`);
+lowercase `wa`…`wf` are rejected; `w0` (mask zero) is invalid; other `c*` digit
+combinations (e.g. `c2`) are invalid.
 
 ## Bitmask quick reference
 

@@ -688,7 +688,7 @@ fn inner_doors_make_all_rooms_accessible() {
     // Slab bits on a walkable cell, or None when the cell cannot be walked.
     let cell_bits = |draft: &MapDraft, x: i32, z: i32| -> Option<u8> {
         match draft.get(x, z) {
-            DraftTile::Open | DraftTile::Corner(_) => Some(0),
+            DraftTile::Open | DraftTile::Corner(_) | DraftTile::Charger(_) => Some(0),
             DraftTile::Wall(bits) => Some(bits),
             DraftTile::Void => None,
         }
@@ -836,4 +836,47 @@ fn every_house_gets_a_door() {
         }
     }
     assert_eq!(missing, 0, "every house must have exactly one entry");
+}
+
+#[test]
+fn charging_stations_back_onto_a_wall_and_skip_corners() {
+    let mut found_any = false;
+    for seed in 0..40u64 {
+        let mut draft = MapDraft::new(MapGeneratorConfig {
+            seed,
+            ..Default::default()
+        });
+        draft.run_pipeline();
+
+        let sz = draft.size;
+        for z in 0..sz {
+            for x in 0..sz {
+                let DraftTile::Charger(facing) = draft.get(x, z) else {
+                    continue;
+                };
+                found_any = true;
+
+                // The backing wall sits in the facing direction.
+                let (dx, dz) = facing.wall_delta();
+                let (wx, wz) = (x + dx, z + dz);
+                assert!(
+                    matches!(draft.get(wx, wz), DraftTile::Wall(_) | DraftTile::Corner(_)),
+                    "charger at ({x},{z}) facing {facing:?} must back onto a wall"
+                );
+
+                // Exactly one orthogonal wall neighbor → not wedged into a corner.
+                let wall_neighbors = [(0, -1), (0, 1), (1, 0), (-1, 0)]
+                    .into_iter()
+                    .filter(|&(ox, oz)| {
+                        matches!(draft.get(x + ox, z + oz), DraftTile::Wall(_) | DraftTile::Corner(_))
+                    })
+                    .count();
+                assert_eq!(
+                    wall_neighbors, 1,
+                    "charger at ({x},{z}) must touch exactly one wall (no corners)"
+                );
+            }
+        }
+    }
+    assert!(found_any, "at least some seeds should place a charging station");
 }

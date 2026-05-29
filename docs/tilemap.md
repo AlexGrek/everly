@@ -100,6 +100,28 @@ Other `c*` combinations are invalid. Parsed as `CellType::Corner` in
 
 Procedural placement at concave union elbows: **`docs/corners.md`**.
 
+### Charging station (`cn` / `cs` / `ce` / `cw`)
+
+A **charging station** is a **walkable** cell (passable like `__` road) that renders
+two extra shapes on top of the normal floor quad: an **elevated metal pad** (inset,
+raised ~0.08 m) and a **glowing-blue cube** mounted on the backing wall. The second
+letter is the **facing** — which wall edge the cube hangs on (its back). The cube faces
+into the room.
+
+| Token | Backing wall (cube edge) in **XZ** |
+|-------|-------------------------------------|
+| `cn`  | North (−Z) — cube on the −Z edge   |
+| `cs`  | South (+Z)                         |
+| `ce`  | East (+X)                          |
+| `cw`  | West (−X)                          |
+
+Uppercase (`CN` … `CW`) is also accepted. The `c` + **letter** form never collides
+with the `c` + **digit** corner pillars. Parsed as `CellType::Charger(ChargerFacing)`
+in `src/map/world_map.rs`; meshing lives in `src/map/hypermap_world.rs`
+(`build_*_charger_metal_mesh` / `build_*_charger_glow_mesh`), see `docs/rendering-pipeline.md`.
+Procedural placement (one per house, against an interior wall, not in a corner) is in
+`src/map/map_generator/step_charging_stations.rs` — see `docs/map-generator.md`.
+
 ## Wall Types At Runtime
 
 Parsed cells use `CellType::Wall(WallMask)` or `CellType::Corner(WallCorner)`;
@@ -165,10 +187,12 @@ Applies per brush:
 | WallG | yes | fixed `wg` |
 | Room  | yes | yes |
 | Corner | yes | yes |
+| Charger | — | — |
 | Road  | yes | — |
 | Others | — | — |
 
-Scroll-wheel on the Wall / WallG / Corner brush cycles the wall mask (1–15 bits).
+Scroll-wheel on the Wall / WallG / Corner brush cycles the wall mask (1–15 bits);
+on the **Charger** brush it cycles the facing (N → E → S → W).
 
 ## Parse Errors
 

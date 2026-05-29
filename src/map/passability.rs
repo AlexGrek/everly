@@ -490,7 +490,7 @@ fn baked_circle_shadow(radius_subtiles: i32) -> &'static CircleShadow {
 /// Returns the passability flags for the subtile at `(local_x, local_y)`
 /// within a tile of the given [`CellType`].
 ///
-/// - `Road` → `0` (always passable)
+/// - `Road` / `Charger` → `0` (always passable)
 /// - `Void` → [`FLAG_VOID`] for every subtile
 /// - `Wall(mask)` → [`FLAG_BLOCKED`] for the edge-strip subtile(s) matching
 ///   the mask; `0` elsewhere
@@ -500,7 +500,7 @@ fn baked_circle_shadow(radius_subtiles: i32) -> &'static CircleShadow {
 #[inline]
 pub fn cell_subtile_flags(cell: CellType, local_x: usize, local_y: usize) -> u64 {
     match cell {
-        CellType::Road => 0,
+        CellType::Road | CellType::Charger(_) => 0,
         CellType::Void => FLAG_VOID,
         CellType::Wall(mask) => {
             if wall_mask_blocks_subtile(mask, local_x, local_y) {

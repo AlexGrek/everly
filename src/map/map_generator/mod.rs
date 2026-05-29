@@ -9,6 +9,7 @@ mod draft;
 pub mod grid_fill;
 mod house;
 mod step_carpet;
+mod step_charging_stations;
 mod step_corners;
 mod step_door;
 mod step_home_crawler;
@@ -58,6 +59,7 @@ impl MapDraft {
         self.step_split_houses_into_rooms();
         self.step_place_inner_doors();
         self.step_home_crawlers();
+        self.step_place_charging_stations();
     }
 
     fn run_into_chunk(
