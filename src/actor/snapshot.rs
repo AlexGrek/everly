@@ -1,6 +1,6 @@
 //! Serializable actor snapshots for level save/load.
 //!
-//! Written to `levels/level_{name}/actors.json` when the map editor Save button runs.
+//! Written to `levels/level_{name}/actors.yaml` when the map editor Save button runs.
 
 use std::fs;
 use std::io;
@@ -10,6 +10,7 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::actor::black_bot::{spawn_black_bot_from_snapshot, BlackBotVisual};
+use crate::actor::charge::Charge;
 use crate::actor::glitch_bot::{spawn_glitch_bot_from_snapshot, GlitchBotVisual};
 use crate::actor::{ActorMoveBuffer, ActorMovementError, ActorObject, ActorState, LevelActor};
 use crate::map::hypermap_world::HypermapRuntime;
@@ -212,6 +213,12 @@ pub struct BlackBotVisualSnap {
     pub rng_seed: u64,
 }
 
+/// Charge level for actors saved before charge persistence existed: a missing
+/// `charge` field loads as full so older `actors.yaml` files keep working.
+fn default_charge() -> f32 {
+    1.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SavedActor {
@@ -220,12 +227,16 @@ pub enum SavedActor {
         name: String,
         state: ActorStateSnap,
         visual: GlitchBotVisualSnap,
+        #[serde(default = "default_charge")]
+        charge: f32,
     },
     BlackBot {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         name: String,
         state: ActorStateSnap,
         visual: BlackBotVisualSnap,
+        #[serde(default = "default_charge")]
+        charge: f32,
     },
 }
 
@@ -241,22 +252,24 @@ fn saved_name_from_entity(name: Option<&Name>) -> String {
 
 impl LevelActorsFile {
     pub fn collect(
-        glitch_bots: &Query<(&ActorObject, &GlitchBotVisual, Option<&Name>)>,
-        black_bots: &Query<(&ActorObject, &BlackBotVisual, Option<&Name>)>,
+        glitch_bots: &Query<(&ActorObject, &GlitchBotVisual, Option<&Charge>, Option<&Name>)>,
+        black_bots: &Query<(&ActorObject, &BlackBotVisual, Option<&Charge>, Option<&Name>)>,
     ) -> Self {
         let mut actors = Vec::new();
-        for (obj, vis, name) in glitch_bots.iter() {
+        for (obj, vis, charge, name) in glitch_bots.iter() {
             actors.push(SavedActor::GlitchBot {
                 name: saved_name_from_entity(name),
                 state: obj.inner.state().into(),
                 visual: vis.to_snapshot(),
+                charge: charge.map_or(1.0, |c| c.level),
             });
         }
-        for (obj, vis, name) in black_bots.iter() {
+        for (obj, vis, charge, name) in black_bots.iter() {
             actors.push(SavedActor::BlackBot {
                 name: saved_name_from_entity(name),
                 state: obj.inner.state().into(),
                 visual: vis.to_snapshot(),
+                charge: charge.map_or(1.0, |c| c.level),
             });
         }
         Self {
@@ -269,7 +282,7 @@ impl LevelActorsFile {
 pub fn actors_path(level_name: &str) -> PathBuf {
     PathBuf::from("levels")
         .join(format!("level_{level_name}"))
-        .join("actors.json")
+        .join("actors.yaml")
 }
 
 pub fn save_level_actors(level_name: &str, file: &LevelActorsFile) -> io::Result<()> {
@@ -277,20 +290,20 @@ pub fn save_level_actors(level_name: &str, file: &LevelActorsFile) -> io::Result
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string_pretty(file)
+    let yaml = serde_yaml::to_string(file)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    fs::write(path, json)?;
+    fs::write(path, yaml)?;
     Ok(())
 }
 
-/// Reads `levels/level_{name}/actors.json` when present.
+/// Reads `levels/level_{name}/actors.yaml` when present.
 pub fn try_load_level_actors(level_name: &str) -> io::Result<Option<LevelActorsFile>> {
     let path = actors_path(level_name);
     if !path.is_file() {
         return Ok(None);
     }
     let text = fs::read_to_string(&path)?;
-    let file: LevelActorsFile = serde_json::from_str(&text)
+    let file: LevelActorsFile = serde_yaml::from_str(&text)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(Some(file))
 }
@@ -304,7 +317,7 @@ pub fn spawn_level_actors(
 ) {
     for saved in &file.actors {
         match saved {
-            SavedActor::GlitchBot { name, state, visual } => {
+            SavedActor::GlitchBot { name, state, visual, charge } => {
                 let entity = spawn_glitch_bot_from_snapshot(
                     commands,
                     meshes,
@@ -313,9 +326,9 @@ pub fn spawn_level_actors(
                     state.clone().into(),
                     visual.clone(),
                 );
-                commands.entity(entity).insert(LevelActor);
+                commands.entity(entity).insert((LevelActor, Charge::new(*charge)));
             }
-            SavedActor::BlackBot { name, state, visual } => {
+            SavedActor::BlackBot { name, state, visual, charge } => {
                 let entity = spawn_black_bot_from_snapshot(
                     commands,
                     meshes,
@@ -324,7 +337,7 @@ pub fn spawn_level_actors(
                     state.clone().into(),
                     visual.clone(),
                 );
-                commands.entity(entity).insert(LevelActor);
+                commands.entity(entity).insert((LevelActor, Charge::new(*charge)));
             }
         }
     }
@@ -360,19 +373,19 @@ fn load_level_actors_on_enter(
         Ok(Some(f)) => f,
         Ok(None) => return,
         Err(e) => {
-            warn!("failed to read `levels/level_{level_name}/actors.json`: {e}");
+            warn!("failed to read `levels/level_{level_name}/actors.yaml`: {e}");
             return;
         }
     };
     if file.version != ACTOR_SNAPSHOT_VERSION {
         warn!(
-            "actors.json version {} (expected {ACTOR_SNAPSHOT_VERSION}); loading anyway",
+            "actors.yaml version {} (expected {ACTOR_SNAPSHOT_VERSION}); loading anyway",
             file.version
         );
     }
     let count = file.actors.len();
     spawn_level_actors(&mut commands, &mut meshes, &mut materials, &file);
-    info!("loaded {count} actor(s) from `levels/level_{level_name}/actors.json`");
+    info!("loaded {count} actor(s) from `levels/level_{level_name}/actors.yaml`");
 }
 
 fn restore_loaded_actor_footprints_system(
@@ -438,40 +451,42 @@ mod tests {
 
     #[test]
     fn saved_actor_deserializes_missing_name_as_empty() {
-        let json = r#"{
-            "type": "black_bot",
-            "state": {
-                "center": { "x": 0.0, "y": 0.0 },
-                "radius_subtiles": 2,
-                "rotation": 0.0,
-                "move_buffer": {
-                    "tile_delta": { "x": 0.0, "y": 0.0 },
-                    "subtile_shift": { "x": 0, "y": 0 },
-                    "rotation_shift": 0.0
-                },
-                "last_movement_error": null,
-                "last_accepted_center_subtile": null,
-                "last_accepted_radius_subtiles": 2
-            },
-            "visual": {
-                "main_tile": null,
-                "direction": { "x": 1.0, "y": 0.0 },
-                "has_target": false,
-                "path": [],
-                "path_index": 0,
-                "movement_state": { "kind": "moving" },
-                "rng_seed": 1
-            }
-        }"#;
-        let actor: SavedActor = serde_json::from_str(json).unwrap();
+        // Flush-left so the block mapping starts at column 0 (no root indentation).
+        let yaml = r#"
+type: black_bot
+state:
+  center: { x: 0.0, y: 0.0 }
+  radius_subtiles: 2
+  rotation: 0.0
+  move_buffer:
+    tile_delta: { x: 0.0, y: 0.0 }
+    subtile_shift: { x: 0, y: 0 }
+    rotation_shift: 0.0
+  last_movement_error: null
+  last_accepted_center_subtile: null
+  last_accepted_radius_subtiles: 2
+visual:
+  main_tile: null
+  direction: { x: 1.0, y: 0.0 }
+  has_target: false
+  path: []
+  path_index: 0
+  movement_state: { kind: moving }
+  rng_seed: 1
+"#;
+        let actor: SavedActor = serde_yaml::from_str(yaml).unwrap();
         match actor {
-            SavedActor::BlackBot { name, .. } => assert_eq!(name, ""),
+            SavedActor::BlackBot { name, charge, .. } => {
+                assert_eq!(name, "");
+                // No `charge` field in the YAML above → defaults to full.
+                assert_eq!(charge, 1.0);
+            }
             _ => panic!("expected black_bot"),
         }
     }
 
     #[test]
-    fn level_actors_file_json_round_trip() {
+    fn level_actors_file_yaml_round_trip() {
         let file = LevelActorsFile {
             version: ACTOR_SNAPSHOT_VERSION,
             actors: vec![
@@ -498,6 +513,7 @@ mod tests {
                         collision_streak: 0,
                         rng_seed: 42,
                     },
+                    charge: 0.75,
                 },
                 SavedActor::BlackBot {
                     name: String::new(),
@@ -523,11 +539,12 @@ mod tests {
                         movement_state: MovementStateSnap::Waiting { remaining_s: 0.5 },
                         rng_seed: 99,
                     },
+                    charge: 0.4,
                 },
             ],
         };
-        let json = serde_json::to_string_pretty(&file).unwrap();
-        let parsed: LevelActorsFile = serde_json::from_str(&json).unwrap();
+        let yaml = serde_yaml::to_string(&file).unwrap();
+        let parsed: LevelActorsFile = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed, file);
     }
 }

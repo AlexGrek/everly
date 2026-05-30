@@ -16,7 +16,7 @@ The low-level pipeline is deterministic and synchronous. High-level planning is 
 ## Level persistence
 
 On `InGame` enter, [`ActorSnapshotPlugin`](../src/actor/snapshot.rs) loads
-`levels/level_{name}/actors.json` when present and spawns saved glitch/black bots
+`levels/level_{name}/actors.yaml` when present and spawns saved glitch/black bots
 with [`LevelActor`](../src/actor/snapshot.rs). Dynamic passability footprints are
 restored immediately after spawn. Positions and state are written only when the
 player presses map editor **Save** (same action as geometry). Full format and load
@@ -89,6 +89,15 @@ Canonical API: [`actor_main_tile`](../src/actor/mod.rs) and [`ActorState::main_t
 Do **not** use `floor(center)` for main-tile or field logic — an actor spawned at tile center `(0.5, 0.5)` would be assigned the wrong tile. Subtile collision intentionally keeps `floor` so the footprint stays inside the subtile that contains the float position.
 
 After [`process_actors`](../src/actor/mod.rs), [`dirt_actor_interaction`](../src/map/field_interactions.rs) updates `field_main_tile` and applies field rules to the tile the actor **left** when main tile changes. See `docs/field-interactions.md`.
+
+## Charge
+
+Every bot entity carries a [`Charge`](../src/actor/charge.rs) component — a
+battery `level` in `[0.0, 1.0]` that drains over time. A depleted bot is
+immobilized **in its think system** (zeroing `move_buffer`), not in
+`process_actors` — see [`charge.md`](charge.md) for the full system, including
+why the gate must live in `think`, the discharge rate, spawn ranges, inspector
+display, and persistence.
 
 ## Movement and collision
 

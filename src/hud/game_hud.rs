@@ -12,11 +12,15 @@ use crate::edit::map_edit::{MapEditToggleButton, MapEditToggleLabel};
 use crate::map::chunk_overlay::OccupancyOverlayEnabled;
 use crate::map::temperature_overlay::TemperatureOverlayEnabled;
 use crate::map::floor_level::{ActiveFloorLevel, HYPERMAP_FLOOR_MAX};
+use crate::hud::panel_anim::PanelAnim;
 use crate::menu::main_menu::GameState;
 
 const BAR_BG: Color = Color::srgba(0.06, 0.07, 0.1, 0.62);
 const BTN_BG: Color = Color::srgba(0.18, 0.2, 0.24, 0.55);
+const BTN_HOVER: Color = Color::srgba(0.26, 0.29, 0.35, 0.72);
+const BTN_PRESSED: Color = Color::srgba(0.10, 0.12, 0.16, 0.88);
 const BTN_BORDER: Color = Color::srgba(0.9, 0.92, 0.96, 0.35);
+const BTN_BORDER_HOVER: Color = Color::srgba(0.9, 0.92, 0.96, 0.65);
 const TEXT_MAIN: Color = Color::srgba(0.95, 0.96, 0.98, 0.92);
 
 #[derive(Component)]
@@ -74,6 +78,7 @@ impl Plugin for GameHudPlugin {
                 sync_heatmap_toggle_label,
                 floor_level_buttons,
                 update_floor_level_readout,
+                update_button_visuals,
             )
                 .run_if(in_state(GameState::InGame)),
         );
@@ -89,11 +94,12 @@ pub(crate) fn spawn_bottom_hud(mut commands: Commands, camera: Query<Entity, Wit
         .spawn((
             Name::new("Bottom HUD"),
             UiTargetCamera(cam),
+            PanelAnim { progress: 0.0, target: 1.0, open_bottom: 0.0, panel_height: 52.0 },
             Node {
                 position_type: PositionType::Absolute,
                 width: Val::Percent(100.0),
                 height: Val::Px(52.0),
-                bottom: Val::Px(0.0),
+                bottom: Val::Px(-52.0),
                 left: Val::Px(0.0),
                 padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
                 column_gap: Val::Px(10.0),
@@ -483,5 +489,29 @@ fn sync_heatmap_toggle_label(
     let label = if enabled.0 { "Heat: On" } else { "Heat: Off" };
     for mut text in &mut texts {
         **text = label.to_string();
+    }
+}
+
+fn update_button_visuals(
+    mut buttons: Query<
+        (&Interaction, &mut BackgroundColor, &mut BorderColor),
+        (Changed<Interaction>, With<Button>),
+    >,
+) {
+    for (interaction, mut bg, mut border) in &mut buttons {
+        match interaction {
+            Interaction::Pressed => {
+                *bg = BackgroundColor(BTN_PRESSED);
+                *border = BorderColor::all(BTN_BORDER_HOVER);
+            }
+            Interaction::Hovered => {
+                *bg = BackgroundColor(BTN_HOVER);
+                *border = BorderColor::all(BTN_BORDER_HOVER);
+            }
+            Interaction::None => {
+                *bg = BackgroundColor(BTN_BG);
+                *border = BorderColor::all(BTN_BORDER);
+            }
+        }
     }
 }

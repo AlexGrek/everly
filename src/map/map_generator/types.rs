@@ -46,7 +46,7 @@ pub struct GeneratedHouse {
     pub entry: HouseEntrypoint,
 }
 
-/// Procedural layout reference data for one chunk (persisted as `metadata/{x}_{y}.json`).
+/// Procedural layout reference data for one chunk (persisted as `metadata/{x}_{y}.yaml`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct GeneratedChunkMetadata {
     pub version: u32,

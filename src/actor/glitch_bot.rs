@@ -14,6 +14,7 @@ use rand::{Rng, SeedableRng};
 
 use crate::actor::actor_name::random_actor_name;
 use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
+use crate::actor::charge::Charge;
 use bevy::picking::prelude::Pickable;
 use crate::actor::snapshot::{GlitchBotVisualSnap, SerVec2};
 use crate::actor::{is_paused, process_actors, Actor, ActorMoveBuffer, ActorObject, ActorState, OffScreenActor};
@@ -186,12 +187,20 @@ impl Plugin for GlitchBotPlugin {
 /// change so they can never diverge.
 fn glitch_bot_think(
     time: Res<Time>,
-    mut query: Query<(&mut ActorObject, &mut GlitchBotVisual)>,
+    mut query: Query<(&mut ActorObject, &mut GlitchBotVisual, Option<&Charge>)>,
 ) {
     let dt = time.delta_secs();
 
-    for (mut obj, mut vis) in &mut query {
+    for (mut obj, mut vis, charge) in &mut query {
         let state = obj.inner.state_mut();
+
+        // Depleted bots are immobilized: clear any pending intent and freeze the
+        // accumulator so the bot neither steps on the collision grid nor drifts
+        // visually (sync renders from last_accepted_center_subtile + accumulator).
+        if charge.is_some_and(Charge::is_depleted) {
+            state.move_buffer = ActorMoveBuffer::default();
+            continue;
+        }
 
         if state.last_movement_error.is_some() {
             vis.collision_streak = vis.collision_streak.saturating_add(1);
@@ -398,6 +407,7 @@ pub fn spawn_glitch_bot(
         .spawn((
             Name::new(random_actor_name()),
             ActorInspectable,
+            Charge::random(rng),
             GlitchBotVisual {
                 direction: initial_dir,
                 accumulator,

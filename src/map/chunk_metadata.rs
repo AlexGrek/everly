@@ -1,6 +1,6 @@
 //! Procedural chunk metadata: per-house centers, entries, save/load.
 //!
-//! Written to `levels/level_{name}/metadata/{chunk_x}_{chunk_y}.json` on Save when
+//! Written to `levels/level_{name}/metadata/{chunk_x}_{chunk_y}.yaml` on Save when
 //! the chunk was procedurally generated this session. See `docs/map-generator.md`.
 
 use std::collections::HashMap;
@@ -94,7 +94,7 @@ pub fn metadata_dir(level_name: &str) -> PathBuf {
 }
 
 pub fn chunk_metadata_path(level_name: &str, coord: ChunkCoord) -> PathBuf {
-    metadata_dir(level_name).join(format!("{}_{}.json", coord.x, coord.y))
+    metadata_dir(level_name).join(format!("{}_{}.yaml", coord.x, coord.y))
 }
 
 pub fn try_load_chunk_metadata(
@@ -106,7 +106,7 @@ pub fn try_load_chunk_metadata(
         return Ok(None);
     }
     let text = fs::read_to_string(&path)?;
-    let meta: GeneratedChunkMetadata = serde_json::from_str(&text)
+    let meta: GeneratedChunkMetadata = serde_yaml::from_str(&text)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(Some(meta))
 }
@@ -115,12 +115,12 @@ pub fn save_chunk_metadata(level_name: &str, coord: ChunkCoord, meta: &Generated
     let dir = metadata_dir(level_name);
     fs::create_dir_all(&dir)?;
     let path = chunk_metadata_path(level_name, coord);
-    let text = serde_json::to_string_pretty(meta)
+    let text = serde_yaml::to_string(meta)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     fs::write(path, text)
 }
 
-/// Saves metadata JSON for every chunk present in `store` that also exists in `cell_map`.
+/// Saves metadata YAML for every chunk present in `store` that also exists in `cell_map`.
 pub fn save_level_chunk_metadata(
     level_name: &str,
     store: &ChunkGeneratorMetadata,

@@ -43,7 +43,7 @@ spawns an actor. The two palettes can be open at the same time, stacked vertical
 ## Persistence
 
 The spawner does **not** save. Actors are persisted by the map editor's **Save** button
-(the single level-save path), which writes `actors.json` via `save_level_actors`. See
+(the single level-save path), which writes `actors.yaml` via `save_level_actors`. See
 [`level-persistence.md`](level-persistence.md) and [`map-editor.md`](map-editor.md) § Save.
 Re-gen in the map editor despawns actors on the regenerated chunk.
 

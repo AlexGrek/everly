@@ -25,9 +25,9 @@ levels/level_{name}/
 ├── dirt.bin                       # all saved dirt chunks (binary)
 ├── temperature.bin                # all saved temperature chunks (binary)
 ├── metadata/
-│   └── {chunk_x}_{chunk_y}.json   # procedural room layout reference (optional)
-├── actors.json                    # all actors in the level (JSON)
-└── camera.json                    # strategy camera (JSON)
+│   └── {chunk_x}_{chunk_y}.yaml   # procedural room layout reference (optional)
+├── actors.yaml                    # all actors in the level (YAML)
+└── camera.yaml                    # strategy camera (YAML)
 ```
 
 Files may be absent (e.g. a level with only `geometry/0_0.txt` until the player
@@ -69,9 +69,9 @@ Chunks that were never visited (no hypermap allocation) are not written.
 | Wall style | One file per chunk | Omitted if every cell is default style |
 | Dirt | **Single** `dirt.bin` | All in-memory dirt chunks in one file ([`save_dirt_bin`](../src/map/tile_field_level.rs)) |
 | Temperature | **Single** `temperature.bin` | Same format as dirt |
-| Actors | `actors.json` | Position, movement state, visuals, RNG seeds — see `src/actor/snapshot.rs` |
-| Camera | `camera.json` | Focus, distance, yaw, pitch, view mode |
-| Procedural metadata | `metadata/{x}_{y}.json` | Per-chunk houses + entries (see [`map-generator.md`](map-generator.md)) |
+| Actors | `actors.yaml` | Position, movement state, visuals, RNG seeds — see `src/actor/snapshot.rs` |
+| Camera | `camera.yaml` | Focus, distance, yaw, pitch, view mode |
+| Procedural metadata | `metadata/{x}_{y}.yaml` | Per-chunk houses + entries (see [`map-generator.md`](map-generator.md)) |
 
 ## What is not saved separately
 
@@ -92,9 +92,9 @@ Order matters for plugins that chain after hypermap setup:
 | When | Source | Condition |
 |------|--------|-----------|
 | Camera spawn | Default `StrategyCamera` | Always |
-| Camera override | `levels/level_{name}/camera.json` | If file exists (`CameraSnapshotPlugin`) |
+| Camera override | `levels/level_{name}/camera.yaml` | If file exists (`CameraSnapshotPlugin`) |
 | Hypermap runtime | Empty hypermaps + defaults | `setup_hypermap_runtime` |
-| Actors | `levels/level_{name}/actors.json` | If file exists (`ActorSnapshotPlugin`); then footprint restore into dynamic passability |
+| Actors | `levels/level_{name}/actors.yaml` | If file exists (`ActorSnapshotPlugin`); then footprint restore into dynamic passability |
 
 No geometry or field files are loaded at menu transition — only when chunks are
 needed.
@@ -162,16 +162,19 @@ Binary format implemented in [`src/map/tile_field_level.rs`](../src/map/tile_fie
 - Dirt values are typically `0.0..=1.0`; temperature values are degrees Celsius
   (clamped at runtime to `−30..=+30` when sampled for display).
 
-### Actors (`actors.json`)
+### Actors (`actors.yaml`)
 
-- JSON, pretty-printed; `version` field (currently `1`).
-- Tagged union `glitch_bot` / `black_bot` with `state` and `visual` snapshots.
+- YAML (`serde_yaml`); `version` field (currently `1`).
+- Tagged union `glitch_bot` / `black_bot` with `state` and `visual` snapshots,
+  plus a `charge` float in `[0.0, 1.0]` (battery level; see
+  [`actor.md`](actor.md#charge)). Omitted `charge` defaults to full (`1.0`), so
+  pre-charge `actors.yaml` files still load.
 - Loaded actors get [`LevelActor`](../src/actor/snapshot.rs) and replace any
   default spawns for that session.
 
-### Camera (`camera.json`)
+### Camera (`camera.yaml`)
 
-- JSON; `version` `1`; nested `camera` with focus, pan velocity, distance, yaw,
+- YAML; `version` `1`; nested `camera` with focus, pan velocity, distance, yaw,
   pitch, `view_mode` (`strategy` | `map`).
 
 ## New levels
@@ -179,7 +182,7 @@ Binary format implemented in [`src/map/tile_field_level.rs`](../src/map/tile_fie
 [`create_new_level_with_road_origin`](../src/map/level.rs) (main menu **+ New level**):
 
 - Creates `geometry/0_0.txt` with floor `0` entirely road.
-- Does **not** create `dirt.bin`, `temperature.bin`, `actors.json`, or `camera.json`.
+- Does **not** create `dirt.bin`, `temperature.bin`, `actors.yaml`, or `camera.yaml`.
 - Other chunks appear when the camera reaches them (procedural generator, random
   seed) until the player saves.
 

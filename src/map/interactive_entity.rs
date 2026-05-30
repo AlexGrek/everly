@@ -360,8 +360,8 @@ pub type InteractiveEntityHypertileList = HypertileList<InteractiveEntityEntry>;
 /// [`InteractiveEntityPlugin`].
 ///
 /// Serializes as a flat list of [`InteractiveEntityEntry`] (each carries its own
-/// coordinates), which both keeps the JSON compact and sidesteps `serde_json`'s
-/// "map keys must be strings" limitation on the struct key.
+/// coordinates), which both keeps the output compact and sidesteps the
+/// "map keys must be strings" limitation many serde formats place on struct keys.
 #[derive(Debug, Default, Resource)]
 pub struct InteractiveEntityMap {
     tiles: HashMap<EntityCoordinates, InteractiveEntityHypertileList>,
@@ -722,15 +722,15 @@ mod tests {
     }
 
     #[test]
-    fn map_round_trips_through_json() {
+    fn map_round_trips_through_yaml() {
         let mut map = InteractiveEntityMap::new();
         let mut charger = ChargerEntity::new(EntityCoordinates::ground(2, 3), ChargerFacing::South);
         charger.set_charge_level(42.0);
         charger.change_prop("label", "dock-7");
         map.insert(InteractiveEntity::Charger(charger));
 
-        let json = serde_json::to_string(&map).expect("serialize");
-        let restored: InteractiveEntityMap = serde_json::from_str(&json).expect("deserialize");
+        let yaml = serde_yaml::to_string(&map).expect("serialize");
+        let restored: InteractiveEntityMap = serde_yaml::from_str(&yaml).expect("deserialize");
 
         assert_eq!(restored.len(), 1);
         let entry = &restored.entities_at(EntityCoordinates::ground(2, 3))[0];

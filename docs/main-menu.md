@@ -67,7 +67,7 @@ The text after the prefix becomes the level name displayed on a button.
 
 On the next frame, every plugin's `OnEnter(GameState::InGame)` setup
 runs in order, including `setup_hypermap_runtime` →
-`setup_hypermap_assets`. Actors and camera load from disk when their JSON
+`setup_hypermap_assets`. Actors and camera load from disk when their YAML
 files exist; geometry and tile fields load lazily per chunk. See
 [`level-persistence.md`](level-persistence.md) for the full timeline and file
 layout.

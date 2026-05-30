@@ -13,6 +13,7 @@ Current behavior docs:
 - `docs/interactive-entities.md` — sparse per-tile store of stateful reference-type objects (chargers), the `InteractiveEntity` trait/enum, and the `InteractiveEntityMap` resource.
 - `docs/corners.md` — inner `c*` corner pillars (concave union elbows, detection algorithm).
 - `docs/actor.md` — actor trait runtime loop, movement buffer, footprint collision flow, **main tile** (`round(center)`), and usage examples.
+- `docs/charge.md` — bot **battery charge**: `Charge` component, discharge system, depletion → movement disabled, inspector display, persistence.
 - `docs/chunk-overlay.md` — per-chunk RGBA overlays: temperature heatmap (F5), dirt, generic layer, occupancy debug (F4).
 - `docs/tile-fields.md` — tile-resolution scalar fields (dirt, temperature) and shared `TileFieldMap`.
 - `docs/field-interactions.md` — actor main-tile tracking and dirt deposits on tiles actors leave.

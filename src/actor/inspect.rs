@@ -30,6 +30,21 @@ pub fn common_actor_rows(state: &crate::actor::ActorState) -> Vec<InspectRow> {
     ]
 }
 
+/// Battery charge row (shared by every bot), shown as a whole-percent value.
+/// A depleted bot is annotated so the immobilized state is obvious.
+pub fn charge_row(level: f32) -> InspectRow {
+    let pct = (level * 100.0).round() as i32;
+    let value = if level <= 0.0 {
+        format!("{pct}% (depleted)")
+    } else {
+        format!("{pct}%")
+    };
+    InspectRow {
+        label: "charge",
+        value,
+    }
+}
+
 pub fn black_bot_rows(vis: &BlackBotVisual) -> Vec<InspectRow> {
     let main_tile = vis
         .main_tile()
@@ -66,10 +81,14 @@ pub fn glitch_bot_rows(vis: &GlitchBotVisual) -> Vec<InspectRow> {
 
 pub fn collect_inspect_rows(
     obj: &ActorObject,
+    charge: Option<f32>,
     black: Option<&BlackBotVisual>,
     glitch: Option<&GlitchBotVisual>,
 ) -> Vec<InspectRow> {
     let mut rows = common_actor_rows(obj.inner.state());
+    if let Some(level) = charge {
+        rows.push(charge_row(level));
+    }
     if let Some(vis) = black {
         rows.extend(black_bot_rows(vis));
     }

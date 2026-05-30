@@ -1,6 +1,6 @@
 //! Serializable strategy camera state for level save/load.
 //!
-//! Written to `levels/level_{name}/camera.json` when the map editor saves.
+//! Written to `levels/level_{name}/camera.yaml` when the map editor saves.
 
 use std::fs;
 use std::io;
@@ -113,7 +113,7 @@ impl LevelCameraFile {
 pub fn camera_path(level_name: &str) -> PathBuf {
     PathBuf::from("levels")
         .join(format!("level_{level_name}"))
-        .join("camera.json")
+        .join("camera.yaml")
 }
 
 pub fn save_level_camera(level_name: &str, file: &LevelCameraFile) -> io::Result<()> {
@@ -121,9 +121,9 @@ pub fn save_level_camera(level_name: &str, file: &LevelCameraFile) -> io::Result
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string_pretty(file)
+    let yaml = serde_yaml::to_string(file)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    fs::write(path, json)?;
+    fs::write(path, yaml)?;
     Ok(())
 }
 
@@ -133,7 +133,7 @@ pub fn try_load_level_camera(level_name: &str) -> io::Result<Option<LevelCameraF
         return Ok(None);
     }
     let text = fs::read_to_string(&path)?;
-    let file: LevelCameraFile = serde_json::from_str(&text)
+    let file: LevelCameraFile = serde_yaml::from_str(&text)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(Some(file))
 }
@@ -147,13 +147,13 @@ fn load_level_camera_on_enter(
         Ok(Some(f)) => f,
         Ok(None) => return,
         Err(e) => {
-            warn!("failed to read `levels/level_{level_name}/camera.json`: {e}");
+            warn!("failed to read `levels/level_{level_name}/camera.yaml`: {e}");
             return;
         }
     };
     if file.version != CAMERA_SNAPSHOT_VERSION {
         warn!(
-            "camera.json version {} (expected {CAMERA_SNAPSHOT_VERSION}); loading anyway",
+            "camera.yaml version {} (expected {CAMERA_SNAPSHOT_VERSION}); loading anyway",
             file.version
         );
     }
@@ -161,7 +161,7 @@ fn load_level_camera_on_enter(
         *cam = file.camera.clone().into();
         *transform = strategy_transform(&cam);
     }
-    info!("loaded strategy camera from `levels/level_{level_name}/camera.json`");
+    info!("loaded strategy camera from `levels/level_{level_name}/camera.yaml`");
 }
 
 pub struct CameraSnapshotPlugin;
@@ -201,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn level_camera_file_json_round_trip() {
+    fn level_camera_file_yaml_round_trip() {
         let file = LevelCameraFile {
             version: CAMERA_SNAPSHOT_VERSION,
             camera: StrategyCameraSnap {
@@ -221,8 +221,8 @@ mod tests {
                 view_mode: StrategyCameraViewModeSnap::Strategy,
             },
         };
-        let json = serde_json::to_string_pretty(&file).unwrap();
-        let parsed: LevelCameraFile = serde_json::from_str(&json).unwrap();
+        let yaml = serde_yaml::to_string(&file).unwrap();
+        let parsed: LevelCameraFile = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed, file);
     }
 }

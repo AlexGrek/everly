@@ -30,7 +30,7 @@ Do **not** stamp per-rectangle [`perimeter_wall_mask`](../../src/map/world_map.r
 
 ## Metadata (`GeneratedChunkMetadata`, version 3)
 
-After generation, reference data is stored in [`HypermapRuntime::procedural_metadata`](../../src/map/hypermap_world.rs) (chunk-local tile coords) and saved as `levels/level_{name}/metadata/{x}_{y}.json` on **Save**.
+After generation, reference data is stored in [`HypermapRuntime::procedural_metadata`](../../src/map/hypermap_world.rs) (chunk-local tile coords) and saved as `levels/level_{name}/metadata/{x}_{y}.yaml` on **Save**.
 
 | Field | Meaning |
 |-------|---------|

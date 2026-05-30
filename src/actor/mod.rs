@@ -25,6 +25,7 @@
 pub mod black_bot;
 pub mod actor_name;
 pub mod actor_pick;
+pub mod charge;
 pub mod glitch_bot;
 pub mod inspect;
 pub mod snapshot;
@@ -355,7 +356,7 @@ pub trait Actor: Send + Sync + 'static {
 // ECS wrapper
 // ---------------------------------------------------------------------------
 
-/// Marker on actor roots spawned from `levels/level_{name}/actors.json`.
+/// Marker on actor roots spawned from `levels/level_{name}/actors.yaml`.
 #[derive(Component)]
 pub struct LevelActor;
 

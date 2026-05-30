@@ -12,8 +12,10 @@ use bevy::ui::widget::Button;
 use crate::actor::black_bot::{self, BlackBotRng};
 use crate::actor::glitch_bot::{self, GlitchBotRng};
 use crate::edit::map_edit::{
-    ray_intersect_horizontal_plane, void_preview_plane, MapEditPreviewMaterial, MapEditState,
+    ray_intersect_horizontal_plane, void_preview_plane, MapEditPaletteRoot, MapEditPreviewMaterial,
+    MapEditState,
 };
+use crate::hud::panel_anim::PanelAnim;
 use crate::map::floor_level::{ActiveFloorLevel, HYPERMAP_FLOOR_HEIGHT};
 use crate::menu::main_menu::GameState;
 use crate::scene::camera::StrategyCameraRig;
@@ -41,7 +43,7 @@ pub struct ActorSpawnToggleButton;
 pub(crate) struct ActorSpawnToggleLabel;
 
 #[derive(Component)]
-struct ActorSpawnPaletteRoot;
+pub(crate) struct ActorSpawnPaletteRoot;
 
 #[derive(Component, Clone, Copy)]
 struct ActorSpawnPickButton(ActorKind);
@@ -97,12 +99,13 @@ pub(crate) fn spawn_actor_spawn_palette(
         .spawn((
             Name::new("Actor spawn palette"),
             ActorSpawnPaletteRoot,
+            PanelAnim::closed(92.0, 40.0),
             UiTargetCamera(cam),
             Node {
                 position_type: PositionType::Absolute,
                 width: Val::Percent(100.0),
                 height: Val::Px(40.0),
-                bottom: Val::Px(92.0),
+                bottom: Val::Px(52.0),
                 left: Val::Px(0.0),
                 padding: UiRect::horizontal(Val::Px(12.0)),
                 column_gap: Val::Px(8.0),
@@ -164,7 +167,9 @@ fn sync_actor_spawn_toggle_label(
 fn actor_spawn_toggle_panel(
     interactions: Query<&Interaction, (With<ActorSpawnToggleButton>, Changed<Interaction>)>,
     mut state: ResMut<ActorSpawnState>,
-    mut palette: Query<&mut Visibility, With<ActorSpawnPaletteRoot>>,
+    mut palette: Query<&mut PanelAnim, (With<ActorSpawnPaletteRoot>, Without<MapEditPaletteRoot>)>,
+    mut map_edit: ResMut<MapEditState>,
+    mut map_palette: Query<&mut PanelAnim, (With<MapEditPaletteRoot>, Without<ActorSpawnPaletteRoot>)>,
 ) {
     for interaction in &interactions {
         if *interaction != Interaction::Pressed {
@@ -173,13 +178,16 @@ fn actor_spawn_toggle_panel(
         state.panel_open = !state.panel_open;
         if !state.panel_open {
             state.placement = None;
+        } else {
+            map_edit.panel_open = false;
+            map_edit.placement_tile = None;
+            for mut anim in &mut map_palette {
+                anim.target = 0.0;
+            }
         }
-        for mut vis in &mut palette {
-            *vis = if state.panel_open {
-                Visibility::Inherited
-            } else {
-                Visibility::Hidden
-            };
+        let target = if state.panel_open { 1.0 } else { 0.0 };
+        for mut anim in &mut palette {
+            anim.target = target;
         }
     }
 }

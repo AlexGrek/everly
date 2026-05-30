@@ -6,6 +6,7 @@ use bevy::ui::widget::Button;
 
 use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
 use crate::actor::black_bot::BlackBotVisual;
+use crate::actor::charge::Charge;
 use crate::actor::glitch_bot::GlitchBotVisual;
 use crate::map::hypermap_world::HypermapRuntime;
 use crate::actor::inspect::{collect_inspect_rows, display_actor_name};
@@ -71,6 +72,9 @@ struct ActorInspectorRowsHost;
 struct ActorInspectorRow;
 
 #[derive(Component)]
+struct ActorInspectorCard;
+
+#[derive(Component)]
 struct ActorInspectorActionsHost;
 
 #[derive(Component)]
@@ -78,6 +82,9 @@ struct ActorInspectorActionBtn;
 
 #[derive(Component)]
 struct BlackBotResetButton;
+
+#[derive(Component)]
+struct ActorDeleteButton;
 
 pub struct ActorInspectorPlugin;
 
@@ -97,8 +104,10 @@ impl Plugin for ActorInspectorPlugin {
                 (
                     sync_actor_hover_tooltip,
                     sync_actor_inspector_modal,
+                    animate_actor_inspector,
                     actor_inspector_close_input,
                     black_bot_reset_button,
+                    actor_delete_button,
                 )
                     .run_if(in_state(GameState::InGame)),
             );
@@ -253,6 +262,7 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                 overlay
                     .spawn((
                         Name::new("Actor inspector card"),
+                        ActorInspectorCard,
                         Pickable::default(),
                         Node {
                             width: Val::Px(400.0),
@@ -452,6 +462,42 @@ fn cursor_in_playfield(window: &Query<&Window>) -> bool {
     pos.y >= PLAYFIELD_BOTTOM_MARGIN_PX
 }
 
+const ANIM_DURATION_S: f32 = 0.18;
+
+fn ease_out_cubic(t: f32) -> f32 {
+    1.0 - (1.0 - t).powi(3)
+}
+
+fn animate_actor_inspector(
+    modal: Res<ActorInspectorModal>,
+    time: Res<Time>,
+    mut progress: Local<f32>,
+    mut was_open: Local<bool>,
+    mut card: Query<&mut Transform, With<ActorInspectorCard>>,
+    mut scrim: Query<&mut BackgroundColor, With<ActorInspectorScrim>>,
+) {
+    if modal.open && !*was_open {
+        *progress = 0.0;
+    }
+    *was_open = modal.open;
+
+    if !modal.open {
+        return;
+    }
+
+    *progress = (*progress + time.delta_secs() / ANIM_DURATION_S).min(1.0);
+    let t = ease_out_cubic(*progress);
+
+    if let Ok(mut tf) = card.single_mut() {
+        let s = 0.94 + 0.06 * t;
+        tf.scale = Vec3::new(s, s, 1.0);
+        tf.translation.y = 10.0 * (1.0 - t);
+    }
+    if let Ok(mut bg) = scrim.single_mut() {
+        bg.0 = SCRIM.with_alpha(SCRIM.alpha() * t);
+    }
+}
+
 fn spawn_black_bot_reset_button(parent: &mut ChildSpawnerCommands) {
     parent
         .spawn((
@@ -506,6 +552,58 @@ fn black_bot_reset_button(
     }
 }
 
+fn spawn_actor_delete_button(parent: &mut ChildSpawnerCommands) {
+    const DELETE_BG: Color = Color::srgba(0.22, 0.10, 0.10, 0.9);
+    const DELETE_BORDER: Color = Color::srgba(0.75, 0.28, 0.28, 0.6);
+    const DELETE_TEXT: Color = Color::srgb(0.95, 0.55, 0.55);
+
+    parent
+        .spawn((
+            Name::new("Actor delete"),
+            ActorInspectorActionBtn,
+            ActorDeleteButton,
+            Pickable::default(),
+            Button,
+            Node {
+                min_width: Val::Px(72.0),
+                height: Val::Px(32.0),
+                padding: UiRect::horizontal(Val::Px(14.0)),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(6.0)),
+                ..default()
+            },
+            BorderColor::all(DELETE_BORDER),
+            BackgroundColor(DELETE_BG),
+        ))
+        .with_children(|btn| {
+            btn.spawn((
+                Text::new("Delete"),
+                TextFont::from_font_size(14.0),
+                TextColor(DELETE_TEXT),
+            ));
+        });
+}
+
+fn actor_delete_button(
+    interactions: Query<&Interaction, (With<ActorDeleteButton>, Changed<Interaction>)>,
+    mut commands: Commands,
+    mut modal: ResMut<ActorInspectorModal>,
+) {
+    for interaction in &interactions {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        let Some(actor) = modal.actor else {
+            continue;
+        };
+        commands.entity(actor).despawn();
+        modal.open = false;
+        modal.actor = None;
+    }
+}
+
 fn sync_actor_inspector_modal(
     mut commands: Commands,
     modal: Res<ActorInspectorModal>,
@@ -520,6 +618,7 @@ fn sync_actor_inspector_modal(
     actors: Query<&ActorObject, With<ActorInspectable>>,
     black: Query<&BlackBotVisual>,
     glitch: Query<&GlitchBotVisual>,
+    charges: Query<&Charge>,
     mut last_content_stamp: Local<u32>,
 ) {
     let Ok(mut overlay_vis) = overlay.single_mut() else {
@@ -551,19 +650,20 @@ fn sync_actor_inspector_modal(
 
     let kind_label;
     let rows;
+    let charge = charges.get(actor).ok().map(|c| c.level);
     let is_black_bot = black.get(actor).is_ok();
     if let Ok(vis) = black.get(actor) {
         kind_label = "BlackBot";
         let Ok(obj) = actors.get(actor) else {
             return;
         };
-        rows = collect_inspect_rows(obj, Some(vis), None);
+        rows = collect_inspect_rows(obj, charge, Some(vis), None);
     } else if let Ok(vis) = glitch.get(actor) {
         kind_label = "GlitchBot";
         let Ok(obj) = actors.get(actor) else {
             return;
         };
-        rows = collect_inspect_rows(obj, None, Some(vis));
+        rows = collect_inspect_rows(obj, charge, None, Some(vis));
     } else {
         return;
     };
@@ -598,6 +698,9 @@ fn sync_actor_inspector_modal(
             .entity(actions_entity)
             .with_children(spawn_black_bot_reset_button);
     }
+    commands
+        .entity(actions_entity)
+        .with_children(spawn_actor_delete_button);
 
     for (i, row) in rows.iter().enumerate() {
         commands.entity(host).with_children(|parent| {

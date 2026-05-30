@@ -55,12 +55,14 @@ impl Plugin for GamePlugin {
                 map::passability::PassabilityMapPlugin,
             ))
             .add_plugins((
+                hud::panel_anim::PanelAnimPlugin,
                 map::temperature::TemperatureMapPlugin,
                 map::temperature_overlay::TemperatureOverlayPlugin,
                 map::field_interactions::FieldInteractionsPlugin,
                 map::interactive_entity::InteractiveEntityPlugin,
                 actor::ActorPlugin,
                 actor::snapshot::ActorSnapshotPlugin,
+                actor::charge::ChargePlugin,
                 actor::glitch_bot::GlitchBotPlugin,
                 actor::black_bot::BlackBotPlugin,
                 edit::map_edit::MapEditPlugin,

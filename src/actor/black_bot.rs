@@ -20,6 +20,7 @@ use rand::{Rng, SeedableRng};
 
 use crate::actor::actor_name::random_actor_name;
 use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
+use crate::actor::charge::Charge;
 use bevy::picking::prelude::Pickable;
 use crate::actor::snapshot::{BlackBotVisualSnap, MovementStateSnap, SerIVec2, SerVec2};
 use crate::actor::{
@@ -476,13 +477,21 @@ fn update_path_following(
 fn black_bot_think(
     time: Res<Time>,
     hypermap: Res<HypermapRuntime>,
-    mut query: Query<(&mut ActorObject, &mut BlackBotVisual)>,
+    mut query: Query<(&mut ActorObject, &mut BlackBotVisual, Option<&Charge>)>,
 ) {
     let dt = time.delta_secs();
     let passability = &*hypermap.static_passability_map;
 
-    for (mut obj, mut vis) in &mut query {
+    for (mut obj, mut vis, charge) in &mut query {
         let state = obj.inner.state_mut();
+
+        // Depleted bots are immobilized: clear movement intent and skip pathing
+        // so the float center (which the mesh follows) stays put.
+        if charge.is_some_and(Charge::is_depleted) {
+            state.move_buffer = ActorMoveBuffer::default();
+            state.next_waypoint_hint = None;
+            continue;
+        }
 
         // Tick the waiting timer first. `black_bot_think` runs before
         // `process_actors`, so the error we observe here is from the previous
@@ -742,6 +751,7 @@ pub fn spawn_black_bot(
         .spawn((
             Name::new(random_actor_name()),
             ActorInspectable,
+            Charge::random(rng),
             BlackBotVisual {
                 main_tile: None,
                 direction: Vec2::X,

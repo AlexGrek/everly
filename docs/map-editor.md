@@ -66,7 +66,7 @@ Does **not** write to disk; use **Save** to persist.
 
 The palette **Save** button is the **only** persistence path (no autosave). It flushes
 dirt/temperature write buffers, calls `save_full_generated_level` in `src/map/level.rs`,
-then writes `actors.json` and `camera.json`.
+then writes `actors.yaml` and `camera.yaml`.
 
 Full layout, load order, binary `EVTF` format, chunk union rules, and what is *not*
 saved are documented in [`level-persistence.md`](level-persistence.md).

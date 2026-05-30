@@ -71,10 +71,10 @@ map and the chunk on every step.)
 ## Serialization
 
 `InteractiveEntityMap` serializes as a **flat `Vec<InteractiveEntityEntry>`**
-(each entry carries its own coordinates). This keeps JSON compact and sidesteps
-`serde_json`'s "map keys must be strings" limit on the struct key. The runtime
-`occupant` is `#[serde(skip)]` — Bevy `Entity` ids are not stable across sessions
-— so it loads back as `None`.
+(each entry carries its own coordinates). This keeps the output compact and
+sidesteps the "map keys must be strings" limit many serde formats place on a
+non-string struct key. The runtime `occupant` is `#[serde(skip)]` — Bevy
+`Entity` ids are not stable across sessions — so it loads back as `None`.
 
 ## Not yet wired
 

@@ -22,11 +22,13 @@ use crate::map::level::{save_full_generated_level, LevelName};
 use crate::map::temperature::TemperatureMap;
 use crate::actor::glitch_bot::GlitchBotVisual;
 use crate::actor::black_bot::BlackBotVisual;
+use crate::actor::charge::Charge;
 use crate::actor::snapshot::{save_level_actors, LevelActorsFile};
 use crate::scene::camera::{StrategyCamera, StrategyCameraRig};
 use crate::scene::camera_snapshot::{save_level_camera, LevelCameraFile};
 use crate::actor::{actor_main_tile, ActorObject};
-use crate::edit::actor_spawn::ActorSpawnState;
+use crate::edit::actor_spawn::{ActorSpawnPaletteRoot, ActorSpawnState};
+use crate::hud::panel_anim::PanelAnim;
 use crate::map::world_map::{
     CellType, ChargerFacing, TileStyle, WallCorner, WallMask, perimeter_wall_mask,
 };
@@ -47,7 +49,7 @@ const TEXT_MAIN: Color = Color::srgba(0.94, 0.95, 0.97, 0.92);
 pub struct MapEditToggleButton;
 
 #[derive(Component)]
-struct MapEditPaletteRoot;
+pub(crate) struct MapEditPaletteRoot;
 
 #[derive(Component, Clone, Copy)]
 struct MapEditTilePickButton(MapTileKind);
@@ -149,12 +151,13 @@ pub(crate) fn spawn_map_edit_palette(mut commands: Commands, camera: Query<Entit
         .spawn((
             Name::new("Map edit palette"),
             MapEditPaletteRoot,
+            PanelAnim::closed(52.0, 40.0),
             UiTargetCamera(cam),
             Node {
                 position_type: PositionType::Absolute,
                 width: Val::Percent(100.0),
                 height: Val::Px(40.0),
-                bottom: Val::Px(52.0),
+                bottom: Val::Px(12.0),
                 left: Val::Px(0.0),
                 padding: UiRect::horizontal(Val::Px(12.0)),
                 column_gap: Val::Px(8.0),
@@ -291,7 +294,9 @@ fn map_edit_toggle_panel(
     interactions: Query<&Interaction, (With<MapEditToggleButton>, Changed<Interaction>)>,
     mut state: ResMut<MapEditState>,
     mut drag: ResMut<MapEditDragAnchor>,
-    mut palette: Query<&mut Visibility, With<MapEditPaletteRoot>>,
+    mut palette: Query<&mut PanelAnim, (With<MapEditPaletteRoot>, Without<ActorSpawnPaletteRoot>)>,
+    mut actor_state: ResMut<ActorSpawnState>,
+    mut actor_palette: Query<&mut PanelAnim, (With<ActorSpawnPaletteRoot>, Without<MapEditPaletteRoot>)>,
 ) {
     for interaction in &interactions {
         if *interaction != Interaction::Pressed {
@@ -301,13 +306,16 @@ fn map_edit_toggle_panel(
         if !state.panel_open {
             state.placement_tile = None;
             drag.0 = None;
+        } else {
+            actor_state.panel_open = false;
+            actor_state.placement = None;
+            for mut anim in &mut actor_palette {
+                anim.target = 0.0;
+            }
         }
-        for mut vis in &mut palette {
-            *vis = if state.panel_open {
-                Visibility::Inherited
-            } else {
-                Visibility::Hidden
-            };
+        let target = if state.panel_open { 1.0 } else { 0.0 };
+        for mut anim in &mut palette {
+            anim.target = target;
         }
     }
 }
@@ -381,8 +389,8 @@ fn map_edit_save_button(
     dirt: Res<DirtMap>,
     temperature: Res<TemperatureMap>,
     camera: Query<&StrategyCamera, With<StrategyCameraRig>>,
-    glitch_bots: Query<(&ActorObject, &GlitchBotVisual, Option<&Name>)>,
-    black_bots: Query<(&ActorObject, &BlackBotVisual, Option<&Name>)>,
+    glitch_bots: Query<(&ActorObject, &GlitchBotVisual, Option<&Charge>, Option<&Name>)>,
+    black_bots: Query<(&ActorObject, &BlackBotVisual, Option<&Charge>, Option<&Name>)>,
 ) {
     if !state.panel_open {
         return;
@@ -419,7 +427,7 @@ fn map_edit_save_button(
         let actors_file = LevelActorsFile::collect(&glitch_bots, &black_bots);
         match save_level_actors(level_name, &actors_file) {
             Ok(()) => info!(
-                "saved {} actor(s) to `levels/level_{level_name}/actors.json`",
+                "saved {} actor(s) to `levels/level_{level_name}/actors.yaml`",
                 actors_file.actors.len()
             ),
             Err(e) => warn!("save level actors failed: {e}"),
@@ -427,7 +435,7 @@ fn map_edit_save_button(
         if let Ok(cam) = camera.single() {
             let camera_file = LevelCameraFile::from_camera(cam);
             match save_level_camera(level_name, &camera_file) {
-                Ok(()) => info!("saved strategy camera to `levels/level_{level_name}/camera.json`"),
+                Ok(()) => info!("saved strategy camera to `levels/level_{level_name}/camera.yaml`"),
                 Err(e) => warn!("save level camera failed: {e}"),
             }
         }
