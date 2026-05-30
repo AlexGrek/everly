@@ -13,6 +13,14 @@
 //! path is picked only when the current path is exhausted.
 //! Ground walker traversal rules (blocked by walls and void) are inherited
 //! from the default [`Actor`] impl.
+//!
+//! Movement has apparent mass: the bot carries a `velocity` that is steered
+//! toward `direction * MAX_SPEED_TILES_PER_S` under a finite acceleration cap
+//! ([`approach_velocity`] / [`drive_velocity`]), so it ramps up to speed,
+//! curves into heading changes, and coasts to a stop under stronger braking
+//! deceleration. Momentum lost to a wall collision is bled off per world axis
+//! by reconciling the stored velocity against the distance actually travelled
+//! last frame, preserving wall-sliding while preventing full-speed grinding.
 
 use bevy::prelude::*;
 use rand::rngs::StdRng;
@@ -46,8 +54,15 @@ use crate::menu::main_menu::GameState;
 const SUBTILE_SNAP_EPSILON: f32 = 1e-4;
 
 const BLACK_RADIUS_SUBTILES: i32 = 2;
-/// Continuous travel speed in tiles per second. 1 tile = 5 subtiles.
-const SPEED_TILES_PER_S: f32 = 1.2;
+/// Maximum continuous travel speed in tiles per second. 1 tile = 5 subtiles.
+const MAX_SPEED_TILES_PER_S: f32 = 1.2;
+/// Acceleration toward the target heading (tiles/s²). Finite acceleration is
+/// what gives the bot apparent mass: it ramps up to speed and curves into
+/// heading changes instead of snapping. Lower = heavier, more sluggish.
+const ACCEL_TILES_PER_S2: f32 = 2.5;
+/// Braking deceleration when slowing or stopping (tiles/s²). Stronger than
+/// acceleration so the bot settles onto a stop without a long glide.
+const DECEL_TILES_PER_S2: f32 = 4.0;
 const SPHERE_RADIUS: f32 = 0.45;
 /// Hover height above the floor during normal operation. The sphere center
 /// is at `SPHERE_RADIUS + HOVER_HEIGHT` when healthy; when the movement engine
@@ -85,11 +100,11 @@ const STUCK_REPATH_SECS: f32 = 2.0;
 const STUCK_PROGRESS_EPSILON: f32 = 0.05;
 
 /// Wear accumulated per second on the movement engine while the bot is moving.
-const MOVEMENT_ENGINE_WEAR_RATE: f32 = 0.005;
+const MOVEMENT_ENGINE_WEAR_RATE: f32 = 0.0001;
 /// Wear accumulated per second on the control plane at all times (while not depleted).
-const CONTROL_PLANE_WEAR_RATE: f32 = 0.002;
+const CONTROL_PLANE_WEAR_RATE: f32 = 0.00004;
 /// Wear accumulated per second on the sensory system at all times (while not depleted).
-const SENSORY_SYSTEM_WEAR_RATE: f32 = 0.001;
+const SENSORY_SYSTEM_WEAR_RATE: f32 = 0.00002;
 
 /// State of one breakable sub-component of a [`Breakable`] bot.
 #[derive(Debug, Clone)]
@@ -186,6 +201,21 @@ pub struct BlackBotVisual {
     /// Seed for [`Self::rng`]; persisted in level actor snapshots only.
     rng_seed: u64,
     rng: StdRng,
+    /// Seconds elapsed without measurable progress toward `path[path_index]`.
+    stuck_timer: f32,
+    /// Closest distance (tiles) to `path[stuck_waypoint_index]` seen so far.
+    closest_approach: f32,
+    /// The `path_index` for which `closest_approach` was last reset.
+    stuck_waypoint_index: usize,
+    /// Current velocity in tile-space units per second. Carries momentum
+    /// between frames; steered toward the target heading under finite
+    /// acceleration so the bot moves with apparent mass. Transient — not
+    /// serialized; a loaded bot starts at rest.
+    velocity: Vec2,
+    /// Float `center` recorded at the previous frame's movement step, used to
+    /// measure how far the bot *actually* moved and bleed off momentum lost to
+    /// wall collisions. `None` = no reconcile this frame (rest start).
+    prev_center: Option<Vec2>,
 }
 
 impl BlackBotVisual {
@@ -224,6 +254,11 @@ impl BlackBotVisual {
             movement_state,
             rng_seed: snap.rng_seed,
             rng: StdRng::seed_from_u64(snap.rng_seed),
+            stuck_timer: 0.0,
+            closest_approach: f32::MAX,
+            stuck_waypoint_index: 0,
+            velocity: Vec2::ZERO,
+            prev_center: None,
         }
     }
 
@@ -257,6 +292,9 @@ impl BlackBotVisual {
         self.path_index = 0;
         self.has_target = false;
         self.main_tile = None;
+        self.stuck_timer = 0.0;
+        self.closest_approach = f32::MAX;
+        self.stuck_waypoint_index = 0;
 
         let center = state.center;
         let current_tile = actor_main_tile(center);
@@ -546,6 +584,60 @@ fn float_subtile(pos: Vec2) -> IVec2 {
     IVec2::new((pos.x * sc).floor() as i32, (pos.y * sc).floor() as i32)
 }
 
+/// Steers `velocity` toward `desired`, changing it by at most `rate * dt`
+/// (tiles/s²). Below that threshold it snaps to `desired` so the bot settles
+/// exactly rather than oscillating. Gives smooth acceleration when speeding up
+/// or turning and smooth deceleration when `desired` is slower or zero.
+#[inline]
+fn approach_velocity(velocity: Vec2, desired: Vec2, rate: f32, dt: f32) -> Vec2 {
+    let dv = desired - velocity;
+    let max_step = rate * dt;
+    if dv.length() <= max_step {
+        desired
+    } else {
+        velocity + dv.normalize() * max_step
+    }
+}
+
+/// Drives one bot for a frame: reconcile momentum with reality, steer toward
+/// `desired` velocity at `rate`, then emit the resulting displacement into
+/// `state.move_buffer` and record `prev_center` for the next reconcile.
+///
+/// The reconcile step compares last frame's actual displacement against the
+/// stored `velocity`: a wall that `try_move` snapped against collapses the
+/// achieved speed on that world axis, so the blocked component is bled off
+/// (the bot rests against the wall instead of grinding at full momentum) while
+/// the free axis keeps sliding. The `0.8` slack tolerates per-frame `dt` jitter
+/// without mistaking it for a collision.
+fn drive_velocity(
+    vis: &mut BlackBotVisual,
+    state: &mut ActorState,
+    center: Vec2,
+    desired: Vec2,
+    rate: f32,
+    dt: f32,
+) {
+    if dt > 1e-6 {
+        if let Some(prev) = vis.prev_center {
+            let achieved = (center - prev) / dt;
+            if achieved.x.abs() < vis.velocity.x.abs() * 0.8 {
+                vis.velocity.x = achieved.x;
+            }
+            if achieved.y.abs() < vis.velocity.y.abs() * 0.8 {
+                vis.velocity.y = achieved.y;
+            }
+        }
+    }
+
+    vis.velocity = approach_velocity(vis.velocity, desired, rate, dt);
+
+    let delta = vis.velocity * dt;
+    state.move_buffer.tile_delta = delta;
+    state.move_buffer.subtile_shift = float_subtile(center + delta) - float_subtile(center);
+    state.move_buffer.rotation_shift = 0.0;
+    vis.prev_center = Some(center);
+}
+
 /// Advances past reached waypoints, picks a new path when needed, and aims at
 /// the next waypoint center.
 fn update_path_following(
@@ -601,6 +693,8 @@ fn black_bot_think(
         // Depleted bots are immobilized: clear movement intent and skip pathing
         // so the float center (which the mesh follows) stays put.
         if charge.is_some_and(Charge::is_depleted) {
+            vis.velocity = Vec2::ZERO;
+            vis.prev_center = None;
             state.move_buffer = ActorMoveBuffer::default();
             state.next_waypoint_hint = None;
             continue;
@@ -618,6 +712,8 @@ fn black_bot_think(
 
         // Broken engine or control plane: halt all movement.
         if breakable.as_ref().map_or(false, |b| b.movement_engine.broken || b.control_plane.broken) {
+            vis.velocity = Vec2::ZERO;
+            vis.prev_center = None;
             state.move_buffer = ActorMoveBuffer::default();
             state.next_waypoint_hint = None;
             continue;
@@ -636,6 +732,8 @@ fn black_bot_think(
                 } else {
                     None
                 };
+                vis.velocity = Vec2::ZERO;
+                vis.prev_center = None;
                 state.move_buffer = ActorMoveBuffer::default();
                 continue;
             }
@@ -650,23 +748,37 @@ fn black_bot_think(
             let roll = vis.rng.gen_range(0.0_f32..1.0);
             if roll < BOT_COLLISION_REROUTE_CHANCE {
                 let distance = vis.rng.gen_range(1..=2) as f32;
-                let escape_dir = -vis.direction;
-                let escape = (
-                    (current_tile.x as f32 + escape_dir.x * distance).round() as i32,
-                    (current_tile.y as f32 + escape_dir.y * distance).round() as i32,
-                );
-                if escape != (current_tile.x, current_tile.y)
-                    && world_tile_walkable(passability, escape.0, escape.1)
-                {
-                    let insert_idx = vis.path_index.min(vis.path.len());
-                    vis.path.insert(insert_idx, escape);
-                    // Force direction recalculation toward the escape tile this frame.
-                    vis.main_tile = None;
+                // Candidate escape directions: back, strafe-left, strafe-right.
+                // Shuffle so each has equal probability of being tried first;
+                // the first passable tile wins. This breaks symmetry near narrow
+                // passages (doors, corridors) where only one side is open.
+                let d = vis.direction;
+                let mut candidates = [-d, Vec2::new(-d.y, d.x), Vec2::new(d.y, -d.x)];
+                for i in (1..3).rev() {
+                    let j = vis.rng.gen_range(0..=i);
+                    candidates.swap(i, j);
+                }
+                for escape_dir in candidates {
+                    let escape = (
+                        (current_tile.x as f32 + escape_dir.x * distance).round() as i32,
+                        (current_tile.y as f32 + escape_dir.y * distance).round() as i32,
+                    );
+                    if escape != (current_tile.x, current_tile.y)
+                        && world_tile_walkable(passability, escape.0, escape.1)
+                    {
+                        let insert_idx = vis.path_index.min(vis.path.len());
+                        vis.path.insert(insert_idx, escape);
+                        // Force direction recalculation toward the escape tile this frame.
+                        vis.main_tile = None;
+                        break;
+                    }
                 }
             } else if roll < BOT_COLLISION_REROUTE_CHANCE + BOT_COLLISION_WAIT_CHANCE {
                 vis.movement_state = MovementState::Waiting {
                     remaining_s: BOT_COLLISION_WAIT_S,
                 };
+                vis.velocity = Vec2::ZERO;
+                vis.prev_center = None;
                 state.move_buffer = ActorMoveBuffer::default();
                 continue;
             }
@@ -678,8 +790,40 @@ fn black_bot_think(
         update_path_following(&mut vis, center, here, passability);
 
         if !vis.has_target {
+            // No path right now: coast to a stop under braking deceleration
+            // rather than halting instantly, so residual momentum glides out.
+            drive_velocity(&mut vis, state, center, Vec2::ZERO, DECEL_TILES_PER_S2, dt);
             state.next_waypoint_hint = None;
+            continue;
+        }
+
+        // Stuck detection: if the bot hasn't closed the distance to its current
+        // waypoint by STUCK_PROGRESS_EPSILON in STUCK_REPATH_SECS, abandon the
+        // path and repath. This recovers from wall-wedge freezes that
+        // axis-decomposed sliding cannot escape on its own.
+        if vis.stuck_waypoint_index != vis.path_index {
+            vis.stuck_timer = 0.0;
+            vis.closest_approach = f32::MAX;
+            vis.stuck_waypoint_index = vis.path_index;
+        }
+        let dist_to_wp = (waypoint_center(vis.path[vis.path_index]) - center).length();
+        if dist_to_wp < vis.closest_approach - STUCK_PROGRESS_EPSILON {
+            vis.closest_approach = dist_to_wp;
+            vis.stuck_timer = 0.0;
+        } else {
+            vis.stuck_timer += dt;
+        }
+        if vis.stuck_timer >= STUCK_REPATH_SECS {
+            vis.path.clear();
+            vis.path_index = 0;
+            vis.has_target = false;
+            vis.stuck_timer = 0.0;
+            vis.closest_approach = f32::MAX;
+            vis.stuck_waypoint_index = 0;
+            vis.velocity = Vec2::ZERO;
+            vis.prev_center = None;
             state.move_buffer = ActorMoveBuffer::default();
+            state.next_waypoint_hint = None;
             continue;
         }
 
@@ -688,14 +832,12 @@ fn black_bot_think(
             b.movement_engine.tick(dt, MOVEMENT_ENGINE_WEAR_RATE, tile_changed, &mut vis.rng);
         }
 
-        let delta = vis.direction * SPEED_TILES_PER_S * dt;
-        let new_center = center + delta;
-        let old_sub = float_subtile(center);
-        let new_sub = float_subtile(new_center);
+        // Steer toward the active waypoint under finite acceleration so the bot
+        // ramps up to speed and curves into heading changes (apparent mass),
+        // rather than teleporting to full speed in the new direction.
+        let desired = vis.direction * MAX_SPEED_TILES_PER_S;
+        drive_velocity(&mut vis, state, center, desired, ACCEL_TILES_PER_S2, dt);
 
-        state.move_buffer.tile_delta = delta;
-        state.move_buffer.subtile_shift = new_sub - old_sub;
-        state.move_buffer.rotation_shift = 0.0;
         state.next_waypoint_hint = if vis.path_index < vis.path.len() {
             Some(waypoint_center(vis.path[vis.path_index]))
         } else {
@@ -931,6 +1073,11 @@ pub fn spawn_black_bot(
                 movement_state: MovementState::Moving,
                 rng_seed: vis_seed,
                 rng: vis_rng,
+                stuck_timer: 0.0,
+                closest_approach: f32::MAX,
+                stuck_waypoint_index: 0,
+                velocity: Vec2::ZERO,
+                prev_center: None,
             },
             ActorObject::new(Box::new(bot)),
             Transform::default(),
@@ -980,6 +1127,11 @@ mod tests {
             movement_state: MovementState::Moving,
             rng_seed: 0,
             rng: StdRng::seed_from_u64(0),
+            stuck_timer: 0.0,
+            closest_approach: f32::MAX,
+            stuck_waypoint_index: 0,
+            velocity: Vec2::ZERO,
+            prev_center: None,
         };
         let near_start = Vec2::new(0.2, 0.5);
         advance_past_reached_waypoints(&mut vis, near_start);
@@ -987,5 +1139,31 @@ mod tests {
 
         advance_past_reached_waypoints(&mut vis, waypoint_center((0, 0)));
         assert_eq!(vis.path_index, 1);
+    }
+
+    #[test]
+    fn approach_velocity_ramps_up_capped_by_accel() {
+        // From rest, one step changes velocity by exactly rate * dt, not the
+        // full desired magnitude — this is the inertia.
+        let v = approach_velocity(Vec2::ZERO, Vec2::new(10.0, 0.0), 4.0, 0.5);
+        assert!((v.x - 2.0).abs() < 1e-5, "expected 2.0, got {}", v.x);
+        assert_eq!(v.y, 0.0);
+    }
+
+    #[test]
+    fn approach_velocity_snaps_when_within_one_step() {
+        // When the remaining delta is below rate * dt, snap to desired so the
+        // bot settles instead of oscillating around the target velocity.
+        let v = approach_velocity(Vec2::new(1.0, 0.0), Vec2::new(1.2, 0.0), 4.0, 0.5);
+        assert_eq!(v, Vec2::new(1.2, 0.0));
+    }
+
+    #[test]
+    fn approach_velocity_decelerates_toward_zero() {
+        let v = approach_velocity(Vec2::new(3.0, 0.0), Vec2::ZERO, 4.0, 0.5);
+        assert!((v.x - 1.0).abs() < 1e-5, "expected 1.0, got {}", v.x);
+        // A second braking step reaches a full stop (remaining < step).
+        let v2 = approach_velocity(v, Vec2::ZERO, 4.0, 0.5);
+        assert_eq!(v2, Vec2::ZERO);
     }
 }
