@@ -1,6 +1,6 @@
 //! Human-readable actor state for the HUD inspector modal.
 
-use crate::actor::black_bot::BlackBotVisual;
+use crate::actor::black_bot::{Breakable, BreakablePartState, BlackBotVisual};
 use crate::actor::glitch_bot::GlitchBotVisual;
 use crate::actor::ActorObject;
 
@@ -19,19 +19,12 @@ pub fn common_actor_rows(state: &crate::actor::ActorState) -> Vec<InspectRow> {
         None => "—".to_string(),
     };
     vec![
-        InspectRow {
-            label: "center",
-            value: center,
-        },
-        InspectRow {
-            label: "last_accepted_center_subtile",
-            value: last_sub,
-        },
+        InspectRow { label: "center", value: center },
+        InspectRow { label: "last_accepted_center_subtile", value: last_sub },
     ]
 }
 
-/// Battery charge row (shared by every bot), shown as a whole-percent value.
-/// A depleted bot is annotated so the immobilized state is obvious.
+/// Battery charge row, shown as a whole-percent value.
 pub fn charge_row(level: f32) -> InspectRow {
     let pct = (level * 100.0).round() as i32;
     let value = if level <= 0.0 {
@@ -39,10 +32,7 @@ pub fn charge_row(level: f32) -> InspectRow {
     } else {
         format!("{pct}%")
     };
-    InspectRow {
-        label: "charge",
-        value,
-    }
+    InspectRow { label: "charge", value }
 }
 
 pub fn black_bot_rows(vis: &BlackBotVisual) -> Vec<InspectRow> {
@@ -51,18 +41,9 @@ pub fn black_bot_rows(vis: &BlackBotVisual) -> Vec<InspectRow> {
         .map(|t| format!("({}, {})", t.x, t.y))
         .unwrap_or_else(|| "—".to_string());
     vec![
-        InspectRow {
-            label: "main_tile",
-            value: main_tile,
-        },
-        InspectRow {
-            label: "has_target",
-            value: vis.has_target().to_string(),
-        },
-        InspectRow {
-            label: "movement_state",
-            value: vis.movement_state_label(),
-        },
+        InspectRow { label: "main_tile", value: main_tile },
+        InspectRow { label: "has_target", value: vis.has_target().to_string() },
+        InspectRow { label: "movement_state", value: vis.movement_state_label() },
     ]
 }
 
@@ -79,7 +60,16 @@ pub fn glitch_bot_rows(vis: &GlitchBotVisual) -> Vec<InspectRow> {
     ]
 }
 
-pub fn collect_inspect_rows(
+fn format_part(p: &BreakablePartState) -> String {
+    if p.broken {
+        format!("{:.3} (BROKEN)", p.wear)
+    } else {
+        format!("{:.3}", p.wear)
+    }
+}
+
+/// Status-tab rows: position, charge, and actor-specific movement info.
+pub fn status_rows(
     obj: &ActorObject,
     charge: Option<f32>,
     black: Option<&BlackBotVisual>,
@@ -96,6 +86,15 @@ pub fn collect_inspect_rows(
         rows.extend(glitch_bot_rows(vis));
     }
     rows
+}
+
+/// Systems-tab rows: wear and breakage status for each sub-component.
+pub fn systems_rows(b: &Breakable) -> Vec<InspectRow> {
+    vec![
+        InspectRow { label: "MOVEMENT_ENGINE", value: format_part(&b.movement_engine) },
+        InspectRow { label: "CONTROL_PLANE", value: format_part(&b.control_plane) },
+        InspectRow { label: "SENSORY_SYSTEM", value: format_part(&b.sensory_system) },
+    ]
 }
 
 pub fn display_actor_name(name: &str) -> String {

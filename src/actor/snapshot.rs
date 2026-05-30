@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::actor::black_bot::{spawn_black_bot_from_snapshot, BlackBotVisual};
+use crate::actor::black_bot::{spawn_black_bot_from_snapshot, Breakable, BlackBotVisual};
 use crate::actor::charge::Charge;
 use crate::actor::glitch_bot::{spawn_glitch_bot_from_snapshot, GlitchBotVisual};
 use crate::actor::{ActorMoveBuffer, ActorMovementError, ActorObject, ActorState, LevelActor};
@@ -187,6 +187,30 @@ impl From<ActorStateSnap> for ActorState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BreakablePartSnap {
+    pub wear: f32,
+    pub broken: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BreakableSnap {
+    pub movement_engine: BreakablePartSnap,
+    pub control_plane: BreakablePartSnap,
+    pub sensory_system: BreakablePartSnap,
+}
+
+impl Default for BreakableSnap {
+    fn default() -> Self {
+        let fresh = || BreakablePartSnap { wear: 0.0, broken: false };
+        Self {
+            movement_engine: fresh(),
+            control_plane: fresh(),
+            sensory_system: fresh(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GlitchBotVisualSnap {
     pub direction: SerVec2,
     pub accumulator: SerVec2,
@@ -238,6 +262,8 @@ pub enum SavedActor {
         visual: BlackBotVisualSnap,
         #[serde(default = "default_charge")]
         charge: f32,
+        #[serde(default)]
+        breakable: BreakableSnap,
     },
 }
 
@@ -254,7 +280,13 @@ fn saved_name_from_entity(name: Option<&Name>) -> String {
 impl LevelActorsFile {
     pub fn collect(
         glitch_bots: &Query<(&ActorObject, &GlitchBotVisual, Option<&Charge>, Option<&Name>)>,
-        black_bots: &Query<(&ActorObject, &BlackBotVisual, Option<&Charge>, Option<&Name>)>,
+        black_bots: &Query<(
+            &ActorObject,
+            &BlackBotVisual,
+            Option<&Charge>,
+            Option<&Name>,
+            Option<&Breakable>,
+        )>,
     ) -> Self {
         let mut actors = Vec::new();
         for (obj, vis, charge, name) in glitch_bots.iter() {
@@ -265,12 +297,13 @@ impl LevelActorsFile {
                 charge: charge.map_or(1.0, |c| c.level),
             });
         }
-        for (obj, vis, charge, name) in black_bots.iter() {
+        for (obj, vis, charge, name, breakable) in black_bots.iter() {
             actors.push(SavedActor::BlackBot {
                 name: saved_name_from_entity(name),
                 state: obj.inner.state().into(),
                 visual: vis.to_snapshot(),
                 charge: charge.map_or(1.0, |c| c.level),
+                breakable: breakable.map(|b| b.to_snapshot()).unwrap_or_default(),
             });
         }
         Self {
@@ -329,7 +362,7 @@ pub fn spawn_level_actors(
                 );
                 commands.entity(entity).insert((LevelActor, Charge::new(*charge)));
             }
-            SavedActor::BlackBot { name, state, visual, charge } => {
+            SavedActor::BlackBot { name, state, visual, charge, breakable } => {
                 let entity = spawn_black_bot_from_snapshot(
                     commands,
                     meshes,
@@ -337,6 +370,7 @@ pub fn spawn_level_actors(
                     name,
                     state.clone().into(),
                     visual.clone(),
+                    breakable.clone(),
                 );
                 commands.entity(entity).insert((LevelActor, Charge::new(*charge)));
             }
@@ -478,10 +512,12 @@ visual:
 "#;
         let actor: SavedActor = serde_yaml::from_str(yaml).unwrap();
         match actor {
-            SavedActor::BlackBot { name, charge, .. } => {
+            SavedActor::BlackBot { name, charge, breakable, .. } => {
                 assert_eq!(name, "");
                 // No `charge` field in the YAML above → defaults to full.
                 assert_eq!(charge, 1.0);
+                // No `breakable` field → defaults to fresh (0 wear, not broken).
+                assert_eq!(breakable, BreakableSnap::default());
             }
             _ => panic!("expected black_bot"),
         }
@@ -542,6 +578,7 @@ visual:
                         rng_seed: 99,
                     },
                     charge: 0.4,
+                    breakable: BreakableSnap::default(),
                 },
             ],
         };

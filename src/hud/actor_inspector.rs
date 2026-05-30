@@ -5,11 +5,11 @@ use bevy::prelude::*;
 use bevy::ui::widget::Button;
 
 use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
-use crate::actor::black_bot::BlackBotVisual;
+use crate::actor::black_bot::{Breakable, BlackBotVisual};
 use crate::actor::charge::Charge;
 use crate::actor::glitch_bot::GlitchBotVisual;
 use crate::map::hypermap_world::HypermapRuntime;
-use crate::actor::inspect::{collect_inspect_rows, display_actor_name};
+use crate::actor::inspect::{display_actor_name, status_rows, systems_rows};
 use crate::actor::ActorObject;
 use crate::edit::actor_spawn::{ActorSpawnState, ActorTool};
 use crate::menu::main_menu::GameState;
@@ -27,6 +27,18 @@ const SCRIM: Color = Color::srgba(0.02, 0.03, 0.06, 0.68);
 const CARD_BG: Color = Color::srgba(0.09, 0.11, 0.15, 0.96);
 const CARD_BORDER: Color = Color::srgba(0.55, 0.62, 0.72, 0.35);
 const ROW_DIVIDER: Color = Color::srgba(0.4, 0.45, 0.52, 0.25);
+
+const TAB_ACTIVE_BG: Color = Color::srgba(0.48, 0.78, 0.96, 0.15);
+const TAB_ACTIVE_BORDER: Color = Color::srgba(0.48, 0.78, 0.96, 0.7);
+const TAB_INACTIVE_BG: Color = Color::srgba(0.12, 0.14, 0.18, 0.7);
+
+/// Which tab is currently active in the actor inspector modal.
+#[derive(Resource, Default, PartialEq, Clone, Copy, Debug)]
+pub enum InspectorTab {
+    #[default]
+    Status,
+    Systems,
+}
 
 #[derive(Resource, Default)]
 struct HoveredActor {
@@ -87,12 +99,17 @@ struct BlackBotResetButton;
 #[derive(Component)]
 struct ActorDeleteButton;
 
+/// Marker on each tab button; carries which tab it activates.
+#[derive(Component, Clone, Copy)]
+struct ActorInspectorTabBtn(InspectorTab);
+
 pub struct ActorInspectorPlugin;
 
 impl Plugin for ActorInspectorPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<HoveredActor>()
             .init_resource::<ActorInspectorModal>()
+            .init_resource::<InspectorTab>()
             .add_observer(on_actor_pointer_over)
             .add_observer(on_actor_pointer_out)
             .add_observer(on_actor_pointer_click)
@@ -107,6 +124,14 @@ impl Plugin for ActorInspectorPlugin {
                     sync_actor_inspector_modal,
                     animate_actor_inspector,
                     actor_inspector_close_input,
+                )
+                    .run_if(in_state(GameState::InGame)),
+            )
+            .add_systems(
+                Update,
+                (
+                    actor_inspector_tab_buttons,
+                    sync_tab_button_visuals,
                     black_bot_reset_button,
                     actor_delete_button,
                 )
@@ -181,8 +206,6 @@ fn on_actor_pointer_click(
     let Some(root) = find_actor_root(click.entity, &child_of, &inspectable) else {
         return;
     };
-    // With the palette's Kill brush armed, a click destroys the bot instead of
-    // inspecting it. The footprint clears itself on the next occupancy flush.
     if matches!(spawn_state.tool, Some(ActorTool::Kill)) {
         commands.entity(root).despawn();
         return;
@@ -201,7 +224,6 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
             Name::new("Actor inspector UI"),
             ActorInspectorUiRoot,
             UiTargetCamera(cam),
-            // Full-screen layout container; must not block mesh picking (floor select, actors).
             Pickable::IGNORE,
             Node {
                 position_type: PositionType::Absolute,
@@ -288,6 +310,7 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                         ZIndex(1),
                     ))
                     .with_children(|card| {
+                        // Header: kind badge + title + close button.
                         card.spawn(Node {
                             width: Val::Percent(100.0),
                             flex_direction: FlexDirection::Row,
@@ -346,6 +369,7 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                                 });
                         });
 
+                        // Accent divider.
                         card.spawn((
                             Node {
                                 width: Val::Percent(100.0),
@@ -355,6 +379,19 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                             BackgroundColor(ACCENT.with_alpha(0.45)),
                         ));
 
+                        // Tab bar: Status | Systems
+                        card.spawn(Node {
+                            width: Val::Percent(100.0),
+                            flex_direction: FlexDirection::Row,
+                            column_gap: Val::Px(6.0),
+                            ..default()
+                        })
+                        .with_children(|tabs| {
+                            spawn_tab_button(tabs, "Status", InspectorTab::Status, true);
+                            spawn_tab_button(tabs, "Systems", InspectorTab::Systems, false);
+                        });
+
+                        // Actions host (Reset, Delete — always visible).
                         card.spawn((
                             ActorInspectorActionsHost,
                             Node {
@@ -365,6 +402,7 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                             },
                         ));
 
+                        // Rows host: content varies by active tab.
                         card.spawn((
                             ActorInspectorRowsHost,
                             Node {
@@ -377,6 +415,35 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                         ));
                     });
             });
+        });
+}
+
+fn spawn_tab_button(parent: &mut ChildSpawnerCommands, label: &str, tab: InspectorTab, active: bool) {
+    let bg = if active { TAB_ACTIVE_BG } else { TAB_INACTIVE_BG };
+    let border = if active { TAB_ACTIVE_BORDER } else { CARD_BORDER };
+    parent
+        .spawn((
+            ActorInspectorTabBtn(tab),
+            Pickable::default(),
+            Button,
+            Node {
+                height: Val::Px(28.0),
+                padding: UiRect::horizontal(Val::Px(14.0)),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(6.0)),
+                ..default()
+            },
+            BorderColor::all(border),
+            BackgroundColor(bg),
+        ))
+        .with_children(|btn| {
+            btn.spawn((
+                Text::new(label.to_string()),
+                TextFont::from_font_size(13.0),
+                TextColor(if active { ACCENT } else { TEXT_MUTED }),
+            ));
         });
 }
 
@@ -402,6 +469,41 @@ fn actor_inspector_close_input(
     if keys.just_pressed(KeyCode::Escape) && modal.open {
         modal.open = false;
         modal.actor = None;
+    }
+}
+
+/// Handles tab button presses; updates active tab and triggers a content rebuild.
+fn actor_inspector_tab_buttons(
+    interactions: Query<(&Interaction, &ActorInspectorTabBtn), Changed<Interaction>>,
+    mut tab: ResMut<InspectorTab>,
+    mut modal: ResMut<ActorInspectorModal>,
+) {
+    for (interaction, btn) in &interactions {
+        if *interaction == Interaction::Pressed && *tab != btn.0 {
+            *tab = btn.0;
+            modal.content_stamp = modal.content_stamp.wrapping_add(1);
+        }
+    }
+}
+
+/// Updates tab button appearance to reflect the active tab.
+fn sync_tab_button_visuals(
+    tab: Res<InspectorTab>,
+    mut tab_buttons: Query<(&ActorInspectorTabBtn, &mut BackgroundColor, &mut BorderColor, &Children)>,
+    mut tab_texts: Query<&mut TextColor>,
+) {
+    if !tab.is_changed() {
+        return;
+    }
+    for (btn, mut bg, mut border, children) in &mut tab_buttons {
+        let active = btn.0 == *tab;
+        *bg = BackgroundColor(if active { TAB_ACTIVE_BG } else { TAB_INACTIVE_BG });
+        *border = BorderColor::all(if active { TAB_ACTIVE_BORDER } else { CARD_BORDER });
+        for child in children.iter() {
+            if let Ok(mut color) = tab_texts.get_mut(child) {
+                *color = TextColor(if active { ACCENT } else { TEXT_MUTED });
+            }
+        }
     }
 }
 
@@ -450,7 +552,6 @@ fn sync_actor_hover_tooltip(
         *vis = Visibility::Hidden;
         return;
     };
-    // `world_to_viewport` already returns top-left viewport pixels (same as UI `top`).
 
     for mut text in &mut tooltip_text {
         **text = display_actor_name(name.as_str());
@@ -613,9 +714,17 @@ fn actor_delete_button(
     }
 }
 
+/// Persistent state for the inspector rebuild logic.
+#[derive(Default)]
+struct InspectorBuildState {
+    last_stamp: u32,
+    last_actor: Option<Entity>,
+}
+
 fn sync_actor_inspector_modal(
     mut commands: Commands,
     modal: Res<ActorInspectorModal>,
+    tab: Res<InspectorTab>,
     mut overlay: Query<&mut Visibility, With<ActorInspectorOverlay>>,
     mut title: Query<&mut Text, With<ActorInspectorTitle>>,
     mut badge: Query<&mut Text, (With<ActorInspectorKindBadge>, Without<ActorInspectorTitle>)>,
@@ -623,12 +732,11 @@ fn sync_actor_inspector_modal(
     rows_host: Query<Entity, With<ActorInspectorRowsHost>>,
     existing_rows: Query<Entity, With<ActorInspectorRow>>,
     existing_actions: Query<Entity, With<ActorInspectorActionBtn>>,
-    actor_names: Query<&Name, With<ActorInspectable>>,
-    actors: Query<&ActorObject, With<ActorInspectable>>,
+    actor_data: Query<(&ActorObject, Option<&Name>), With<ActorInspectable>>,
     black: Query<&BlackBotVisual>,
     glitch: Query<&GlitchBotVisual>,
-    charges: Query<&Charge>,
-    mut last_content_stamp: Local<u32>,
+    actor_extras: Query<(Option<&Charge>, Option<&Breakable>)>,
+    mut state: Local<InspectorBuildState>,
 ) {
     let Ok(mut overlay_vis) = overlay.single_mut() else {
         return;
@@ -636,7 +744,8 @@ fn sync_actor_inspector_modal(
 
     if !modal.open {
         *overlay_vis = Visibility::Hidden;
-        *last_content_stamp = 0;
+        state.last_stamp = 0;
+        state.last_actor = None;
         for row in &existing_rows {
             commands.entity(row).despawn();
         }
@@ -648,39 +757,52 @@ fn sync_actor_inspector_modal(
 
     *overlay_vis = Visibility::Inherited;
 
-    if !modal.is_changed() && *last_content_stamp == modal.content_stamp {
+    let content_changed = modal.is_changed()
+        || tab.is_changed()
+        || state.last_stamp != modal.content_stamp
+        || state.last_actor != modal.actor;
+    if !content_changed {
         return;
     }
-    *last_content_stamp = modal.content_stamp;
+    state.last_stamp = modal.content_stamp;
+    state.last_actor = modal.actor;
 
     let Some(actor) = modal.actor else {
         return;
     };
 
+    let (charge, breakable) = actor_extras
+        .get(actor)
+        .map(|(c, b)| (c.map(|c| c.level), b))
+        .unwrap_or((None, None));
+    let is_black_bot = black.get(actor).is_ok();
+
     let kind_label;
     let rows;
-    let charge = charges.get(actor).ok().map(|c| c.level);
-    let is_black_bot = black.get(actor).is_ok();
     if let Ok(vis) = black.get(actor) {
         kind_label = "BlackBot";
-        let Ok(obj) = actors.get(actor) else {
-            return;
+        let Ok((obj, _)) = actor_data.get(actor) else { return };
+        rows = match *tab {
+            InspectorTab::Status => status_rows(obj, charge, Some(vis), None),
+            InspectorTab::Systems => breakable.map(|b| systems_rows(b)).unwrap_or_default(),
         };
-        rows = collect_inspect_rows(obj, charge, Some(vis), None);
     } else if let Ok(vis) = glitch.get(actor) {
         kind_label = "GlitchBot";
-        let Ok(obj) = actors.get(actor) else {
-            return;
+        let Ok((obj, _)) = actor_data.get(actor) else { return };
+        rows = match *tab {
+            InspectorTab::Status => status_rows(obj, charge, None, Some(vis)),
+            InspectorTab::Systems => Vec::new(),
         };
-        rows = collect_inspect_rows(obj, charge, None, Some(vis));
     } else {
         return;
     };
 
-    let display_name = actor_names
+    let display_name = actor_data
         .get(actor)
+        .ok()
+        .and_then(|(_, name)| name)
         .map(|n| display_actor_name(n.as_str()))
-        .unwrap_or_else(|_| "(unnamed)".to_string());
+        .unwrap_or_else(|| "(unnamed)".to_string());
 
     for mut text in &mut badge {
         **text = kind_label.to_string();
@@ -689,12 +811,8 @@ fn sync_actor_inspector_modal(
         **text = display_name.clone();
     }
 
-    let Ok(actions_entity) = actions_host.single() else {
-        return;
-    };
-    let Ok(host) = rows_host.single() else {
-        return;
-    };
+    let Ok(actions_entity) = actions_host.single() else { return };
+    let Ok(host) = rows_host.single() else { return };
     for row in &existing_rows {
         commands.entity(row).despawn();
     }
@@ -710,6 +828,23 @@ fn sync_actor_inspector_modal(
     commands
         .entity(actions_entity)
         .with_children(spawn_actor_delete_button);
+
+    if rows.is_empty() {
+        commands.entity(host).with_children(|parent| {
+            parent.spawn((
+                ActorInspectorRow,
+                Node { padding: UiRect::vertical(Val::Px(8.0)), ..default() },
+            ))
+            .with_children(|block| {
+                block.spawn((
+                    Text::new("No data for this tab."),
+                    TextFont::from_font_size(14.0),
+                    TextColor(TEXT_MUTED),
+                ));
+            });
+        });
+        return;
+    }
 
     for (i, row) in rows.iter().enumerate() {
         commands.entity(host).with_children(|parent| {

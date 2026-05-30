@@ -22,7 +22,7 @@ use crate::actor::actor_name::random_actor_name;
 use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
 use crate::actor::charge::Charge;
 use bevy::picking::prelude::Pickable;
-use crate::actor::snapshot::{BlackBotVisualSnap, MovementStateSnap, SerIVec2, SerVec2};
+use crate::actor::snapshot::{BlackBotVisualSnap, BreakablePartSnap, BreakableSnap, MovementStateSnap, SerIVec2, SerVec2};
 use crate::actor::{
     actor_main_tile, is_paused, process_actors, Actor, ActorMoveBuffer, ActorMovementError,
     ActorObject, ActorState, OffScreenActor,
@@ -49,6 +49,10 @@ const BLACK_RADIUS_SUBTILES: i32 = 2;
 /// Continuous travel speed in tiles per second. 1 tile = 5 subtiles.
 const SPEED_TILES_PER_S: f32 = 1.2;
 const SPHERE_RADIUS: f32 = 0.45;
+/// Hover height above the floor during normal operation. The sphere center
+/// is at `SPHERE_RADIUS + HOVER_HEIGHT` when healthy; when the movement engine
+/// breaks it falls to `SPHERE_RADIUS` (touching the floor).
+const HOVER_HEIGHT: f32 = 0.3;
 const WANDER_RADIUS: f32 = 15.0;
 const MAX_TARGET_ATTEMPTS: u32 = 8;
 /// Distance (in tiles) within which the bot considers a waypoint reached even
@@ -79,6 +83,84 @@ const STUCK_REPATH_SECS: f32 = 2.0;
 /// Minimum reduction (in tiles) of the closest-approach distance to the current
 /// waypoint that counts as progress and resets the stuck timer.
 const STUCK_PROGRESS_EPSILON: f32 = 0.05;
+
+/// Wear accumulated per second on the movement engine while the bot is moving.
+const MOVEMENT_ENGINE_WEAR_RATE: f32 = 0.005;
+/// Wear accumulated per second on the control plane at all times (while not depleted).
+const CONTROL_PLANE_WEAR_RATE: f32 = 0.002;
+/// Wear accumulated per second on the sensory system at all times (while not depleted).
+const SENSORY_SYSTEM_WEAR_RATE: f32 = 0.001;
+
+/// State of one breakable sub-component of a [`Breakable`] bot.
+#[derive(Debug, Clone)]
+pub struct BreakablePartState {
+    /// Monotonically increasing wear; never resets even when the part breaks.
+    pub wear: f32,
+    pub broken: bool,
+}
+
+impl BreakablePartState {
+    fn new() -> Self {
+        Self { wear: 0.0, broken: false }
+    }
+
+    /// Advance wear by `rate * dt`. When `tile_changed` is true, roll a break
+    /// check using `break_chance = min(0.1, wear * 0.1)`.
+    fn tick(&mut self, dt: f32, rate: f32, tile_changed: bool, rng: &mut StdRng) {
+        if self.broken {
+            return;
+        }
+        self.wear += rate * dt;
+        if tile_changed {
+            let chance = (self.wear * 0.1_f32).min(0.1);
+            if rng.gen_range(0.0_f32..1.0) < chance {
+                self.broken = true;
+            }
+        }
+    }
+}
+
+/// Virtual (non-rendered) sub-components attached to every [`BlackBotVisual`]
+/// entity. Each part accumulates wear over time and may break when the bot
+/// crosses a tile boundary.
+///
+/// - `movement_engine`: wears only while the bot is moving.
+/// - `control_plane`: wears at all times (while bot is not depleted).
+/// - `sensory_system`: wears at all times (while bot is not depleted).
+#[derive(Component, Debug, Clone)]
+pub struct Breakable {
+    pub movement_engine: BreakablePartState,
+    pub control_plane: BreakablePartState,
+    pub sensory_system: BreakablePartState,
+}
+
+impl Breakable {
+    pub fn new() -> Self {
+        Self {
+            movement_engine: BreakablePartState::new(),
+            control_plane: BreakablePartState::new(),
+            sensory_system: BreakablePartState::new(),
+        }
+    }
+
+    pub fn to_snapshot(&self) -> BreakableSnap {
+        let part = |s: &BreakablePartState| BreakablePartSnap { wear: s.wear, broken: s.broken };
+        BreakableSnap {
+            movement_engine: part(&self.movement_engine),
+            control_plane: part(&self.control_plane),
+            sensory_system: part(&self.sensory_system),
+        }
+    }
+
+    pub fn from_snapshot(snap: BreakableSnap) -> Self {
+        let part = |s: BreakablePartSnap| BreakablePartState { wear: s.wear, broken: s.broken };
+        Self {
+            movement_engine: part(snap.movement_engine),
+            control_plane: part(snap.control_plane),
+            sensory_system: part(snap.sensory_system),
+        }
+    }
+}
 
 /// High-level movement mode. Distinct from low-level [`ActorState`] — this is
 /// the bot's intent ("moving" vs "pausing on contact"), not the per-frame
@@ -396,6 +478,7 @@ impl Plugin for BlackBotPlugin {
                     .before(process_actors)
                     .run_if(not(is_paused)),
                 sync_black_bot_transforms.after(process_actors),
+                sync_black_bot_broken_visual.after(process_actors),
                 paint_black_bot_targets.after(process_actors),
             )
                 .run_if(in_state(GameState::InGame)),
@@ -507,17 +590,34 @@ fn update_path_following(
 fn black_bot_think(
     time: Res<Time>,
     hypermap: Res<HypermapRuntime>,
-    mut query: Query<(&mut ActorObject, &mut BlackBotVisual, Option<&Charge>)>,
+    mut query: Query<(&mut ActorObject, &mut BlackBotVisual, Option<&Charge>, Option<&mut Breakable>)>,
 ) {
     let dt = time.delta_secs();
     let passability = &*hypermap.static_passability_map;
 
-    for (mut obj, mut vis, charge) in &mut query {
+    for (mut obj, mut vis, charge, mut breakable) in &mut query {
         let state = obj.inner.state_mut();
 
         // Depleted bots are immobilized: clear movement intent and skip pathing
         // so the float center (which the mesh follows) stays put.
         if charge.is_some_and(Charge::is_depleted) {
+            state.move_buffer = ActorMoveBuffer::default();
+            state.next_waypoint_hint = None;
+            continue;
+        }
+
+        // Detect main tile change for wear/break rolls before any state updates.
+        let current_tile = actor_main_tile(state.center);
+        let tile_changed = vis.main_tile.map_or(false, |prev| prev != current_tile);
+
+        // CONTROL_PLANE and SENSORY_SYSTEM wear every non-depleted frame.
+        if let Some(ref mut b) = breakable {
+            b.control_plane.tick(dt, CONTROL_PLANE_WEAR_RATE, tile_changed, &mut vis.rng);
+            b.sensory_system.tick(dt, SENSORY_SYSTEM_WEAR_RATE, tile_changed, &mut vis.rng);
+        }
+
+        // Broken engine or control plane: halt all movement.
+        if breakable.as_ref().map_or(false, |b| b.movement_engine.broken || b.control_plane.broken) {
             state.move_buffer = ActorMoveBuffer::default();
             state.next_waypoint_hint = None;
             continue;
@@ -551,7 +651,6 @@ fn black_bot_think(
             if roll < BOT_COLLISION_REROUTE_CHANCE {
                 let distance = vis.rng.gen_range(1..=2) as f32;
                 let escape_dir = -vis.direction;
-                let current_tile = actor_main_tile(state.center);
                 let escape = (
                     (current_tile.x as f32 + escape_dir.x * distance).round() as i32,
                     (current_tile.y as f32 + escape_dir.y * distance).round() as i32,
@@ -574,7 +673,6 @@ fn black_bot_think(
         }
 
         let center = state.center;
-        let current_tile = actor_main_tile(center);
         vis.main_tile = Some(current_tile);
         let here = (current_tile.x, current_tile.y);
         update_path_following(&mut vis, center, here, passability);
@@ -583,6 +681,11 @@ fn black_bot_think(
             state.next_waypoint_hint = None;
             state.move_buffer = ActorMoveBuffer::default();
             continue;
+        }
+
+        // MOVEMENT_ENGINE wears only while the bot is actively moving this frame.
+        if let Some(ref mut b) = breakable {
+            b.movement_engine.tick(dt, MOVEMENT_ENGINE_WEAR_RATE, tile_changed, &mut vis.rng);
         }
 
         let delta = vis.direction * SPEED_TILES_PER_S * dt;
@@ -602,15 +705,49 @@ fn black_bot_think(
 }
 
 fn sync_black_bot_transforms(
-    actors: Query<(&ActorObject, &Children), (With<BlackBotVisual>, Without<OffScreenActor>)>,
+    actors: Query<(&ActorObject, &Children, Option<&Breakable>), (With<BlackBotVisual>, Without<OffScreenActor>)>,
     mut children_data: Query<Option<&mut Transform>, Without<ActorObject>>,
 ) {
-    for (obj, children) in &actors {
+    for (obj, children, breakable) in &actors {
         let world_pos = obj.inner.state().center;
+        let y = if breakable.map_or(false, |b| b.movement_engine.broken) {
+            SPHERE_RADIUS // fallen: resting on the floor
+        } else {
+            SPHERE_RADIUS + HOVER_HEIGHT // hovering during normal operation
+        };
         for child in children.iter() {
             if let Ok(Some(mut t)) = children_data.get_mut(child) {
-                t.translation = Vec3::new(world_pos.x, SPHERE_RADIUS, world_pos.y);
+                t.translation = Vec3::new(world_pos.x, y, world_pos.y);
             }
+        }
+    }
+}
+
+/// Applies material color changes triggered by breakable state transitions.
+/// Runs only when a bot's control-plane broken flag flips (tracked via `Local`).
+fn sync_black_bot_broken_visual(
+    bots: Query<(Entity, &Breakable, &Children), With<BlackBotVisual>>,
+    pick_meshes: Query<&MeshMaterial3d<StandardMaterial>, With<ActorPickMesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut last_cp_broken: Local<std::collections::HashMap<Entity, bool>>,
+) {
+    for (entity, b, children) in &bots {
+        let cp_broken = b.control_plane.broken;
+        let last = last_cp_broken.get(&entity).copied().unwrap_or(false);
+        if cp_broken == last {
+            continue;
+        }
+        last_cp_broken.insert(entity, cp_broken);
+
+        let target_color = if cp_broken {
+            Color::srgb(1.0, 1.0, 1.0)
+        } else {
+            Color::srgb(0.02, 0.02, 0.02)
+        };
+        for child in children.iter() {
+            let Ok(mat_handle) = pick_meshes.get(child) else { continue };
+            let Some(mat) = materials.get_mut(&mat_handle.0) else { continue };
+            mat.base_color = target_color;
         }
     }
 }
@@ -718,6 +855,7 @@ pub fn spawn_black_bot_from_snapshot(
     name: &str,
     state: ActorState,
     visual: BlackBotVisualSnap,
+    breakable: BreakableSnap,
 ) -> Entity {
     let center = state.center;
     let bot = BlackBot::from_state(state);
@@ -735,6 +873,7 @@ pub fn spawn_black_bot_from_snapshot(
         .spawn((
             Name::new(name.to_string()),
             ActorInspectable,
+            Breakable::from_snapshot(breakable),
             BlackBotVisual::from_snapshot(visual),
             ActorObject::new(Box::new(bot)),
             Transform::default(),
@@ -749,7 +888,7 @@ pub fn spawn_black_bot_from_snapshot(
             Pickable::default(),
             Mesh3d(mesh),
             MeshMaterial3d(mat),
-            Transform::from_xyz(center.x, SPHERE_RADIUS, center.y),
+            Transform::from_xyz(center.x, SPHERE_RADIUS + HOVER_HEIGHT, center.y),
         ))
         .id();
 
@@ -782,6 +921,7 @@ pub fn spawn_black_bot(
             Name::new(random_actor_name()),
             ActorInspectable,
             Charge::random(rng),
+            Breakable::new(),
             BlackBotVisual {
                 main_tile: None,
                 direction: Vec2::X,
@@ -805,7 +945,7 @@ pub fn spawn_black_bot(
             Pickable::default(),
             Mesh3d(mesh),
             MeshMaterial3d(mat),
-            Transform::from_xyz(center.x, SPHERE_RADIUS, center.y),
+            Transform::from_xyz(center.x, SPHERE_RADIUS + HOVER_HEIGHT, center.y),
         ))
         .id();
 

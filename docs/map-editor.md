@@ -1,6 +1,6 @@
 # In-game map editor
 
-Runtime tool for painting **hypermap** tiles under the cursor: void, road, bitmask walls, closed wall outlines (**Room**), and corner pillars. Implemented as `MapEditPlugin` in `src/edit/map_edit.rs`, wired from `GamePlugin` in `src/lib.rs` after `HypermapWorldPlugin` in `src/map/hypermap_world.rs`.
+Runtime tool for painting **hypermap** tiles under the cursor: void, road, bitmask walls, closed wall outlines (**Room**), corner pillars, chargers, and a flood-fill bucket (**Fill**). Implemented as `MapEditPlugin` in `src/edit/map_edit.rs`, wired from `GamePlugin` in `src/lib.rs` after `HypermapWorldPlugin` in `src/map/hypermap_world.rs`.
 
 This editor updates the **live hypermap** chunk data (see `hypermap.md`) and triggers a **chunk mesh rebuild**. It does **not** write `world_map.txt` or `world_map_floor1.txt`; those files are still the authored startup overlay for the center chunk only.
 
@@ -80,6 +80,7 @@ saved are documented in [`level-persistence.md`](level-persistence.md).
 | `MapEditState` | `panel_open`, `placement_tile` |
 | `MapEditDragAnchor` | Start tile for in-progress wall line / floor rectangle / room outline |
 | `room_outline_cells` / `perimeter_wall_mask` | Border tiles and outward-facing `WallMask` for **Room** |
+| `flood_fill_enclosed` | Bounded flood-fill for the **Fill** brush (door-gap bridging, `FILL_CELL_LIMIT` = 50 × 50) |
 | `HypermapChunkRemeshQueue` | Chunks to re-bake after edits |
 | `queue_hypermap_chunk_remesh` | Enqueue by world tile |
 | `ensure_chunk_generated` | Ensures chunk exists (level geometry file, else procedural + center overlay) before edits |
