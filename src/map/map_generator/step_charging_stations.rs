@@ -63,8 +63,7 @@ impl MapDraft {
 
                 let mut wall_sides = SIDES.iter().filter(|&&(dx, dz, _)| {
                     let (nx, nz) = (x + dx, z + dz);
-                    self.houses[house_index].contains(nx, nz)
-                        && matches!(self.get(nx, nz), DraftTile::Wall(_) | DraftTile::Corner(_))
+                    matches!(self.get(nx, nz), DraftTile::Wall(_) | DraftTile::Corner(_))
                 });
 
                 // Exactly one wall neighbor → against a wall, not in a corner.
