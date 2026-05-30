@@ -84,7 +84,7 @@ impl BreakablePartState {
         }
         self.wear += rate * dt;
         if tile_changed {
-            let chance = (self.wear * 0.1_f32).min(0.1);
+            let chance = (self.wear * 0.01_f32).min(0.1);
             if rng.gen_range(0.0_f32..1.0) < chance {
                 self.broken = true;
             }
