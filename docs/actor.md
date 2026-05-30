@@ -11,7 +11,7 @@ The actor subsystem provides:
 - A single processing system (`ActorPlugin`) that runs actor logic each in-game frame.
 - Movement and occupancy integration through `DynamicPassabilityMap`.
 
-The low-level pipeline is deterministic and synchronous. High-level planning is expected to run separately (for example, in async systems), then feed intent into `move_buffer`.
+The low-level pipeline is deterministic and synchronous. High-level planning runs separately and feeds intent into `move_buffer`. BlackBot's planner is the OOP **brain** (behaviors → priorities → high/low-level actions, plus charge-station recharge) — see [actor-brain.md](actor-brain.md).
 
 ## Level persistence
 

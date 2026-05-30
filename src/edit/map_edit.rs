@@ -21,7 +21,8 @@ use crate::map::dirt::DirtMap;
 use crate::map::level::{save_full_generated_level, LevelName};
 use crate::map::temperature::TemperatureMap;
 use crate::actor::glitch_bot::GlitchBotVisual;
-use crate::actor::black_bot::{Breakable, BlackBotVisual};
+use crate::actor::black_bot::Breakable;
+use crate::actor::brain::Brain;
 use crate::actor::charge::Charge;
 use crate::actor::snapshot::{save_level_actors, LevelActorsFile};
 use crate::scene::camera::{StrategyCamera, StrategyCameraRig};
@@ -392,7 +393,7 @@ fn map_edit_save_button(
     glitch_bots: Query<(&ActorObject, &GlitchBotVisual, Option<&Charge>, Option<&Name>)>,
     black_bots: Query<(
         &ActorObject,
-        &BlackBotVisual,
+        &Brain,
         Option<&Charge>,
         Option<&Name>,
         Option<&Breakable>,

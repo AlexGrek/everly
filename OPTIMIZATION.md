@@ -159,3 +159,21 @@ while its window is stable (no race, no regression). **Future:** Bevy re-prepare
 asset (possible GPU-buffer reallocation) each frame because we mutate its data; a persistent GPU
 buffer written via `RenderQueue::write_buffer` would avoid that churn. Mask is re-uploaded every
 frame though it changes only on geometry edits — a `mask_dirty` gate would skip most of those.
+
+### Actor brain layer — allocation-free steady-state planning (2026-05)
+
+Added the OOP brain ([`src/actor/brain/`](src/actor/brain/)) above BlackBot's low-level movement
+(`docs/actor-brain.md`); the per-frame `black_bot_brain` tick was designed against the rules:
+
+- **Rule 4 (allocation-free steady state):** `Priorities::clear()` reuses its `Vec` (never shrinks);
+  a tick's side effects are a fixed-size `BrainEffects` struct (no `Vec`); the `FollowPath` path `Vec`
+  and the A\* / charger BFS allocate only on a cold re-path/seek (same cadence as the previous
+  `black_bot_think`), not on steady moving frames. The tuned mass/inertia steering
+  (`approach_velocity`, `drive_velocity`) and stack-only bot-on-bot reroute moved **verbatim** into
+  [`FollowPath`](src/actor/brain/low_level.rs), preserving the prior single-sqrt steering math.
+- **Sequential by necessity (rule 5 caveat):** `black_bot_brain` mutates the `InteractiveEntityMap`
+  resource (charger dock/undock) and owns the per-bot RNG, so it stays a sequential `for` loop —
+  exactly as the old think system did. The parallel `process_actors` collision stage is untouched, so
+  there is no parallelism regression.
+
+Verified: full lib suite green (414 passed), `cargo check --all-targets` warning-clean.

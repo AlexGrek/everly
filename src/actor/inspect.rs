@@ -1,8 +1,11 @@
 //! Human-readable actor state for the HUD inspector modal.
 
-use crate::actor::black_bot::{Breakable, BreakablePartState, BlackBotVisual};
+use bevy::math::IVec2;
+
+use crate::actor::black_bot::{Breakable, BreakablePartState};
+use crate::actor::brain::Brain;
 use crate::actor::glitch_bot::GlitchBotVisual;
-use crate::actor::ActorObject;
+use crate::actor::{actor_main_tile, ActorObject};
 
 /// One label/value row in the inspector modal.
 #[derive(Clone)]
@@ -35,15 +38,17 @@ pub fn charge_row(level: f32) -> InspectRow {
     InspectRow { label: "charge", value }
 }
 
-pub fn black_bot_rows(vis: &BlackBotVisual) -> Vec<InspectRow> {
-    let main_tile = vis
-        .main_tile()
-        .map(|t| format!("({}, {})", t.x, t.y))
+pub fn black_bot_rows(brain: &Brain, main_tile: IVec2) -> Vec<InspectRow> {
+    let priority = brain
+        .current_priority()
+        .map(|p| format!("{:?} ({:.0})", p.kind, p.value))
         .unwrap_or_else(|| "—".to_string());
     vec![
-        InspectRow { label: "main_tile", value: main_tile },
-        InspectRow { label: "has_target", value: vis.has_target().to_string() },
-        InspectRow { label: "movement_state", value: vis.movement_state_label() },
+        InspectRow { label: "main_tile", value: format!("({}, {})", main_tile.x, main_tile.y) },
+        InspectRow { label: "priority", value: priority },
+        InspectRow { label: "high_level", value: brain.high_level_label() },
+        InspectRow { label: "low_level", value: brain.low_level_label() },
+        InspectRow { label: "has_target", value: brain.has_target().to_string() },
     ]
 }
 
@@ -72,15 +77,16 @@ fn format_part(p: &BreakablePartState) -> String {
 pub fn status_rows(
     obj: &ActorObject,
     charge: Option<f32>,
-    black: Option<&BlackBotVisual>,
+    black: Option<&Brain>,
     glitch: Option<&GlitchBotVisual>,
 ) -> Vec<InspectRow> {
     let mut rows = common_actor_rows(obj.inner.state());
     if let Some(level) = charge {
         rows.push(charge_row(level));
     }
-    if let Some(vis) = black {
-        rows.extend(black_bot_rows(vis));
+    if let Some(brain) = black {
+        let main_tile = actor_main_tile(obj.inner.state().center);
+        rows.extend(black_bot_rows(brain, main_tile));
     }
     if let Some(vis) = glitch {
         rows.extend(glitch_bot_rows(vis));
@@ -89,17 +95,17 @@ pub fn status_rows(
 }
 
 /// Route-tab rows: pathfinding state for BlackBot.
-pub fn route_rows(vis: &BlackBotVisual) -> Vec<InspectRow> {
-    let target = vis
+pub fn route_rows(brain: &Brain) -> Vec<InspectRow> {
+    let target = brain
         .target_tile()
         .map(|(x, y)| format!("({x}, {y})"))
         .unwrap_or_else(|| "—".to_string());
-    let vel = vis.velocity();
+    let vel = brain.velocity();
     vec![
         InspectRow { label: "target", value: target },
-        InspectRow { label: "waypoints_left", value: vis.remaining_waypoints().to_string() },
+        InspectRow { label: "waypoints_left", value: brain.remaining_waypoints().to_string() },
         InspectRow { label: "velocity", value: format!("({:.3}, {:.3})", vel.x, vel.y) },
-        InspectRow { label: "stuck_timer", value: format!("{:.2}s", vis.stuck_timer()) },
+        InspectRow { label: "stuck_timer", value: format!("{:.2}s", brain.stuck_timer()) },
     ]
 }
 

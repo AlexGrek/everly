@@ -5,10 +5,10 @@ use bevy::prelude::*;
 use bevy::ui::widget::Button;
 
 use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
-use crate::actor::black_bot::{Breakable, BlackBotVisual};
+use crate::actor::black_bot::Breakable;
+use crate::actor::brain::Brain;
 use crate::actor::charge::Charge;
 use crate::actor::glitch_bot::GlitchBotVisual;
-use crate::map::hypermap_world::HypermapRuntime;
 use crate::actor::inspect::{display_actor_name, route_rows, status_rows, systems_rows};
 use crate::actor::ActorObject;
 use crate::edit::actor_spawn::{ActorSpawnState, ActorTool};
@@ -643,8 +643,7 @@ fn spawn_black_bot_reset_button(parent: &mut ChildSpawnerCommands) {
 fn black_bot_reset_button(
     interactions: Query<&Interaction, (With<BlackBotResetButton>, Changed<Interaction>)>,
     mut modal: ResMut<ActorInspectorModal>,
-    hypermap: Res<HypermapRuntime>,
-    mut actors: Query<(&mut ActorObject, &mut BlackBotVisual), With<ActorInspectable>>,
+    mut brains: Query<&mut Brain, With<ActorInspectable>>,
 ) {
     for interaction in &interactions {
         if *interaction != Interaction::Pressed {
@@ -653,13 +652,10 @@ fn black_bot_reset_button(
         let Some(actor) = modal.actor else {
             continue;
         };
-        let Ok((mut obj, mut vis)) = actors.get_mut(actor) else {
+        let Ok(mut brain) = brains.get_mut(actor) else {
             continue;
         };
-        vis.reset_route(
-            obj.inner.state_mut(),
-            &hypermap.static_passability_map,
-        );
+        brain.reset();
         modal.content_stamp = modal.content_stamp.wrapping_add(1);
     }
 }
@@ -735,7 +731,7 @@ fn sync_actor_inspector_modal(
     existing_rows: Query<Entity, With<ActorInspectorRow>>,
     existing_actions: Query<Entity, With<ActorInspectorActionBtn>>,
     actor_data: Query<(&ActorObject, Option<&Name>), With<ActorInspectable>>,
-    black: Query<&BlackBotVisual>,
+    black: Query<&Brain>,
     glitch: Query<&GlitchBotVisual>,
     actor_extras: Query<(Option<&Charge>, Option<&Breakable>)>,
     mut state: Local<InspectorBuildState>,

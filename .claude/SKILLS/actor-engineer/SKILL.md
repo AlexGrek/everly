@@ -10,6 +10,7 @@ paths:
   - "src/map/passability.rs"
   - "src/map/field_interactions.rs"
   - "docs/actor.md"
+  - "docs/actor-brain.md"
   - "docs/field-interactions.md"
   - "src/lib.rs"
 ---
@@ -25,6 +26,10 @@ Use this skill for:
 - movement/rotation buffers and per-frame error handling.
 - footprint-based collision and occupancy updates via `DynamicPassabilityMap`.
 - **per-actor static traversal rules** via `Actor::is_static_subtile_passable` (flying, swimming, ground-walking, phasing, …).
+- the high-level **brain** layer (`src/actor/brain/`): `Behavior`s raise
+  `Priorities`, the dominant one selects a `HighLevelAction`, which dictates the
+  `LowLevelAction` (`Wait` / `FollowPath`) that fills `move_buffer`. BlackBot's
+  wander + self-recharge run here. **Read `docs/actor-brain.md` first** for this layer.
 
 For generic Bevy API usage, still read `.claude/SKILLS/bevy-engineer/SKILL.md` first.
 

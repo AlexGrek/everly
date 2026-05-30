@@ -1,47 +1,43 @@
-//! BlackBot — a ground-walking metallic black sphere that pathfinds to
-//! random nearby points.
+//! BlackBot — a ground-walking metallic black sphere driven by an OOP
+//! [`Brain`](crate::actor::brain).
 //!
-//! The bot picks a random walkable tile within 15 tiles of its current
-//! position, runs A* on the tile grid, and simplifies the result with
-//! [`simplify_path_line_of_sight`] so only obstacle-corner waypoints survive.
-//! It then follows those waypoints in straight floating-point segments — the
-//! float `center` is the canonical position, never snapped to the grid.
+//! All of BlackBot's *intent* (wander, recharge when low) lives in its brain:
+//! [`Behavior`](crate::actor::brain::Behavior)s
+//! ([`RandomWalker`](crate::actor::brain::RandomWalker),
+//! [`ChargeSelfKeeper`](crate::actor::brain::ChargeSelfKeeper)) raise
+//! [`Priorities`](crate::actor::brain::Priorities); the dominant one selects a
+//! high-level action ([`GoToRandomPoints`](crate::actor::brain::GoToRandomPoints)
+//! / [`GoToChargeStation`](crate::actor::brain::GoToChargeStation)) which
+//! dictates the per-frame low-level action
+//! ([`FollowPath`](crate::actor::brain::FollowPath) /
+//! [`Wait`](crate::actor::brain::Wait)). See `docs/actor-brain.md`.
 //!
-//! Path-following advances when the float `center` reaches each waypoint's
-//! tile center ([`waypoint_center`]), within [`WAYPOINT_REACHED_EPSILON`].
-//! Heading is recomputed every frame toward the active waypoint. A new wander
-//! path is picked only when the current path is exhausted.
-//! Ground walker traversal rules (blocked by walls and void) are inherited
-//! from the default [`Actor`] impl.
-//!
-//! Movement has apparent mass: the bot carries a `velocity` that is steered
-//! toward `direction * MAX_SPEED_TILES_PER_S` under a finite acceleration cap
-//! ([`approach_velocity`] / [`drive_velocity`]), so it ramps up to speed,
-//! curves into heading changes, and coasts to a stop under stronger braking
-//! deceleration. Momentum lost to a wall collision is bled off per world axis
-//! by reconciling the stored velocity against the distance actually travelled
-//! last frame, preserving wall-sliding while preventing full-speed grinding.
+//! This module keeps only BlackBot-specific pieces: the visual/mesh, the
+//! breakable sub-components and their wear, the battery-recharge wiring, and the
+//! axis-decomposed [`Actor::try_move`] that gives the sphere wall-sliding
+//! collision response. Path-following *feel* (mass/inertia, stuck-repath,
+//! bot-on-bot reroute/wait) lives in [`FollowPath`].
 
+use std::collections::HashSet;
+
+use bevy::picking::prelude::Pickable;
 use bevy::prelude::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use crate::actor::actor_name::random_actor_name;
 use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
+use crate::actor::brain::{make_high_level, Brain, BrainContext, BrainEffects, ChargeSelfKeeper, RandomWalker};
 use crate::actor::charge::Charge;
-use bevy::picking::prelude::Pickable;
-use crate::actor::snapshot::{BlackBotVisualSnap, BreakablePartSnap, BreakableSnap, MovementStateSnap, SerIVec2, SerVec2};
+use crate::actor::snapshot::{BreakablePartSnap, BreakableSnap};
 use crate::actor::{
     actor_main_tile, is_paused, process_actors, Actor, ActorMoveBuffer, ActorMovementError,
     ActorObject, ActorState, OffScreenActor,
 };
 use crate::map::chunk_overlay::{ChunkOverlayState, OVERLAY_RES};
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap};
-use crate::map::hypermap_pathfind::{
-    astar_shortest_world_path, simplify_path_line_of_sight, world_tile_walkable, HypermapPathResult,
-    HypermapSearchLimits,
-};
 use crate::map::hypermap_world::HypermapRuntime;
+use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
 use crate::map::passability::{
     DynamicPassabilityMap, SubtilePassability, TryUpdateFootprintError, SUBTILE_COUNT,
 };
@@ -54,50 +50,11 @@ use crate::menu::main_menu::GameState;
 const SUBTILE_SNAP_EPSILON: f32 = 1e-4;
 
 const BLACK_RADIUS_SUBTILES: i32 = 2;
-/// Maximum continuous travel speed in tiles per second. 1 tile = 5 subtiles.
-const MAX_SPEED_TILES_PER_S: f32 = 1.2;
-/// Acceleration toward the target heading (tiles/s²). Finite acceleration is
-/// what gives the bot apparent mass: it ramps up to speed and curves into
-/// heading changes instead of snapping. Lower = heavier, more sluggish.
-const ACCEL_TILES_PER_S2: f32 = 2.5;
-/// Braking deceleration when slowing or stopping (tiles/s²). Stronger than
-/// acceleration so the bot settles onto a stop without a long glide.
-const DECEL_TILES_PER_S2: f32 = 4.0;
 const SPHERE_RADIUS: f32 = 0.45;
 /// Hover height above the floor during normal operation. The sphere center
 /// is at `SPHERE_RADIUS + HOVER_HEIGHT` when healthy; when the movement engine
 /// breaks it falls to `SPHERE_RADIUS` (touching the floor).
 const HOVER_HEIGHT: f32 = 0.3;
-const WANDER_RADIUS: f32 = 15.0;
-const MAX_TARGET_ATTEMPTS: u32 = 8;
-/// Distance (in tiles) within which the bot considers a waypoint reached even
-/// without entering its containing tile — protects against numerical overshoot
-/// near short segments.
-const WAYPOINT_REACHED_EPSILON: f32 = 0.05;
-/// Tiles kept on each side of every bend during path simplification. The
-/// tile-level line-of-sight test ignores actor radius, so a lone corner
-/// waypoint can leave a wide follower clipping the wall; a small buffer adds
-/// axis-aligned approach + departure tiles that funnel the actor through the
-/// bend.
-const PATH_CORNER_BUFFER: usize = 1;
-/// Chance per bot-on-bot collision that the blocked bot detours 1–2 tiles in
-/// the opposite direction before resuming its original path.
-const BOT_COLLISION_REROUTE_CHANCE: f32 = 0.20;
-/// Chance per bot-on-bot collision that the blocked bot pauses instead of
-/// continuing to push. Walls never trigger this — only `BlockedByOccupancy`.
-const BOT_COLLISION_WAIT_CHANCE: f32 = 0.25;
-/// How long the `Waiting` movement state lasts before the bot resumes path
-/// following.
-const BOT_COLLISION_WAIT_S: f32 = 1.0;
-/// Seconds without measurable progress toward the current waypoint after which
-/// the bot abandons its route and re-paths. A bot whose footprint is a full
-/// tile wide can wedge where the straight approach to a waypoint is
-/// unreachable; static (wall) blocks have no other recovery, so this is the
-/// safety net that prevents a permanent freeze.
-const STUCK_REPATH_SECS: f32 = 2.0;
-/// Minimum reduction (in tiles) of the closest-approach distance to the current
-/// waypoint that counts as progress and resets the stuck timer.
-const STUCK_PROGRESS_EPSILON: f32 = 0.05;
 
 /// Wear accumulated per second on the movement engine while the bot is moving.
 const MOVEMENT_ENGINE_WEAR_RATE: f32 = 0.0001;
@@ -177,160 +134,24 @@ impl Breakable {
     }
 }
 
-/// High-level movement mode. Distinct from low-level [`ActorState`] — this is
-/// the bot's intent ("moving" vs "pausing on contact"), not the per-frame
-/// collision outcome.
-#[derive(Debug, Clone, Copy)]
-enum MovementState {
-    Moving,
-    /// Pausing after bumping another bot. Movement is suppressed until the
-    /// timer expires.
-    Waiting { remaining_s: f32 },
+impl Default for Breakable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
+/// Marker + lightweight visual/debug state for a BlackBot. The `main_tile` is
+/// the bot's last observed [`actor_main_tile`], used to drive wear `tile_changed`
+/// rolls and shown in the inspector. All planning/movement state lives in the
+/// entity's [`Brain`].
 #[derive(Component)]
 pub struct BlackBotVisual {
-    /// Last observed main tile ([`actor_main_tile`]); inspector/debug only.
     main_tile: Option<IVec2>,
-    /// Unit heading toward `path[path_index]`; updated every movement frame.
-    direction: Vec2,
-    has_target: bool,
-    path: Vec<(i32, i32)>,
-    path_index: usize,
-    movement_state: MovementState,
-    /// Seed for [`Self::rng`]; persisted in level actor snapshots only.
-    rng_seed: u64,
-    rng: StdRng,
-    /// Seconds elapsed without measurable progress toward `path[path_index]`.
-    stuck_timer: f32,
-    /// Closest distance (tiles) to `path[stuck_waypoint_index]` seen so far.
-    closest_approach: f32,
-    /// The `path_index` for which `closest_approach` was last reset.
-    stuck_waypoint_index: usize,
-    /// Current velocity in tile-space units per second. Carries momentum
-    /// between frames; steered toward the target heading under finite
-    /// acceleration so the bot moves with apparent mass. Transient — not
-    /// serialized; a loaded bot starts at rest.
-    velocity: Vec2,
-    /// Float `center` recorded at the previous frame's movement step, used to
-    /// measure how far the bot *actually* moved and bleed off momentum lost to
-    /// wall collisions. `None` = no reconcile this frame (rest start).
-    prev_center: Option<Vec2>,
 }
 
 impl BlackBotVisual {
-    pub(crate) fn to_snapshot(&self) -> BlackBotVisualSnap {
-        let movement_state = match self.movement_state {
-            MovementState::Moving => MovementStateSnap::Moving,
-            MovementState::Waiting { remaining_s } => {
-                MovementStateSnap::Waiting { remaining_s }
-            }
-        };
-        BlackBotVisualSnap {
-            main_tile: self.main_tile.map(|t| SerIVec2 { x: t.x, y: t.y }),
-            direction: SerVec2 {
-                x: self.direction.x,
-                y: self.direction.y,
-            },
-            has_target: self.has_target,
-            path: self.path.clone(),
-            path_index: self.path_index,
-            movement_state,
-            rng_seed: self.rng_seed,
-        }
-    }
-
-    fn from_snapshot(snap: BlackBotVisualSnap) -> Self {
-        let movement_state = match snap.movement_state {
-            MovementStateSnap::Moving => MovementState::Moving,
-            MovementStateSnap::Waiting { remaining_s } => MovementState::Waiting { remaining_s },
-        };
-        Self {
-            main_tile: snap.main_tile.map(|t| IVec2::new(t.x, t.y)),
-            direction: Vec2::new(snap.direction.x, snap.direction.y),
-            has_target: snap.has_target,
-            path: snap.path,
-            path_index: snap.path_index,
-            movement_state,
-            rng_seed: snap.rng_seed,
-            rng: StdRng::seed_from_u64(snap.rng_seed),
-            stuck_timer: 0.0,
-            closest_approach: f32::MAX,
-            stuck_waypoint_index: 0,
-            velocity: Vec2::ZERO,
-            prev_center: None,
-        }
-    }
-
-    /// Returns the final destination tile the bot is walking toward, or `None`
-    /// if it has no active path.
-    pub fn target_tile(&self) -> Option<(i32, i32)> {
-        self.path.last().copied()
-    }
-
     pub fn main_tile(&self) -> Option<IVec2> {
         self.main_tile
-    }
-
-    pub fn has_target(&self) -> bool {
-        self.has_target
-    }
-
-    pub fn path_len(&self) -> usize {
-        self.path.len()
-    }
-
-    pub fn remaining_waypoints(&self) -> usize {
-        self.path.len().saturating_sub(self.path_index)
-    }
-
-    pub fn velocity(&self) -> Vec2 {
-        self.velocity
-    }
-
-    pub fn stuck_timer(&self) -> f32 {
-        self.stuck_timer
-    }
-
-    pub fn movement_state_label(&self) -> String {
-        match self.movement_state {
-            MovementState::Moving => "Moving".to_string(),
-            MovementState::Waiting { remaining_s } => {
-                format!("Waiting ({remaining_s:.2}s)")
-            }
-        }
-    }
-
-    /// Marks the current wander task complete and picks a new path from the actor's tile.
-    pub fn reset_route(&mut self, state: &mut ActorState, passability: &Hypermap<f32>) {
-        self.movement_state = MovementState::Moving;
-        self.path.clear();
-        self.path_index = 0;
-        self.has_target = false;
-        self.main_tile = None;
-        self.stuck_timer = 0.0;
-        self.closest_approach = f32::MAX;
-        self.stuck_waypoint_index = 0;
-
-        let center = state.center;
-        let current_tile = actor_main_tile(center);
-        let here = (current_tile.x, current_tile.y);
-
-        if let Some(path) = pick_random_target(&mut self.rng, here, passability) {
-            self.path = path;
-            self.path_index = 0;
-            advance_past_reached_waypoints(self, center);
-        }
-
-        update_path_following(self, center, here, passability);
-
-        state.last_movement_error = None;
-        state.move_buffer = ActorMoveBuffer::default();
-        state.next_waypoint_hint = if self.path_index < self.path.len() {
-            Some(waypoint_center(self.path[self.path_index]))
-        } else {
-            None
-        };
     }
 }
 
@@ -341,6 +162,15 @@ impl Default for BlackBotRng {
     fn default() -> Self {
         Self(StdRng::seed_from_u64(0xB1AC_B07))
     }
+}
+
+/// Builds a BlackBot brain: wander + keep-self-charged, seeded for determinism.
+fn build_black_bot_brain(seed: u64) -> Brain {
+    Brain::new(
+        vec![Box::new(RandomWalker), Box::new(ChargeSelfKeeper::new())],
+        make_high_level,
+        seed,
+    )
 }
 
 pub struct BlackBot {
@@ -354,10 +184,7 @@ impl BlackBot {
 
     pub fn new(center: Vec2) -> Self {
         let sc = SUBTILE_COUNT as f32;
-        let initial_sub = IVec2::new(
-            (center.x * sc).floor() as i32,
-            (center.y * sc).floor() as i32,
-        );
+        let initial_sub = IVec2::new((center.x * sc).floor() as i32, (center.y * sc).floor() as i32);
         Self {
             state: ActorState {
                 center,
@@ -394,15 +221,9 @@ impl Actor for BlackBot {
     /// Strategy: probe X-only and Y-only via
     /// [`DynamicPassabilityMap::probe_footprint`] (no writes), build a final
     /// shift containing only the axes that passed, and commit at most one
-    /// footprint write via [`DynamicPassabilityMap::try_update_footprint`].
-    /// Probing avoids stamping intermediate footprints into the write buffer,
-    /// which would otherwise flush into the next frame's read buffer and make
-    /// the actor block itself.
-    ///
-    /// On a blocked axis the float `center` is snapped to just inside the far
-    /// edge of the last accepted subtile in that axis (by
-    /// [`SUBTILE_SNAP_EPSILON`]) so the actor rests against the obstacle; the
-    /// other axis continues unchanged.
+    /// footprint write. On a blocked axis the float `center` is snapped to just
+    /// inside the far edge of the last accepted subtile in that axis (by
+    /// [`SUBTILE_SNAP_EPSILON`]) so the actor rests against the obstacle.
     fn try_move(
         &mut self,
         dynamic: &DynamicPassabilityMap,
@@ -433,16 +254,12 @@ impl Actor for BlackBot {
         let x_ok = x_probe.is_ok();
         let y_ok = y_probe.is_ok();
 
-        let final_shift = IVec2::new(
-            if x_ok { want.x } else { 0 },
-            if y_ok { want.y } else { 0 },
-        );
+        let final_shift = IVec2::new(if x_ok { want.x } else { 0 }, if y_ok { want.y } else { 0 });
 
         // When `final_shift` keeps at most one axis it equals a shift already
-        // probed above (or the origin, which is all self-overlap) — known
-        // passable, so commit without a redundant re-probe. Only a diagonal
-        // `final_shift` (both axes kept) is a placement no axis-only probe
-        // covered, so it still needs a full collision check.
+        // probed above (or the origin, all self-overlap) — known passable, so
+        // commit without a redundant re-probe. Only a diagonal `final_shift`
+        // (both axes kept) needs a full collision check.
         let needs_probe = final_shift.x != 0 && final_shift.y != 0;
         let committed = if needs_probe {
             match dynamic.try_update_footprint(
@@ -477,10 +294,6 @@ impl Actor for BlackBot {
                 origin.x as f32 / sc_f + SUBTILE_SNAP_EPSILON
             };
             // First blocked axis sets the error; the second does not overwrite it.
-            // Preserving the first error matters when X is blocked by a static wall
-            // and Y by occupancy (or vice-versa): the think loop branches specifically
-            // on BlockedByOccupancy, so reporting the wrong variant triggers the
-            // wrong recovery strategy.
             if let Err(e) = x_probe {
                 self.state.last_movement_error = Some(translate_err(e));
             }
@@ -528,9 +341,7 @@ impl Plugin for BlackBotPlugin {
         app.init_resource::<BlackBotRng>().add_systems(
             Update,
             (
-                black_bot_think
-                    .before(process_actors)
-                    .run_if(not(is_paused)),
+                black_bot_brain.before(process_actors).run_if(not(is_paused)),
                 sync_black_bot_transforms.after(process_actors),
                 sync_black_bot_broken_visual.after(process_actors),
                 paint_black_bot_targets.after(process_actors),
@@ -540,329 +351,126 @@ impl Plugin for BlackBotPlugin {
     }
 }
 
-fn pick_random_target(
-    rng: &mut StdRng,
-    current_tile: (i32, i32),
-    passability: &Hypermap<f32>,
-) -> Option<Vec<(i32, i32)>> {
-    for _ in 0..MAX_TARGET_ATTEMPTS {
-        let dx: f32 = rng.gen_range(-WANDER_RADIUS..WANDER_RADIUS);
-        let dy: f32 = rng.gen_range(-WANDER_RADIUS..WANDER_RADIUS);
-        if dx * dx + dy * dy > WANDER_RADIUS * WANDER_RADIUS {
-            continue;
-        }
-        let target = (
-            current_tile.0 + dx.round() as i32,
-            current_tile.1 + dy.round() as i32,
-        );
-        if target == current_tile {
-            continue;
-        }
-        let result = astar_shortest_world_path(
-            passability,
-            current_tile,
-            target,
-            HypermapSearchLimits { max_expanded: 2000 },
-        );
-        if let HypermapPathResult::Found { path, .. } = result {
-            if path.len() > 1 {
-                return Some(simplify_path_line_of_sight(
-                    passability,
-                    &path,
-                    PATH_CORNER_BUFFER,
-                ));
-            }
-        }
-    }
-    None
-}
-
-#[inline]
-fn waypoint_center(tile: (i32, i32)) -> Vec2 {
-    Vec2::new(tile.0 as f32 + 0.5, tile.1 as f32 + 0.5)
-}
-
-#[inline]
-fn reached_waypoint(center: Vec2, tile: (i32, i32)) -> bool {
-    let wp = waypoint_center(tile);
-    (wp - center).length_squared() <= WAYPOINT_REACHED_EPSILON * WAYPOINT_REACHED_EPSILON
-}
-
-fn advance_past_reached_waypoints(vis: &mut BlackBotVisual, center: Vec2) {
-    while vis.path_index < vis.path.len() && reached_waypoint(center, vis.path[vis.path_index]) {
-        vis.path_index += 1;
-    }
-}
-
-#[inline]
-fn float_subtile(pos: Vec2) -> IVec2 {
-    let sc = SUBTILE_COUNT as f32;
-    IVec2::new((pos.x * sc).floor() as i32, (pos.y * sc).floor() as i32)
-}
-
-/// Steers `velocity` toward `desired`, changing it by at most `rate * dt`
-/// (tiles/s²). Below that threshold it snaps to `desired` so the bot settles
-/// exactly rather than oscillating. Gives smooth acceleration when speeding up
-/// or turning and smooth deceleration when `desired` is slower or zero.
-#[inline]
-fn approach_velocity(velocity: Vec2, desired: Vec2, rate: f32, dt: f32) -> Vec2 {
-    let dv = desired - velocity;
-    let max_step = rate * dt;
-    let len = dv.length();
-    if len <= max_step {
-        desired
-    } else {
-        // `dv.normalize() * max_step` == `dv * (max_step / len)`; reuse the
-        // single `len` instead of letting `normalize` recompute the sqrt.
-        velocity + dv * (max_step / len)
-    }
-}
-
-/// Drives one bot for a frame: reconcile momentum with reality, steer toward
-/// `desired` velocity at `rate`, then emit the resulting displacement into
-/// `state.move_buffer` and record `prev_center` for the next reconcile.
+/// Runs each BlackBot's [`Brain`] once per frame (before `process_actors`),
+/// then applies the requested side effects (charger docking, recharge).
 ///
-/// The reconcile step compares last frame's actual displacement against the
-/// stored `velocity`: a wall that `try_move` snapped against collapses the
-/// achieved speed on that world axis, so the blocked component is bled off
-/// (the bot rests against the wall instead of grinding at full momentum) while
-/// the free axis keeps sliding. The `0.8` slack tolerates per-frame `dt` jitter
-/// without mistaking it for a collision.
-fn drive_velocity(
-    vis: &mut BlackBotVisual,
-    state: &mut ActorState,
-    center: Vec2,
-    desired: Vec2,
-    rate: f32,
-    dt: f32,
-) {
-    if dt > 1e-6 {
-        if let Some(prev) = vis.prev_center {
-            let achieved = (center - prev) / dt;
-            if achieved.x.abs() < vis.velocity.x.abs() * 0.8 {
-                vis.velocity.x = achieved.x;
-            }
-            if achieved.y.abs() < vis.velocity.y.abs() * 0.8 {
-                vis.velocity.y = achieved.y;
-            }
-        }
-    }
-
-    vis.velocity = approach_velocity(vis.velocity, desired, rate, dt);
-
-    let delta = vis.velocity * dt;
-    state.move_buffer.tile_delta = delta;
-    state.move_buffer.subtile_shift = float_subtile(center + delta) - float_subtile(center);
-    state.move_buffer.rotation_shift = 0.0;
-    vis.prev_center = Some(center);
-}
-
-/// Advances past reached waypoints, picks a new path when needed, and aims at
-/// the next waypoint center.
-fn update_path_following(
-    vis: &mut BlackBotVisual,
-    center: Vec2,
-    here: (i32, i32),
-    passability: &Hypermap<f32>,
-) {
-    advance_past_reached_waypoints(vis, center);
-
-    if vis.path.is_empty() || vis.path_index >= vis.path.len() {
-        match pick_random_target(&mut vis.rng, here, passability) {
-            Some(path) => {
-                vis.path = path;
-                vis.path_index = 0;
-                advance_past_reached_waypoints(vis, center);
-            }
-            None => {
-                vis.path.clear();
-                vis.path_index = 0;
-                vis.has_target = false;
-                return;
-            }
-        }
-    }
-
-    if vis.path_index >= vis.path.len() {
-        vis.has_target = false;
-        return;
-    }
-
-    let wp = waypoint_center(vis.path[vis.path_index]);
-    let to_wp = wp - center;
-    if to_wp.length_squared() > 1e-12 {
-        vis.direction = to_wp.normalize();
-        vis.has_target = true;
-    } else {
-        vis.has_target = false;
-    }
-}
-
-fn black_bot_think(
+/// Sequential by design: it mutates the [`InteractiveEntityMap`] resource and
+/// the per-bot RNG lives in the brain, so it must not run on `par_iter`.
+fn black_bot_brain(
     time: Res<Time>,
     hypermap: Res<HypermapRuntime>,
-    mut query: Query<(&mut ActorObject, &mut BlackBotVisual, Option<&Charge>, Option<&mut Breakable>)>,
+    mut interactive: ResMut<InteractiveEntityMap>,
+    mut query: Query<(
+        Entity,
+        &mut ActorObject,
+        &mut Brain,
+        &mut BlackBotVisual,
+        Option<&mut Charge>,
+        Option<&mut Breakable>,
+    )>,
 ) {
     let dt = time.delta_secs();
     let passability = &*hypermap.static_passability_map;
 
-    for (mut obj, mut vis, charge, mut breakable) in &mut query {
+    for (entity, mut obj, mut brain, mut vis, mut charge, mut breakable) in &mut query {
         let state = obj.inner.state_mut();
 
-        // Depleted bots are immobilized: clear movement intent and skip pathing
-        // so the float center (which the mesh follows) stays put.
-        if charge.is_some_and(Charge::is_depleted) {
-            vis.velocity = Vec2::ZERO;
-            vis.prev_center = None;
-            state.move_buffer = ActorMoveBuffer::default();
-            state.next_waypoint_hint = None;
-            continue;
-        }
-
-        // Detect main tile change for wear/break rolls before any state updates.
         let current_tile = actor_main_tile(state.center);
         let tile_changed = vis.main_tile.map_or(false, |prev| prev != current_tile);
+        vis.main_tile = Some(current_tile);
+
+        let depleted = charge.as_ref().is_some_and(|c| c.is_depleted());
 
         // CONTROL_PLANE and SENSORY_SYSTEM wear every non-depleted frame.
-        if let Some(ref mut b) = breakable {
-            b.control_plane.tick(dt, CONTROL_PLANE_WEAR_RATE, tile_changed, &mut vis.rng);
-            b.sensory_system.tick(dt, SENSORY_SYSTEM_WEAR_RATE, tile_changed, &mut vis.rng);
-        }
-
-        // Broken engine or control plane: halt all movement.
-        if breakable.as_ref().map_or(false, |b| b.movement_engine.broken || b.control_plane.broken) {
-            vis.velocity = Vec2::ZERO;
-            vis.prev_center = None;
-            state.move_buffer = ActorMoveBuffer::default();
-            state.next_waypoint_hint = None;
-            continue;
-        }
-
-        // Tick the waiting timer first. `black_bot_think` runs before
-        // `process_actors`, so the error we observe here is from the previous
-        // frame's `try_move`.
-        if let MovementState::Waiting { remaining_s } = &mut vis.movement_state {
-            *remaining_s -= dt;
-            if *remaining_s <= 0.0 {
-                vis.movement_state = MovementState::Moving;
-            } else {
-                state.next_waypoint_hint = if vis.path_index < vis.path.len() {
-                    Some(waypoint_center(vis.path[vis.path_index]))
-                } else {
-                    None
-                };
-                vis.velocity = Vec2::ZERO;
-                vis.prev_center = None;
-                state.move_buffer = ActorMoveBuffer::default();
-                continue;
+        if !depleted {
+            if let Some(b) = breakable.as_mut() {
+                b.control_plane.tick(dt, CONTROL_PLANE_WEAR_RATE, tile_changed, brain.rng_mut());
+                b.sensory_system.tick(dt, SENSORY_SYSTEM_WEAR_RATE, tile_changed, brain.rng_mut());
             }
         }
 
-        // Bot-on-bot bumps: roll once for reroute (20%), wait (25%), or ignore.
-        // Walls (`BlockedByStatic`) are handled by per-axis snapping in `try_move`.
-        if matches!(
-            state.last_movement_error,
-            Some(ActorMovementError::BlockedByOccupancy { .. })
-        ) {
-            let roll = vis.rng.gen_range(0.0_f32..1.0);
-            if roll < BOT_COLLISION_REROUTE_CHANCE {
-                let distance = vis.rng.gen_range(1..=2) as f32;
-                // Candidate escape directions: back, strafe-left, strafe-right.
-                // Shuffle so each has equal probability of being tried first;
-                // the first passable tile wins. This breaks symmetry near narrow
-                // passages (doors, corridors) where only one side is open.
-                let d = vis.direction;
-                let mut candidates = [-d, Vec2::new(-d.y, d.x), Vec2::new(d.y, -d.x)];
-                for i in (1..3).rev() {
-                    let j = vis.rng.gen_range(0..=i);
-                    candidates.swap(i, j);
-                }
-                for escape_dir in candidates {
-                    let escape = (
-                        (current_tile.x as f32 + escape_dir.x * distance).round() as i32,
-                        (current_tile.y as f32 + escape_dir.y * distance).round() as i32,
-                    );
-                    if escape != (current_tile.x, current_tile.y)
-                        && world_tile_walkable(passability, escape.0, escape.1)
-                    {
-                        let insert_idx = vis.path_index.min(vis.path.len());
-                        vis.path.insert(insert_idx, escape);
-                        // Force direction recalculation toward the escape tile this frame.
-                        vis.main_tile = None;
-                        break;
-                    }
-                }
-            } else if roll < BOT_COLLISION_REROUTE_CHANCE + BOT_COLLISION_WAIT_CHANCE {
-                vis.movement_state = MovementState::Waiting {
-                    remaining_s: BOT_COLLISION_WAIT_S,
-                };
-                vis.velocity = Vec2::ZERO;
-                vis.prev_center = None;
-                state.move_buffer = ActorMoveBuffer::default();
-                continue;
-            }
-        }
+        let broken = breakable
+            .as_ref()
+            .map_or(false, |b| b.movement_engine.broken || b.control_plane.broken);
 
-        let center = state.center;
-        vis.main_tile = Some(current_tile);
-        let here = (current_tile.x, current_tile.y);
-        update_path_following(&mut vis, center, here, passability);
-
-        if !vis.has_target {
-            // No path right now: coast to a stop under braking deceleration
-            // rather than halting instantly, so residual momentum glides out.
-            drive_velocity(&mut vis, state, center, Vec2::ZERO, DECEL_TILES_PER_S2, dt);
-            state.next_waypoint_hint = None;
+        // Depleted or broken bots are immobilized: hold position, keep the plan.
+        if depleted || broken {
+            brain.halt(state);
             continue;
         }
 
-        // Stuck detection: if the bot hasn't closed the distance to its current
-        // waypoint by STUCK_PROGRESS_EPSILON in STUCK_REPATH_SECS, abandon the
-        // path and repath. This recovers from wall-wedge freezes that
-        // axis-decomposed sliding cannot escape on its own.
-        if vis.stuck_waypoint_index != vis.path_index {
-            vis.stuck_timer = 0.0;
-            vis.closest_approach = f32::MAX;
-            vis.stuck_waypoint_index = vis.path_index;
-        }
-        let dist_to_wp = (waypoint_center(vis.path[vis.path_index]) - center).length();
-        if dist_to_wp < vis.closest_approach - STUCK_PROGRESS_EPSILON {
-            vis.closest_approach = dist_to_wp;
-            vis.stuck_timer = 0.0;
-        } else {
-            vis.stuck_timer += dt;
-        }
-        if vis.stuck_timer >= STUCK_REPATH_SECS {
-            vis.path.clear();
-            vis.path_index = 0;
-            vis.has_target = false;
-            vis.stuck_timer = 0.0;
-            vis.closest_approach = f32::MAX;
-            vis.stuck_waypoint_index = 0;
-            vis.velocity = Vec2::ZERO;
-            vis.prev_center = None;
-            state.move_buffer = ActorMoveBuffer::default();
-            state.next_waypoint_hint = None;
-            continue;
-        }
-
-        // MOVEMENT_ENGINE wears only while the bot is actively moving this frame.
-        if let Some(ref mut b) = breakable {
-            b.movement_engine.tick(dt, MOVEMENT_ENGINE_WEAR_RATE, tile_changed, &mut vis.rng);
-        }
-
-        // Steer toward the active waypoint under finite acceleration so the bot
-        // ramps up to speed and curves into heading changes (apparent mass),
-        // rather than teleporting to full speed in the new direction.
-        let desired = vis.direction * MAX_SPEED_TILES_PER_S;
-        drive_velocity(&mut vis, state, center, desired, ACCEL_TILES_PER_S2, dt);
-
-        state.next_waypoint_hint = if vis.path_index < vis.path.len() {
-            Some(waypoint_center(vis.path[vis.path_index]))
-        } else {
-            None
+        let charge_level = charge.as_ref().map(|c| c.level).unwrap_or(1.0);
+        let effects = {
+            let ctx = BrainContext {
+                entity,
+                dt,
+                center: state.center,
+                main_tile: current_tile,
+                floor: 0,
+                charge: charge_level,
+                missing_charge_pct: (1.0 - charge_level) * 100.0,
+                depleted,
+                broken,
+                passability,
+                interactive: &interactive,
+            };
+            brain.tick(&ctx, state)
         };
+
+        // MOVEMENT_ENGINE wears only while actually moving this frame.
+        if state.move_buffer.tile_delta != Vec2::ZERO {
+            if let Some(b) = breakable.as_mut() {
+                b.movement_engine.tick(dt, MOVEMENT_ENGINE_WEAR_RATE, tile_changed, brain.rng_mut());
+            }
+        }
+
+        apply_brain_effects(entity, &effects, &mut interactive, charge.as_deref_mut());
     }
+}
+
+/// Applies a brain tick's [`BrainEffects`] to the world: charger docking and
+/// battery recharge.
+fn apply_brain_effects(
+    entity: Entity,
+    effects: &BrainEffects,
+    interactive: &mut InteractiveEntityMap,
+    charge: Option<&mut Charge>,
+) {
+    if let Some(coords) = effects.dock {
+        set_charger_occupant(interactive, coords, Some(entity));
+    }
+    if let Some(coords) = effects.undock {
+        // Only release if we are still the occupant (don't evict a new tenant).
+        if charger_occupant(interactive, coords) == Some(entity) {
+            set_charger_occupant(interactive, coords, None);
+        }
+    }
+    if effects.recharge > 0.0 {
+        if let Some(c) = charge {
+            c.level = (c.level + effects.recharge).min(1.0);
+        }
+    }
+}
+
+fn set_charger_occupant(
+    map: &mut InteractiveEntityMap,
+    coords: EntityCoordinates,
+    occupant: Option<Entity>,
+) {
+    if let Some(list) = map.list_at_mut(coords) {
+        for entry in list.iter_mut() {
+            if let Some(charger) = entry.entity.as_charger_mut() {
+                charger.set_occupant(occupant);
+            }
+        }
+    }
+}
+
+fn charger_occupant(map: &InteractiveEntityMap, coords: EntityCoordinates) -> Option<Entity> {
+    map.entities_at(coords)
+        .iter()
+        .filter_map(|e| e.entity.as_charger())
+        .find_map(|c| c.occupant())
 }
 
 fn sync_black_bot_transforms(
@@ -958,10 +566,9 @@ fn paint_black_bot_targets(
     overlay: Res<ChunkOverlayState>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    bots: Query<&BlackBotVisual>,
+    bots: Query<&Brain, With<BlackBotVisual>>,
 ) {
-    let mut touched_chunks: std::collections::HashSet<ChunkCoord> =
-        std::collections::HashSet::new();
+    let mut touched_chunks: HashSet<ChunkCoord> = HashSet::new();
 
     // Clear previous marks on all visible overlay images. Only this system
     // writes to the generic layer, so a full clear is the simplest correct
@@ -976,20 +583,19 @@ fn paint_black_bot_targets(
 
     // Paint upcoming path waypoints first; targets paint on top so the
     // destination always wins where both overlap.
-    for vis in bots.iter() {
-        if vis.path_index >= vis.path.len() {
-            continue;
-        }
-        for &(tx, ty) in &vis.path[vis.path_index..] {
-            if let Some(c) = stamp_tile(&overlay, &mut images, tx, ty, PATH_NODE_COLOR, 1) {
-                touched_chunks.insert(c);
+    for brain in bots.iter() {
+        if let Some((path, idx)) = brain.path() {
+            for &(tx, ty) in path.get(idx..).unwrap_or(&[]) {
+                if let Some(c) = stamp_tile(&overlay, &mut images, tx, ty, PATH_NODE_COLOR, 1) {
+                    touched_chunks.insert(c);
+                }
             }
         }
     }
 
     // Paint each target as a highlighted tile with a 1-tile halo.
-    for vis in bots.iter() {
-        let Some((wx, wy)) = vis.target_tile() else { continue };
+    for brain in bots.iter() {
+        let Some((wx, wy)) = brain.target_tile() else { continue };
         for dy in -1i32..=1 {
             for dx in -1i32..=1 {
                 let is_center = dx == 0 && dy == 0;
@@ -1008,26 +614,31 @@ fn paint_black_bot_targets(
     }
 }
 
-/// Spawns a BlackBot from a level snapshot (mesh + restored runtime state).
+fn black_bot_material(materials: &mut Assets<StandardMaterial>) -> Handle<StandardMaterial> {
+    materials.add(StandardMaterial {
+        base_color: Color::srgb(0.02, 0.02, 0.02),
+        metallic: 1.0,
+        perceptual_roughness: 0.05,
+        reflectance: 1.0,
+        ..default()
+    })
+}
+
+/// Spawns a BlackBot from a level snapshot (mesh + restored runtime state). The
+/// brain is rebuilt fresh from `rng_seed` and re-plans from scratch.
 pub fn spawn_black_bot_from_snapshot(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     name: &str,
     state: ActorState,
-    visual: BlackBotVisualSnap,
+    rng_seed: u64,
     breakable: BreakableSnap,
 ) -> Entity {
     let center = state.center;
     let bot = BlackBot::from_state(state);
 
-    let mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.02, 0.02, 0.02),
-        metallic: 1.0,
-        perceptual_roughness: 0.05,
-        reflectance: 1.0,
-        ..default()
-    });
+    let mat = black_bot_material(materials);
     let mesh = meshes.add(Sphere::new(SPHERE_RADIUS).mesh().ico(3).unwrap());
 
     let parent = commands
@@ -1035,7 +646,8 @@ pub fn spawn_black_bot_from_snapshot(
             Name::new(name.to_string()),
             ActorInspectable,
             Breakable::from_snapshot(breakable),
-            BlackBotVisual::from_snapshot(visual),
+            BlackBotVisual { main_tile: None },
+            build_black_bot_brain(rng_seed),
             ActorObject::new(Box::new(bot)),
             Transform::default(),
             Visibility::Inherited,
@@ -1064,17 +676,10 @@ pub fn spawn_black_bot(
     rng: &mut StdRng,
     center: Vec2,
 ) -> Entity {
-    let vis_seed: u64 = rng.gen_range(0..u64::MAX);
-    let vis_rng = StdRng::seed_from_u64(vis_seed);
+    let brain_seed: u64 = rng.gen_range(0..u64::MAX);
     let bot = BlackBot::new(center);
 
-    let mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.02, 0.02, 0.02),
-        metallic: 1.0,
-        perceptual_roughness: 0.05,
-        reflectance: 1.0,
-        ..default()
-    });
+    let mat = black_bot_material(materials);
     let mesh = meshes.add(Sphere::new(SPHERE_RADIUS).mesh().ico(3).unwrap());
 
     let parent = commands
@@ -1083,21 +688,8 @@ pub fn spawn_black_bot(
             ActorInspectable,
             Charge::random(rng),
             Breakable::new(),
-            BlackBotVisual {
-                main_tile: None,
-                direction: Vec2::X,
-                has_target: false,
-                path: Vec::new(),
-                path_index: 0,
-                movement_state: MovementState::Moving,
-                rng_seed: vis_seed,
-                rng: vis_rng,
-                stuck_timer: 0.0,
-                closest_approach: f32::MAX,
-                stuck_waypoint_index: 0,
-                velocity: Vec2::ZERO,
-                prev_center: None,
-            },
+            BlackBotVisual { main_tile: None },
+            build_black_bot_brain(brain_seed),
             ActorObject::new(Box::new(bot)),
             Transform::default(),
             Visibility::Inherited,
@@ -1117,72 +709,4 @@ pub fn spawn_black_bot(
 
     commands.entity(parent).add_children(&[mesh_child]);
     parent
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reached_waypoint_uses_center_not_tile_membership() {
-        let tile = (3, 4);
-        let wp = waypoint_center(tile);
-        assert!(!reached_waypoint(wp + Vec2::new(0.2, 0.0), tile));
-        assert!(reached_waypoint(wp, tile));
-        assert!(reached_waypoint(
-            wp + Vec2::splat(WAYPOINT_REACHED_EPSILON * 0.5),
-            tile
-        ));
-    }
-
-    #[test]
-    fn advance_past_reached_skips_only_when_center_at_waypoint() {
-        let mut vis = BlackBotVisual {
-            main_tile: None,
-            direction: Vec2::X,
-            has_target: false,
-            path: vec![(0, 0), (1, 0)],
-            path_index: 0,
-            movement_state: MovementState::Moving,
-            rng_seed: 0,
-            rng: StdRng::seed_from_u64(0),
-            stuck_timer: 0.0,
-            closest_approach: f32::MAX,
-            stuck_waypoint_index: 0,
-            velocity: Vec2::ZERO,
-            prev_center: None,
-        };
-        let near_start = Vec2::new(0.2, 0.5);
-        advance_past_reached_waypoints(&mut vis, near_start);
-        assert_eq!(vis.path_index, 0, "must not skip while center is off waypoint");
-
-        advance_past_reached_waypoints(&mut vis, waypoint_center((0, 0)));
-        assert_eq!(vis.path_index, 1);
-    }
-
-    #[test]
-    fn approach_velocity_ramps_up_capped_by_accel() {
-        // From rest, one step changes velocity by exactly rate * dt, not the
-        // full desired magnitude — this is the inertia.
-        let v = approach_velocity(Vec2::ZERO, Vec2::new(10.0, 0.0), 4.0, 0.5);
-        assert!((v.x - 2.0).abs() < 1e-5, "expected 2.0, got {}", v.x);
-        assert_eq!(v.y, 0.0);
-    }
-
-    #[test]
-    fn approach_velocity_snaps_when_within_one_step() {
-        // When the remaining delta is below rate * dt, snap to desired so the
-        // bot settles instead of oscillating around the target velocity.
-        let v = approach_velocity(Vec2::new(1.0, 0.0), Vec2::new(1.2, 0.0), 4.0, 0.5);
-        assert_eq!(v, Vec2::new(1.2, 0.0));
-    }
-
-    #[test]
-    fn approach_velocity_decelerates_toward_zero() {
-        let v = approach_velocity(Vec2::new(3.0, 0.0), Vec2::ZERO, 4.0, 0.5);
-        assert!((v.x - 1.0).abs() < 1e-5, "expected 1.0, got {}", v.x);
-        // A second braking step reaches a full stop (remaining < step).
-        let v2 = approach_velocity(v, Vec2::ZERO, 4.0, 0.5);
-        assert_eq!(v2, Vec2::ZERO);
-    }
 }

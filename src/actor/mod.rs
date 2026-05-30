@@ -25,6 +25,7 @@
 pub mod black_bot;
 pub mod actor_name;
 pub mod actor_pick;
+pub mod brain;
 pub mod charge;
 pub mod glitch_bot;
 pub mod inspect;

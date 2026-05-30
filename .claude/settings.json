@@ -20,7 +20,9 @@
       "Bash(timeout 30 ./target/debug/everly)",
       "Bash(timeout 25 ./target/debug/everly)",
       "Bash(perl -e 'alarm 25; exec @ARGV' ./target/debug/everly)",
-      "Bash(perl -e 'alarm 35; exec @ARGV' cargo run)"
+      "Bash(perl -e 'alarm 35; exec @ARGV' cargo run)",
+      "Bash(shasum src/actor/snapshot.rs)",
+      "Bash(tee /tmp/everly_check.log)"
     ],
     "additionalDirectories": [
       "/tmp"

@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::actor::black_bot::{spawn_black_bot_from_snapshot, Breakable, BlackBotVisual};
+use crate::actor::black_bot::{spawn_black_bot_from_snapshot, Breakable};
+use crate::actor::brain::Brain;
 use crate::actor::charge::Charge;
 use crate::actor::glitch_bot::{spawn_glitch_bot_from_snapshot, GlitchBotVisual};
 use crate::actor::{ActorMoveBuffer, ActorMovementError, ActorObject, ActorState, LevelActor};
@@ -220,21 +221,11 @@ pub struct GlitchBotVisualSnap {
     pub rng_seed: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum MovementStateSnap {
-    Moving,
-    Waiting { remaining_s: f32 },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BlackBotVisualSnap {
-    pub main_tile: Option<SerIVec2>,
-    pub direction: SerVec2,
-    pub has_target: bool,
-    pub path: Vec<(i32, i32)>,
-    pub path_index: usize,
-    pub movement_state: MovementStateSnap,
+/// Persisted brain state for a BlackBot. The behavior set is fixed by the actor
+/// type, so only the RNG seed is stored; the brain re-plans from scratch on load.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BlackBotBrainSnap {
+    #[serde(default)]
     pub rng_seed: u64,
 }
 
@@ -259,7 +250,8 @@ pub enum SavedActor {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         name: String,
         state: ActorStateSnap,
-        visual: BlackBotVisualSnap,
+        #[serde(default)]
+        brain: BlackBotBrainSnap,
         #[serde(default = "default_charge")]
         charge: f32,
         #[serde(default)]
@@ -282,7 +274,7 @@ impl LevelActorsFile {
         glitch_bots: &Query<(&ActorObject, &GlitchBotVisual, Option<&Charge>, Option<&Name>)>,
         black_bots: &Query<(
             &ActorObject,
-            &BlackBotVisual,
+            &Brain,
             Option<&Charge>,
             Option<&Name>,
             Option<&Breakable>,
@@ -297,11 +289,11 @@ impl LevelActorsFile {
                 charge: charge.map_or(1.0, |c| c.level),
             });
         }
-        for (obj, vis, charge, name, breakable) in black_bots.iter() {
+        for (obj, brain, charge, name, breakable) in black_bots.iter() {
             actors.push(SavedActor::BlackBot {
                 name: saved_name_from_entity(name),
                 state: obj.inner.state().into(),
-                visual: vis.to_snapshot(),
+                brain: BlackBotBrainSnap { rng_seed: brain.rng_seed() },
                 charge: charge.map_or(1.0, |c| c.level),
                 breakable: breakable.map(|b| b.to_snapshot()).unwrap_or_default(),
             });
@@ -362,14 +354,14 @@ pub fn spawn_level_actors(
                 );
                 commands.entity(entity).insert((LevelActor, Charge::new(*charge)));
             }
-            SavedActor::BlackBot { name, state, visual, charge, breakable } => {
+            SavedActor::BlackBot { name, state, brain, charge, breakable } => {
                 let entity = spawn_black_bot_from_snapshot(
                     commands,
                     meshes,
                     materials,
                     name,
                     state.clone().into(),
-                    visual.clone(),
+                    brain.rng_seed,
                     breakable.clone(),
                 );
                 commands.entity(entity).insert((LevelActor, Charge::new(*charge)));
@@ -501,13 +493,7 @@ state:
   last_movement_error: null
   last_accepted_center_subtile: null
   last_accepted_radius_subtiles: 2
-visual:
-  main_tile: null
-  direction: { x: 1.0, y: 0.0 }
-  has_target: false
-  path: []
-  path_index: 0
-  movement_state: { kind: moving }
+brain:
   rng_seed: 1
 "#;
         let actor: SavedActor = serde_yaml::from_str(yaml).unwrap();
@@ -568,15 +554,7 @@ visual:
                         last_accepted_center_subtile: Some(SerIVec2 { x: 15, y: 20 }),
                         last_accepted_radius_subtiles: 2,
                     },
-                    visual: BlackBotVisualSnap {
-                        main_tile: Some(SerIVec2 { x: 3, y: 4 }),
-                        direction: SerVec2 { x: 0.0, y: 1.0 },
-                        has_target: true,
-                        path: vec![(3, 4), (5, 6)],
-                        path_index: 1,
-                        movement_state: MovementStateSnap::Waiting { remaining_s: 0.5 },
-                        rng_seed: 99,
-                    },
+                    brain: BlackBotBrainSnap { rng_seed: 99 },
                     charge: 0.4,
                     breakable: BreakableSnap::default(),
                 },
