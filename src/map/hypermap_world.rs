@@ -1052,7 +1052,7 @@ pub(crate) fn regenerate_procedural_chunk(
     mirror_chunk_into_subtile_cache(&runtime.map, &runtime.static_subtile_cache, coord);
     dirt.reset_chunk_for_regeneration(coord);
     temperature.reset_chunk_for_regeneration(coord);
-    dirt.ensure_chunk_seeded(&runtime.map, coord, level_name);
+    dirt.ensure_chunk_seeded(&runtime.map, &runtime.static_passability_map, coord, level_name);
     temperature.ensure_chunk_seeded(&runtime.map, coord, level_name);
 }
 

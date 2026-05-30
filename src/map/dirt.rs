@@ -2,7 +2,7 @@
 //!
 //! See `docs/field-interactions.md` for actor deposits and `docs/chunk-overlay.md` for rendering.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use bevy::prelude::*;
@@ -10,6 +10,9 @@ use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 
 use crate::map::hypermap::{random_rng_seed, ChunkCoord, Hypermap, LocalCoord, HYPERMAP_CHUNK_SIZE};
+use crate::map::hypermap_pathfind::{
+    astar_shortest_world_path, passability_walkable, HypermapPathResult, HypermapSearchLimits,
+};
 use crate::map::level::LevelName;
 use crate::map::tile_field_level::{dirt_bin_path, load_tile_field_bin};
 use crate::map::hypermap_world::HypermapRuntime;
@@ -21,8 +24,6 @@ pub use crate::map::tile_field::TILE_FIELD_OVERLAY_RES as DIRT_OVERLAY_RES;
 
 const DIRT_CLAMP_MAX: f32 = 1.0;
 
-/// Probability that a non-void ground tile receives a dirty patch when its chunk is first seeded.
-const DIRTY_TILE_CHANCE: f32 = 0.06;
 /// Dirt added to a tile when an actor leaves it (see `field_interactions`).
 pub const DIRT_TRACK_DEPOSIT: f32 = 0.01;
 
@@ -89,6 +90,7 @@ impl DirtMap {
     pub fn ensure_chunk_seeded(
         &self,
         world: &Hypermap<CellType>,
+        passability: &Hypermap<f32>,
         coord: ChunkCoord,
         level_name: &str,
     ) {
@@ -110,25 +112,69 @@ impl DirtMap {
             let seed = dirt_chunk_seed(coord);
             let mut rng = StdRng::seed_from_u64(seed);
 
-            world.with_chunk_read(coord, |wchunk| {
+            let chunk_origin_x = coord.x * HYPERMAP_CHUNK_SIZE;
+            let chunk_origin_y = coord.y * HYPERMAP_CHUNK_SIZE;
+
+            // Collect all passable tile positions within this chunk.
+            let mut passable_tiles: Vec<(i32, i32)> = Vec::new();
+            for ly in 0..HYPERMAP_CHUNK_SIZE {
+                for lx in 0..HYPERMAP_CHUNK_SIZE {
+                    let wx = chunk_origin_x + lx;
+                    let wy = chunk_origin_y + ly;
+                    if passability_walkable(passability.get(wx, wy)) {
+                        passable_tiles.push((wx, wy));
+                    }
+                }
+            }
+
+            if passable_tiles.len() >= 2 {
+                const SAMPLE_COUNT: usize = 50;
+                const PATH_COUNT: usize = 100;
+                // Each traversal of a tile by a path adds this much dirt.
+                // A tile on 20+ paths reaches max dirt (1.0).
+                const DIRT_PER_TRAVERSAL: f32 = 0.05;
+
+                let samples: Vec<(i32, i32)> = if passable_tiles.len() <= SAMPLE_COUNT {
+                    passable_tiles.clone()
+                } else {
+                    (0..SAMPLE_COUNT)
+                        .map(|_| passable_tiles[rng.gen_range(0..passable_tiles.len())])
+                        .collect()
+                };
+
+                let limits = HypermapSearchLimits { max_expanded: 20_000 };
+                let mut hit_counts: HashMap<(i32, i32), f32> = HashMap::new();
+
+                for _ in 0..PATH_COUNT {
+                    let start = samples[rng.gen_range(0..samples.len())];
+                    let goal = samples[rng.gen_range(0..samples.len())];
+                    if start == goal {
+                        continue;
+                    }
+                    if let HypermapPathResult::Found { path, .. } =
+                        astar_shortest_world_path(passability, start, goal, limits)
+                    {
+                        for tile in path {
+                            *hit_counts.entry(tile).or_insert(0.0) += DIRT_PER_TRAVERSAL;
+                        }
+                    }
+                }
+
+                // Write dirt only for tiles within this chunk.
                 self.field.inner().with_chunk_write(coord, |dchunk| {
                     for ly in 0..HYPERMAP_CHUNK_SIZE {
                         for lx in 0..HYPERMAP_CHUNK_SIZE {
-                            let local = LocalCoord::new(lx, ly);
-                            let cell = *wchunk.get_local_floor(local, 0);
-                            if matches!(cell, CellType::Void) {
-                                continue;
+                            let wx = chunk_origin_x + lx;
+                            let wy = chunk_origin_y + ly;
+                            if let Some(&dirt) = hit_counts.get(&(wx, wy)) {
+                                let local = LocalCoord::new(lx, ly);
+                                dchunk.set_local(local, dirt.min(1.0));
                             }
-                            if rng.gen_range(0.0..1.0) >= DIRTY_TILE_CHANCE {
-                                continue;
-                            }
-                            let level = rng.gen_range(0.1..=0.3);
-                            dchunk.set_local(local, level);
                         }
                     }
                 });
-            });
-            self.field.flush_if_pending();
+                self.field.flush_if_pending();
+            }
         }
 
         self.seeded_chunks
@@ -176,7 +222,7 @@ pub(crate) fn seed_dirt_for_visible_chunks(
     level: Res<LevelName>,
 ) {
     for coord in runtime.desired_chunk_coords() {
-        dirt.ensure_chunk_seeded(&runtime.map, coord, level.0.as_str());
+        dirt.ensure_chunk_seeded(&runtime.map, &runtime.static_passability_map, coord, level.0.as_str());
     }
 }
 

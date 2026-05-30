@@ -159,7 +159,7 @@ pub struct ActorState {
 /// floors to subtiles via [`ActorState::center_subtile_i32`].
 #[inline]
 pub fn actor_main_tile(center: Vec2) -> IVec2 {
-    IVec2::new(center.x.round() as i32, center.y.round() as i32)
+    IVec2::new(center.x.floor() as i32, center.y.floor() as i32)
 }
 
 impl ActorState {

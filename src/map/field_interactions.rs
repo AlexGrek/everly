@@ -149,9 +149,9 @@ mod tests {
     }
 
     #[test]
-    fn actor_main_tile_rounds_center() {
-        assert_eq!(actor_main_tile(Vec2::new(1.4, 1.5)), IVec2::new(1, 2));
-        assert_eq!(actor_main_tile(Vec2::new(1.6, -0.1)), IVec2::new(2, 0));
+    fn actor_main_tile_floors_to_containing_tile() {
+        assert_eq!(actor_main_tile(Vec2::new(1.4, 1.5)), IVec2::new(1, 1));
+        assert_eq!(actor_main_tile(Vec2::new(1.6, -0.1)), IVec2::new(1, -1));
     }
 
     #[test]
