@@ -21,18 +21,29 @@ use crate::menu::main_menu::GameState;
 use crate::scene::camera::StrategyCameraRig;
 
 /// Pixels from the bottom of the window where spawn clicks are suppressed (covers the
-/// 52 px HUD bar, the 40 px tile palette, and this 40 px actor palette above it).
-const ACTOR_DEAD_ZONE_PX: f32 = 140.0;
+/// 52 px HUD bar + the 40 px palette row this panel shares with the map-edit palette).
+const ACTOR_DEAD_ZONE_PX: f32 = 120.0;
 
 const PALETTE_BG: Color = Color::srgba(0.05, 0.06, 0.09, 0.78);
 const BTN_BG: Color = Color::srgba(0.16, 0.18, 0.22, 0.75);
 const BTN_BORDER: Color = Color::srgba(0.85, 0.88, 0.92, 0.4);
 const TEXT_MAIN: Color = Color::srgba(0.94, 0.95, 0.97, 0.92);
+const KILL_BTN_BG: Color = Color::srgba(0.22, 0.10, 0.10, 0.85);
+const KILL_BTN_BORDER: Color = Color::srgba(0.75, 0.28, 0.28, 0.6);
+const KILL_TEXT: Color = Color::srgb(0.95, 0.55, 0.55);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ActorKind {
     GlitchBot,
     BlackBot,
+}
+
+/// Active brush in the actor palette: either spawn a kind on click, or kill the
+/// clicked bot. `None` means no brush is armed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ActorTool {
+    Spawn(ActorKind),
+    Kill,
 }
 
 /// HUD toggle (next to Edit) — wired in [`crate::hud::game_hud`].
@@ -46,7 +57,7 @@ pub(crate) struct ActorSpawnToggleLabel;
 pub(crate) struct ActorSpawnPaletteRoot;
 
 #[derive(Component, Clone, Copy)]
-struct ActorSpawnPickButton(ActorKind);
+struct ActorSpawnPickButton(ActorTool);
 
 #[derive(Component)]
 struct ActorSpawnPreviewRoot;
@@ -55,8 +66,8 @@ struct ActorSpawnPreviewRoot;
 pub struct ActorSpawnState {
     /// Palette + interactions enabled (Actors was pressed).
     pub panel_open: bool,
-    /// Active actor brush; `None` = nothing to spawn on click.
-    pub placement: Option<ActorKind>,
+    /// Active brush; `None` = clicks do nothing.
+    pub tool: Option<ActorTool>,
 }
 
 #[derive(Resource, Default)]
@@ -99,13 +110,13 @@ pub(crate) fn spawn_actor_spawn_palette(
         .spawn((
             Name::new("Actor spawn palette"),
             ActorSpawnPaletteRoot,
-            PanelAnim::closed(92.0, 40.0),
+            PanelAnim::closed(52.0, 40.0),
             UiTargetCamera(cam),
             Node {
                 position_type: PositionType::Absolute,
                 width: Val::Percent(100.0),
                 height: Val::Px(40.0),
-                bottom: Val::Px(52.0),
+                bottom: Val::Px(12.0),
                 left: Val::Px(0.0),
                 padding: UiRect::horizontal(Val::Px(12.0)),
                 column_gap: Val::Px(8.0),
@@ -119,13 +130,18 @@ pub(crate) fn spawn_actor_spawn_palette(
             ZIndex(999),
         ))
         .with_children(|row| {
-            for (label, kind) in [
-                ("Bot", ActorKind::GlitchBot),
-                ("Black", ActorKind::BlackBot),
+            for (label, tool) in [
+                ("Bot", ActorTool::Spawn(ActorKind::GlitchBot)),
+                ("Black", ActorTool::Spawn(ActorKind::BlackBot)),
+                ("Kill", ActorTool::Kill),
             ] {
+                let (bg, border, text) = match tool {
+                    ActorTool::Kill => (KILL_BTN_BG, KILL_BTN_BORDER, KILL_TEXT),
+                    ActorTool::Spawn(_) => (BTN_BG, BTN_BORDER, TEXT_MAIN),
+                };
                 row.spawn((
                     Name::new(format!("Actor spawn pick {label}")),
-                    ActorSpawnPickButton(kind),
+                    ActorSpawnPickButton(tool),
                     Button,
                     Node {
                         min_width: Val::Px(72.0),
@@ -137,14 +153,14 @@ pub(crate) fn spawn_actor_spawn_palette(
                         border_radius: BorderRadius::all(Val::Px(5.0)),
                         ..default()
                     },
-                    BorderColor::all(BTN_BORDER),
-                    BackgroundColor(BTN_BG),
+                    BorderColor::all(border),
+                    BackgroundColor(bg),
                 ))
                 .with_children(|p| {
                     p.spawn((
                         Text::new(label),
                         TextFont::from_font_size(15.0),
-                        TextColor(TEXT_MAIN),
+                        TextColor(text),
                     ));
                 });
             }
@@ -177,7 +193,7 @@ fn actor_spawn_toggle_panel(
         }
         state.panel_open = !state.panel_open;
         if !state.panel_open {
-            state.placement = None;
+            state.tool = None;
         } else {
             map_edit.panel_open = false;
             map_edit.placement_tile = None;
@@ -207,7 +223,7 @@ fn actor_spawn_pick_buttons(
         if *interaction != Interaction::Pressed {
             continue;
         }
-        state.placement = Some(btn.0);
+        state.tool = Some(btn.0);
         // Mutually exclusive with the tile brush (see module docs).
         map_edit.placement_tile = None;
     }
@@ -220,7 +236,7 @@ fn actor_spawn_hover_under_cursor(
     cameras: Query<(&Camera, &GlobalTransform), With<StrategyCameraRig>>,
     floor: Res<ActiveFloorLevel>,
 ) {
-    if state.placement.is_none() {
+    if !matches!(state.tool, Some(ActorTool::Spawn(_))) {
         if hover.0.is_some() {
             hover.0 = None;
         }
@@ -249,7 +265,7 @@ fn actor_spawn_pointer_click(
     mut bot_rng: ResMut<GlitchBotRng>,
     mut black_rng: ResMut<BlackBotRng>,
 ) {
-    let Some(kind) = state.placement else {
+    let Some(ActorTool::Spawn(kind)) = state.tool else {
         return;
     };
     if !mouse.just_released(MouseButton::Left) {
@@ -293,7 +309,7 @@ fn actor_spawn_right_click_cancel(
     mut state: ResMut<ActorSpawnState>,
 ) {
     if mouse.just_pressed(MouseButton::Right) {
-        state.placement = None;
+        state.tool = None;
     }
 }
 
@@ -310,7 +326,8 @@ fn actor_spawn_update_preview(
         return;
     };
 
-    let Some((cx, cz)) = (state.placement.is_some()).then_some(hover.0).flatten() else {
+    let spawning = matches!(state.tool, Some(ActorTool::Spawn(_)));
+    let Some((cx, cz)) = spawning.then_some(hover.0).flatten() else {
         if let Some(e) = *preview_entity {
             commands.entity(e).insert(Visibility::Hidden);
         }

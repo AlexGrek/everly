@@ -11,6 +11,7 @@ use crate::actor::glitch_bot::GlitchBotVisual;
 use crate::map::hypermap_world::HypermapRuntime;
 use crate::actor::inspect::{collect_inspect_rows, display_actor_name};
 use crate::actor::ActorObject;
+use crate::edit::actor_spawn::{ActorSpawnState, ActorTool};
 use crate::menu::main_menu::GameState;
 use crate::scene::camera::StrategyCameraRig;
 
@@ -167,6 +168,8 @@ fn on_actor_pointer_click(
     pick_meshes: Query<(), With<ActorPickMesh>>,
     child_of: Query<&ChildOf>,
     inspectable: Query<(), With<ActorInspectable>>,
+    spawn_state: Res<ActorSpawnState>,
+    mut commands: Commands,
     mut modal: ResMut<ActorInspectorModal>,
 ) {
     if click.event().button != PointerButton::Primary {
@@ -178,6 +181,12 @@ fn on_actor_pointer_click(
     let Some(root) = find_actor_root(click.entity, &child_of, &inspectable) else {
         return;
     };
+    // With the palette's Kill brush armed, a click destroys the bot instead of
+    // inspecting it. The footprint clears itself on the next occupancy flush.
+    if matches!(spawn_state.tool, Some(ActorTool::Kill)) {
+        commands.entity(root).despawn();
+        return;
+    }
     modal.open = true;
     modal.actor = Some(root);
 }

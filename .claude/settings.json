@@ -7,6 +7,9 @@
       "Bash(yq --version)",
       "Bash(python3 -c \"import yaml; print\\('pyyaml', yaml.__version__\\)\")",
       "Bash(uv run *)",
+      "Bash(sed *)",
+      "Bash(awk *)",
+      "Bash(grep *)",
       "Edit(/.claude/skills/field-interactions/**)",
       "Edit(/.claude/skills/optimize/**)"
     ],

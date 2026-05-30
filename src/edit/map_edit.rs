@@ -308,7 +308,7 @@ fn map_edit_toggle_panel(
             drag.0 = None;
         } else {
             actor_state.panel_open = false;
-            actor_state.placement = None;
+            actor_state.tool = None;
             for mut anim in &mut actor_palette {
                 anim.target = 0.0;
             }
@@ -467,7 +467,7 @@ fn map_edit_tile_pick_buttons(
         drag_anchor.0 = None;
         // The map-edit tile brush and the actor-spawn brush are mutually exclusive
         // so a single click never both paints a tile and spawns an actor.
-        actor_spawn.placement = None;
+        actor_spawn.tool = None;
     }
 }
 
