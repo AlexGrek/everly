@@ -224,6 +224,7 @@ impl BlackBot {
                 last_accepted_radius_subtiles: BLACK_RADIUS_SUBTILES,
                 next_waypoint_hint: None,
                 field_main_tile: None,
+                dirtiness: 0.0,
             },
         }
     }
@@ -292,11 +293,31 @@ impl Actor for BlackBot {
             if y_ok { want.y } else { 0 },
         );
 
-        if let Err(e) =
-            dynamic.try_update_footprint(origin + final_shift, radius, previous, actor_blocked, static_cache)
-        {
-            self.state.last_movement_error = Some(translate_err(e));
+        // When `final_shift` keeps at most one axis it equals a shift already
+        // probed above (or the origin, which is all self-overlap) — known
+        // passable, so commit without a redundant re-probe. Only a diagonal
+        // `final_shift` (both axes kept) is a placement no axis-only probe
+        // covered, so it still needs a full collision check.
+        let needs_probe = final_shift.x != 0 && final_shift.y != 0;
+        let committed = if needs_probe {
+            match dynamic.try_update_footprint(
+                origin + final_shift,
+                radius,
+                previous,
+                actor_blocked,
+                static_cache,
+            ) {
+                Ok(()) => true,
+                Err(e) => {
+                    self.state.last_movement_error = Some(translate_err(e));
+                    false
+                }
+            }
         } else {
+            dynamic.commit_footprint(origin + final_shift, radius);
+            true
+        };
+        if committed {
             self.state.last_accepted_center_subtile = Some(origin + final_shift);
             self.state.last_accepted_radius_subtiles = radius;
         }

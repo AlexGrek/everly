@@ -33,7 +33,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use bevy::prelude::*;
 
-use crate::map::hypermap::{DoubleBufferedHypermap, Hypermap};
+use crate::map::hypermap::{
+    world_to_chunk_local, ChunkCoord, DoubleBufferedHypermap, Hypermap, HypermapChunkHandle,
+};
 use crate::map::world_map::{CellType, WallCorner, WallMask, MASK_EAST, MASK_NORTH, MASK_SOUTH, MASK_WEST};
 
 /// Number of sub-cells along each axis of a single world tile.
@@ -183,7 +185,7 @@ impl DynamicPassabilityMap {
         actor_blocked: u64,
         static_cache: &Hypermap<SubtilePassability>,
     ) -> Result<(), TryUpdateFootprintError> {
-        let subtile_map = SubtilePassabilityMap::new(self);
+        let write_map = self.inner.write_map();
         match self.probe_footprint(
             next_center_subtile,
             radius_subtiles,
@@ -193,7 +195,7 @@ impl DynamicPassabilityMap {
         ) {
             Ok(()) => {
                 let new_shadow = baked_circle_shadow(radius_subtiles);
-                write_circle(&subtile_map, next_center_subtile, new_shadow);
+                write_circle(write_map, next_center_subtile, new_shadow);
                 Ok(())
             }
             Err(e) => {
@@ -202,7 +204,7 @@ impl DynamicPassabilityMap {
                 if let Some((prev_center, prev_r)) = previous {
                     if prev_r >= 0 {
                         let prev_shadow = baked_circle_shadow(prev_r);
-                        write_circle(&subtile_map, prev_center, prev_shadow);
+                        write_circle(write_map, prev_center, prev_shadow);
                     }
                 }
                 Err(e)
@@ -239,7 +241,14 @@ impl DynamicPassabilityMap {
 
         let new_shadow = baked_circle_shadow(radius_subtiles);
         let previous_info = previous.map(|(c, r)| (c, baked_circle_shadow(r)));
-        let subtile_map = SubtilePassabilityMap::new(self);
+
+        // Chunk-local access: a compact footprint's subtiles almost always
+        // share a single hypermap chunk, so each cursor resolves the chunk
+        // (global table lock + `Arc` clone) at most once per distinct chunk and
+        // reads each per-tile `SubtilePassability` by reference — no per-subtile
+        // table lock, `Arc` clone, or 200-byte tile copy.
+        let mut static_cursor = SubtileReadCursor::new(static_cache);
+        let mut dynamic_cursor = SubtileReadCursor::new(self.inner.read_map());
 
         for offset in new_shadow.offsets {
             let target = next_center_subtile + *offset;
@@ -254,14 +263,14 @@ impl DynamicPassabilityMap {
                 continue;
             }
 
-            let static_flags = static_subtile_flags(static_cache, target);
+            let static_flags = static_cursor.flags(target);
             if static_flags & actor_blocked != 0 {
                 return Err(TryUpdateFootprintError::BlockedByStatic {
                     world_subtile: target,
                 });
             }
 
-            let dynamic_flags = subtile_map.flags_xy(0, 0, target.x, target.y);
+            let dynamic_flags = dynamic_cursor.flags(target);
             if dynamic_flags & actor_blocked != 0 {
                 return Err(TryUpdateFootprintError::BlockedByOccupancy {
                     world_subtile: target,
@@ -269,6 +278,21 @@ impl DynamicPassabilityMap {
             }
         }
         Ok(())
+    }
+
+    /// Stamps a **known-passable** circular footprint into the write buffer
+    /// without any collision check.
+    ///
+    /// The caller must have already validated the placement this frame (e.g. via
+    /// [`probe_footprint`]). Used to avoid re-probing a footprint a prior probe
+    /// already proved clear — [`try_update_footprint`] always re-probes, which is
+    /// wasted work when the placement is the same one just probed.
+    pub fn commit_footprint(&self, center_subtile: IVec2, radius_subtiles: i32) {
+        if radius_subtiles < 0 {
+            return;
+        }
+        let shadow = baked_circle_shadow(radius_subtiles);
+        write_circle(self.inner.write_map(), center_subtile, shadow);
     }
 
     /// Stamps an arbitrary list of world-subtiles as creature-blocked in the
@@ -286,29 +310,108 @@ impl DynamicPassabilityMap {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// ORs `FLAG_BLOCKED | FLAG_CREATURE` for every subtile in `shadow` centered
-/// at `center` into the write buffer. Used to stamp actor footprints.
+/// ORs `FLAG_BLOCKED | FLAG_CREATURE` for every subtile in `shadow` centered at
+/// `center` into the given write-side map. Used to stamp actor footprints.
+/// Chunk-local: the cursor resolves each chunk at most once for the whole circle.
 #[inline]
-fn write_circle(map: &SubtilePassabilityMap, center: IVec2, shadow: &CircleShadow) {
+fn write_circle(map: &Hypermap<SubtilePassability>, center: IVec2, shadow: &CircleShadow) {
+    let mut cursor = SubtileWriteCursor::new(map);
     for offset in shadow.offsets {
-        let cell = center + *offset;
-        map.or_flags_xy(0, 0, cell.x, cell.y, FLAG_BLOCKED | FLAG_CREATURE);
+        cursor.or_flags(center + *offset, FLAG_BLOCKED | FLAG_CREATURE);
     }
 }
 
-/// Reads the static passability flags for a world-subtile from the persistent
-/// cache. The cache stores one [`SubtilePassability`] per world tile (pre-baked
-/// on chunk generation / cell edit), so this is a simple tile lookup + array
-/// index — no per-frame iteration.
+/// Resolves a world-subtile into `(chunk_coord, local_tile, local_subtile_row,
+/// local_subtile_col)` for a `Hypermap<SubtilePassability>` (one tile = one
+/// [`SubtilePassability`]; `SUBTILE_COUNT²` sub-cells per tile).
 #[inline]
-fn static_subtile_flags(cache: &Hypermap<SubtilePassability>, world_subtile: IVec2) -> u64 {
+fn subtile_addr(
+    world_subtile: IVec2,
+) -> (ChunkCoord, crate::map::hypermap::LocalCoord, usize, usize) {
     let sc = SUBTILE_COUNT as i32;
     let tile_x = world_subtile.x.div_euclid(sc);
     let tile_y = world_subtile.y.div_euclid(sc);
-    let local_x = world_subtile.x.rem_euclid(sc) as usize;
-    let local_y = world_subtile.y.rem_euclid(sc) as usize;
-    let tile_data = cache.get(tile_x, tile_y);
-    tile_data.flags_at(local_y, local_x)
+    let local_sx = world_subtile.x.rem_euclid(sc) as usize;
+    let local_sy = world_subtile.y.rem_euclid(sc) as usize;
+    let (coord, local_tile) = world_to_chunk_local(tile_x, tile_y);
+    (coord, local_tile, local_sy, local_sx)
+}
+
+/// Reads subtile flags from a `Hypermap<SubtilePassability>` while caching the
+/// last-touched chunk handle. Since a footprint's subtiles nearly always share
+/// one chunk, the expensive global chunk-table lookup + `Arc` clone is paid at
+/// most once per distinct chunk; per-subtile cost is one uncontended per-chunk
+/// read lock and a direct array index (no 200-byte tile clone).
+struct SubtileReadCursor<'a> {
+    map: &'a Hypermap<SubtilePassability>,
+    /// `(coord, handle)`; the inner `Option` caches a *missing* chunk so absent
+    /// regions don't re-hit the global table lock on every subtile.
+    cached: Option<(ChunkCoord, Option<HypermapChunkHandle<SubtilePassability>>)>,
+}
+
+impl<'a> SubtileReadCursor<'a> {
+    #[inline]
+    fn new(map: &'a Hypermap<SubtilePassability>) -> Self {
+        Self { map, cached: None }
+    }
+
+    #[inline]
+    fn handle_for(&mut self, coord: ChunkCoord) -> Option<&HypermapChunkHandle<SubtilePassability>> {
+        let hit = matches!(&self.cached, Some((c, _)) if *c == coord);
+        if !hit {
+            let handle = self.map.get_chunk(coord);
+            self.cached = Some((coord, handle));
+        }
+        self.cached.as_ref().and_then(|(_, h)| h.as_ref())
+    }
+
+    #[inline]
+    fn flags(&mut self, world_subtile: IVec2) -> u64 {
+        let (coord, local_tile, row, col) = subtile_addr(world_subtile);
+        match self.handle_for(coord) {
+            // Missing chunk reads as the default (EMPTY) tile → no flags.
+            None => 0,
+            Some(handle) => {
+                let guard = handle.read().expect("chunk lock poisoned");
+                guard.get_local(local_tile).flags_at(row, col)
+            }
+        }
+    }
+}
+
+/// Write-side counterpart to [`SubtileReadCursor`]: ORs flags into a
+/// `Hypermap<SubtilePassability>`, caching the chunk handle (created lazily) so
+/// a footprint stamps through a single chunk resolution. The per-chunk write
+/// lock is taken per subtile (fine-grained), so concurrent actors stamping
+/// other subtiles of the same chunk are not blocked for the whole footprint.
+struct SubtileWriteCursor<'a> {
+    map: &'a Hypermap<SubtilePassability>,
+    cached: Option<(ChunkCoord, HypermapChunkHandle<SubtilePassability>)>,
+}
+
+impl<'a> SubtileWriteCursor<'a> {
+    #[inline]
+    fn new(map: &'a Hypermap<SubtilePassability>) -> Self {
+        Self { map, cached: None }
+    }
+
+    #[inline]
+    fn handle_for(&mut self, coord: ChunkCoord) -> &HypermapChunkHandle<SubtilePassability> {
+        let hit = matches!(&self.cached, Some((c, _)) if *c == coord);
+        if !hit {
+            let handle = self.map.get_or_create_chunk(coord);
+            self.cached = Some((coord, handle));
+        }
+        &self.cached.as_ref().expect("just populated").1
+    }
+
+    #[inline]
+    fn or_flags(&mut self, world_subtile: IVec2, flags: u64) {
+        let (coord, local_tile, row, col) = subtile_addr(world_subtile);
+        let handle = self.handle_for(coord);
+        let mut guard = handle.write().expect("chunk lock poisoned");
+        guard.get_local_mut(local_tile).or_flags(row, col, flags);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -445,18 +548,41 @@ impl CircleShadow {
     }
 }
 
-/// Returns the cached [`CircleShadow`] for a given radius. Built once per
-/// distinct radius; subsequent calls are pure hash-lookups under a `Mutex`.
-fn baked_circle_shadow(radius_subtiles: i32) -> &'static CircleShadow {
-    static CACHE: OnceLock<Mutex<HashMap<i32, &'static CircleShadow>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+/// Largest radius served by the lock-free fast-path table. Actor radii are a
+/// handful of subtiles, so every real lookup lands here; only pathological
+/// radii fall back to the slow, locked path below.
+const SHADOW_FAST_CACHE_LEN: usize = 32;
 
-    let mut guard = cache.lock().expect("passability shadow cache lock poisoned");
-    if let Some(existing) = guard.get(&radius_subtiles) {
-        return existing;
+/// Returns the cached [`CircleShadow`] for a given radius. Built once per
+/// distinct radius, then leaked to `&'static`.
+///
+/// The steady-state hot path is **lock-free**: each radius `< SHADOW_FAST_CACHE_LEN`
+/// has its own [`OnceLock`] slot, so a warm lookup is a single atomic load with
+/// no contention. Multiple actors (including across threads) can bake/read
+/// shadows concurrently — critical for parallelizing `process_actors`, which
+/// otherwise serialized on one global `Mutex` ~7× per actor per frame. Only
+/// oversized radii (rare) take a lock.
+fn baked_circle_shadow(radius_subtiles: i32) -> &'static CircleShadow {
+    let r = radius_subtiles.max(0);
+
+    static FAST: [OnceLock<&'static CircleShadow>; SHADOW_FAST_CACHE_LEN] =
+        [const { OnceLock::new() }; SHADOW_FAST_CACHE_LEN];
+
+    if (r as usize) < SHADOW_FAST_CACHE_LEN {
+        return FAST[r as usize].get_or_init(|| build_circle_shadow(r));
     }
 
-    let r = radius_subtiles.max(0);
+    // Rare oversized-radius path: a lock is acceptable because it is virtually
+    // never hit and never on the per-frame collision hot path.
+    static SLOW: OnceLock<Mutex<HashMap<i32, &'static CircleShadow>>> = OnceLock::new();
+    let cache = SLOW.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().expect("passability shadow cache lock poisoned");
+    *guard.entry(r).or_insert_with(|| build_circle_shadow(r))
+}
+
+/// Builds a filled-circle [`CircleShadow`] of radius `r` (`r >= 0`) and leaks it
+/// to `&'static`. Called at most once per distinct radius.
+fn build_circle_shadow(r: i32) -> &'static CircleShadow {
     let rr = r * r;
     let stride = (2 * r + 1) as usize;
     let bitmap_len = stride * stride;
@@ -474,13 +600,11 @@ fn baked_circle_shadow(radius_subtiles: i32) -> &'static CircleShadow {
 
     let leaked_offsets: &'static [IVec2] = Box::leak(offsets.into_boxed_slice());
     let leaked_bitmap: &'static [bool] = Box::leak(bitmap_vec.into_boxed_slice());
-    let shadow = Box::leak(Box::new(CircleShadow {
+    Box::leak(Box::new(CircleShadow {
         offsets: leaked_offsets,
         radius: r,
         bitmap: leaked_bitmap,
-    }));
-    guard.insert(radius_subtiles, shadow);
-    shadow
+    }))
 }
 
 // ---------------------------------------------------------------------------

@@ -129,6 +129,7 @@ impl GlitchBot {
                 last_accepted_radius_subtiles: GLITCH_RADIUS_SUBTILES,
                 next_waypoint_hint: None,
                 field_main_tile: None,
+                dirtiness: 0.0,
             },
         }
     }

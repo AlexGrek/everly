@@ -81,6 +81,13 @@ where
         self.get_local_floor(local, 0)
     }
 
+    /// Mutable ground-floor (`0`) cell reference for in-place updates without
+    /// cloning the cell value (hot path for subtile footprint stamping).
+    #[inline]
+    pub fn get_local_mut(&mut self, local: LocalCoord) -> &mut T {
+        &mut self.cells[local_floor_to_index(local, 0)]
+    }
+
     /// Writes ground floor (`0`).
     pub fn set_local(&mut self, local: LocalCoord, value: T) {
         self.set_local_floor(local, 0, value);

@@ -161,7 +161,35 @@ The actor pipeline performs **zero heap allocations per actor per frame** on the
 - self-overlap test is an `O(1)` bitmap lookup against the baked `CircleShadow` — no `HashSet` construction;
 - the new footprint is stamped directly into the write buffer as the candidate loop iterates — no `Vec<IVec2>` materialized then re-iterated.
 
-`CircleShadow` instances are baked once per radius (lazy, behind a `Mutex<HashMap>`) and leaked to `&'static`, so every subsequent frame is a pure read.
+`CircleShadow` instances are baked once per radius into a lock-free `OnceLock`
+slot table (indexed by radius) and leaked to `&'static`, so every warm lookup is
+a single atomic load with no contention. Only pathological radii (≥ the table
+length) fall back to a locked map.
+
+### Lock-free, chunk-local collision
+
+The collision core has **no process-global lock on the hot path**:
+
+- Shadow lookups are the lock-free `OnceLock` table above.
+- Footprint reads/writes are *chunk-local*: a compact footprint's subtiles
+  almost always share one hypermap chunk, so a per-call cursor
+  (`SubtileReadCursor` / `SubtileWriteCursor` in `passability.rs`) resolves that
+  chunk — the global chunk-table lock plus `Arc` clone — at most once per
+  distinct chunk instead of once per subtile, and reads each per-tile
+  `SubtilePassability` by reference (no 200-byte clone). The only locks taken are
+  fine-grained per-chunk `RwLock`s, acquired exactly when a cell is touched.
+
+### Parallel actor processing
+
+`process_actors` runs via `par_iter_mut` + `ParallelCommands`. This is correct
+and deterministic because the data model is order-independent within a frame:
+collision reads hit the **read** buffer (immutable for the whole frame, flushed
+once up front), and writes accumulate into the **write** buffer as commutative
+per-chunk `|=` ORs. Each actor mutates only its own state; the sole shared writes
+are those order-independent occupancy ORs and per-entity `OffScreenActor` marker
+changes deferred through `ParallelCommands`. Two actors stepping into the same
+free cell still both succeed for one frame (they read last frame's snapshot) and
+resolve after the next flush — exactly as in the previous sequential loop.
 
 ### Per-actor static passability
 

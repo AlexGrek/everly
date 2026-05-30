@@ -10,6 +10,9 @@ use crate::scene::camera::{
 use crate::edit::actor_spawn::{ActorSpawnToggleButton, ActorSpawnToggleLabel};
 use crate::edit::map_edit::{MapEditToggleButton, MapEditToggleLabel};
 use crate::map::chunk_overlay::OccupancyOverlayEnabled;
+use crate::map::dirt::DirtMap;
+use crate::map::hypermap_world::{HypermapChunkRemeshQueue, HypermapRuntime};
+use crate::map::temperature::TemperatureMap;
 use crate::map::temperature_overlay::TemperatureOverlayEnabled;
 use crate::map::floor_level::{ActiveFloorLevel, HYPERMAP_FLOOR_MAX};
 use crate::hud::panel_anim::PanelAnim;
@@ -53,6 +56,9 @@ struct HeatmapToggleButton;
 #[derive(Component)]
 struct HeatmapToggleLabel;
 
+#[derive(Component)]
+struct RedrawAllButton;
+
 pub struct GameHudPlugin;
 
 impl Plugin for GameHudPlugin {
@@ -76,6 +82,7 @@ impl Plugin for GameHudPlugin {
                 sync_occupancy_toggle_label,
                 heatmap_toggle_button,
                 sync_heatmap_toggle_label,
+                redraw_all_button,
                 floor_level_buttons,
                 update_floor_level_readout,
                 update_button_visuals,
@@ -268,6 +275,32 @@ pub(crate) fn spawn_bottom_hud(mut commands: Commands, camera: Query<Entity, Wit
                     p.spawn((
                         HeatmapToggleLabel,
                         Text::new("Heat: Off"),
+                        TextFont::from_font_size(17.0),
+                        TextColor(TEXT_MAIN),
+                    ));
+                });
+
+            parent
+                .spawn((
+                    Name::new("HUD redraw all"),
+                    RedrawAllButton,
+                    Button,
+                    Node {
+                        min_width: Val::Px(96.0),
+                        height: Val::Px(36.0),
+                        padding: UiRect::horizontal(Val::Px(12.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(1.0)),
+                        border_radius: BorderRadius::all(Val::Px(6.0)),
+                        ..default()
+                    },
+                    BorderColor::all(BTN_BORDER),
+                    BackgroundColor(BTN_BG),
+                ))
+                .with_children(|p| {
+                    p.spawn((
+                        Text::new("Redraw"),
                         TextFont::from_font_size(17.0),
                         TextColor(TEXT_MAIN),
                     ));
@@ -489,6 +522,27 @@ fn sync_heatmap_toggle_label(
     let label = if enabled.0 { "Heat: On" } else { "Heat: Off" };
     for mut text in &mut texts {
         **text = label.to_string();
+    }
+}
+
+/// Forces every visible chunk's field overlay textures (dirt + heat) to repaint
+/// and re-bakes the chunk meshes — a manual recovery for stale or out-of-sync
+/// GPU textures. Marking a chunk dirty makes the overlay update systems repaint
+/// it from current field data on the next frame.
+fn redraw_all_button(
+    interactions: Query<&Interaction, (With<RedrawAllButton>, Changed<Interaction>)>,
+    runtime: Res<HypermapRuntime>,
+    dirt: Res<DirtMap>,
+    temperature: Res<TemperatureMap>,
+    mut remesh: ResMut<HypermapChunkRemeshQueue>,
+) {
+    if !interactions.iter().any(|i| *i == Interaction::Pressed) {
+        return;
+    }
+    for coord in runtime.desired_chunk_coords() {
+        dirt.mark_dirty(coord);
+        temperature.mark_dirty(coord);
+        remesh.0.insert(coord);
     }
 }
 

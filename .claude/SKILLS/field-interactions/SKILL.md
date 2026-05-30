@@ -36,12 +36,18 @@ paths:
 
 ## Dirt (current)
 
-- [`dirt_actor_interaction`](../../src/map/field_interactions.rs): if zero
-  [`MainTileTransition`]s, return immediately (no deposits, no dirty chunks from actors).
-- [`deposit_dirt_on_tile`](../../src/map/field_interactions.rs): skip `CellType::Void`;
-  call [`DirtMap::add_tile_dirt`](../../src/map/dirt.rs) with
-  [`DIRT_TRACK_DEPOSIT`](../../src/map/dirt.rs) (`0.01`) on the **tile** scalar
-  ([`TileFieldMap`](../../src/map/tile_field.rs), not subtile grid).
+- Per-actor [`ActorState::dirtiness`](../../src/actor/mod.rs) (`0.0..=1.0`); actors
+  spawn clean and it is **not** serialized in snapshots.
+- [`dirt_actor_interaction`](../../src/map/field_interactions.rs): iterate actors;
+  per actor, if it crossed main tiles, exchange dirt with the **left** tile. Actors
+  that didn't change tile do no field math, and only the cleaner-floor branch writes
+  the dirt buffer.
+- [`exchange_dirt_with_tile`](../../src/map/field_interactions.rs): skip `CellType::Void`;
+  apply pure [`dirt_exchange`](../../src/map/field_interactions.rs) (rate
+  [`DIRT_TRACK_DEPOSIT`](../../src/map/dirt.rs) = `0.01`): floor cleaner → actor wipes
+  1% onto the tile via [`DirtMap::add_tile_dirt`](../../src/map/dirt.rs) (conserved,
+  capped at `0.0`); floor dirtier → actor picks up 1% *of the floor*, tile unchanged.
+  Writes the **tile** scalar ([`TileFieldMap`](../../src/map/tile_field.rs), not subtile grid).
 - [`flush_dirt_map`](../../src/map/dirt.rs): no-op when
   `write_map().loaded_chunk_count() == 0` (no buffer swap).
 - Overlay: only repaints `take_dirty_chunks()`.

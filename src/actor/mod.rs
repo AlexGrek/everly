@@ -145,6 +145,11 @@ pub struct ActorState {
     /// Last committed main world tile for [`crate::map::field_interactions`].
     /// Updated after movement each frame; not serialized in actor snapshots.
     pub field_main_tile: Option<IVec2>,
+    /// How dirty the actor is, `0.0` (clean) ..= `1.0` (filthy). Exchanged with
+    /// the floor [`crate::map::dirt::DirtMap`] on each main-tile transition (see
+    /// [`crate::map::field_interactions`]). Actors spawn clean and this is not
+    /// serialized in snapshots — a loaded actor starts clean again.
+    pub dirtiness: f32,
 }
 
 /// Nearest world tile to a tile-space [`Vec2`] center (`round`, not `floor`).
@@ -506,36 +511,52 @@ pub(crate) fn process_actors(
     mut actors: Query<(Entity, &mut ActorObject, Option<&OffScreenActor>)>,
     dynamic_passability: Res<DynamicPassabilityMap>,
     hypermap: Res<HypermapRuntime>,
-    mut commands: Commands,
+    par_commands: ParallelCommands,
 ) {
+    // Parallel-safe by construction: collision reads hit the **read** buffer,
+    // which is immutable for the whole frame (flushed once up front), and writes
+    // accumulate into the **write** buffer as commutative per-chunk `|=` ORs. The
+    // result is therefore independent of actor processing order, so `par_iter_mut`
+    // is deterministic. Each actor mutates only its own disjoint state; the only
+    // shared writes are the order-independent occupancy ORs and deferred
+    // `OffScreenActor` marker changes (one per distinct entity) via `ParallelCommands`.
     let static_cache = hypermap.static_subtile_cache.as_ref();
-    for (entity, mut actor_obj, off_screen) in &mut actors {
-        let actor = actor_obj.inner.as_mut();
-        actor.state_mut().last_movement_error = None;
-        actor.think_low_level();
-        actor.prepare_movement();
+    let dynamic_passability = &*dynamic_passability;
+    let hypermap = &*hypermap;
 
-        let center = actor.state().center;
-        let is_rendered =
-            hypermap.is_world_pos_rendered(center.x.floor() as i32, center.y.floor() as i32);
-        let was_off_screen = off_screen.is_some();
+    actors
+        .par_iter_mut()
+        .for_each(|(entity, mut actor_obj, off_screen)| {
+            let actor = actor_obj.inner.as_mut();
+            actor.state_mut().last_movement_error = None;
+            actor.think_low_level();
+            actor.prepare_movement();
 
-        if is_rendered {
-            if was_off_screen {
-                // Transition: off-screen → on-screen. Place actor at valid position, then
-                // normal movement resumes next frame once the marker is removed.
-                commands.entity(entity).remove::<OffScreenActor>();
-                resolve_offscreen_collision(actor, &dynamic_passability, static_cache);
+            let center = actor.state().center;
+            let is_rendered =
+                hypermap.is_world_pos_rendered(center.x.floor() as i32, center.y.floor() as i32);
+            let was_off_screen = off_screen.is_some();
+
+            if is_rendered {
+                if was_off_screen {
+                    // Transition: off-screen → on-screen. Place actor at valid position, then
+                    // normal movement resumes next frame once the marker is removed.
+                    par_commands.command_scope(|mut commands| {
+                        commands.entity(entity).remove::<OffScreenActor>();
+                    });
+                    resolve_offscreen_collision(actor, dynamic_passability, static_cache);
+                } else {
+                    actor.try_move(dynamic_passability, static_cache);
+                }
             } else {
-                actor.try_move(&dynamic_passability, static_cache);
+                if !was_off_screen {
+                    par_commands.command_scope(|mut commands| {
+                        commands.entity(entity).insert(OffScreenActor);
+                    });
+                }
+                actor.advance_unchecked();
             }
-        } else {
-            if !was_off_screen {
-                commands.entity(entity).insert(OffScreenActor);
-            }
-            actor.advance_unchecked();
-        }
-    }
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -599,6 +620,7 @@ mod tests {
                     last_accepted_radius_subtiles: radius_subtiles,
                     next_waypoint_hint: None,
                     field_main_tile: None,
+                    dirtiness: 0.0,
                 },
             }
         }
@@ -631,6 +653,7 @@ mod tests {
                 last_accepted_radius_subtiles: radius_subtiles,
                 next_waypoint_hint: None,
                 field_main_tile: None,
+                dirtiness: 0.0,
             },
         }
     }

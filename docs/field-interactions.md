@@ -28,26 +28,36 @@ flush_actor_occupancy → process_actors → dirt_actor_interaction → seed_dir
 | Step | What happens |
 |------|----------------|
 | `process_actors` | Think, prepare, try_move / advance_unchecked |
-| `dirt_actor_interaction` | Collect main-tile transitions; deposit dirt on left tiles |
+| `dirt_actor_interaction` | Collect main-tile transitions; exchange dirt between each actor and its left tile |
 | `seed_dirt_for_visible_chunks` | One-time procedural dirt (write buffer) |
 | `flush_dirt_map` | **`flush_merge` only if write buffer has chunks** |
 | `update_dirt_overlay_textures` | Repaint only chunks in `take_dirty_chunks()` |
 
 ### Skip work when nothing moved
 
-- **`dirt_actor_interaction`** returns immediately when no actor changed main tile
-  (no field math, no write-buffer dirt updates).
+- **`dirt_actor_interaction`** only touches the dirt write buffer for actors that
+  changed main tile (and only in the cleaner-floor branch); actors that did not
+  move tiles do no field math.
 - **`flush_dirt_map`** skips buffer merge when the write buffer is empty (no actor
   deposits and no seeding this frame).
 - **Overlay** already skips GPU upload when `take_dirty_chunks()` is empty.
 
 ## Dirt rule
 
-On each main-tile transition, add [`DIRT_TRACK_DEPOSIT`](../src/map/dirt.rs) (`0.01`) to
-the **left** tile's scalar dirt value (clamped to `1.0`). Void tiles are skipped.
+Every actor carries its own [`ActorState::dirtiness`](../src/actor/mod.rs) in `0.0..=1.0`
+and **spawns clean** (`0.0`; not serialized, so a loaded actor starts clean again). On
+each main-tile transition the actor **exchanges** dirt with the tile it just **left**
+([`dirt_exchange`](../src/map/field_interactions.rs), rate
+[`DIRT_TRACK_DEPOSIT`](../src/map/dirt.rs) = `0.01` = 1%):
+
+| Floor vs actor | Effect |
+|----------------|--------|
+| Floor **cleaner** than actor | Actor wipes `1%` of its dirtiness onto the tile (capped so it never goes below `0.0`); the tile gains exactly what the actor lost (conserved). |
+| Floor **dirtier** than actor | Actor picks up `1%` *of the floor's* dirtiness (clamped to `1.0`); the tile is unchanged. |
+| Equal, or **Void** tile | No-op. |
 
 Dirt is stored in a **tile-only** [`DoubleBufferedHypermap<f32>`](../src/map/tile_field.rs)
-(one value per world tile), not per subtile.
+(one value per world tile), not per subtile. The actor's dirtiness lives on the actor.
 
 **Persistence:** deposits and procedural seeds stay in memory until the player uses
 map editor **Save**, which writes `levels/level_{name}/dirt.bin` (all loaded dirt chunks).

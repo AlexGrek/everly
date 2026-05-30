@@ -43,6 +43,16 @@ integration, read `.claude/SKILLS/actor-engineer/SKILL.md` first.
 When editing hypermap fields (dirt, actor deposits, field overlays), read
 `.claude/SKILLS/field-interactions/SKILL.md` and `docs/field-interactions.md` first.
 
+**Any performance/optimization task MUST read `OPTIMIZATION.md` first and update
+it after.** It holds the project's optimization rules (lock-free hot paths,
+hypertile-locality, allocation-free steady state, order-independent parallelism)
+and a log of applied optimizations. Before optimizing hot-path, locking, or
+parallelism code, read its rules; after landing an optimization, append an entry
+to its "Applied optimizations" section with file references. This is
+non-negotiable — do not optimize without reading **and** updating `OPTIMIZATION.md`.
+The `/optimize` skill (`.claude/SKILLS/optimize/`) automates this loop: read the
+rules, find blockers, fix the major ones, ask about minor ones, log each change.
+
 ## Repository layout
 
 ```
@@ -51,6 +61,7 @@ everly/
 ├── .cargo/config.toml    # safe defaults + commented lld blocks
 ├── README.md             # user-facing docs (run, controls, license)
 ├── CLAUDE.md             # this file
+├── OPTIMIZATION.md       # perf rules + applied-optimizations log (read+update for any perf work)
 ├── world_map.txt         # startup map input (2 chars per cell)
 ├── scripts/              # e.g. generate_world_map.py → regen world_map.txt
 ├── docs/
