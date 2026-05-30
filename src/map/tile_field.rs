@@ -62,6 +62,7 @@ impl TileFieldMap {
 
     pub fn set_tile(&self, world_x: i32, world_y: i32, value: f32) {
         let (coord, _) = world_to_chunk_local(world_x, world_y);
+        self.cow_write_chunk(coord);
         let v = self.clamp_value(value);
         self.inner.set(world_x, world_y, v);
         self.mark_dirty(coord);
@@ -69,10 +70,32 @@ impl TileFieldMap {
 
     pub fn add_tile(&self, world_x: i32, world_y: i32, delta: f32) {
         let (coord, _) = world_to_chunk_local(world_x, world_y);
+        self.cow_write_chunk(coord);
         self.inner.update(world_x, world_y, |v| {
             *v = self.clamp_value(*v + delta);
         });
         self.mark_dirty(coord);
+    }
+
+    /// Copy-on-write: if the write chunk for `coord` hasn't been touched this frame,
+    /// seed it from the read chunk so that `flush_merge` doesn't overwrite unmodified
+    /// tiles with the write buffer's default (0.0).
+    fn cow_write_chunk(&self, coord: ChunkCoord) {
+        if self.inner.write_map().has_chunk(coord) {
+            return;
+        }
+        let Some(read_handle) = self.inner.read_map().get_chunk(coord) else {
+            return;
+        };
+        let read_guard = read_handle.read().expect("chunk lock poisoned");
+        self.inner.write_map().with_chunk_write(coord, |write_chunk| {
+            for y in 0..HYPERMAP_CHUNK_SIZE {
+                for x in 0..HYPERMAP_CHUNK_SIZE {
+                    let local = LocalCoord::new(x, y);
+                    write_chunk.set_local(local, *read_guard.get_local(local));
+                }
+            }
+        });
     }
 
     pub fn mark_dirty(&self, coord: ChunkCoord) {
