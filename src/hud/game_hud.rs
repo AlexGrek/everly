@@ -1,8 +1,10 @@
 //! Bottom-screen HUD: semi-transparent controls wired to gameplay.
 
+use bevy::picking::prelude::Pickable;
 use bevy::prelude::*;
 use bevy::ui::widget::Button;
 
+use crate::actor::Paused;
 use crate::scene::camera::{
     spawn_camera, AmbientFillEnabled, StrategyCamera, StrategyCameraRig,
     StrategyCameraViewMode, STRATEGY_CAMERA_DEFAULT_PITCH, STRATEGY_CAMERA_MAP_PITCH,
@@ -59,6 +61,15 @@ struct HeatmapToggleLabel;
 #[derive(Component)]
 struct RedrawAllButton;
 
+#[derive(Component)]
+struct PauseButton;
+
+#[derive(Component)]
+struct PauseButtonLabel;
+
+#[derive(Component)]
+struct PausedBanner;
+
 pub struct GameHudPlugin;
 
 impl Plugin for GameHudPlugin {
@@ -69,7 +80,10 @@ impl Plugin for GameHudPlugin {
         // the HUD's `Query<&StrategyCameraRig>::single()` returns `Err`.
         app.add_systems(
             OnEnter(GameState::InGame),
-            spawn_bottom_hud.after(spawn_camera),
+            (
+                spawn_bottom_hud.after(spawn_camera),
+                spawn_paused_banner.after(spawn_camera),
+            ),
         )
         .add_systems(
             Update,
@@ -86,6 +100,8 @@ impl Plugin for GameHudPlugin {
                 floor_level_buttons,
                 update_floor_level_readout,
                 update_button_visuals,
+                pause_button_click,
+                sync_pause_ui,
             )
                 .run_if(in_state(GameState::InGame)),
         );
@@ -301,6 +317,33 @@ pub(crate) fn spawn_bottom_hud(mut commands: Commands, camera: Query<Entity, Wit
                 .with_children(|p| {
                     p.spawn((
                         Text::new("Redraw"),
+                        TextFont::from_font_size(17.0),
+                        TextColor(TEXT_MAIN),
+                    ));
+                });
+
+            parent
+                .spawn((
+                    Name::new("HUD pause"),
+                    PauseButton,
+                    Button,
+                    Node {
+                        min_width: Val::Px(88.0),
+                        height: Val::Px(36.0),
+                        padding: UiRect::horizontal(Val::Px(12.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(1.0)),
+                        border_radius: BorderRadius::all(Val::Px(6.0)),
+                        ..default()
+                    },
+                    BorderColor::all(BTN_BORDER),
+                    BackgroundColor(BTN_BG),
+                ))
+                .with_children(|p| {
+                    p.spawn((
+                        PauseButtonLabel,
+                        Text::new("Pause"),
                         TextFont::from_font_size(17.0),
                         TextColor(TEXT_MAIN),
                     ));
@@ -567,5 +610,80 @@ fn update_button_visuals(
                 *border = BorderColor::all(BTN_BORDER);
             }
         }
+    }
+}
+
+fn spawn_paused_banner(mut commands: Commands, camera: Query<Entity, With<StrategyCameraRig>>) {
+    let Ok(cam) = camera.single() else {
+        return;
+    };
+
+    const BANNER_BG: Color = Color::srgba(0.10, 0.08, 0.03, 0.90);
+    const BANNER_BORDER: Color = Color::srgba(0.95, 0.75, 0.20, 0.60);
+    const BANNER_TEXT: Color = Color::srgb(0.98, 0.85, 0.30);
+
+    commands
+        .spawn((
+            Name::new("Paused banner"),
+            PausedBanner,
+            UiTargetCamera(cam),
+            Pickable::IGNORE,
+            Visibility::Hidden,
+            Node {
+                position_type: PositionType::Absolute,
+                width: Val::Percent(100.0),
+                top: Val::Px(18.0),
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            ZIndex(2000),
+        ))
+        .with_children(|root| {
+            root.spawn((
+                Node {
+                    padding: UiRect::axes(Val::Px(28.0), Val::Px(7.0)),
+                    border: UiRect::all(Val::Px(1.0)),
+                    border_radius: BorderRadius::all(Val::Px(10.0)),
+                    ..default()
+                },
+                BackgroundColor(BANNER_BG),
+                BorderColor::all(BANNER_BORDER),
+            ))
+            .with_children(|pill| {
+                pill.spawn((
+                    Text::new("|| PAUSED"),
+                    TextFont::from_font_size(16.0),
+                    TextColor(BANNER_TEXT),
+                ));
+            });
+        });
+}
+
+fn pause_button_click(
+    interactions: Query<&Interaction, (With<PauseButton>, Changed<Interaction>)>,
+    mut paused: ResMut<Paused>,
+) {
+    for interaction in &interactions {
+        if *interaction == Interaction::Pressed {
+            paused.0 = !paused.0;
+        }
+    }
+}
+
+fn sync_pause_ui(
+    paused: Res<Paused>,
+    mut banner: Query<&mut Visibility, With<PausedBanner>>,
+    mut labels: Query<&mut Text, With<PauseButtonLabel>>,
+) {
+    if !paused.is_changed() {
+        return;
+    }
+    let is_paused = paused.0;
+    for mut vis in &mut banner {
+        *vis = if is_paused { Visibility::Inherited } else { Visibility::Hidden };
+    }
+    let label = if is_paused { "Resume" } else { "Pause" };
+    for mut text in &mut labels {
+        **text = label.to_string();
     }
 }

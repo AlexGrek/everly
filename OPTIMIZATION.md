@@ -112,3 +112,21 @@ Net effect: the collision hot path holds **no process-global lock** — only
 fine-grained per-chunk locks taken exactly when a cell is touched — and the actor
 loop scales across cores. Verified: `cargo test` full suite green, `cargo check`
 warning-clean, semantics byte-identical.
+
+### BlackBot steering — single sqrt in `approach_velocity` (2026-05)
+
+Audited the new mass/inertia movement code in
+[`src/actor/black_bot.rs`](src/actor/black_bot.rs) (`black_bot_think`,
+`drive_velocity`, `approach_velocity`, reroute shuffle). The steady-state
+moving path was already allocation-free and lock-free — `passability` is
+resolved once before the loop, the reroute `candidates` is a stack `[Vec2; 3]`,
+and A\*/`world_tile_walkable` only fire on cold repath/reroute branches; the
+`*_think` system stays intentionally sequential for per-bot RNG determinism.
+
+One micro-fix (rule 8): [`approach_velocity`](src/actor/black_bot.rs) computed
+two square roots per moving bot per frame — `dv.length()` for the threshold
+then `dv.normalize()` recomputing it. Now computes `len = dv.length()` once and
+steers via `velocity + dv * (max_step / len)` (algebraically identical to
+`dv.normalize() * max_step`). Behavior pinned by the `approach_velocity_*` unit
+tests (ramp / snap / decel). Small constant win on per-bot-per-frame math; no
+semantic change.

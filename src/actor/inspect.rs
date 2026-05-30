@@ -88,6 +88,21 @@ pub fn status_rows(
     rows
 }
 
+/// Route-tab rows: pathfinding state for BlackBot.
+pub fn route_rows(vis: &BlackBotVisual) -> Vec<InspectRow> {
+    let target = vis
+        .target_tile()
+        .map(|(x, y)| format!("({x}, {y})"))
+        .unwrap_or_else(|| "—".to_string());
+    let vel = vis.velocity();
+    vec![
+        InspectRow { label: "target", value: target },
+        InspectRow { label: "waypoints_left", value: vis.remaining_waypoints().to_string() },
+        InspectRow { label: "velocity", value: format!("({:.3}, {:.3})", vel.x, vel.y) },
+        InspectRow { label: "stuck_timer", value: format!("{:.2}s", vis.stuck_timer()) },
+    ]
+}
+
 /// Systems-tab rows: wear and breakage status for each sub-component.
 pub fn systems_rows(b: &Breakable) -> Vec<InspectRow> {
     vec![

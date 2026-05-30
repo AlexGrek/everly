@@ -9,7 +9,7 @@ use crate::actor::black_bot::{Breakable, BlackBotVisual};
 use crate::actor::charge::Charge;
 use crate::actor::glitch_bot::GlitchBotVisual;
 use crate::map::hypermap_world::HypermapRuntime;
-use crate::actor::inspect::{display_actor_name, status_rows, systems_rows};
+use crate::actor::inspect::{display_actor_name, route_rows, status_rows, systems_rows};
 use crate::actor::ActorObject;
 use crate::edit::actor_spawn::{ActorSpawnState, ActorTool};
 use crate::menu::main_menu::GameState;
@@ -38,6 +38,7 @@ pub enum InspectorTab {
     #[default]
     Status,
     Systems,
+    Route,
 }
 
 #[derive(Resource, Default)]
@@ -296,8 +297,8 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                         ActorInspectorCard,
                         Pickable::default(),
                         Node {
-                            width: Val::Px(400.0),
-                            max_height: Val::Percent(72.0),
+                            width: Val::Px(520.0),
+                            max_height: Val::Percent(80.0),
                             flex_direction: FlexDirection::Column,
                             padding: UiRect::all(Val::Px(20.0)),
                             row_gap: Val::Px(14.0),
@@ -389,6 +390,7 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                         .with_children(|tabs| {
                             spawn_tab_button(tabs, "Status", InspectorTab::Status, true);
                             spawn_tab_button(tabs, "Systems", InspectorTab::Systems, false);
+                            spawn_tab_button(tabs, "Route", InspectorTab::Route, false);
                         });
 
                         // Actions host (Reset, Delete — always visible).
@@ -785,13 +787,14 @@ fn sync_actor_inspector_modal(
         rows = match *tab {
             InspectorTab::Status => status_rows(obj, charge, Some(vis), None),
             InspectorTab::Systems => breakable.map(|b| systems_rows(b)).unwrap_or_default(),
+            InspectorTab::Route => route_rows(vis),
         };
     } else if let Ok(vis) = glitch.get(actor) {
         kind_label = "GlitchBot";
         let Ok((obj, _)) = actor_data.get(actor) else { return };
         rows = match *tab {
             InspectorTab::Status => status_rows(obj, charge, None, Some(vis)),
-            InspectorTab::Systems => Vec::new(),
+            InspectorTab::Systems | InspectorTab::Route => Vec::new(),
         };
     } else {
         return;

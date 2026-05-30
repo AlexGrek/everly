@@ -276,6 +276,22 @@ impl BlackBotVisual {
         self.has_target
     }
 
+    pub fn path_len(&self) -> usize {
+        self.path.len()
+    }
+
+    pub fn remaining_waypoints(&self) -> usize {
+        self.path.len().saturating_sub(self.path_index)
+    }
+
+    pub fn velocity(&self) -> Vec2 {
+        self.velocity
+    }
+
+    pub fn stuck_timer(&self) -> f32 {
+        self.stuck_timer
+    }
+
     pub fn movement_state_label(&self) -> String {
         match self.movement_state {
             MovementState::Moving => "Moving".to_string(),
@@ -592,10 +608,13 @@ fn float_subtile(pos: Vec2) -> IVec2 {
 fn approach_velocity(velocity: Vec2, desired: Vec2, rate: f32, dt: f32) -> Vec2 {
     let dv = desired - velocity;
     let max_step = rate * dt;
-    if dv.length() <= max_step {
+    let len = dv.length();
+    if len <= max_step {
         desired
     } else {
-        velocity + dv.normalize() * max_step
+        // `dv.normalize() * max_step` == `dv * (max_step / len)`; reuse the
+        // single `len` instead of letting `normalize` recompute the sqrt.
+        velocity + dv * (max_step / len)
     }
 }
 
