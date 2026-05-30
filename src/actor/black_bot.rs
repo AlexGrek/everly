@@ -70,6 +70,15 @@ const BOT_COLLISION_WAIT_CHANCE: f32 = 0.25;
 /// How long the `Waiting` movement state lasts before the bot resumes path
 /// following.
 const BOT_COLLISION_WAIT_S: f32 = 1.0;
+/// Seconds without measurable progress toward the current waypoint after which
+/// the bot abandons its route and re-paths. A bot whose footprint is a full
+/// tile wide can wedge where the straight approach to a waypoint is
+/// unreachable; static (wall) blocks have no other recovery, so this is the
+/// safety net that prevents a permanent freeze.
+const STUCK_REPATH_SECS: f32 = 2.0;
+/// Minimum reduction (in tiles) of the closest-approach distance to the current
+/// waypoint that counts as progress and resets the stuck timer.
+const STUCK_PROGRESS_EPSILON: f32 = 0.05;
 
 /// High-level movement mode. Distinct from low-level [`ActorState`] — this is
 /// the bot's intent ("moving" vs "pausing on contact"), not the per-frame

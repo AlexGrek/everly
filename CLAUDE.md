@@ -10,9 +10,11 @@ the task is a one-line fix with no behavioral surface.
 ## Project
 
 **Everly** — a 3D strategy-camera sandbox built with the
-[Bevy Engine](https://bevy.org) v0.18 in Rust. Currently a starter
-scene: tilted overhead camera, camera ambient fill, ground plane, and a
-handful of randomly scattered colored boxes.
+[Bevy Engine](https://bevy.org) v0.18 in Rust. A chunked hypermap
+world with procedurally generated buildings, a strategy camera, actors
+(GlitchBot / BlackBot) with subtile collision and battery charge, a
+live tile editor, level persistence, and scalar tile fields (dirt,
+temperature).
 
 ## Tech stack
 
@@ -20,7 +22,10 @@ handful of randomly scattered colored boxes.
 - **Engine:** `bevy = "0.18.1"` with default features. Do not pin to an
   older version or hand-pick low-level sub-crate features — prefer
   Bevy's high-level feature bundles.
-- **Other deps:** `rand = "0.8"` (uses `gen_range`, not the 0.9 API).
+- **Other deps:** `rand = "0.8"` (uses `gen_range`, not the 0.9 API),
+  `bevy_water = "0.18.1"`, `pathfinding = "4.15"` (A\*),
+  `names = "0.14"` (actor name gen), `serde + serde_yaml = "0.9"`
+  (level persistence), `futures-lite = "2.6.1"` (async task helpers).
 
 Always read `.claude/SKILLS/bevy-engineer/SKILL.md` before touching
 Rust, `Cargo.toml`, or `*.wgsl` files. It is the source of truth for
@@ -57,19 +62,14 @@ rules, find blockers, fix the major ones, ask about minor ones, log each change.
 
 ```
 everly/
-├── Cargo.toml            # bevy + rand, dev profile tuned for Bevy
+├── Cargo.toml            # bevy + deps, dev profile tuned for Bevy
 ├── .cargo/config.toml    # safe defaults + commented lld blocks
 ├── README.md             # user-facing docs (run, controls, license)
 ├── CLAUDE.md             # this file
 ├── OPTIMIZATION.md       # perf rules + applied-optimizations log (read+update for any perf work)
 ├── world_map.txt         # startup map input (2 chars per cell)
 ├── scripts/              # e.g. generate_world_map.py → regen world_map.txt
-├── docs/
-│   ├── README.md         # index of behavior docs
-│   ├── tilemap.md        # encoding + world units (1 m cells, walls, storeys)
-│   ├── hypermap.md       # chunks, multi-floor, visibility, water
-│   ├── rendering-pipeline.md  # batched meshes, floor vs wall layers
-│   └── map-editor.md     # in-game tile paint + chunk remesh
+├── docs/                 # behavior docs — read before touching related code
 ├── .claude/SKILLS/       # repo-local skills (read these first)
 │   ├── bevy-engineer/
 │   ├── map-creator/
@@ -78,23 +78,43 @@ everly/
 └── src/
     ├── main.rs                   # window setup + DefaultPlugins + GamePlugin
     ├── lib.rs                    # GamePlugin wires every subsystem
-    ├── scene/                    # how the world is presented
+    ├── scene/                    # world presentation
     │   ├── camera.rs             #   StrategyCameraPlugin (RTS cam + post-fx stack)
+    │   ├── camera_snapshot.rs    #   CameraSnapshotPlugin (save/load camera.yaml)
     │   └── sun.rs                #   SunPlugin (directional light)
     ├── hud/                      # 2D UI overlay
-    │   └── game_hud.rs           #   GameHudPlugin (bottom bar, floor selector, edit toggle)
+    │   ├── game_hud.rs           #   GameHudPlugin (bottom bar, floor selector, edit/actors toggles)
+    │   ├── actor_inspector.rs    #   ActorInspectorPlugin (click-to-inspect modal)
+    │   └── panel_anim.rs         #   PanelAnim (slide-in/out helper)
     ├── menu/                     # pre-gameplay screens (run only in MainMenu state)
     │   └── main_menu.rs          #   MainMenuPlugin + GameState (MainMenu / InGame), level picker
+    ├── actor/                    # actor runtime + bot types
+    │   ├── mod.rs                #   ActorPlugin, Actor trait, ActorState, process_actors
+    │   ├── glitch_bot.rs         #   GlitchBot (wander + void-traversal)
+    │   ├── black_bot.rs          #   BlackBot (A*-based path follower)
+    │   ├── charge.rs             #   ChargePlugin (battery discharge, depletion gate)
+    │   ├── snapshot.rs           #   ActorSnapshotPlugin (actors.yaml save/load)
+    │   └── inspect.rs            #   collect_inspect_rows (inspector row builders)
     ├── map/                      # world data + rendering + pathfinding
     │   ├── hypermap.rs           #   chunked, concurrent tile store
     │   ├── floor_level.rs        #   ActiveFloorLevel + storey-height constants
-    │   ├── world_map.rs          #   `.txt` parser, CellType, wall masks
+    │   ├── world_map.rs          #   `.txt` parser, CellType, wall masks, TileStyle
     │   ├── level.rs              #   LevelPlugin + level save/load (`docs/level-persistence.md`)
     │   ├── hypermap_world.rs     #   HypermapWorldPlugin (chunk meshing + water)
-    │   └── hypermap_pathfind.rs  #   A* over hypermap floors
+    │   ├── hypermap_pathfind.rs  #   A* over hypermap floors
+    │   ├── passability.rs        #   DynamicPassabilityMap (double-buffered subtile grid)
+    │   ├── dirt.rs               #   DirtMapPlugin + DirtMap
+    │   ├── temperature.rs        #   TemperatureMapPlugin + TemperatureMap
+    │   ├── chunk_overlay.rs      #   ChunkOverlayPlugin (occupancy F4, generic RGBA planes)
+    │   ├── field_interactions.rs #   dirt_actor_interaction + main-tile tracking
+    │   ├── interactive_entity.rs #   InteractiveEntityMap (sparse charger store)
+    │   ├── tile_field.rs         #   DoubleBufferedHypermap<f32> shared impl
+    │   ├── tile_field_level.rs   #   dirt/temperature binary save/load (EVTF)
+    │   ├── test_world.rs         #   TestWorld fixture (6×6 chunks, test-only)
+    │   └── map_generator/        #   procedural chunk geometry
     └── edit/                     # in-game editing tools
-        ├── map_edit.rs           #   MapEditPlugin (HUD palette, paint, remesh queue)
-        ├── actor_spawn.rs        #   ActorSpawnPlugin (Actors palette, click-to-spawn bots)
+        ├── map_edit.rs           #   MapEditPlugin (HUD palette, paint, fill, remesh queue)
+        ├── actor_spawn.rs        #   ActorSpawnPlugin (Actors palette, spawn + kill bots)
         └── map_selection.rs      #   MapSelectionPlugin (click-to-select + highlight)
 ```
 
@@ -116,15 +136,15 @@ everly/
   configuration and nothing else. All gameplay wiring goes through
   `GamePlugin`.
 - **ECS first.** Data lives in `Component`s, behavior lives in
-  systems. Avoid god structs. Markers (e.g. `Ground`,
-  `ScatterBox`, `StrategyCamera`) are how systems find their entities.
+  systems. Avoid god structs. Markers (e.g. `StrategyCamera`,
+  `ActorInspectable`) are how systems find their entities.
 - **Public surface area is minimal.** Plugins are public; internal
-  systems and helpers stay `fn` (private). Constants like
-  `ground::GROUND_SIZE` are `pub` only when another module needs them.
+  systems and helpers stay `fn` (private). Constants are `pub` only
+  when another module needs them.
 - **Names matter.** Every spawned entity gets a `Name::new(...)` so
   the world is readable in inspector tooling.
-- **Determinism by default.** Anything random (e.g. `boxes.rs`) uses a
-  seeded `StdRng`, never `thread_rng`, so scenes are reproducible.
+- **Determinism by default.** Anything random uses a seeded `StdRng`,
+  never `thread_rng`, so scenes are reproducible.
 
 ## Bevy 0.18 specifics worth remembering
 

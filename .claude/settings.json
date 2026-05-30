@@ -11,7 +11,8 @@
       "Bash(awk *)",
       "Bash(grep *)",
       "Edit(/.claude/skills/field-interactions/**)",
-      "Edit(/.claude/skills/optimize/**)"
+      "Edit(/.claude/skills/optimize/**)",
+      "Bash(xargs -n1 basename)"
     ],
     "additionalDirectories": [
       "/tmp"

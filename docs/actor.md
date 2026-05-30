@@ -49,7 +49,9 @@ This means movement for frame `N` writes occupancy into passability write buffer
 - `last_movement_error: Option<ActorMovementError>` — cleared every low-level step.
 - `last_accepted_center_subtile: Option<IVec2>` — integer subtile center of the last accepted occupancy update; `None` for a brand-new actor.
 - `last_accepted_radius_subtiles: i32` — radius (in subtiles) of that last accepted footprint; tracked separately from `radius_subtiles` so an actor that resizes still re-stamps the correct old circle on rejection.
+- `next_waypoint_hint: Option<Vec2>` — destination hint set each frame by the actor's think system (e.g. current path waypoint). When an off-screen actor re-enters a rendered chunk and its footprint overlaps static geometry, `resolve_offscreen_collision` tries this tile before falling back to a ring search. May be `None` for actors that don't pathfind.
 - `field_main_tile: Option<IVec2>` — last observed **main tile** for hypermap field coupling (dirt, etc.); see [Main tile](#main-tile) and `docs/field-interactions.md`.
+- `dirtiness: f32` — actor's own dirt level `0.0..=1.0`; exchanged with the floor `DirtMap` on each main-tile transition (see `docs/field-interactions.md`). Actors spawn clean (`0.0`) and this is **not** serialized in snapshots — a loaded actor starts clean again.
 
 > **Previous-footprint encoding.** The previous frame's occupied cells are described compactly by the `(last_accepted_center_subtile, last_accepted_radius_subtiles)` pair and the baked `CircleShadow` for that radius — *not* by storing a `Vec<IVec2>`. This keeps the per-actor hot path allocation-free; self-overlap is an `O(1)` bitmap test against the previous shadow.
 
@@ -256,6 +258,9 @@ impl Walker {
                 last_movement_error: None,
                 last_accepted_center_subtile: None,
                 last_accepted_radius_subtiles: radius_subtiles,
+                next_waypoint_hint: None,
+                field_main_tile: None,
+                dirtiness: 0.0,
             },
             direction: Vec2::new(1.0, 0.0),
             accumulator: Vec2::ZERO,
@@ -349,6 +354,9 @@ Use this when introducing a new actor class:
   - [ ] `last_movement_error: None`
   - [ ] `last_accepted_center_subtile: None`
   - [ ] `last_accepted_radius_subtiles: <same as radius_subtiles>`
+  - [ ] `next_waypoint_hint: None` (set each frame in think if the actor pathfinds)
+  - [ ] `field_main_tile: None`
+  - [ ] `dirtiness: 0.0`
 - [ ] Implement `Actor`:
   - [ ] `state()` and `state_mut()`
   - [ ] `think_low_level()` if needed

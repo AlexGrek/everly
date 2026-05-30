@@ -2,6 +2,7 @@
 
 Current behavior docs:
 
+- `docs/main-menu.md` — main menu, `GameState`, level discovery, loading, and new-level creation.
 - `docs/tilemap.md` — tilemap file format, **world units** (1 m cells, wall thickness/height, storey spacing), wall bitmask → **world XZ** placement, and center-chunk overlay behavior.
 - `docs/hypermap.md` — Hypermap chunk model, multi-floor data, generation, visibility, and water rules.
 - `docs/rendering-pipeline.md` — runtime planning, async prep, 30 FPS render stream, floor vs wall meshes.

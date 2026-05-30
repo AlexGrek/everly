@@ -10,8 +10,8 @@ wired from `GamePlugin` in `src/lib.rs`. It is **independent** from the tile
 1. Press **Actors** in the bottom HUD (next to **Edit**). The label toggles between
    `Actors` and `Actors *`.
 2. A **palette strip** appears above the map-edit palette (window bottom `92 px`,
-   `40 px` tall): **Bot** (GlitchBot) and **Black** (BlackBot).
-3. Press **Actors** again to close the palette. Closing also clears the active brush.
+   `40 px` tall): **Bot** (GlitchBot), **Black** (BlackBot), and **Kill**.
+3. Press **Actors** again to close the palette. Closing also clears the active tool.
 
 HUD wiring for the toggle lives in `src/hud/game_hud.rs` (`ActorSpawnToggleButton` /
 `ActorSpawnToggleLabel`); the palette root is spawned by `spawn_actor_spawn_palette`
@@ -19,7 +19,8 @@ HUD wiring for the toggle lives in `src/hud/game_hud.rs` (`ActorSpawnToggleButto
 
 ## Spawn workflow
 
-1. With the palette open, click **Bot** or **Black**. `ActorSpawnState.placement` is set.
+1. With the palette open, click **Bot** or **Black**. `ActorSpawnState.tool` is set to
+   `ActorTool::Spawn(kind)`.
 2. Move the mouse over the world. A **semi-transparent lime** preview plane (shared
    `MapEditPreviewMaterial`) marks the target cell center on the **active floor**
    (`ActiveFloorLevel`, plane height `floor * HYPERMAP_FLOOR_HEIGHT`).
@@ -27,18 +28,26 @@ HUD wiring for the toggle lives in `src/hud/game_hud.rs` (`ActorSpawnToggleButto
    (`tile + 0.5`). The spawn goes through `glitch_bot::spawn_glitch_bot` /
    `black_bot::spawn_black_bot` and consumes the actor's seeded RNG resource
    (`GlitchBotRng` / `BlackBotRng`), so placements stay reproducible per seed.
-4. **Right-click** to leave placement mode (brush cleared) without closing the palette.
+4. **Right-click** to leave placement mode (tool cleared) without closing the palette.
 
-There is no drag — each click drops one actor. Clicks in the **bottom `140 px`** of the
+There is no drag — each click drops one actor. Clicks in the **bottom `120 px`** of the
 window (HUD bar + both palettes) are ignored (`ACTOR_DEAD_ZONE_PX`) so palette/HUD
 buttons never spawn actors underneath.
 
+## Kill workflow
+
+1. With the palette open, click **Kill**. `ActorSpawnState.tool` is set to
+   `ActorTool::Kill`. No preview plane is shown.
+2. **Left-click** any bot entity in the world to despawn it immediately. The dynamic
+   occupancy footprint clears automatically on the next flush.
+3. **Right-click** to disarm Kill mode without closing the palette.
+
 ## Mutual exclusion with the tile brush
 
-The actor brush and the map-editor tile brush are mutually exclusive: picking an actor
-clears `MapEditState.placement_tile`, and picking a tile clears
-`ActorSpawnState.placement`. This guarantees a single click never both paints a tile and
-spawns an actor. The two palettes can be open at the same time, stacked vertically.
+The actor tool and the map-editor tile brush are mutually exclusive: picking an actor
+tool clears `MapEditState.placement_tile`, and picking a tile clears
+`ActorSpawnState.tool`. This guarantees a single click never both paints a tile and
+spawns/kills an actor. The two palettes can be open at the same time, stacked vertically.
 
 ## Persistence
 
@@ -51,9 +60,11 @@ Re-gen in the map editor despawns actors on the regenerated chunk.
 
 | Piece | Role |
 |-------|------|
-| `ActorSpawnState` | `panel_open`, `placement: Option<ActorKind>` |
+| `ActorSpawnState` | `panel_open`, `tool: Option<ActorTool>` |
+| `ActorTool` | `Spawn(ActorKind)` / `Kill` |
 | `ActorKind` | `GlitchBot` / `BlackBot` |
-| `actor_spawn_pointer_click` | Spawns the chosen actor on left-mouse-up |
+| `actor_spawn_pointer_click` | Spawns the chosen actor on left-mouse-up (spawn mode only) |
+| `on_actor_pointer_click` (`actor_inspector.rs`) | Despawns the clicked bot when Kill mode is armed |
 | `actor_spawn_plane_cell` | Cursor → active-floor tile (reuses `ray_intersect_horizontal_plane`) |
 
 For the actor runtime itself (trait, movement, collision), see [`actor.md`](actor.md).

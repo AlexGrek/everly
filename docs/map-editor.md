@@ -26,6 +26,7 @@ Stroke rules (world grid `(x, z)`):
 - **Room:** same drag as void/road, but only the **rectangle border** is written. Each border cell gets a [`WallMask`](tilemap.md) on the **outer** sides of the selection (`perimeter_wall_mask` in `map_edit.rs`), consistent with the world-space rules in `tilemap.md` § Wall bitmask. The interior is left unchanged.
 - **Corner:** single pillar at the **mouse-up** cell (variant still from the wheel).
 - **Charger:** single walkable charging station at the **mouse-up** cell — an elevated metal pad plus a glowing-blue cube on the backing wall (variant = facing, from the wheel). See [`tilemap.md`](tilemap.md) § Charging station.
+- **Fill:** flood-fill bucket. Clicks a single cell; the fill spreads outward through connected non-wall tiles using door-gap bridging (openings ≤ 2 tiles wide are treated as virtual walls, so the fill stays inside a room). The active **floor style** is painted on every reachable floor tile and every bordering wall/corner tile. The fill is cancelled if the region or its boundary exceeds `FILL_CELL_LIMIT` (50 × 50 tiles). No variant; the wheel does not apply.
 
 Releasing over the HUD dead zone or with no valid ray cancels the stroke (nothing written). The preview entity does not modify picking or existing meshes until mouse up.
 
@@ -34,9 +35,10 @@ Releasing over the HUD dead zone or with no valid ray cancels the stroke (nothin
 | Palette type | Wheel behavior |
 |--------------|----------------|
 | **Wall** | Cycles bitmask **1 … 15** (same numeric masks as hex `w1`…`wF` in [`tilemap.md`](tilemap.md)). Order is variant index modulo 15, mapped to `bits = (index % 15) + 1`. |
+| **WallG** | Same as **Wall** — cycles bitmask 1 … 15. |
 | **Corner** | Cycles pillar corners **NW → NE → SW → SE** (same semantics as `c7` / `c9` / `c1` / `c3`). |
 | **Charger** | Cycles facing **N → E → S → W** (which wall the cube backs onto; `cn` / `ce` / `cs` / `cw`). |
-| **Void**, **Road**, **Room** | No variants. The wheel does **not** reserve placement input for these types. |
+| **Void**, **Road**, **Room**, **Fill** | No variants. The wheel does **not** reserve placement input for these types. |
 
 While placing **Wall**, **Corner**, or **Charger**, the **strategy camera zoom** is disabled so the wheel only changes the variant (`zoom_camera` in `src/scene/camera.rs` checks `MapEditState`). With **Void**, **Road**, or **Room** selected, zoom behaves normally.
 

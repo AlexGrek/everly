@@ -157,7 +157,8 @@ Applies to the horizontal floor quad rendered under **every** cell type (road an
 
 | Token | Meaning |
 |-------|---------|
-| `..`  | Default road — dark asphalt |
+| `..`  | Default (same as `fr`) |
+| `fr`  | Floor **Road** — default dark asphalt |
 | `fg`  | Floor **Glass** — reflective dark glass |
 | `fp`  | Floor **Pavement** — grey |
 | `fm`  | Floor **Marble** — white, reflective |
@@ -189,12 +190,14 @@ Applies per brush:
 | WallG | yes | fixed `wg` |
 | Room  | yes | yes |
 | Corner | yes | yes |
+| Fill  | yes | — |
 | Charger | — | — |
 | Road  | yes | — |
 | Others | — | — |
 
 Scroll-wheel on the Wall / WallG / Corner brush cycles the wall mask (1–15 bits);
 on the **Charger** brush it cycles the facing (N → E → S → W).
+**Fill**, **Void**, **Road**, and **Room** have no variants — the wheel zooms normally with those brushes active.
 
 ## Parse Errors
 

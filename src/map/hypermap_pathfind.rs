@@ -12,7 +12,8 @@
 //!
 //! [`simplify_path_line_of_sight`] runs a greedy string-pulling pass over the
 //! returned tile path: interior tiles whose neighbours have line-of-sight (the
-//! Bresenham line between them passes only through walkable tiles) are
+//! Bresenham line between them passes only through walkable tiles, and never
+//! squeezes diagonally between two wall corners) are
 //! discarded. The result is a sparse waypoint list where intermediate nodes
 //! exist only where the path must bend around an obstacle. A final pass keeps
 //! the straight approach/exit tiles on either side of every one-tile doorway so
@@ -235,6 +236,12 @@ pub fn astar_shortest_world_path(
 /// Walks the integer Bresenham line from `a` to `b` and returns true iff every
 /// tile on that line (including both endpoints) is walkable per `map`.
 ///
+/// Diagonal steps additionally require both orthogonal "shoulder" tiles to be
+/// walkable: a line that slips between two diagonally-touching wall cells is
+/// **not** line-of-sight, because a follower with real width clips the corner.
+/// This corner-cutting guard is what forces string-pulling to keep a waypoint
+/// on the outside of a convex wall corner instead of collapsing it.
+///
 /// Used by [`simplify_path_line_of_sight`] to test whether two waypoints can
 /// be joined by a straight floating-point trajectory without crossing a wall.
 pub fn line_of_sight(map: &Hypermap<f32>, a: (i32, i32), b: (i32, i32)) -> bool {
@@ -253,11 +260,24 @@ pub fn line_of_sight(map: &Hypermap<f32>, a: (i32, i32), b: (i32, i32)) -> bool 
             return true;
         }
         let e2 = 2 * err;
-        if e2 >= dy {
+        let step_x = e2 >= dy;
+        let step_y = e2 <= dx;
+        // A simultaneous diagonal step slips between the two "shoulder" tiles
+        // `(x + sx, y)` and `(x, y + sy)`. A follower with real width would clip
+        // a wall corner squeezing through that gap, so a blocked shoulder means
+        // no line of sight. This stops string-pulling from cutting the outside
+        // of a convex wall corner and leaving a wide actor stuck against it.
+        if step_x
+            && step_y
+            && (!world_tile_walkable(map, x + sx, y) || !world_tile_walkable(map, x, y + sy))
+        {
+            return false;
+        }
+        if step_x {
             err += dy;
             x += sx;
         }
-        if e2 <= dx {
+        if step_y {
             err += dx;
             y += sy;
         }
@@ -749,6 +769,58 @@ mod tests {
         assert!(!line_of_sight(&map, (0, 0), (2, 0)));
         map.set(1, 0, 1.0);
         assert!(line_of_sight(&map, (0, 0), (2, 0)));
+    }
+
+    #[test]
+    fn line_of_sight_blocks_corner_cut() {
+        // Three tiles wrap a solid convex corner at (1, 1).
+        let map: Hypermap<f32> = Hypermap::new(0.0);
+        map.set(0, 0, 1.0);
+        map.set(1, 0, 1.0);
+        map.set(0, 1, 1.0);
+        // The diagonal (1,0)->(0,1) slips past the solid corner (1,1): a wide
+        // follower would clip it, so there is no line of sight.
+        assert!(!line_of_sight(&map, (1, 0), (0, 1)));
+        // Opening the corner clears both shoulders, so the diagonal is allowed.
+        map.set(1, 1, 1.0);
+        assert!(line_of_sight(&map, (1, 0), (0, 1)));
+    }
+
+    #[test]
+    fn simplify_keeps_corner_when_diagonal_would_cut() {
+        // An open field with one blocked shoulder tile on the main diagonal.
+        // A straight (0,0)->(3,3) line would slip past it, so string-pulling
+        // must keep an intermediate waypoint instead of cutting the corner —
+        // this is the case where a wide ground bot otherwise wedges on a wall.
+        let map: Hypermap<f32> = Hypermap::new(0.0);
+        for x in 0..4 {
+            for y in 0..4 {
+                map.set(x, y, 1.0);
+            }
+        }
+        map.set(2, 1, 0.0); // shoulder of the (1,1)->(2,2) diagonal step
+
+        assert!(
+            !line_of_sight(&map, (0, 0), (3, 3)),
+            "diagonal must not cut the blocked shoulder",
+        );
+
+        let raw = match astar_shortest_world_path(
+            &map,
+            (0, 0),
+            (3, 3),
+            HypermapSearchLimits::default(),
+        ) {
+            HypermapPathResult::Found { path, .. } => path,
+            other => panic!("expected Found, got {other:?}"),
+        };
+        let simplified = simplify_path_line_of_sight(&map, &raw, 0);
+        assert_eq!(simplified.first().copied(), Some((0, 0)));
+        assert_eq!(simplified.last().copied(), Some((3, 3)));
+        assert!(
+            simplified.len() >= 3,
+            "must keep a corner waypoint rather than cut the diagonal: {simplified:?}",
+        );
     }
 
     #[test]
