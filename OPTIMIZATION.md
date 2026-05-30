@@ -130,3 +130,32 @@ steers via `velocity + dv * (max_step / len)` (algebraically identical to
 `dv.normalize() * max_step`). Behavior pinned by the `approach_velocity_*` unit
 tests (ramp / snap / decel). Small constant win on per-bot-per-frame math; no
 semantic change.
+
+### GPU temperature diffusion — chunk-local pack, order-independent kernel (2026-05)
+
+New GPU compute temperature spread
+([`src/map/temperature_diffusion.rs`](src/map/temperature_diffusion.rs),
+`docs/temperature-diffusion.md`) runs per-frame while in-game. Designed against the rules:
+
+- **Rule 2 (hypertile-local):** [`pack_window`](src/map/temperature_diffusion.rs) resolves each
+  chunk handle **once** (`with_chunk_read` on the temperature read map + passability) and fills the
+  whole 128×128 region under that one lock — never a per-tile `get()` (which would take the global
+  chunk-table lock + `HashMap` lookup per tile, ~65k times/frame).
+- **Rule 4 (allocation-free steady state):** the pack `temps`/`mask` `Vec`s live in a reused
+  `DiffusionScratch` resource sized once to `WINDOW_CAPACITY`; the per-frame upload overwrites the
+  storage-buffer asset's existing bytes in place (`bytemuck::cast_slice` → `data[..].copy_from_slice`),
+  no per-frame `Vec` allocation on the CPU side.
+- **Rule 5 (order-independence / parallelism):** the kernel is the textbook parallel pattern — reads
+  hit an immutable `src` snapshot, each invocation writes only its own `dst[idx]`; ping-pong A↔B
+  across substeps. Trivially parallel on the GPU and bit-reproducible per dispatch.
+- **Rule 8 (prove it):** the WGSL is mirrored by `diffusion_step_cpu` in the test module
+  (conservation, wall insulation, ambient relaxation); `apply_window_to_read` has a clamp/dirty/
+  skip-unloaded round-trip test. Full suite green, `cargo check` warning-clean.
+
+Cost: the window is tiny (visible set ≈ a 2×2-chunk bbox; capacity 3×3 = 384²), so the per-frame
+upload + GPU→CPU readback is ~0.6 MB each way — the readback round-trip was an explicit product
+choice (CPU stays source of truth). Gated by `SETTLE_FRAMES` so an async result is only applied
+while its window is stable (no race, no regression). **Future:** Bevy re-prepares the storage-buffer
+asset (possible GPU-buffer reallocation) each frame because we mutate its data; a persistent GPU
+buffer written via `RenderQueue::write_buffer` would avoid that churn. Mask is re-uploaded every
+frame though it changes only on geometry edits — a `mask_dirty` gate would skip most of those.

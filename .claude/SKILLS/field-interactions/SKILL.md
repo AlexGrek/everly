@@ -70,7 +70,13 @@ paths:
 4. Conditional `flush_if_pending` + tile overlay (`TILE_FIELD_OVERLAY_RES` = 128).
 5. Extend `docs/field-interactions.md` and this skill.
 
-[`TemperatureMap`](../../src/map/temperature.rs) already exists (seed + overlay only).
+[`TemperatureMap`](../../src/map/temperature.rs) exists with seed + overlay **and GPU diffusion**
+([`src/map/temperature_diffusion.rs`](../../src/map/temperature_diffusion.rs),
+`docs/temperature-diffusion.md`): heat spreads on the GPU each frame and is read back into the CPU
+field (still the source of truth). No actor coupling yet — add it via the dirt pattern above.
+The diffusion readback writes the field's **read** buffer directly
+([`TileFieldMap::apply_window_to_read`](../../src/map/tile_field.rs)); actor deposits should keep
+using the write buffer + flush.
 
 ## Pitfalls
 

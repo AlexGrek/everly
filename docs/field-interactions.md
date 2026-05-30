@@ -72,8 +72,21 @@ See [`level-persistence.md`](level-persistence.md).
 4. Gate flush and overlay on non-empty writes / dirty chunks.
 5. Document the rule here and in `.claude/SKILLS/field-interactions/SKILL.md`.
 
+## Temperature
+
+Temperature is a sibling tile field ([`TemperatureMap`](../src/map/temperature.rs), same
+[`TileFieldMap`](../src/map/tile_field.rs) backing as dirt). Unlike dirt, it is not yet coupled to
+actors, but it **diffuses on the GPU** every frame: heat spreads across tiles (seamlessly over
+chunk borders), insulated by walls/void, relaxing toward ambient. The CPU field stays
+authoritative — results are read back and applied via
+[`TileFieldMap::apply_window_to_read`](../src/map/tile_field.rs), which marks chunks dirty so the
+overlay repaints. See [`temperature-diffusion.md`](temperature-diffusion.md). When adding actor ↔
+temperature coupling, follow the dirt pattern (deposit on the **left** tile after a main-tile
+transition); the diffusion readback and actor deposits both target the same read buffer.
+
 ## Related docs
 
+- `docs/temperature-diffusion.md` — GPU temperature spread
 - `docs/chunk-overlay.md` — dirt overlay rendering
 - `docs/actor.md` — movement pipeline
 - `docs/hypermap.md` — chunked storage

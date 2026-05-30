@@ -13,6 +13,7 @@ futures-lite = "2.6.1"
 pathfinding = "4.15"
 names = "0.14"
 rand = "0.8"
+bytemuck = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 

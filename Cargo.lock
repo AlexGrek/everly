@@ -2430,6 +2430,7 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "bevy_water",
+ "bytemuck",
  "futures-lite",
  "names",
  "pathfinding",

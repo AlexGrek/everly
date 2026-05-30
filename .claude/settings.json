@@ -12,7 +12,15 @@
       "Bash(grep *)",
       "Edit(/.claude/skills/field-interactions/**)",
       "Edit(/.claude/skills/optimize/**)",
-      "Bash(xargs -n1 basename)"
+      "Bash(xargs -n1 basename)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(curl -sL https://raw.githubusercontent.com/bevyengine/bevy/release-0.18.0/examples/shader/gpu_readback.rs)",
+      "Bash(curl -sL https://raw.githubusercontent.com/bevyengine/bevy/release-0.18.0/examples/shader/compute_shader_game_of_life.rs)",
+      "Bash(timeout 90 cargo run)",
+      "Bash(timeout 30 ./target/debug/everly)",
+      "Bash(timeout 25 ./target/debug/everly)",
+      "Bash(perl -e 'alarm 25; exec @ARGV' ./target/debug/everly)",
+      "Bash(perl -e 'alarm 35; exec @ARGV' cargo run)"
     ],
     "additionalDirectories": [
       "/tmp"

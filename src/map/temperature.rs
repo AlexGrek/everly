@@ -89,6 +89,20 @@ impl TemperatureMap {
         self.field.take_dirty_chunks()
     }
 
+    /// Pushes a GPU-diffused window back onto the CPU read buffer (source of truth).
+    /// See [`TileFieldMap::apply_window_to_read`] and `src/map/temperature_diffusion.rs`.
+    pub fn apply_window_readback(
+        &self,
+        origin_x: i32,
+        origin_y: i32,
+        width: usize,
+        height: usize,
+        data: &[f32],
+    ) {
+        self.field
+            .apply_window_to_read(origin_x, origin_y, width, height, data);
+    }
+
     fn hydrate_level_bin(&self, level_name: &str) {
         let mut slot = self
             .hydrated_level

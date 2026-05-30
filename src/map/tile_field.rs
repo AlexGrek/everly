@@ -145,6 +145,60 @@ impl TileFieldMap {
         dirty.extend(pending);
     }
 
+    /// Writes a packed row-major window (`width`×`height`, origin at world tile
+    /// `(origin_x, origin_y)`) **directly into the read buffer**, clamped to the field
+    /// range. Only chunks already loaded on the read side are touched — unseeded chunks
+    /// are skipped so this never materializes empty geometry. Every touched chunk is
+    /// marked dirty so overlays repaint. Used by the GPU diffusion readback to push the
+    /// evolved field back onto the CPU source of truth (`src/map/temperature_diffusion.rs`).
+    pub fn apply_window_to_read(
+        &self,
+        origin_x: i32,
+        origin_y: i32,
+        width: usize,
+        height: usize,
+        data: &[f32],
+    ) {
+        debug_assert_eq!(data.len(), width.saturating_mul(height));
+        if width == 0 || height == 0 {
+            return;
+        }
+        let (min_chunk, _) = world_to_chunk_local(origin_x, origin_y);
+        let (max_chunk, _) =
+            world_to_chunk_local(origin_x + width as i32 - 1, origin_y + height as i32 - 1);
+
+        for cy in min_chunk.y..=max_chunk.y {
+            for cx in min_chunk.x..=max_chunk.x {
+                let coord = ChunkCoord::new(cx, cy);
+                if !self.inner.read_map().has_chunk(coord) {
+                    continue;
+                }
+                let chunk_origin_x = cx * HYPERMAP_CHUNK_SIZE;
+                let chunk_origin_y = cy * HYPERMAP_CHUNK_SIZE;
+                self.inner.read_map().with_chunk_write(coord, |chunk| {
+                    for ly in 0..HYPERMAP_CHUNK_SIZE {
+                        let wy = chunk_origin_y + ly;
+                        let win_y = wy - origin_y;
+                        if win_y < 0 || win_y >= height as i32 {
+                            continue;
+                        }
+                        for lx in 0..HYPERMAP_CHUNK_SIZE {
+                            let wx = chunk_origin_x + lx;
+                            let win_x = wx - origin_x;
+                            if win_x < 0 || win_x >= width as i32 {
+                                continue;
+                            }
+                            let idx = win_y as usize * width + win_x as usize;
+                            let value = self.clamp_value(data[idx]);
+                            chunk.set_local(LocalCoord::new(lx, ly), value);
+                        }
+                    }
+                });
+                self.mark_dirty(coord);
+            }
+        }
+    }
+
     /// Writes one chunk of tile samples into an RGBA8 image (`TILE_FIELD_OVERLAY_RES`²).
     pub fn paint_chunk_to_rgba(
         data: &mut [u8],
@@ -160,5 +214,40 @@ impl TileFieldMap {
                 data[idx..idx + 4].copy_from_slice(&sample_to_rgba(value));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_window_writes_loaded_chunk_clamped_and_marks_dirty() {
+        let field = TileFieldMap::new(0.0, 1.0);
+        // Promote chunk (0,0) onto the read side so the window write targets it.
+        field.set_tile(0, 0, 0.0);
+        field.flush_if_pending();
+        let _ = field.take_dirty_chunks();
+
+        // 2×2 window at origin (0,0): row-major, with one over-range value to clamp.
+        let data = [0.25_f32, 5.0, -1.0, 0.75];
+        field.apply_window_to_read(0, 0, 2, 2, &data);
+
+        assert_eq!(field.get_tile(0, 0), 0.25);
+        assert_eq!(field.get_tile(1, 0), 1.0, "clamped to max");
+        assert_eq!(field.get_tile(0, 1), 0.0, "clamped to min");
+        assert_eq!(field.get_tile(1, 1), 0.75);
+
+        let dirty = field.take_dirty_chunks();
+        assert!(dirty.contains(&ChunkCoord::new(0, 0)));
+    }
+
+    #[test]
+    fn apply_window_skips_unloaded_chunks() {
+        let field = TileFieldMap::new(0.0, 1.0);
+        // No chunk loaded on the read side.
+        field.apply_window_to_read(0, 0, 2, 2, &[0.5, 0.5, 0.5, 0.5]);
+        assert_eq!(field.read_map().loaded_chunk_count(), 0, "must not materialize chunks");
+        assert_eq!(field.get_tile(0, 0), 0.0);
     }
 }

@@ -13,6 +13,7 @@ pub mod dirt;
 pub mod dirt_overlay;
 pub mod field_interactions;
 pub mod temperature;
+pub mod temperature_diffusion;
 pub mod temperature_overlay;
 pub mod tile_field;
 pub mod tile_field_level;
