@@ -14,10 +14,10 @@
 
 use bevy::prelude::*;
 use rand::rngs::StdRng;
-use rand::Rng;
 
-use crate::actor::{ActorMoveBuffer, ActorMovementError, ActorState};
-use crate::map::hypermap_pathfind::world_tile_walkable;
+use crate::actor::{
+    occupancy_collision_normal, reflect_velocity, ActorMoveBuffer, ActorMovementError, ActorState,
+};
 use crate::map::passability::SUBTILE_COUNT;
 
 use super::BrainContext;
@@ -245,7 +245,7 @@ impl FollowPath {
 }
 
 impl LowLevelAction for FollowPath {
-    fn execute(&mut self, state: &mut ActorState, ctx: &BrainContext, rng: &mut StdRng, t: &FollowTuning) {
+    fn execute(&mut self, state: &mut ActorState, ctx: &BrainContext, _rng: &mut StdRng, t: &FollowTuning) {
         let dt = ctx.dt;
         let center = state.center;
 
@@ -256,38 +256,21 @@ impl LowLevelAction for FollowPath {
             return;
         }
 
-        // React to last frame's bot-on-bot collision (walls are handled by the
-        // actor's axis-decomposed `try_move`, not here).
-        if matches!(state.last_movement_error, Some(ActorMovementError::BlockedByOccupancy { .. })) {
-            let roll = rng.gen_range(0.0_f32..1.0);
-            if roll < t.bot_reroute_chance {
-                let distance = rng.gen_range(1..=2) as f32;
-                let d = self.direction;
-                // Back, strafe-left, strafe-right — shuffled so each can win first.
-                let mut candidates = [-d, Vec2::new(-d.y, d.x), Vec2::new(d.y, -d.x)];
-                for i in (1..3).rev() {
-                    let j = rng.gen_range(0..=i);
-                    candidates.swap(i, j);
-                }
-                let cur = ctx.main_tile;
-                for escape_dir in candidates {
-                    let escape = (
-                        (cur.x as f32 + escape_dir.x * distance).round() as i32,
-                        (cur.y as f32 + escape_dir.y * distance).round() as i32,
-                    );
-                    if escape != (cur.x, cur.y) && world_tile_walkable(ctx.passability, escape.0, escape.1) {
-                        let insert_idx = self.index.min(self.path.len());
-                        self.path.insert(insert_idx, escape);
-                        // Force heading recalculation toward the escape tile this frame.
-                        self.stuck_waypoint_index = usize::MAX;
-                        break;
-                    }
-                }
-            } else if roll < t.bot_reroute_chance + t.bot_wait_chance {
-                self.contact_wait_s = t.bot_wait_secs;
-                self.pause_in_place(state);
-                return;
+        // Bot-on-bot collisions bounce elastically around the contact normal.
+        if let Some(ActorMovementError::BlockedByOccupancy {
+            world_subtile_x,
+            world_subtile_y,
+        }) = state.last_movement_error.clone()
+        {
+            let normal = occupancy_collision_normal(center, world_subtile_x, world_subtile_y);
+            self.velocity = reflect_velocity(self.velocity, normal);
+            if self.velocity.length_squared() > 1e-8 {
+                self.direction = self.velocity.normalize();
+            } else {
+                self.direction = -self.direction;
             }
+            // Skip achieved-vs-planned clamping this frame so reflection is preserved.
+            self.prev_center = None;
         }
 
         self.advance_past_reached(center, t.waypoint_eps);
@@ -403,6 +386,9 @@ pub fn approach_velocity(velocity: Vec2, desired: Vec2, rate: f32, dt: f32) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::map::hypermap::Hypermap;
+    use crate::map::interactive_entity::InteractiveEntityMap;
+    use rand::SeedableRng;
 
     #[test]
     fn reached_waypoint_uses_center_not_tile_membership() {
@@ -439,5 +425,51 @@ mod tests {
     fn empty_path_is_finished() {
         let fp = FollowPath::new(Vec::new());
         assert!(fp.is_finished());
+    }
+
+    #[test]
+    fn follow_path_bounces_velocity_on_bot_collision() {
+        let mut fp = FollowPath::new(vec![(8, 5)]);
+        fp.velocity = Vec2::new(1.0, 0.0);
+        fp.direction = Vec2::new(1.0, 0.0);
+
+        let mut state = ActorState {
+            center: Vec2::new(5.0, 5.0),
+            radius_subtiles: 2,
+            rotation: 0.0,
+            move_buffer: ActorMoveBuffer::default(),
+            last_movement_error: Some(ActorMovementError::BlockedByOccupancy {
+                world_subtile_x: 26,
+                world_subtile_y: 25,
+            }),
+            last_accepted_center_subtile: Some(IVec2::new(25, 25)),
+            last_accepted_radius_subtiles: 2,
+            next_waypoint_hint: None,
+            field_main_tile: None,
+            dirtiness: 0.0,
+        };
+        let passability = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let ctx = BrainContext {
+            entity: Entity::PLACEHOLDER,
+            dt: 0.1,
+            center: state.center,
+            main_tile: IVec2::new(5, 5),
+            main_tile_changed: false,
+            floor: 0,
+            charge: 1.0,
+            missing_charge_pct: 0.0,
+            depleted: false,
+            broken: false,
+            passability: &passability,
+            interactive: &interactive,
+        };
+        let mut rng = StdRng::seed_from_u64(1);
+        fp.execute(&mut state, &ctx, &mut rng, &FollowTuning::default());
+
+        assert!(
+            fp.velocity.x < 0.0,
+            "collision with blocker on +X should produce reflected X velocity"
+        );
     }
 }

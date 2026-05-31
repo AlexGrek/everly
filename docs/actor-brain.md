@@ -42,8 +42,8 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
 - **[`LowLevelAction`](../src/actor/brain/low_level.rs)** — what the bot is
   physically doing this frame: `Idle`, `Wait(time)`, or `FollowPath(path)`.
   `execute` writes `move_buffer`. **All of BlackBot's movement feel lives in
-  `FollowPath`** (mass/inertia, wall-momentum bleed, stuck-repath, bot-on-bot
-  reroute/wait — tuned by [`FollowTuning`]).
+  `FollowPath`** (mass/inertia, wall-momentum bleed, stuck-repath, and
+  elastic bot-on-bot bounce — tuned by [`FollowTuning`]).
 
 ## Tick (`Brain::tick`)
 

@@ -17,7 +17,10 @@ use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
 use crate::actor::charge::Charge;
 use bevy::picking::prelude::Pickable;
 use crate::actor::snapshot::{GlitchBotVisualSnap, SerVec2};
-use crate::actor::{is_paused, process_actors, Actor, ActorMoveBuffer, ActorObject, ActorState, OffScreenActor};
+use crate::actor::{
+    is_paused, occupancy_collision_normal, process_actors, reflect_velocity, Actor, ActorMoveBuffer,
+    ActorMovementError, ActorObject, ActorState, OffScreenActor,
+};
 use crate::map::passability::{FLAG_BLOCKED, SUBTILE_COUNT};
 use crate::menu::main_menu::GameState;
 
@@ -203,24 +206,37 @@ fn glitch_bot_think(
             continue;
         }
 
-        if state.last_movement_error.is_some() {
-            vis.collision_streak = vis.collision_streak.saturating_add(1);
-            vis.direction = match vis.collision_streak {
-                1 => -vis.direction,
-                2 => {
-                    let turn_left = vis.rng.gen_range(0..2) == 0;
-                    if turn_left {
-                        Vec2::new(-vis.direction.y, vis.direction.x)
-                    } else {
-                        Vec2::new(vis.direction.y, -vis.direction.x)
-                    }
+        let movement_error = state.last_movement_error.clone();
+        if let Some(err) = movement_error {
+            match err {
+                ActorMovementError::BlockedByOccupancy { world_subtile_x, world_subtile_y } => {
+                    // Bot-on-bot collisions bounce elastically around the contact normal.
+                    let normal = occupancy_collision_normal(state.center, world_subtile_x, world_subtile_y);
+                    let bounced_dir = reflect_velocity(vis.direction, normal);
+                    vis.direction = bounced_dir.try_normalize().unwrap_or(-vis.direction);
+                    vis.accumulator = reflect_velocity(vis.accumulator, normal);
+                    vis.collision_streak = 0;
                 }
                 _ => {
-                    vis.collision_streak = 0;
-                    random_direction(&mut vis.rng)
+                    vis.collision_streak = vis.collision_streak.saturating_add(1);
+                    vis.direction = match vis.collision_streak {
+                        1 => -vis.direction,
+                        2 => {
+                            let turn_left = vis.rng.gen_range(0..2) == 0;
+                            if turn_left {
+                                Vec2::new(-vis.direction.y, vis.direction.x)
+                            } else {
+                                Vec2::new(vis.direction.y, -vis.direction.x)
+                            }
+                        }
+                        _ => {
+                            vis.collision_streak = 0;
+                            random_direction(&mut vis.rng)
+                        }
+                    };
+                    vis.accumulator = Vec2::ZERO;
                 }
-            };
-            vis.accumulator = Vec2::ZERO;
+            }
         } else {
             vis.collision_streak = 0;
         }

@@ -163,6 +163,37 @@ pub fn actor_main_tile(center: Vec2) -> IVec2 {
     IVec2::new(center.x.floor() as i32, center.y.floor() as i32)
 }
 
+/// Unit normal pointing from a blocking occupancy subtile toward `center`.
+///
+/// Used to compute elastic reflection when two actors collide. Returns
+/// `Vec2::ZERO` when `center` is exactly on the blocker subtile center.
+#[inline]
+pub fn occupancy_collision_normal(center: Vec2, world_subtile_x: i32, world_subtile_y: i32) -> Vec2 {
+    let sc = SUBTILE_COUNT as f32;
+    let blocker_center = (Vec2::new(world_subtile_x as f32, world_subtile_y as f32) + Vec2::splat(0.5)) / sc;
+    let delta = center - blocker_center;
+    if delta.length_squared() <= 1e-12 {
+        Vec2::ZERO
+    } else {
+        delta.normalize()
+    }
+}
+
+/// Reflect `velocity` across `normal` (perfectly elastic, restitution = 1.0).
+///
+/// If `normal` is zero-length, falls back to an opposite-direction bounce.
+#[inline]
+pub fn reflect_velocity(velocity: Vec2, normal: Vec2) -> Vec2 {
+    if velocity.length_squared() <= 1e-12 {
+        return Vec2::ZERO;
+    }
+    if normal.length_squared() <= 1e-12 {
+        return -velocity;
+    }
+    let n = normal.normalize();
+    velocity - 2.0 * velocity.dot(n) * n
+}
+
 impl ActorState {
     /// Tile-space center converted to integer tile coordinates (floor).
     ///
@@ -764,6 +795,25 @@ mod tests {
         actor.state.move_buffer.subtile_shift = IVec2::new(1, 0);
         actor.try_move(&map, &sc);
         assert!(actor.state.last_movement_error.is_none());
+    }
+
+    #[test]
+    fn occupancy_collision_normal_points_away_from_blocker() {
+        let center = Vec2::new(10.0, 10.0);
+        // Subtile immediately to the actor's +X side.
+        let blocker_x = 10 * SUBTILE_COUNT as i32 + 1;
+        let blocker_y = 10 * SUBTILE_COUNT as i32;
+        let n = occupancy_collision_normal(center, blocker_x, blocker_y);
+        assert!(n.x < 0.0, "normal must point left away from right-side blocker");
+    }
+
+    #[test]
+    fn reflect_velocity_flips_normal_component() {
+        let v = Vec2::new(1.0, 0.0);
+        let n = Vec2::new(-1.0, 0.0);
+        let bounced = reflect_velocity(v, n);
+        assert!((bounced.x + 1.0).abs() < 1e-6);
+        assert!(bounced.y.abs() < 1e-6);
     }
 
     // --- Off-screen actor optimization ---
