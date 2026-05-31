@@ -45,6 +45,7 @@ pub struct BrainContext<'a> {
     pub dt: f32,
     pub center: Vec2,
     pub main_tile: IVec2,
+    pub main_tile_changed: bool,
     pub floor: i32,
     pub charge: f32,
     pub missing_charge_pct: f32,
@@ -58,6 +59,14 @@ pub struct BrainContext<'a> {
 /// after the tick. Fixed-size — the tick never allocates to report effects.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BrainEffects {
+    /// Add this bot to the station's wanting queue.
+    pub queue_want: Option<EntityCoordinates>,
+    /// Remove this bot from the station's wanting queue.
+    pub queue_unwant: Option<EntityCoordinates>,
+    /// Add this bot to the station's waiting queue (and drop from wanting).
+    pub queue_wait: Option<EntityCoordinates>,
+    /// Remove this bot from the station's waiting queue.
+    pub queue_unwait: Option<EntityCoordinates>,
     /// Dock this bot at the charger at these coordinates.
     pub dock: Option<EntityCoordinates>,
     /// Undock this bot from the charger at these coordinates.
@@ -222,6 +231,7 @@ pub(crate) mod test_support {
             dt: 1.0 / 60.0,
             center: Vec2::ZERO,
             main_tile: IVec2::ZERO,
+            main_tile_changed: true,
             floor: 0,
             charge,
             missing_charge_pct: (1.0 - charge) * 100.0,

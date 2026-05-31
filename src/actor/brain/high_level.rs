@@ -9,12 +9,11 @@
 use rand::rngs::StdRng;
 use rand::Rng;
 
-use crate::map::hypermap::Hypermap;
+use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap, HYPERMAP_CHUNK_SIZE};
 use crate::map::hypermap_pathfind::{
-    astar_shortest_world_path, manhattan, simplify_path_line_of_sight, HypermapPathResult,
-    HypermapSearchLimits,
+    astar_shortest_world_path, simplify_path_line_of_sight, HypermapPathResult, HypermapSearchLimits,
 };
-use crate::map::interactive_entity::{EntityCoordinates, EntityType, InteractiveEntityMap};
+use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
 
 use super::low_level::{FollowPath, LowLevelAction, Wait};
 use super::priority::PriorityKind;
@@ -32,8 +31,6 @@ const RETRY_S: f32 = 0.5;
 /// A* expansion cap for charger routes.
 const SEARCH_LIMIT: usize = 5000;
 
-/// Max 4-neighbour steps out to look for a reachable charger.
-const CHARGER_SEARCH_STEPS: u32 = 64;
 /// Charge gained per second while docked (infinite station — charger stored
 /// energy is intentionally ignored).
 pub const RECHARGE_PER_S: f32 = 0.05;
@@ -41,6 +38,11 @@ pub const RECHARGE_PER_S: f32 = 0.05;
 const CHARGE_FULL: f32 = 0.999;
 /// Retry delay while seeking a charger that isn't currently reachable/free.
 const CHARGE_RETRY_S: f32 = 1.0;
+/// Enter waiting queue once Manhattan distance to the station is < 5.
+const WAITING_QUEUE_ENTER_DISTANCE: i32 = 4;
+/// Random backoff while holding a waiting-queue slot near a station.
+const WAITING_RECHECK_MIN_S: f32 = 0.2;
+const WAITING_RECHECK_MAX_S: f32 = 0.8;
 
 /// Result of a [`HighLevelAction::update`].
 pub enum HighLevelStatus {
@@ -132,6 +134,7 @@ impl HighLevelAction for GoToRandomPoints {
 enum ChargePhase {
     Seeking,
     Traveling,
+    WaitingQueue,
     Charging,
 }
 
@@ -140,11 +143,54 @@ enum ChargePhase {
 pub struct GoToChargeStation {
     phase: ChargePhase,
     charger: Option<EntityCoordinates>,
+    queued_wanting: Option<EntityCoordinates>,
+    queued_waiting: Option<EntityCoordinates>,
 }
 
 impl GoToChargeStation {
     pub fn new() -> Self {
-        Self { phase: ChargePhase::Seeking, charger: None }
+        Self {
+            phase: ChargePhase::Seeking,
+            charger: None,
+            queued_wanting: None,
+            queued_waiting: None,
+        }
+    }
+
+    fn clear_queues(&mut self, effects: &mut BrainEffects) {
+        if let Some(coords) = self.queued_wanting.take() {
+            effects.queue_unwant = Some(coords);
+        }
+        if let Some(coords) = self.queued_waiting.take() {
+            effects.queue_unwait = Some(coords);
+        }
+    }
+
+    fn retarget(&mut self, coords: EntityCoordinates, effects: &mut BrainEffects) {
+        if self.queued_wanting != Some(coords) {
+            if let Some(old) = self.queued_wanting.replace(coords) {
+                effects.queue_unwant = Some(old);
+            }
+            effects.queue_want = Some(coords);
+        }
+        if let Some(old_wait) = self.queued_waiting.take() {
+            effects.queue_unwait = Some(old_wait);
+        }
+        self.charger = Some(coords);
+        self.phase = ChargePhase::Traveling;
+    }
+
+    fn enter_waiting_queue(&mut self, coords: EntityCoordinates, effects: &mut BrainEffects) {
+        if self.queued_waiting != Some(coords) {
+            if let Some(old_wait) = self.queued_waiting.replace(coords) {
+                effects.queue_unwait = Some(old_wait);
+            }
+            effects.queue_wait = Some(coords);
+        }
+        if self.queued_wanting == Some(coords) {
+            self.queued_wanting = None;
+        }
+        self.phase = ChargePhase::WaitingQueue;
     }
 }
 
@@ -162,6 +208,7 @@ impl HighLevelAction for GoToChargeStation {
         match self.phase {
             ChargePhase::Seeking => "GoToChargeStation (seeking)".to_string(),
             ChargePhase::Traveling => "GoToChargeStation (traveling)".to_string(),
+            ChargePhase::WaitingQueue => "GoToChargeStation (waiting queue)".to_string(),
             ChargePhase::Charging => "GoToChargeStation (charging)".to_string(),
         }
     }
@@ -169,43 +216,109 @@ impl HighLevelAction for GoToChargeStation {
         &mut self,
         ctx: &BrainContext,
         low: &mut Box<dyn LowLevelAction>,
-        _rng: &mut StdRng,
+        rng: &mut StdRng,
     ) -> HighLevelOutcome {
         match self.phase {
             ChargePhase::Seeking => {
-                match find_nearest_charger(ctx) {
+                if !ctx.main_tile_changed && !low.is_finished() {
+                    return HighLevelOutcome::running();
+                }
+
+                let mut effects = BrainEffects::default();
+                match find_best_charger(ctx) {
                     Some((coords, path)) => {
-                        self.charger = Some(coords);
+                        self.retarget(coords, &mut effects);
                         *low = Box::new(FollowPath::new(path));
-                        self.phase = ChargePhase::Traveling;
                     }
                     None => {
+                        self.clear_queues(&mut effects);
+                        self.charger = None;
                         *low = Box::new(Wait::new(CHARGE_RETRY_S));
+                    }
+                }
+                HighLevelOutcome::running_with(effects)
+            }
+            ChargePhase::Traveling => {
+                let Some(charger) = self.charger else {
+                    self.phase = ChargePhase::Seeking;
+                    return HighLevelOutcome::running();
+                };
+
+                if ctx.main_tile_changed && in_waiting_zone(ctx, charger) {
+                    let mut effects = BrainEffects::default();
+                    self.enter_waiting_queue(charger, &mut effects);
+                    *low = Box::new(Wait::new(short_wait_recheck_s(rng)));
+                    return HighLevelOutcome::running_with(effects);
+                }
+
+                if low.is_finished() {
+                    if dock_allowed_for(ctx, self.queued_waiting, charger) {
+                        self.phase = ChargePhase::Charging;
+                        *low = Box::new(Wait::new(f32::INFINITY));
+                        let mut effects = BrainEffects::default();
+                        effects.queue_unwait = self.queued_waiting.take();
+                        effects.dock = Some(charger);
+                        return HighLevelOutcome::running_with(effects);
+                    }
+                    if self.queued_waiting.is_some() {
+                        self.phase = ChargePhase::WaitingQueue;
+                        *low = Box::new(Wait::new(short_wait_recheck_s(rng)));
+                    } else {
+                        self.phase = ChargePhase::Seeking;
+                        self.charger = None;
                     }
                 }
                 HighLevelOutcome::running()
             }
-            ChargePhase::Traveling => {
-                if low.is_finished() {
-                    if let Some(c) = self.charger {
-                        if charger_free_for(ctx.interactive, c, ctx.entity) {
-                            self.phase = ChargePhase::Charging;
-                            // Dwell indefinitely; we exit via the charge check below.
-                            *low = Box::new(Wait::new(f32::INFINITY));
-                            let mut e = BrainEffects::default();
-                            e.dock = Some(c);
-                            return HighLevelOutcome::running_with(e);
-                        }
-                    }
-                    // Lost the charger (taken) or the path was abandoned: re-seek.
+            ChargePhase::WaitingQueue => {
+                let Some(charger) = self.charger else {
                     self.phase = ChargePhase::Seeking;
-                    self.charger = None;
+                    return HighLevelOutcome::running();
+                };
+
+                if low.is_finished() {
+                    if dock_allowed_for(ctx, self.queued_waiting, charger) {
+                        let here = (ctx.main_tile.x, ctx.main_tile.y);
+                        let goal = (charger.x, charger.y);
+                        match astar_shortest_world_path(
+                            ctx.passability,
+                            here,
+                            goal,
+                            HypermapSearchLimits { max_expanded: SEARCH_LIMIT },
+                        ) {
+                            HypermapPathResult::Found { path, .. } if path.len() <= 1 => {
+                                self.phase = ChargePhase::Charging;
+                                *low = Box::new(Wait::new(f32::INFINITY));
+                                let mut effects = BrainEffects::default();
+                                effects.queue_unwait = self.queued_waiting.take();
+                                effects.dock = Some(charger);
+                                return HighLevelOutcome::running_with(effects);
+                            }
+                            HypermapPathResult::Found { path, .. } => {
+                                let simplified = simplify_path_line_of_sight(
+                                    ctx.passability,
+                                    &path,
+                                    PATH_CORNER_BUFFER,
+                                );
+                                self.phase = ChargePhase::Traveling;
+                                *low = Box::new(FollowPath::new(simplified));
+                            }
+                            _ => {
+                                self.phase = ChargePhase::Seeking;
+                                self.charger = None;
+                            }
+                        }
+                    } else {
+                        *low = Box::new(Wait::new(short_wait_recheck_s(rng)));
+                    }
                 }
                 HighLevelOutcome::running()
             }
             ChargePhase::Charging => {
                 if ctx.charge >= CHARGE_FULL {
                     let mut e = BrainEffects::default();
+                    e.queue_unwait = self.queued_waiting.take();
+                    e.queue_unwant = self.queued_wanting.take();
                     e.undock = self.charger;
                     return HighLevelOutcome::done(e);
                 }
@@ -249,51 +362,74 @@ pub fn pick_random_target(
     None
 }
 
-/// Finds the nearest charger reachable from the bot that is free (no occupant,
-/// or occupied by the bot itself) and returns its coordinates plus a simplified
-/// path to its (passable) tile.
-fn find_nearest_charger(ctx: &BrainContext) -> Option<(EntityCoordinates, Vec<(i32, i32)>)> {
+/// Finds a charger in the nearest 4 hypertiles using queue-aware selection:
+/// prefer waiting queues with <2 actors; when all are busier, bias toward
+/// farther-ranked stations (`2nd nearest`, `3rd nearest`, ...).
+fn find_best_charger(ctx: &BrainContext) -> Option<(EntityCoordinates, Vec<(i32, i32)>)> {
     let here = (ctx.main_tile.x, ctx.main_tile.y);
-    let candidates = ctx.interactive.find_accessible_within(
-        ctx.passability,
-        here,
-        ctx.floor,
-        CHARGER_SEARCH_STEPS,
-        Some(EntityType::Charger),
-    );
+    let nearby_chunks = nearest_hypertiles_4(here);
 
-    let mut best: Option<(EntityCoordinates, u32)> = None;
-    for entry in candidates {
-        let free = entry
-            .entity
-            .as_charger()
-            .map(|c| c.occupant().is_none_or(|o| o == ctx.entity))
-            .unwrap_or(false);
-        if !free {
+    let mut candidates: Vec<(EntityCoordinates, Vec<(i32, i32)>, usize, usize)> = Vec::new();
+    for entry in ctx.interactive.iter().filter(|e| e.coordinates.floor == ctx.floor) {
+        let (chunk, _) = world_to_chunk_local(entry.coordinates.x, entry.coordinates.y);
+        if !nearby_chunks.contains(&chunk) {
+            continue;
+        }
+        if entry.entity.as_charger().is_none() {
             continue;
         }
         let goal = (entry.coordinates.x, entry.coordinates.y);
-        let dist = manhattan(here, goal);
-        if best.is_none_or(|(_, d)| dist < d) {
-            best = Some((entry.coordinates, dist));
-        }
+        let (path_cost, path) = match astar_shortest_world_path(
+            ctx.passability,
+            here,
+            goal,
+            HypermapSearchLimits { max_expanded: SEARCH_LIMIT },
+        ) {
+            HypermapPathResult::Found { path, .. } if path.len() > 1 => {
+                (
+                    path.len(),
+                    simplify_path_line_of_sight(ctx.passability, &path, PATH_CORNER_BUFFER),
+                )
+            }
+            // Already on/at the charger tile — a single-waypoint path arrives at once.
+            HypermapPathResult::Found { path, .. } => (path.len(), path),
+            _ => continue,
+        };
+        let waiting_len = ctx.interactive.waiting_len(entry.coordinates);
+        candidates.push((entry.coordinates, path, waiting_len, path_cost));
     }
 
-    let (coords, _) = best?;
-    let goal = (coords.x, coords.y);
-    match astar_shortest_world_path(
-        ctx.passability,
-        here,
-        goal,
-        HypermapSearchLimits { max_expanded: SEARCH_LIMIT },
-    ) {
-        HypermapPathResult::Found { path, .. } if path.len() > 1 => {
-            Some((coords, simplify_path_line_of_sight(ctx.passability, &path, PATH_CORNER_BUFFER)))
-        }
-        // Already on/at the charger tile — a single-waypoint path arrives at once.
-        HypermapPathResult::Found { path, .. } => Some((coords, path)),
-        _ => None,
+    if candidates.is_empty() {
+        return None;
     }
+
+    candidates.sort_by_key(|(_, _, _, path_cost)| *path_cost);
+    if let Some((coords, path, _, _)) = candidates
+        .iter()
+        .find(|(_, _, waiting_len, _)| *waiting_len < 2)
+        .cloned()
+    {
+        return Some((coords, path));
+    }
+
+    let closest_waiting = candidates[0].2;
+    let rank = closest_waiting.saturating_sub(1);
+    let idx = rank.min(candidates.len().saturating_sub(1));
+    let (coords, path, _, _) = candidates.swap_remove(idx);
+    Some((coords, path))
+}
+
+fn nearest_hypertiles_4(here: (i32, i32)) -> [ChunkCoord; 4] {
+    let (center, local) = world_to_chunk_local(here.0, here.1);
+    let mid = HYPERMAP_CHUNK_SIZE / 2;
+    let dx = if local.x >= mid { 1 } else { -1 };
+    let dy = if local.y >= mid { 1 } else { -1 };
+    [
+        center,
+        ChunkCoord::new(center.x + dx, center.y),
+        ChunkCoord::new(center.x, center.y + dy),
+        ChunkCoord::new(center.x + dx, center.y + dy),
+    ]
 }
 
 /// `true` if the charger at `coords` has no occupant or is occupied by `me`.
@@ -308,6 +444,30 @@ fn charger_free_for(
         .next()
         .map(|c| c.occupant().is_none_or(|o| o == me))
         .unwrap_or(false)
+}
+
+fn in_waiting_zone(ctx: &BrainContext, coords: EntityCoordinates) -> bool {
+    let dx = (ctx.main_tile.x - coords.x).abs();
+    let dy = (ctx.main_tile.y - coords.y).abs();
+    dx + dy <= WAITING_QUEUE_ENTER_DISTANCE
+}
+
+fn dock_allowed_for(
+    ctx: &BrainContext,
+    queued_waiting: Option<EntityCoordinates>,
+    coords: EntityCoordinates,
+) -> bool {
+    if !charger_free_for(ctx.interactive, coords, ctx.entity) {
+        return false;
+    }
+    if queued_waiting == Some(coords) {
+        return ctx.interactive.is_waiting_front(coords, ctx.entity);
+    }
+    true
+}
+
+fn short_wait_recheck_s(rng: &mut StdRng) -> f32 {
+    rng.gen_range(WAITING_RECHECK_MIN_S..WAITING_RECHECK_MAX_S)
 }
 
 #[cfg(test)]
@@ -332,6 +492,7 @@ mod tests {
             dt: 1.0 / 60.0,
             center: Vec2::new(tile.0 as f32 + 0.5, tile.1 as f32 + 0.5),
             main_tile: IVec2::new(tile.0, tile.1),
+            main_tile_changed: true,
             floor: 0,
             charge,
             missing_charge_pct: (1.0 - charge) * 100.0,
@@ -370,7 +531,13 @@ mod tests {
         low.execute(&mut state, &ctx(&passability, &interactive, 0.1, (4, 0)), &mut rng, &tuning);
         assert!(low.is_finished(), "single-waypoint route completes on arrival");
 
-        // Traveling → arrived & free → dock + start charging.
+        // Traveling near station -> joins waiting queue first.
+        let out = action.update(&ctx(&passability, &interactive, 0.1, (4, 0)), &mut low, &mut rng);
+        assert_eq!(out.effects.queue_wait, Some(EntityCoordinates::ground(4, 0)));
+        interactive.add_waiting(EntityCoordinates::ground(4, 0), Entity::PLACEHOLDER);
+
+        // Next waiting recheck (forced finished low action) -> first in queue and free -> dock.
+        low = Box::new(Idle);
         let out = action.update(&ctx(&passability, &interactive, 0.1, (4, 0)), &mut low, &mut rng);
         assert_eq!(out.effects.dock, Some(EntityCoordinates::ground(4, 0)));
 
@@ -398,5 +565,94 @@ mod tests {
         assert!(matches!(out.status, HighLevelStatus::Running));
         assert!(low.path().is_none(), "no charger → should be waiting, not following a path");
         assert!(!low.is_finished(), "the retry Wait keeps the action alive");
+    }
+
+    #[test]
+    fn recharge_search_uses_nearest_four_hypertiles() {
+        let passability: Hypermap<f32> = Hypermap::new(0.0);
+        for x in -2..=0 {
+            passability.set(x, 0, 1.0);
+        }
+        // Also make a reachable charger in a far chunk that should be ignored by
+        // the bounded 4-hypertile search from (0, 0).
+        for x in 0..=130 {
+            passability.set(x, 1, 1.0);
+        }
+
+        let mut interactive = InteractiveEntityMap::new();
+        interactive.insert(InteractiveEntity::Charger(ChargerEntity::new(
+            EntityCoordinates::ground(-2, 0), // chunk (-1, 0), should be considered
+            ChargerFacing::North,
+        )));
+        interactive.insert(InteractiveEntity::Charger(ChargerEntity::new(
+            EntityCoordinates::ground(130, 1), // chunk (1, 0), excluded from nearest 4
+            ChargerFacing::North,
+        )));
+
+        let mut action = GoToChargeStation::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = StdRng::seed_from_u64(0);
+        let out = action.update(&ctx(&passability, &interactive, 0.1, (0, 0)), &mut low, &mut rng);
+
+        assert!(matches!(out.status, HighLevelStatus::Running));
+        let (path, _) = low.path().expect("must route to charger in nearest hypertiles");
+        assert_eq!(path.last().copied(), Some((-2, 0)));
+    }
+
+    #[test]
+    fn recharge_prefers_station_with_less_than_two_waiters() {
+        let passability: Hypermap<f32> = Hypermap::new(0.0);
+        for x in 0..=8 {
+            passability.set(x, 0, 1.0);
+        }
+        let mut interactive = InteractiveEntityMap::new();
+        let close = EntityCoordinates::ground(2, 0);
+        let farther = EntityCoordinates::ground(6, 0);
+        interactive.insert(InteractiveEntity::Charger(ChargerEntity::new(close, ChargerFacing::North)));
+        interactive.insert(InteractiveEntity::Charger(ChargerEntity::new(farther, ChargerFacing::North)));
+        interactive.add_waiting(close, Entity::from_bits(100));
+        interactive.add_waiting(close, Entity::from_bits(101));
+        interactive.add_waiting(farther, Entity::from_bits(200));
+
+        let mut action = GoToChargeStation::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = StdRng::seed_from_u64(0);
+        let out = action.update(&ctx(&passability, &interactive, 0.1, (0, 0)), &mut low, &mut rng);
+
+        assert!(matches!(out.status, HighLevelStatus::Running));
+        let (path, _) = low.path().expect("must pick a charger");
+        assert_eq!(path.last().copied(), Some((6, 0)));
+    }
+
+    #[test]
+    fn recharge_uses_ranked_fallback_when_all_waiting_queues_are_long() {
+        let passability: Hypermap<f32> = Hypermap::new(0.0);
+        for x in 0..=9 {
+            passability.set(x, 0, 1.0);
+        }
+        let mut interactive = InteractiveEntityMap::new();
+        let first = EntityCoordinates::ground(2, 0);
+        let second = EntityCoordinates::ground(4, 0);
+        let third = EntityCoordinates::ground(8, 0);
+        interactive.insert(InteractiveEntity::Charger(ChargerEntity::new(first, ChargerFacing::North)));
+        interactive.insert(InteractiveEntity::Charger(ChargerEntity::new(second, ChargerFacing::North)));
+        interactive.insert(InteractiveEntity::Charger(ChargerEntity::new(third, ChargerFacing::North)));
+
+        for (coords, base) in [(first, 10u64), (second, 20u64), (third, 30u64)] {
+            interactive.add_waiting(coords, Entity::from_bits(base));
+            interactive.add_waiting(coords, Entity::from_bits(base + 1));
+        }
+        assert_eq!(interactive.waiting_len(first), 2);
+        assert_eq!(interactive.waiting_len(second), 2);
+        assert_eq!(interactive.waiting_len(third), 2);
+
+        let mut action = GoToChargeStation::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = StdRng::seed_from_u64(0);
+        let out = action.update(&ctx(&passability, &interactive, 0.1, (0, 0)), &mut low, &mut rng);
+
+        assert!(matches!(out.status, HighLevelStatus::Running));
+        let (path, _) = low.path().expect("must pick ranked fallback charger");
+        assert_eq!(path.last().copied(), Some((4, 0)), "closest has 2 waiters, so choose 2nd closest");
     }
 }

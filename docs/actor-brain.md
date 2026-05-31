@@ -86,11 +86,18 @@ only on a re-path).
 - **`GoToRandomPoints`** (serves `RandomWalking`) — whenever the path finishes,
   pick a new random reachable target and follow it. Perpetual.
 - **`GoToChargeStation`** (serves `RechargeYourself`) — `Seeking` → `Traveling` →
-  `Charging`:
-  - find the nearest *accessible, unoccupied* charger
-    ([`InteractiveEntityMap::find_accessible_within`](../src/map/interactive_entity.rs))
-    and follow a path to its (passable) tile;
-  - on arrival, request `dock` and `Wait`;
+  `WaitingQueue` → `Charging`:
+  - scan chargers in the bot's 4 nearest hypertiles (current chunk + nearest X/Y
+    neighbors + diagonal), rank by reachable path length, then apply queue policy:
+    prefer stations with `< 2` waiting bots; if all candidates are busier, pick
+    `2nd`/`3rd`/... nearest based on the nearest station's waiting depth;
+  - queue-selection and "enter waiting zone" transitions are evaluated on main-tile
+    changes (the actor-brain integration's usual coarse cadence);
+  - on selection, join that station's **wanting** queue;
+  - when Manhattan distance to the station drops below 5 tiles, move from wanting
+    into the **waiting** queue and stop near the station;
+  - while waiting, re-check availability after short random waits; only approach
+    and dock when the station is free and this bot is first in waiting queue;
   - while charging, request `recharge` (`RECHARGE_PER_S`, an **infinite station** —
     the charger's stored energy is intentionally ignored) until full, then request
     `undock` and report `Done`.
@@ -98,10 +105,11 @@ only on a re-path).
 ### Effects
 
 `apply_brain_effects` (black_bot.rs) is the only place that mutates the world from
-a brain decision: `dock`/`undock` set the [`ChargerEntity`] occupant; `recharge`
-raises the bot's [`Charge`](../src/actor/charge.rs) toward `1.0`. A depleted bot is
-immobilized **before** the tick, so a bot must trigger recharge (25%) with enough
-runway to reach a charger.
+a brain decision: queue add/remove requests update station wanting/waiting queues,
+`dock`/`undock` set the [`ChargerEntity`] occupant, and `recharge` raises the bot's
+[`Charge`](../src/actor/charge.rs) toward `1.0`. Waiting-queue membership is removed
+when docking succeeds. A depleted bot is immobilized **before** the tick, so a bot
+must trigger recharge (25%) with enough runway to reach a charger.
 
 ## Persistence
 

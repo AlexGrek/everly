@@ -17,10 +17,29 @@ value array.
 | `InteractiveEntityBehavior` | Trait shared by every kind; implemented on the enum so callers need no `match`. |
 | `InteractiveEntityEntry` | The "special type": `(EntityType, EntityCoordinates, InteractiveEntity)`. The first two are redundant tags for cheap filtering. |
 | `HypertileList<T>` | Generic ordered list of items sharing one hypertile. `InteractiveEntityHypertileList = HypertileList<InteractiveEntityEntry>`. |
-| `InteractiveEntityMap` | The `Resource`: sparse `HashMap<EntityCoordinates, …list>`. One tile can hold **multiple** entities. |
+| `InteractiveEntityMap` | The `Resource`: sparse `HashMap<EntityCoordinates, …list>` plus runtime station queues. One tile can hold **multiple** entities. |
 
 `EntityCoordinates` is `(x, y, floor)` — the full hypermap address — and doubles
 as the map key.
+
+## Runtime station queues
+
+`InteractiveEntityMap` also keeps non-serialized, per-tile queue state for charger
+coordination:
+
+- **wanting queue** (`VecDeque<Entity>`) — actors that selected this charger as a target.
+- **waiting queue** (`VecDeque<Entity>`) — actors already near the charger, waiting for
+  their dock turn.
+
+Queue operations are unique-by-actor and order-preserving:
+
+- `add_wanting` / `remove_wanting`
+- `add_waiting` / `remove_waiting` (`add_waiting` also removes from wanting)
+- `is_waiting_front`, `waiting_len`, `remove_actor_from_queues`
+
+These queues are runtime coordination only (not persisted). They are cleared with
+`InteractiveEntityMap::clear`, and charger sync drops queue state for rebuilt/removed
+charger tiles.
 
 ## Trait surface (`InteractiveEntityBehavior`)
 
@@ -75,11 +94,16 @@ map and the chunk on every step.)
 sidesteps the "map keys must be strings" limit many serde formats place on a
 non-string struct key. The runtime `occupant` is `#[serde(skip)]` — Bevy
 `Entity` ids are not stable across sessions — so it loads back as `None`.
+Queue membership is runtime-only for the same reason and also loads empty.
 
-## Not yet wired
+## Runtime indexing
 
-The store exists and round-trips, but nothing populates it from the map yet:
-generation/editor placement of `CellType::Charger` does not auto-register a
-`ChargerEntity`, and there is no save/load to a level file. Those are the natural
-next steps (see `docs/level-persistence.md` for where a `interactive_entities`
-file would slot in).
+`CellType::Charger` tiles are indexed into `InteractiveEntityMap` at runtime by
+syncing charger entities from loaded world chunks. The sync runs for newly
+loaded chunks and remeshed chunks, so bot recharge search (`find_accessible_within`)
+always sees up-to-date charger coordinates after generation and edits.
+
+`occupant` remains runtime-only (`#[serde(skip)]`): docking state is rebuilt in
+session and not persisted with level files. Charger queues are similarly runtime
+state; when a charger tile is rebuilt/removed, queue state at that coordinate is
+dropped with it.

@@ -36,8 +36,11 @@ use crate::actor::{
 };
 use crate::map::chunk_overlay::{ChunkOverlayState, OVERLAY_RES};
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap};
-use crate::map::hypermap_world::HypermapRuntime;
-use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
+use crate::map::hypermap_world::{HypermapChunkRemeshQueue, HypermapRuntime};
+use crate::map::interactive_entity::{
+    sync_chargers_for_chunks, EntityCoordinates, InteractiveEntityMap,
+};
+use crate::map::level::LevelName;
 use crate::map::passability::{
     DynamicPassabilityMap, SubtilePassability, TryUpdateFootprintError, SUBTILE_COUNT,
 };
@@ -351,6 +354,12 @@ impl Plugin for BlackBotPlugin {
     }
 }
 
+#[derive(Default)]
+struct IndexedChargerChunks {
+    level: String,
+    chunks: HashSet<ChunkCoord>,
+}
+
 /// Runs each BlackBot's [`Brain`] once per frame (before `process_actors`),
 /// then applies the requested side effects (charger docking, recharge).
 ///
@@ -358,8 +367,11 @@ impl Plugin for BlackBotPlugin {
 /// the per-bot RNG lives in the brain, so it must not run on `par_iter`.
 fn black_bot_brain(
     time: Res<Time>,
+    level_name: Res<LevelName>,
     hypermap: Res<HypermapRuntime>,
+    remesh: Res<HypermapChunkRemeshQueue>,
     mut interactive: ResMut<InteractiveEntityMap>,
+    mut indexed: Local<IndexedChargerChunks>,
     mut query: Query<(
         Entity,
         &mut ActorObject,
@@ -371,6 +383,13 @@ fn black_bot_brain(
 ) {
     let dt = time.delta_secs();
     let passability = &*hypermap.static_passability_map;
+    refresh_charger_index(
+        &hypermap.map,
+        &mut interactive,
+        &mut indexed,
+        &level_name,
+        &remesh,
+    );
 
     for (entity, mut obj, mut brain, mut vis, mut charge, mut breakable) in &mut query {
         let state = obj.inner.state_mut();
@@ -406,6 +425,7 @@ fn black_bot_brain(
                 dt,
                 center: state.center,
                 main_tile: current_tile,
+                main_tile_changed: tile_changed,
                 floor: 0,
                 charge: charge_level,
                 missing_charge_pct: (1.0 - charge_level) * 100.0,
@@ -428,6 +448,38 @@ fn black_bot_brain(
     }
 }
 
+fn refresh_charger_index(
+    map: &Hypermap<crate::map::world_map::CellType>,
+    interactive: &mut InteractiveEntityMap,
+    indexed: &mut IndexedChargerChunks,
+    level_name: &LevelName,
+    remesh: &HypermapChunkRemeshQueue,
+) {
+    if indexed.level != level_name.0 {
+        indexed.level = level_name.0.clone();
+        indexed.chunks.clear();
+        interactive.clear();
+    }
+
+    let loaded_chunks = map.loaded_chunks();
+    let loaded_set: HashSet<ChunkCoord> = loaded_chunks.iter().copied().collect();
+
+    let mut sync_chunks: HashSet<ChunkCoord> = loaded_set
+        .difference(&indexed.chunks)
+        .copied()
+        .collect();
+    sync_chunks.extend(remesh.0.iter().copied());
+    if interactive.is_empty() {
+        sync_chunks.extend(loaded_chunks.iter().copied());
+    }
+
+    if !sync_chunks.is_empty() {
+        sync_chargers_for_chunks(map, interactive, sync_chunks.iter().copied());
+        indexed.chunks.extend(sync_chunks);
+    }
+    indexed.chunks.retain(|chunk| loaded_set.contains(chunk));
+}
+
 /// Applies a brain tick's [`BrainEffects`] to the world: charger docking and
 /// battery recharge.
 fn apply_brain_effects(
@@ -436,7 +488,20 @@ fn apply_brain_effects(
     interactive: &mut InteractiveEntityMap,
     charge: Option<&mut Charge>,
 ) {
+    if let Some(coords) = effects.queue_unwant {
+        interactive.remove_wanting(coords, entity);
+    }
+    if let Some(coords) = effects.queue_want {
+        interactive.add_wanting(coords, entity);
+    }
+    if let Some(coords) = effects.queue_wait {
+        interactive.add_waiting(coords, entity);
+    }
+    if let Some(coords) = effects.queue_unwait {
+        interactive.remove_waiting(coords, entity);
+    }
     if let Some(coords) = effects.dock {
+        interactive.remove_waiting(coords, entity);
         set_charger_occupant(interactive, coords, Some(entity));
     }
     if let Some(coords) = effects.undock {
@@ -444,6 +509,7 @@ fn apply_brain_effects(
         if charger_occupant(interactive, coords) == Some(entity) {
             set_charger_occupant(interactive, coords, None);
         }
+        interactive.remove_actor_from_queues(coords, entity);
     }
     if effects.recharge > 0.0 {
         if let Some(c) = charge {
