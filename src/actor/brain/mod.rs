@@ -199,6 +199,10 @@ impl Brain {
         self.low_level.stuck_timer()
     }
 
+    pub fn is_stuck(&self) -> bool {
+        self.low_level.is_stuck()
+    }
+
     pub fn has_target(&self) -> bool {
         self.low_level.path().map(|(p, i)| i < p.len()).unwrap_or(false)
     }

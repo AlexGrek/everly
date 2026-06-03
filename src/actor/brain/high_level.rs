@@ -115,7 +115,8 @@ impl HighLevelAction for GoToRandomPoints {
         low: &mut Box<dyn LowLevelAction>,
         rng: &mut StdRng,
     ) -> HighLevelOutcome {
-        if low.is_finished() {
+        let needs_new_target = low.is_stuck() || low.is_finished();
+        if needs_new_target {
             let here = (ctx.main_tile.x, ctx.main_tile.y);
             match pick_random_target(rng, here, ctx.passability) {
                 Some(path) => *low = Box::new(FollowPath::new(path)),
@@ -218,6 +219,25 @@ impl HighLevelAction for GoToChargeStation {
         low: &mut Box<dyn LowLevelAction>,
         rng: &mut StdRng,
     ) -> HighLevelOutcome {
+        if low.is_stuck() && self.phase != ChargePhase::Charging {
+            // Handler for "need charge but got stuck": immediately restart charger
+            // selection instead of progressing the previous phase state machine.
+            let mut effects = BrainEffects::default();
+            self.clear_queues(&mut effects);
+            self.charger = None;
+            self.phase = ChargePhase::Seeking;
+            match find_best_charger(ctx) {
+                Some((coords, path)) => {
+                    self.retarget(coords, &mut effects);
+                    *low = Box::new(FollowPath::new(path));
+                }
+                None => {
+                    *low = Box::new(Wait::new(CHARGE_RETRY_S));
+                }
+            }
+            return HighLevelOutcome::running_with(effects);
+        }
+
         match self.phase {
             ChargePhase::Seeking => {
                 if !ctx.main_tile_changed && !low.is_finished() {
@@ -481,6 +501,28 @@ mod tests {
     use bevy::prelude::Entity;
     use rand::SeedableRng;
 
+    struct StuckLowAction;
+
+    impl LowLevelAction for StuckLowAction {
+        fn execute(
+            &mut self,
+            _state: &mut crate::actor::ActorState,
+            _ctx: &BrainContext,
+            _rng: &mut StdRng,
+            _tuning: &FollowTuning,
+        ) {
+        }
+        fn is_finished(&self) -> bool {
+            false
+        }
+        fn is_stuck(&self) -> bool {
+            true
+        }
+        fn label(&self) -> String {
+            "StuckLowAction".to_string()
+        }
+    }
+
     fn ctx<'a>(
         passability: &'a Hypermap<f32>,
         interactive: &'a InteractiveEntityMap,
@@ -654,5 +696,39 @@ mod tests {
         assert!(matches!(out.status, HighLevelStatus::Running));
         let (path, _) = low.path().expect("must pick ranked fallback charger");
         assert_eq!(path.last().copied(), Some((4, 0)), "closest has 2 waiters, so choose 2nd closest");
+    }
+
+    #[test]
+    fn random_walker_stuck_handler_retargets() {
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let mut action = GoToRandomPoints;
+        let mut low: Box<dyn LowLevelAction> = Box::new(StuckLowAction);
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let out = action.update(&ctx(&passability, &interactive, 1.0, (0, 0)), &mut low, &mut rng);
+        assert!(matches!(out.status, HighLevelStatus::Running));
+        assert!(low.path().is_some(), "stuck random walker should install a new route");
+    }
+
+    #[test]
+    fn recharge_stuck_handler_reruns_charger_search() {
+        let passability: Hypermap<f32> = Hypermap::new(0.0);
+        for x in 0..=6 {
+            passability.set(x, 0, 1.0);
+        }
+        let mut interactive = InteractiveEntityMap::new();
+        interactive.insert(InteractiveEntity::Charger(ChargerEntity::new(
+            EntityCoordinates::ground(6, 0),
+            ChargerFacing::North,
+        )));
+        let mut action = GoToChargeStation::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(StuckLowAction);
+        let mut rng = StdRng::seed_from_u64(1);
+
+        let out = action.update(&ctx(&passability, &interactive, 0.2, (0, 0)), &mut low, &mut rng);
+        assert!(matches!(out.status, HighLevelStatus::Running));
+        let (path, _) = low.path().expect("stuck recharge should immediately rerun charger search");
+        assert_eq!(path.last().copied(), Some((6, 0)));
     }
 }

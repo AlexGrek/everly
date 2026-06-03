@@ -44,6 +44,9 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
   `execute` writes `move_buffer`. **All of BlackBot's movement feel lives in
   `FollowPath`** (mass/inertia, wall-momentum bleed, stuck-repath, and
   elastic bot-on-bot bounce — tuned by [`FollowTuning`]).
+  When `FollowPath` abandons an unfinished route due to no progress, the brain
+  exposes a `stuck` status (`Brain::is_stuck`) and the bot mesh turns red until
+  a new low-level action takes over.
 
 ## Tick (`Brain::tick`)
 
@@ -84,7 +87,9 @@ only on a re-path).
 ### High-level actions
 
 - **`GoToRandomPoints`** (serves `RandomWalking`) — whenever the path finishes,
-  pick a new random reachable target and follow it. Perpetual.
+  pick a new random reachable target and follow it. Perpetual. If the low-level
+  route reports `stuck`, this handler immediately retargets to a different
+  random point.
 - **`GoToChargeStation`** (serves `RechargeYourself`) — `Seeking` → `Traveling` →
   `WaitingQueue` → `Charging`:
   - scan chargers in the bot's 4 nearest hypertiles (current chunk + nearest X/Y
@@ -101,6 +106,8 @@ only on a re-path).
   - while charging, request `recharge` (`RECHARGE_PER_S`, an **infinite station** —
     the charger's stored energy is intentionally ignored) until full, then request
     `undock` and report `Done`.
+  - if movement reports `stuck` while not already charging, clear queue state and
+    re-run charger search immediately.
 
 ### Effects
 

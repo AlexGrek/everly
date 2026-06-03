@@ -346,7 +346,7 @@ impl Plugin for BlackBotPlugin {
             (
                 black_bot_brain.before(process_actors).run_if(not(is_paused)),
                 sync_black_bot_transforms.after(process_actors),
-                sync_black_bot_broken_visual.after(process_actors),
+                sync_black_bot_status_visual.after(process_actors),
                 paint_black_bot_targets.after(process_actors),
             )
                 .run_if(in_state(GameState::InGame)),
@@ -558,24 +558,32 @@ fn sync_black_bot_transforms(
     }
 }
 
-/// Applies material color changes triggered by breakable state transitions.
-/// Runs only when a bot's control-plane broken flag flips (tracked via `Local`).
-fn sync_black_bot_broken_visual(
-    bots: Query<(Entity, &Breakable, &Children), With<BlackBotVisual>>,
+/// Applies material color changes for BlackBot runtime status.
+///
+/// Priority order:
+/// 1. Broken control plane => white
+/// 2. Stuck while trying to route => red
+/// 3. Healthy => default black
+fn sync_black_bot_status_visual(
+    bots: Query<(Entity, &Breakable, &Brain, &Children), With<BlackBotVisual>>,
     pick_meshes: Query<&MeshMaterial3d<StandardMaterial>, With<ActorPickMesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut last_cp_broken: Local<std::collections::HashMap<Entity, bool>>,
+    mut last_status: Local<std::collections::HashMap<Entity, (bool, bool)>>,
 ) {
-    for (entity, b, children) in &bots {
+    for (entity, b, brain, children) in &bots {
         let cp_broken = b.control_plane.broken;
-        let last = last_cp_broken.get(&entity).copied().unwrap_or(false);
-        if cp_broken == last {
+        let stuck = brain.is_stuck();
+        let status = (cp_broken, stuck);
+        let last = last_status.get(&entity).copied().unwrap_or((false, false));
+        if status == last {
             continue;
         }
-        last_cp_broken.insert(entity, cp_broken);
+        last_status.insert(entity, status);
 
         let target_color = if cp_broken {
             Color::srgb(1.0, 1.0, 1.0)
+        } else if stuck {
+            Color::srgb(0.95, 0.15, 0.15)
         } else {
             Color::srgb(0.02, 0.02, 0.02)
         };

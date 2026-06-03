@@ -51,7 +51,7 @@ impl Default for FollowTuning {
         Self {
             max_speed: 1.2,
             accel: 2.5,
-            decel: 4.0,
+            decel: 6.0,
             waypoint_eps: 0.05,
             stuck_repath_secs: 2.0,
             stuck_progress_eps: 0.05,
@@ -97,6 +97,11 @@ pub trait LowLevelAction: Send + Sync {
     /// Seconds stuck against an obstacle (inspector). Default zero.
     fn stuck_timer(&self) -> f32 {
         0.0
+    }
+
+    /// `true` when this action is currently considered stuck and needs replanning.
+    fn is_stuck(&self) -> bool {
+        false
     }
 
     /// Final destination tile, if any (overlay / inspector).
@@ -310,8 +315,18 @@ impl LowLevelAction for FollowPath {
             return;
         }
 
-        let desired = self.direction * t.max_speed;
-        self.drive(state, center, desired, t.accel, dt);
+        // Braking profile: as we approach the waypoint, cap target speed to the
+        // maximum speed that can stop within remaining distance (v^2 = 2 a d).
+        // This prevents late, floaty overshoot and makes slowdown feel snappier.
+        let brake_limited_speed = (2.0 * t.decel * dist).sqrt();
+        let desired_speed = t.max_speed.min(brake_limited_speed);
+        let desired = self.direction * desired_speed;
+        let steer_rate = if self.velocity.length() > desired_speed {
+            t.decel
+        } else {
+            t.accel
+        };
+        self.drive(state, center, desired, steer_rate, dt);
         state.next_waypoint_hint = Some(wp);
     }
 
@@ -338,6 +353,11 @@ impl LowLevelAction for FollowPath {
 
     fn stuck_timer(&self) -> f32 {
         self.stuck_timer
+    }
+
+    fn is_stuck(&self) -> bool {
+        // "Stuck" means we abandoned an unfinished route because progress stalled.
+        self.abandoned && self.index < self.path.len()
     }
 
     fn target_tile(&self) -> Option<(i32, i32)> {
@@ -471,5 +491,96 @@ mod tests {
             fp.velocity.x < 0.0,
             "collision with blocker on +X should produce reflected X velocity"
         );
+    }
+
+    #[test]
+    fn follow_path_brakes_near_waypoint_with_decel_rate() {
+        let mut fp = FollowPath::new(vec![(1, 0)]);
+        fp.velocity = Vec2::new(1.2, 0.0);
+        fp.direction = Vec2::new(1.0, 0.0);
+
+        let mut state = ActorState {
+            center: Vec2::new(1.45, 0.5), // within braking zone of waypoint center (1.5, 0.5)
+            radius_subtiles: 2,
+            rotation: 0.0,
+            move_buffer: ActorMoveBuffer::default(),
+            last_movement_error: None,
+            last_accepted_center_subtile: Some(IVec2::new(6, 2)),
+            last_accepted_radius_subtiles: 2,
+            next_waypoint_hint: None,
+            field_main_tile: None,
+            dirtiness: 0.0,
+        };
+        let passability = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let ctx = BrainContext {
+            entity: Entity::PLACEHOLDER,
+            dt: 0.1,
+            center: state.center,
+            main_tile: IVec2::new(1, 0),
+            main_tile_changed: false,
+            floor: 0,
+            charge: 1.0,
+            missing_charge_pct: 0.0,
+            depleted: false,
+            broken: false,
+            passability: &passability,
+            interactive: &interactive,
+        };
+        let mut rng = StdRng::seed_from_u64(7);
+
+        fp.execute(&mut state, &ctx, &mut rng, &FollowTuning::default());
+
+        assert!(
+            fp.velocity.x < 1.2,
+            "velocity should be reduced near waypoint to brake sooner"
+        );
+    }
+
+    #[test]
+    fn follow_path_sets_stuck_status_after_no_progress() {
+        let mut fp = FollowPath::new(vec![(10, 10)]);
+        let mut state = ActorState {
+            center: Vec2::new(0.5, 0.5),
+            radius_subtiles: 2,
+            rotation: 0.0,
+            move_buffer: ActorMoveBuffer::default(),
+            last_movement_error: None,
+            last_accepted_center_subtile: Some(IVec2::new(2, 2)),
+            last_accepted_radius_subtiles: 2,
+            next_waypoint_hint: None,
+            field_main_tile: None,
+            dirtiness: 0.0,
+        };
+        let passability = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let mut rng = StdRng::seed_from_u64(11);
+        let tuning = FollowTuning {
+            stuck_repath_secs: 0.3,
+            ..FollowTuning::default()
+        };
+
+        for _ in 0..4 {
+            let ctx = BrainContext {
+                entity: Entity::PLACEHOLDER,
+                dt: 0.1,
+                center: state.center,
+                main_tile: IVec2::new(0, 0),
+                main_tile_changed: false,
+                floor: 0,
+                charge: 1.0,
+                missing_charge_pct: 0.0,
+                depleted: false,
+                broken: false,
+                passability: &passability,
+                interactive: &interactive,
+            };
+            fp.execute(&mut state, &ctx, &mut rng, &tuning);
+            // Simulate being physically pinned: position never changes.
+            state.move_buffer = ActorMoveBuffer::default();
+        }
+
+        assert!(fp.is_stuck(), "no-progress route should mark low-level action as stuck");
+        assert!(fp.is_finished(), "stuck route must request replanning");
     }
 }
