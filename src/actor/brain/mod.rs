@@ -29,6 +29,7 @@ use rand::SeedableRng;
 use crate::actor::{ActorMoveBuffer, ActorState};
 use crate::map::hypermap::Hypermap;
 use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
+use crate::map::passability::{DynamicPassabilityMap, SubtilePassability};
 
 pub use behavior::{Behavior, ChargeSelfKeeper, RandomWalker};
 pub use high_level::{
@@ -37,6 +38,22 @@ pub use high_level::{
 };
 pub use low_level::{FollowPath, FollowTuning, Idle, LowLevelAction, Wait};
 pub use priority::{Priorities, Priority, PriorityKind};
+
+/// Read-only views the low-level subtile bot-on-bot detour needs: the actor's
+/// own size-aware footprint test against static geometry and the dynamic
+/// occupancy of other creatures.
+///
+/// Bundled into one optional so most call sites (and unit tests) that don't run
+/// collision avoidance can simply pass `None`.
+#[derive(Clone, Copy)]
+pub struct AvoidanceViews<'a> {
+    /// Dynamic occupancy (other actors' footprints); read buffer.
+    pub dynamic: &'a DynamicPassabilityMap,
+    /// Static geometry as per-subtile flags (walls, void, corners).
+    pub static_subtiles: &'a Hypermap<SubtilePassability>,
+    /// Flag bits this actor treats as impassable (size-aware footprint test).
+    pub blocked_flags: u64,
+}
 
 /// Read-only snapshot of every bot property a behavior / high-level action may
 /// consult during a single brain tick.
@@ -53,6 +70,8 @@ pub struct BrainContext<'a> {
     pub broken: bool,
     pub passability: &'a Hypermap<f32>,
     pub interactive: &'a InteractiveEntityMap,
+    /// Occupancy views for the bot-on-bot subtile detour; `None` disables it.
+    pub avoidance: Option<AvoidanceViews<'a>>,
 }
 
 /// Side effects a high-level action requests, applied by the owning ECS system
@@ -243,6 +262,7 @@ pub(crate) mod test_support {
             broken: false,
             passability: empty_passability(),
             interactive: empty_interactive(),
+            avoidance: None,
         }
     }
 

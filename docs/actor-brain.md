@@ -48,6 +48,43 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
   exposes a `stuck` status (`Brain::is_stuck`) and the bot mesh turns red until
   a new low-level action takes over.
 
+### Bot-on-bot collision response
+
+`FollowPath`'s tile path is planned on **static** geometry only, so it does not
+route around other (moving) bots. When a step is rejected with
+`BlockedByOccupancy` (another bot's footprint), `FollowPath` first bounces its
+velocity elastically off the contact normal, then rolls **one** response,
+weighted by [`FollowTuning`]:
+
+| Roll band | Response |
+|-----------|----------|
+| `bot_reroute_chance` | Insert a single back/strafe **tile** waypoint to step away. |
+| `bot_wait_chance` | Pause in place for `bot_wait_secs` to let the clump clear. |
+| `bot_subtile_detour_chance` | Plan a **subtile-level detour** around the blocker (see below). |
+| remainder | Just keep the elastic bounce. |
+
+The subtile detour is a *second, finer* pathfinding pass for short distances:
+[`astar_subtile_detour`](../src/map/hypermap_pathfind.rs) runs a bounded
+4-neighbour A\* on the subtile grid (`1 tile = SUBTILE_COUNT subtiles`) from the
+bot's current subtile to the **next already-calculated path node**. Each
+candidate subtile is accepted only when the bot's whole circular footprint —
+i.e. its **size** (`radius_subtiles`) — is clear of both static geometry and
+other creatures, tested via
+[`DynamicPassabilityMap::probe_footprint`](../src/map/passability.rs). The
+search is kept local: it is skipped past `DETOUR_MAX_SPAN_SUBTILES`, confined to
+the start/goal bounding box grown by `DETOUR_PAD_SUBTILES`, and capped at
+`DETOUR_MAX_EXPANDED` expansions. The resulting subtile staircase is collapsed
+to its corners and followed (in tile-space float coordinates) until the bot
+reaches that next node, then the normal tile path resumes. A detour is dropped
+if a fresh bump invalidates it or it runs longer than `stuck_repath_secs`.
+
+This needs occupancy data the rest of the brain doesn't: `BrainContext` carries
+an optional [`AvoidanceViews`](../src/actor/brain/mod.rs) (the dynamic map, the
+static subtile cache, and the actor's `blocked_flags`). It is `Some` only in the
+live `black_bot_brain` system (which runs after `flush_actor_occupancy` so it
+reads the current occupancy snapshot) and `None` everywhere else, which disables
+the detour.
+
 ## Tick (`Brain::tick`)
 
 Each frame, the owning ECS system builds a `BrainContext` and calls
@@ -72,9 +109,11 @@ only on a re-path).
 
 - Spawns carry a [`Brain`] with behaviors `[RandomWalker, ChargeSelfKeeper]`, the
   default `make_high_level` factory, and a seeded `StdRng`.
-- `black_bot_brain` (runs `.before(process_actors)`, sequential) ticks each
-  brain, gates depleted/broken bots (`brain.halt`), ticks wear/break, and applies
-  effects via `apply_brain_effects`.
+- `black_bot_brain` (runs `.after(flush_actor_occupancy).before(process_actors)`,
+  sequential) ticks each brain, gates depleted/broken bots (`brain.halt`), ticks
+  wear/break, and applies effects via `apply_brain_effects`. It runs after the
+  occupancy flush so the bot-on-bot subtile detour reads the same dynamic
+  passability snapshot `process_actors` will use this frame.
 
 ### Behaviors
 

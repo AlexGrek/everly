@@ -27,12 +27,15 @@ use rand::{Rng, SeedableRng};
 
 use crate::actor::actor_name::random_actor_name;
 use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
-use crate::actor::brain::{make_high_level, Brain, BrainContext, BrainEffects, ChargeSelfKeeper, RandomWalker};
+use crate::actor::brain::{
+    make_high_level, AvoidanceViews, Brain, BrainContext, BrainEffects, ChargeSelfKeeper,
+    RandomWalker,
+};
 use crate::actor::charge::Charge;
 use crate::actor::snapshot::{BreakablePartSnap, BreakableSnap};
 use crate::actor::{
-    actor_main_tile, is_paused, process_actors, Actor, ActorMoveBuffer, ActorMovementError,
-    ActorObject, ActorState, OffScreenActor,
+    actor_main_tile, flush_actor_occupancy, is_paused, process_actors, Actor, ActorMoveBuffer,
+    ActorMovementError, ActorObject, ActorState, OffScreenActor,
 };
 use crate::map::chunk_overlay::{ChunkOverlayState, OVERLAY_RES};
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap};
@@ -344,7 +347,10 @@ impl Plugin for BlackBotPlugin {
         app.init_resource::<BlackBotRng>().add_systems(
             Update,
             (
-                black_bot_brain.before(process_actors).run_if(not(is_paused)),
+                black_bot_brain
+                    .after(flush_actor_occupancy)
+                    .before(process_actors)
+                    .run_if(not(is_paused)),
                 sync_black_bot_transforms.after(process_actors),
                 sync_black_bot_status_visual.after(process_actors),
                 paint_black_bot_targets.after(process_actors),
@@ -369,6 +375,7 @@ fn black_bot_brain(
     time: Res<Time>,
     level_name: Res<LevelName>,
     hypermap: Res<HypermapRuntime>,
+    dynamic: Res<DynamicPassabilityMap>,
     remesh: Res<HypermapChunkRemeshQueue>,
     mut interactive: ResMut<InteractiveEntityMap>,
     mut indexed: Local<IndexedChargerChunks>,
@@ -383,6 +390,7 @@ fn black_bot_brain(
 ) {
     let dt = time.delta_secs();
     let passability = &*hypermap.static_passability_map;
+    let static_subtiles = &*hypermap.static_subtile_cache;
     refresh_charger_index(
         &hypermap.map,
         &mut interactive,
@@ -392,6 +400,7 @@ fn black_bot_brain(
     );
 
     for (entity, mut obj, mut brain, mut vis, mut charge, mut breakable) in &mut query {
+        let blocked_flags = obj.inner.blocked_flags();
         let state = obj.inner.state_mut();
 
         let current_tile = actor_main_tile(state.center);
@@ -433,6 +442,11 @@ fn black_bot_brain(
                 broken,
                 passability,
                 interactive: &interactive,
+                avoidance: Some(AvoidanceViews {
+                    dynamic: &dynamic,
+                    static_subtiles,
+                    blocked_flags,
+                }),
             };
             brain.tick(&ctx, state)
         };
@@ -593,6 +607,10 @@ fn sync_black_bot_status_visual(
             mat.base_color = target_color;
         }
     }
+
+    // Keep cache bounded to currently alive bots so long sessions with
+    // spawn/despawn churn don't accumulate dead-entity entries forever.
+    last_status.retain(|entity, _| bots.get(*entity).is_ok());
 }
 
 const TARGET_COLOR: [u8; 4] = [180, 40, 220, 160];

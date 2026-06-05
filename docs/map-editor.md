@@ -24,6 +24,7 @@ Stroke rules (world grid `(x, z)`):
 - **Wall:** strictly orthogonal segment from start to end. Compare `|Δx|` and `|Δz|` from start; the axis with the **larger** span gets the line (constant `z` from start when `|Δx| > |Δz|`, constant `x` from start when `|Δz| > |Δx|`). If `|Δx| == |Δz|` (including diagonal endpoints), the stroke is the **horizontal** segment at start `z`. One tile if start equals end.
 - **Void / Road:** axis-aligned **rectangle** (filled) between start and end on mouse up. New “floor” palette kinds should extend `MapTileKind`, `stroke_world_cells`, and `map_edit_update_preview` in `map_edit.rs` the same way.
 - **Room:** same drag as void/road, but only the **rectangle border** is written. Each border cell gets a [`WallMask`](tilemap.md) on the **outer** sides of the selection (`perimeter_wall_mask` in `map_edit.rs`), consistent with the world-space rules in `tilemap.md` § Wall bitmask. The interior is left unchanged.
+- **House:** same drag as **Room** (preview shows the boundary outline), but on mouse up it **generates a full procedural building inside the boundary** — outer shell, one door, inner room walls + doors, marble/glass floor waves, and a charger — using the same map-generator steps as procedural chunks. The boundary must be at least `10×10` cells ([`MIN_HOUSE_TOOL_SIDE`](../src/map/map_generator/mod.rs)); smaller selections are rejected with a warning and nothing is written. The whole selection rectangle is overwritten (interior road + walls + floor styles); the surrounding tiles are untouched. Each placement uses a fresh random seed, so dragging the same boundary twice yields different interiors. See [`generate_house_tiles`](../src/map/map_generator/mod.rs) and [`map-generator.md`](map-generator.md).
 - **Corner:** single pillar at the **mouse-up** cell (variant still from the wheel).
 - **Charger:** single walkable charging station at the **mouse-up** cell — an elevated metal pad plus a glowing-blue cube on the backing wall (variant = facing, from the wheel). See [`tilemap.md`](tilemap.md) § Charging station.
 - **Fill:** flood-fill bucket. Clicks a single cell; the fill spreads outward through connected non-wall tiles using door-gap bridging (openings ≤ 2 tiles wide are treated as virtual walls, so the fill stays inside a room). The active **floor style** is painted on every reachable floor tile and every bordering wall/corner tile. The fill is cancelled if the region or its boundary exceeds `FILL_CELL_LIMIT` (50 × 50 tiles). No variant; the wheel does not apply.
@@ -38,9 +39,9 @@ Releasing over the HUD dead zone or with no valid ray cancels the stroke (nothin
 | **WallG** | Same as **Wall** — cycles bitmask 1 … 15. |
 | **Corner** | Cycles pillar corners **NW → NE → SW → SE** (same semantics as `c7` / `c9` / `c1` / `c3`). |
 | **Charger** | Cycles facing **N → E → S → W** (which wall the cube backs onto; `cn` / `ce` / `cs` / `cw`). |
-| **Void**, **Road**, **Room**, **Fill** | No variants. The wheel does **not** reserve placement input for these types. |
+| **Void**, **Road**, **Room**, **House**, **Fill** | No variants. The wheel does **not** reserve placement input for these types. |
 
-While placing **Wall**, **Corner**, or **Charger**, the **strategy camera zoom** is disabled so the wheel only changes the variant (`zoom_camera` in `src/scene/camera.rs` checks `MapEditState`). With **Void**, **Road**, or **Room** selected, zoom behaves normally.
+While placing **Wall**, **Corner**, or **Charger**, the **strategy camera zoom** is disabled so the wheel only changes the variant (`zoom_camera` in `src/scene/camera.rs` checks `MapEditState`). With **Void**, **Road**, **Room**, or **House** selected, zoom behaves normally.
 
 ## UI chrome guard
 

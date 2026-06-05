@@ -447,7 +447,7 @@ fn toggle_pause(keys: Res<ButtonInput<KeyCode>>, mut paused: ResMut<Paused>) {
 }
 
 /// Flush write→read; clear write buffer. Must be first in the actor pipeline.
-fn flush_actor_occupancy(passability: Res<DynamicPassabilityMap>) {
+pub(crate) fn flush_actor_occupancy(passability: Res<DynamicPassabilityMap>) {
     passability.flush();
 }
 

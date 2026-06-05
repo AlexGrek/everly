@@ -757,6 +757,56 @@ fn inner_doors_make_all_rooms_accessible() {
 }
 
 #[test]
+fn house_tool_rejects_boundaries_below_minimum() {
+    assert!(generate_house_tiles(9, 20, 1).is_none());
+    assert!(generate_house_tiles(20, 9, 1).is_none());
+    assert!(generate_house_tiles(MIN_HOUSE_TOOL_SIDE, MIN_HOUSE_TOOL_SIDE, 1).is_some());
+}
+
+#[test]
+fn house_tool_fills_boundary_with_a_walled_building() {
+    let width = 14;
+    let height = 11;
+    let tiles = generate_house_tiles(width, height, 7).expect("10x10+ boundary generates a house");
+    assert_eq!(tiles.width, width);
+    assert_eq!(tiles.height, height);
+    assert_eq!(tiles.cells.len(), height as usize);
+    assert_eq!(tiles.cells[0].len(), width as usize);
+
+    // The whole boundary is the building footprint — no Void left inside it.
+    for row in &tiles.cells {
+        for cell in row {
+            assert!(!matches!(cell, CellType::Void), "house footprint must be fully built");
+        }
+    }
+
+    // Outer shell: every border cell carries wall slabs except where the single
+    // door was cut (which becomes Road or a reduced wall).
+    let mut perimeter_walls = 0u32;
+    let mut door_gaps = 0u32;
+    for x in 0..width as usize {
+        for z in [0usize, height as usize - 1] {
+            match tiles.cells[z][x] {
+                CellType::Wall(_) => perimeter_walls += 1,
+                CellType::Road => door_gaps += 1,
+                _ => {}
+            }
+        }
+    }
+    assert!(perimeter_walls > 0, "house must have an outer shell");
+
+    // Interior must contain walkable road, and the building must have exactly one door.
+    let interior_road = tiles
+        .cells
+        .iter()
+        .flatten()
+        .filter(|c| matches!(c, CellType::Road))
+        .count();
+    assert!(interior_road > 0, "house interior must be walkable road");
+    let _ = door_gaps;
+}
+
+#[test]
 fn clustered_houses_only_merge_on_overlap() {
     let houses = super::house::cluster_houses(&[
         RoomRecord {

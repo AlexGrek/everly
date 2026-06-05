@@ -177,3 +177,23 @@ Added the OOP brain ([`src/actor/brain/`](src/actor/brain/)) above BlackBot's lo
   there is no parallelism regression.
 
 Verified: full lib suite green (414 passed), `cargo check --all-targets` warning-clean.
+
+### BlackBot status visual cache bounded to live entities (2026-06)
+
+Follow-up optimization for the new stuck/broken color sync in
+[`src/actor/black_bot.rs`](src/actor/black_bot.rs)
+(`sync_black_bot_status_visual`):
+
+- **Issue (rule 4):** The per-system `Local<HashMap<Entity, (bool, bool)>>`
+  cached the last seen `(control_plane_broken, stuck)` state but never removed
+  despawned entities. In long sessions with actor spawn/despawn churn, this
+  map grew monotonically, adding unnecessary hash work every frame and
+  violating allocation-free steady-state expectations.
+- **Fix:** After processing live bots, prune cache entries with
+  `last_status.retain(|entity, _| bots.get(*entity).is_ok())`, so retained
+  state remains proportional to currently alive BlackBots.
+- **Semantics:** Visual behavior is unchanged for live entities; only stale
+  dead-entity cache rows are discarded.
+
+Verified green: `cargo test -p everly` (183 passed, 0 failed, 2 ignored) and
+`cargo check -p everly` warning-clean.

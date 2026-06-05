@@ -18,6 +18,27 @@ pub(crate) struct House {
 }
 
 impl House {
+    /// A single axis-aligned building footprint (one rect, no merge).
+    ///
+    /// Used by the editor "House" tool to drop one building into a chosen
+    /// boundary; the procedural pipeline instead clusters subseed rects via
+    /// [`cluster_houses`].
+    pub(crate) fn from_single_rect(rect: Room) -> Self {
+        let house = House {
+            rects: vec![rect],
+            x0: rect.x0,
+            z0: rect.z0,
+            x1: rect.x1,
+            z1: rect.z1,
+            footprint_area: 0,
+            entry: None,
+        };
+        House {
+            footprint_area: footprint_cell_area(&house),
+            ..house
+        }
+    }
+
     pub fn contains(&self, x: i32, z: i32) -> bool {
         self.rects.iter().any(|r| r.contains(x, z))
     }

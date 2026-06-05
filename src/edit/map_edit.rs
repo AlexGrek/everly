@@ -8,7 +8,8 @@ use bevy::prelude::*;
 use bevy::ui::widget::Button;
 
 use crate::map::floor_level::{ActiveFloorLevel, HYPERMAP_FLOOR_HEIGHT, HYPERMAP_FLOOR_MAX};
-use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, HYPERMAP_CHUNK_SIZE};
+use crate::map::hypermap::{random_rng_seed, world_to_chunk_local, ChunkCoord, HYPERMAP_CHUNK_SIZE};
+use crate::map::map_generator::{generate_house_tiles, MIN_HOUSE_TOOL_SIDE};
 use crate::map::hypermap_world::{
     build_charger_preview_mesh, build_floor0_road_mesh, build_floor0_wall_mesh,
     build_upper_road_mesh, build_upper_wall_mesh,
@@ -70,6 +71,10 @@ pub enum MapTileKind {
     WallGlass,
     /// Drag a rectangle; on mouse up, place walls only on the **border** with masks facing outward (closed loop).
     Room,
+    /// Drag a rectangle; on mouse up, generate a full procedural building inside the
+    /// boundary (outer shell, door, inner rooms, chargers, floor styles) when the
+    /// boundary is at least [`MIN_HOUSE_TOOL_SIDE`]×[`MIN_HOUSE_TOOL_SIDE`] cells.
+    House,
     Corner,
     /// Charging station: a walkable metal pad with a glowing-blue cube on the
     /// backing wall. Scroll cycles the facing (which wall the cube hangs on).
@@ -178,6 +183,7 @@ pub(crate) fn spawn_map_edit_palette(mut commands: Commands, camera: Query<Entit
                 ("Wall", MapTileKind::Wall),
                 ("WallG", MapTileKind::WallGlass),
                 ("Room", MapTileKind::Room),
+                ("House", MapTileKind::House),
                 ("Corner", MapTileKind::Corner),
                 ("Charger", MapTileKind::Charger),
                 ("Fill", MapTileKind::Fill),
@@ -608,7 +614,7 @@ fn stroke_world_cells(kind: MapTileKind, start: (i32, i32), end: (i32, i32)) -> 
     match kind {
         MapTileKind::Wall | MapTileKind::WallGlass => wall_line_cells(start, end),
         MapTileKind::Void | MapTileKind::Road => floor_rect_cells(start, end),
-        MapTileKind::Room => room_outline_cells(start, end),
+        MapTileKind::Room | MapTileKind::House => room_outline_cells(start, end),
         MapTileKind::Corner | MapTileKind::Charger | MapTileKind::Fill => vec![end],
     }
 }
@@ -644,7 +650,7 @@ fn resolved_cell(kind: MapTileKind, variant: u32) -> CellType {
             let bits = ((variant % 15) + 1) as u8;
             CellType::Wall(WallMask::from_bits(bits).expect("1..=15 valid"))
         }
-        MapTileKind::Room => CellType::Road,
+        MapTileKind::Room | MapTileKind::House => CellType::Road,
         MapTileKind::Corner => {
             let c = match variant % 4 {
                 0 => WallCorner::Nw,
@@ -703,7 +709,7 @@ fn map_edit_update_preview(
     let min_x = strokes.iter().map(|(x, _)| *x).min().unwrap();
     let min_z = strokes.iter().map(|(_, z)| *z).min().unwrap();
 
-    let room_bounds = (kind == MapTileKind::Room).then(|| match (drag.0, hover.0) {
+    let room_bounds = matches!(kind, MapTileKind::Room | MapTileKind::House).then(|| match (drag.0, hover.0) {
         (Some(s), Some(h)) => rect_axis_bounds(s, h),
         (Some(s), None) => rect_axis_bounds(s, s),
         (None, Some(h)) => rect_axis_bounds(h, h),
@@ -739,8 +745,8 @@ fn map_edit_update_preview(
                     .collect();
                 build_floor0_wall_mesh(&rel, min_x, min_z).or_else(void_preview_plane)
             }
-            MapTileKind::Room => {
-                let (bx0, bx1, bz0, bz1) = room_bounds.expect("room_bounds set for Room");
+            MapTileKind::Room | MapTileKind::House => {
+                let (bx0, bx1, bz0, bz1) = room_bounds.expect("room_bounds set for Room/House");
                 let rel: Vec<_> = strokes
                     .iter()
                     .map(|&(x, z)| {
@@ -786,8 +792,8 @@ fn map_edit_update_preview(
                     .collect();
                 build_upper_wall_mesh(&rel, min_x, min_z).or_else(void_preview_plane)
             }
-            MapTileKind::Room => {
-                let (bx0, bx1, bz0, bz1) = room_bounds.expect("room_bounds set for Room");
+            MapTileKind::Room | MapTileKind::House => {
+                let (bx0, bx1, bz0, bz1) = room_bounds.expect("room_bounds set for Room/House");
                 let rel: Vec<_> = strokes
                     .iter()
                     .map(|&(x, z)| {
@@ -979,6 +985,50 @@ fn map_edit_pointer_stroke(
         return;
     }
 
+    if kind == MapTileKind::House {
+        let (bx0, bx1, bz0, bz1) = rect_axis_bounds(start, end);
+        let width = bx1 - bx0 + 1;
+        let height = bz1 - bz0 + 1;
+        let Some(house) = generate_house_tiles(width, height, random_rng_seed()) else {
+            warn!(
+                "House: boundary {width}×{height} is below the {MIN_HOUSE_TOOL_SIDE}×{MIN_HOUSE_TOOL_SIDE} minimum — not generating"
+            );
+            return;
+        };
+
+        let mut chunk_coords = HashSet::<ChunkCoord>::new();
+        for lz in 0..height {
+            for lx in 0..width {
+                chunk_coords.insert(world_to_chunk_local(bx0 + lx, bz0 + lz).0);
+            }
+        }
+        for c in &chunk_coords {
+            runtime.ensure_chunk_generated(*c, level.0.as_str());
+        }
+
+        for lz in 0..height {
+            for lx in 0..width {
+                let (wx, wz) = (bx0 + lx, bz0 + lz);
+                let cell = house.cells[lz as usize][lx as usize];
+                write_world_cell(&runtime, wx, wz, fl, cell);
+                write_world_floor_style(&runtime, wx, wz, fl, house.floor_styles[lz as usize][lx as usize]);
+                write_world_wall_style(&runtime, wx, wz, fl, TileStyle::DEFAULT);
+            }
+        }
+
+        let mut remeshed = HashSet::<ChunkCoord>::new();
+        for lz in 0..height {
+            for lx in 0..width {
+                let (wx, wz) = (bx0 + lx, bz0 + lz);
+                if remeshed.insert(world_to_chunk_local(wx, wz).0) {
+                    queue_hypermap_chunk_remesh(&mut remesh, wx, wz);
+                }
+            }
+        }
+        info!("House: generated {width}×{height} building at ({bx0}, {bz0})");
+        return;
+    }
+
     let tiles = stroke_world_cells(kind, start, end);
     if tiles.is_empty() {
         return;
@@ -1046,7 +1096,8 @@ fn map_edit_scroll_variants(
     let max_v = match kind {
         MapTileKind::Wall | MapTileKind::WallGlass => 15,
         MapTileKind::Corner | MapTileKind::Charger => 4,
-        MapTileKind::Void | MapTileKind::Road | MapTileKind::Room | MapTileKind::Fill => return,
+        MapTileKind::Void | MapTileKind::Road | MapTileKind::Room | MapTileKind::House
+        | MapTileKind::Fill => return,
     };
 
     let mut scroll = 0.0f32;

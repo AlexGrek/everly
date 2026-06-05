@@ -542,6 +542,7 @@ mod tests {
             broken: false,
             passability,
             interactive,
+            avoidance: None,
         }
     }
 
