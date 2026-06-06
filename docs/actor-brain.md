@@ -42,26 +42,55 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
 - **[`LowLevelAction`](../src/actor/brain/low_level.rs)** — what the bot is
   physically doing this frame: `Idle`, `Wait(time)`, or `FollowPath(path)`.
   `execute` writes `move_buffer`. **All of BlackBot's movement feel lives in
-  `FollowPath`** (mass/inertia, wall-momentum bleed, stuck-repath, and
-  elastic bot-on-bot bounce — tuned by [`FollowTuning`]).
+  `FollowPath`** (mass/inertia, wall-momentum bleed, stuck-repath, and the
+  head-on bot-on-bot response — elastic bounce then either a detour or a
+  step-aside-and-pause; rear bumps ignored — tuned by [`FollowTuning`]).
   When `FollowPath` abandons an unfinished route due to no progress, the brain
   exposes a `stuck` status (`Brain::is_stuck`) and the bot mesh turns red until
   a new low-level action takes over.
+
+### BlackBot status colors
+
+`sync_black_bot_status_visual` (in `black_bot.rs`, runs `.after(process_actors)`)
+recolors the sphere by priority: **white** when the control plane breaks,
+**red** while `Brain::is_stuck`, otherwise a **collision flash** — a blocked
+movement step relights `BlackBotVisual::collision_flash` to `1.0`, which then
+fades linearly back to black over `COLLISION_FLASH_FADE_SECS` (a quick red
+blink). A wall graze (`BlockedByStatic`) always counts, but a bot-on-bot bump
+(`BlockedByOccupancy`) only flashes when it is **head-on** — a rear bump is
+ignored, exactly mirroring the movement response below (both call
+[`is_front_collision`](../src/actor/mod.rs)). The material is only rewritten when
+the displayed color changes, so a settled bot costs no per-frame asset writes.
 
 ### Bot-on-bot collision response
 
 `FollowPath`'s tile path is planned on **static** geometry only, so it does not
 route around other (moving) bots. When a step is rejected with
-`BlockedByOccupancy` (another bot's footprint), `FollowPath` first bounces its
-velocity elastically off the contact normal, then rolls **one** response,
-weighted by [`FollowTuning`]:
+`BlockedByOccupancy` (another bot's footprint):
 
-| Roll band | Response |
-|-----------|----------|
-| `bot_reroute_chance` | Insert a single back/strafe **tile** waypoint to step away. |
-| `bot_wait_chance` | Pause in place for `bot_wait_secs` to let the clump clear. |
-| `bot_subtile_detour_chance` | Plan a **subtile-level detour** around the blocker (see below). |
-| remainder | Just keep the elastic bounce. |
+1. **Front/back gate.** Classify the contact with `is_front_collision` against
+   the bot's heading (its velocity, or `direction` when stopped). A **rear bump**
+   (blocker behind the heading) is **ignored entirely** — no bounce, step, or
+   detour. Only a **head-on or side** contact provokes a response. (Ambiguous
+   cases — degenerate normal or a stationary bot — count as front.)
+2. **Bounce** the velocity elastically off the contact normal (recoil; feel only).
+3. **Roll the response (`FollowTuning::bot_detour_chance`, default `0.5`).**
+   - *Detour* → plan a **subtile-level detour** around the blocker (see below)
+     toward the next path node.
+   - *Step aside + pause* → step to an adjacent cell and hold there for a random
+     1–3 s (`STEP_BACK_WAIT_*_SECS`). The step is usually **straight back** to the
+     previously occupied cell (`track_tiles` records `prev_tile`), but
+     `FollowTuning::bot_strafe_chance` (default `0.3`) of the time it **strafes
+     left/right** relative to the heading instead (falling back to straight-back
+     if the chosen side is blocked). The pause begins only once the bot *reaches*
+     that cell (`pending_wait` → `contact_wait_s`), so it retreats then waits.
+
+   A detour is **forced** (regardless of the roll) when no valid step cell is
+   known, and the step is the fallback when a rolled detour can't be planned (no
+   avoidance data / no clear route).
+
+This applies to bot-on-bot bumps only; a wall graze (`BlockedByStatic`) is left
+to the normal wall-slide / stuck-repath path.
 
 The subtile detour is a *second, finer* pathfinding pass for short distances:
 [`astar_subtile_detour`](../src/map/hypermap_pathfind.rs) runs a bounded
@@ -114,6 +143,13 @@ only on a re-path).
   wear/break, and applies effects via `apply_brain_effects`. It runs after the
   occupancy flush so the bot-on-bot subtile detour reads the same dynamic
   passability snapshot `process_actors` will use this frame.
+  - **Offline eviction:** when a bot first becomes non-operational
+    (depleted or broken), the gate calls
+    `InteractiveEntityMap::evict_actor_everywhere`, dropping it from every
+    charger's wanting/waiting queue and releasing any charger it occupied, so a
+    dead bot never blocks a station or queue slot. This map-wide sweep runs once
+    on the transition (latched by `BlackBotVisual::offline_released`), not every
+    frame; the latch clears when the bot is operational again.
 
 ### Behaviors
 

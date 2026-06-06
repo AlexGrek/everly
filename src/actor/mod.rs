@@ -179,6 +179,26 @@ pub fn occupancy_collision_normal(center: Vec2, world_subtile_x: i32, world_subt
     }
 }
 
+/// Classifies a bot-on-bot occupancy collision relative to the bot's `heading`.
+///
+/// Returns `true` for a **head-on or side** contact (the bot is moving into the
+/// blocker) and `false` for a **rear** bump (the blocker is behind the heading),
+/// so callers can ignore bumps that come from behind. Degenerate inputs — the
+/// bot is effectively stationary, or sits exactly on the blocker subtile — are
+/// treated as front so a wedged bot never silently freezes.
+///
+/// [`occupancy_collision_normal`] points from the blocker toward the bot, so
+/// moving *into* the blocker means `heading` opposes the normal (`dot <= 0`); a
+/// positive dot means the blocker is behind the heading.
+#[inline]
+pub fn is_front_collision(center: Vec2, heading: Vec2, world_subtile_x: i32, world_subtile_y: i32) -> bool {
+    let normal = occupancy_collision_normal(center, world_subtile_x, world_subtile_y);
+    if normal.length_squared() <= 1e-8 || heading.length_squared() <= 1e-8 {
+        return true;
+    }
+    heading.dot(normal) <= 0.0
+}
+
 /// Reflect `velocity` across `normal` (perfectly elastic, restitution = 1.0).
 ///
 /// If `normal` is zero-length, falls back to an opposite-direction bounce.

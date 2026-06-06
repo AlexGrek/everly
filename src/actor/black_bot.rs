@@ -34,8 +34,8 @@ use crate::actor::brain::{
 use crate::actor::charge::Charge;
 use crate::actor::snapshot::{BreakablePartSnap, BreakableSnap};
 use crate::actor::{
-    actor_main_tile, flush_actor_occupancy, is_paused, process_actors, Actor, ActorMoveBuffer,
-    ActorMovementError, ActorObject, ActorState, OffScreenActor,
+    actor_main_tile, flush_actor_occupancy, is_front_collision, is_paused, process_actors, Actor,
+    ActorMoveBuffer, ActorMovementError, ActorObject, ActorState, OffScreenActor,
 };
 use crate::map::chunk_overlay::{ChunkOverlayState, OVERLAY_RES};
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap};
@@ -68,6 +68,16 @@ const MOVEMENT_ENGINE_WEAR_RATE: f32 = 0.0001;
 const CONTROL_PLANE_WEAR_RATE: f32 = 0.00004;
 /// Wear accumulated per second on the sensory system at all times (while not depleted).
 const SENSORY_SYSTEM_WEAR_RATE: f32 = 0.00002;
+
+/// Healthy metallic-black base tint of a BlackBot.
+const BLACK_TINT: Color = Color::srgb(0.02, 0.02, 0.02);
+/// Red used for the persistent stuck state and the transient collision flash.
+const ALERT_RED: Color = Color::srgb(0.95, 0.15, 0.15);
+/// White shown when the control plane breaks.
+const BROKEN_WHITE: Color = Color::srgb(1.0, 1.0, 1.0);
+/// Seconds for the red collision flash to fade fully back to black. Short so a
+/// bump reads as a quick blink rather than a lingering state.
+const COLLISION_FLASH_FADE_SECS: f32 = 0.45;
 
 /// State of one breakable sub-component of a [`Breakable`] bot.
 #[derive(Debug, Clone)]
@@ -153,6 +163,20 @@ impl Default for Breakable {
 #[derive(Component)]
 pub struct BlackBotVisual {
     main_tile: Option<IVec2>,
+    /// Red collision-flash intensity in `0.0..=1.0`. Set to `1.0` on any frame
+    /// the bot's movement step is blocked (wall graze or bot-on-bot), then
+    /// decays linearly back to `0.0` so the sphere flashes red and settles to
+    /// black. Transient render state — not serialized.
+    collision_flash: f32,
+    /// Last `base_color` written to the mesh material. The status system only
+    /// touches [`Assets<StandardMaterial>`] when the displayed color actually
+    /// changes, so a settled bot incurs no per-frame material writes.
+    applied_color: Option<Color>,
+    /// `true` once a non-operational (broken / depleted) bot has been evicted
+    /// from all charger queues and released as a charger occupant. Gates the
+    /// map-wide eviction to the offline *transition* so it never repeats every
+    /// frame; cleared when the bot is operational again.
+    offline_released: bool,
 }
 
 impl BlackBotVisual {
@@ -421,11 +445,18 @@ fn black_bot_brain(
             .as_ref()
             .map_or(false, |b| b.movement_engine.broken || b.control_plane.broken);
 
-        // Depleted or broken bots are immobilized: hold position, keep the plan.
+        // Depleted or broken bots are immobilized: cancel movement, hold
+        // position, and release every charger queue slot / occupancy they hold
+        // (once, on the offline transition) so they stop blocking working bots.
         if depleted || broken {
             brain.halt(state);
+            if !vis.offline_released {
+                interactive.evict_actor_everywhere(entity);
+                vis.offline_released = true;
+            }
             continue;
         }
+        vis.offline_released = false;
 
         let charge_level = charge.as_ref().map(|c| c.level).unwrap_or(1.0);
         let effects = {
@@ -572,45 +603,78 @@ fn sync_black_bot_transforms(
     }
 }
 
+/// Linearly interpolates two colors in sRGB space (`t` clamped to `0.0..=1.0`).
+fn lerp_srgb(a: Color, b: Color, t: f32) -> Color {
+    let a = a.to_srgba();
+    let b = b.to_srgba();
+    let t = t.clamp(0.0, 1.0);
+    Color::srgb(
+        a.red + (b.red - a.red) * t,
+        a.green + (b.green - a.green) * t,
+        a.blue + (b.blue - a.blue) * t,
+    )
+}
+
 /// Applies material color changes for BlackBot runtime status.
 ///
 /// Priority order:
 /// 1. Broken control plane => white
 /// 2. Stuck while trying to route => red
-/// 3. Healthy => default black
+/// 3. Collision flash => black→red by [`BlackBotVisual::collision_flash`],
+///    which is relit to `1.0` on a blocked step and fades back over
+///    [`COLLISION_FLASH_FADE_SECS`].
+/// 4. Healthy / settled => default black
+///
+/// Runs `.after(process_actors)` so `last_movement_error` reflects this frame's
+/// movement outcome. The material is only rewritten when the displayed color
+/// actually changes, so a settled (non-flashing) bot costs no asset writes.
 fn sync_black_bot_status_visual(
-    bots: Query<(Entity, &Breakable, &Brain, &Children), With<BlackBotVisual>>,
+    time: Res<Time>,
+    mut bots: Query<(&ActorObject, &Breakable, &Brain, &mut BlackBotVisual, &Children)>,
     pick_meshes: Query<&MeshMaterial3d<StandardMaterial>, With<ActorPickMesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut last_status: Local<std::collections::HashMap<Entity, (bool, bool)>>,
 ) {
-    for (entity, b, brain, children) in &bots {
+    let dt = time.delta_secs();
+    for (obj, b, brain, mut vis, children) in &mut bots {
+        // A blocked movement step this frame relights the flash; otherwise it
+        // keeps fading. Wall grazes always count, but a bot-on-bot bump only
+        // counts when it is **head-on** — a rear bump is ignored (mirrors the
+        // movement response in `FollowPath`).
+        let state = obj.inner.state();
+        let collided = match state.last_movement_error {
+            Some(ActorMovementError::BlockedByStatic { .. }) => true,
+            Some(ActorMovementError::BlockedByOccupancy { world_subtile_x, world_subtile_y }) => {
+                is_front_collision(state.center, brain.velocity(), world_subtile_x, world_subtile_y)
+            }
+            _ => false,
+        };
+        if collided {
+            vis.collision_flash = 1.0;
+        }
+
         let cp_broken = b.control_plane.broken;
         let stuck = brain.is_stuck();
-        let status = (cp_broken, stuck);
-        let last = last_status.get(&entity).copied().unwrap_or((false, false));
-        if status == last {
-            continue;
-        }
-        last_status.insert(entity, status);
-
         let target_color = if cp_broken {
-            Color::srgb(1.0, 1.0, 1.0)
+            BROKEN_WHITE
         } else if stuck {
-            Color::srgb(0.95, 0.15, 0.15)
+            ALERT_RED
         } else {
-            Color::srgb(0.02, 0.02, 0.02)
+            lerp_srgb(BLACK_TINT, ALERT_RED, vis.collision_flash)
         };
-        for child in children.iter() {
-            let Ok(mat_handle) = pick_meshes.get(child) else { continue };
-            let Some(mat) = materials.get_mut(&mat_handle.0) else { continue };
-            mat.base_color = target_color;
+
+        if vis.applied_color != Some(target_color) {
+            for child in children.iter() {
+                let Ok(mat_handle) = pick_meshes.get(child) else { continue };
+                let Some(mat) = materials.get_mut(&mat_handle.0) else { continue };
+                mat.base_color = target_color;
+            }
+            vis.applied_color = Some(target_color);
+        }
+
+        if vis.collision_flash > 0.0 {
+            vis.collision_flash = (vis.collision_flash - dt / COLLISION_FLASH_FADE_SECS).max(0.0);
         }
     }
-
-    // Keep cache bounded to currently alive bots so long sessions with
-    // spawn/despawn churn don't accumulate dead-entity entries forever.
-    last_status.retain(|entity, _| bots.get(*entity).is_ok());
 }
 
 const TARGET_COLOR: [u8; 4] = [180, 40, 220, 160];
@@ -708,7 +772,7 @@ fn paint_black_bot_targets(
 
 fn black_bot_material(materials: &mut Assets<StandardMaterial>) -> Handle<StandardMaterial> {
     materials.add(StandardMaterial {
-        base_color: Color::srgb(0.02, 0.02, 0.02),
+        base_color: BLACK_TINT,
         metallic: 1.0,
         perceptual_roughness: 0.05,
         reflectance: 1.0,
@@ -738,7 +802,12 @@ pub fn spawn_black_bot_from_snapshot(
             Name::new(name.to_string()),
             ActorInspectable,
             Breakable::from_snapshot(breakable),
-            BlackBotVisual { main_tile: None },
+            BlackBotVisual {
+                main_tile: None,
+                collision_flash: 0.0,
+                applied_color: None,
+                offline_released: false,
+            },
             build_black_bot_brain(rng_seed),
             ActorObject::new(Box::new(bot)),
             Transform::default(),
@@ -780,7 +849,12 @@ pub fn spawn_black_bot(
             ActorInspectable,
             Charge::random(rng),
             Breakable::new(),
-            BlackBotVisual { main_tile: None },
+            BlackBotVisual {
+                main_tile: None,
+                collision_flash: 0.0,
+                applied_color: None,
+                offline_released: false,
+            },
             build_black_bot_brain(brain_seed),
             ActorObject::new(Box::new(bot)),
             Transform::default(),

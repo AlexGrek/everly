@@ -10,14 +10,17 @@
 //! - [`FollowPath`] — steer along a simplified waypoint path. This is where all
 //!   of BlackBot's tuned movement *feel* lives: mass/inertia (finite
 //!   accel/decel velocity steering), wall-momentum bleed, a stuck-repath safety
-//!   net, and bot-on-bot reroute/wait — see [`FollowTuning`].
+//!   net, and the bot-on-bot response — a deterministic elastic bounce + step
+//!   back to the previously occupied cell, with a subtile detour as fallback —
+//!   see [`FollowTuning`].
 
 use bevy::prelude::*;
 use rand::rngs::StdRng;
 use rand::Rng;
 
 use crate::actor::{
-    occupancy_collision_normal, reflect_velocity, ActorMoveBuffer, ActorMovementError, ActorState,
+    is_front_collision, occupancy_collision_normal, reflect_velocity, ActorMoveBuffer,
+    ActorMovementError, ActorState,
 };
 use crate::map::hypermap_pathfind::{astar_subtile_detour, world_tile_walkable};
 use crate::map::passability::SUBTILE_COUNT;
@@ -35,6 +38,11 @@ const DETOUR_MAX_SPAN_SUBTILES: i32 = 40;
 /// Hard cap on subtile A\* node expansions for a detour (safety bound).
 const DETOUR_MAX_EXPANDED: usize = 1024;
 
+/// Inclusive bounds (seconds) of the pause a bot holds after stepping aside from
+/// a head-on bot-on-bot bump.
+const STEP_BACK_WAIT_MIN_SECS: f32 = 1.0;
+const STEP_BACK_WAIT_MAX_SECS: f32 = 3.0;
+
 /// Tuning for [`FollowPath`]. Defaults reproduce BlackBot's historical movement
 /// feel so the planning refactor changes nothing about how a bot moves.
 #[derive(Debug, Clone, Copy)]
@@ -51,16 +59,14 @@ pub struct FollowTuning {
     pub stuck_repath_secs: f32,
     /// Minimum closest-approach reduction (tiles) that resets the stuck timer.
     pub stuck_progress_eps: f32,
-    /// Chance per bot-on-bot bump to detour around the other bot.
-    pub bot_reroute_chance: f32,
-    /// Chance per bot-on-bot bump to pause instead of pushing.
-    pub bot_wait_chance: f32,
-    /// How long a bot-on-bot pause lasts.
-    pub bot_wait_secs: f32,
-    /// Chance per bot-on-bot bump to compute a **subtile-level** detour that
-    /// threads the actor's footprint around the blocker to the next path node.
-    /// Defaults to the same odds as [`Self::bot_wait_chance`].
-    pub bot_subtile_detour_chance: f32,
+    /// Probability per **head-on** bot-on-bot bump of routing a subtile detour
+    /// around the blocker; otherwise the bot steps aside and pauses. A detour is
+    /// still forced when no valid step-aside cell exists. (Rear bumps are ignored
+    /// entirely.)
+    pub bot_detour_chance: f32,
+    /// When a bump resolves to a step-aside, the probability it strafes left/right
+    /// instead of stepping straight back to the previously occupied cell.
+    pub bot_strafe_chance: f32,
 }
 
 impl Default for FollowTuning {
@@ -72,10 +78,8 @@ impl Default for FollowTuning {
             waypoint_eps: 0.05,
             stuck_repath_secs: 2.0,
             stuck_progress_eps: 0.05,
-            bot_reroute_chance: 0.20,
-            bot_wait_chance: 0.25,
-            bot_wait_secs: 1.0,
-            bot_subtile_detour_chance: 0.25,
+            bot_detour_chance: 0.5,
+            bot_strafe_chance: 0.3,
         }
     }
 }
@@ -201,8 +205,17 @@ pub struct FollowPath {
     stuck_timer: f32,
     closest_approach: f32,
     stuck_waypoint_index: usize,
-    /// Remaining bot-on-bot pause; movement is suppressed while `> 0`.
+    /// Current main tile, tracked across frames so a bot-on-bot bump can retreat
+    /// to [`prev_tile`](Self::prev_tile) — the cell it stood in just before.
+    last_tile: Option<IVec2>,
+    /// The distinct main tile occupied immediately before [`last_tile`](Self::last_tile).
+    /// `None` until the bot has crossed at least one tile boundary on this path.
+    prev_tile: Option<IVec2>,
+    /// Remaining post-step-aside pause (seconds); position is held while `> 0`.
     contact_wait_s: f32,
+    /// A queued step-aside pause: `(target tile, seconds)`. The pause begins once
+    /// the bot reaches `target`, so it retreats *then* waits. `None` = no pending wait.
+    pending_wait: Option<((i32, i32), f32)>,
     /// Active subtile-level detour: tile-space waypoint centers to thread around
     /// a blocking bot before resuming the tile path. Empty = no detour.
     detour: Vec<Vec2>,
@@ -224,7 +237,10 @@ impl FollowPath {
             stuck_timer: 0.0,
             closest_approach: f32::MAX,
             stuck_waypoint_index: 0,
+            last_tile: None,
+            prev_tile: None,
             contact_wait_s: 0.0,
+            pending_wait: None,
             detour: Vec::new(),
             detour_index: 0,
             detour_timer: 0.0,
@@ -274,11 +290,78 @@ impl FollowPath {
         Some(collapsed.into_iter().skip(1).map(subtile_center).collect())
     }
 
+    /// The cell to retreat to on a bot-on-bot bump: the last *distinct* tile the
+    /// bot stood in before its current one, if that tile is statically walkable.
+    /// `None` until the bot has crossed at least one tile boundary on this path.
+    fn step_back_target(&self, ctx: &BrainContext) -> Option<(i32, i32)> {
+        let prev = self.prev_tile?;
+        if prev == ctx.main_tile || !world_tile_walkable(ctx.passability, prev.x, prev.y) {
+            return None;
+        }
+        Some((prev.x, prev.y))
+    }
+
+    /// The tile to step aside into on a head-on bump. Usually the previous cell
+    /// (straight back), but with `bot_strafe_chance` a walkable left/right tile
+    /// relative to `heading` instead. Falls back to the step-back cell when a
+    /// chosen strafe is blocked.
+    fn step_target(
+        &self,
+        ctx: &BrainContext,
+        heading: Vec2,
+        rng: &mut StdRng,
+        t: &FollowTuning,
+    ) -> Option<(i32, i32)> {
+        if heading.length_squared() > 1e-8 && rng.gen_range(0.0_f32..1.0) < t.bot_strafe_chance {
+            let d = heading.normalize();
+            let mut sides = [Vec2::new(-d.y, d.x), Vec2::new(d.y, -d.x)];
+            if rng.gen_range(0..2) == 1 {
+                sides.swap(0, 1);
+            }
+            let cur = ctx.main_tile;
+            for s in sides {
+                let tile = (
+                    (cur.x as f32 + s.x).round() as i32,
+                    (cur.y as f32 + s.y).round() as i32,
+                );
+                if tile != (cur.x, cur.y) && world_tile_walkable(ctx.passability, tile.0, tile.1) {
+                    return Some(tile);
+                }
+            }
+        }
+        self.step_back_target(ctx)
+    }
+
+    /// Center of the current path waypoint, used as the off-screen-resolution
+    /// hint while the bot holds position.
     fn current_waypoint_hint(&self) -> Option<Vec2> {
-        if self.index < self.path.len() {
-            Some(waypoint_center(self.path[self.index]))
-        } else {
-            None
+        self.path.get(self.index).copied().map(waypoint_center)
+    }
+
+    /// Plans and installs a subtile detour around the blocker; returns whether
+    /// one was found.
+    fn try_begin_detour(&mut self, state: &ActorState, ctx: &BrainContext) -> bool {
+        match self.plan_subtile_detour(state, ctx) {
+            Some(detour) => {
+                self.detour = detour;
+                self.detour_index = 0;
+                self.detour_timer = 0.0;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Records the bot's current main tile, shifting the previous one into
+    /// [`prev_tile`](Self::prev_tile) whenever it crosses a tile boundary.
+    fn track_tiles(&mut self, main_tile: IVec2) {
+        match self.last_tile {
+            Some(t) if t != main_tile => {
+                self.prev_tile = Some(t);
+                self.last_tile = Some(main_tile);
+            }
+            None => self.last_tile = Some(main_tile),
+            _ => {}
         }
     }
 
@@ -309,85 +392,71 @@ impl FollowPath {
         state.move_buffer.rotation_shift = 0.0;
         self.prev_center = Some(center);
     }
-
-    fn pause_in_place(&mut self, state: &mut ActorState) {
-        self.velocity = Vec2::ZERO;
-        self.prev_center = None;
-        state.move_buffer = ActorMoveBuffer::default();
-        state.next_waypoint_hint = self.current_waypoint_hint();
-    }
 }
 
 impl LowLevelAction for FollowPath {
     fn execute(&mut self, state: &mut ActorState, ctx: &BrainContext, rng: &mut StdRng, t: &FollowTuning) {
         let dt = ctx.dt;
         let center = state.center;
+        self.track_tiles(ctx.main_tile);
 
-        // Bot-on-bot pause countdown.
+        // Holding position after a step-aside: stay put until the pause elapses.
         if self.contact_wait_s > 0.0 {
             self.contact_wait_s -= dt;
-            self.pause_in_place(state);
+            self.velocity = Vec2::ZERO;
+            self.prev_center = None;
+            state.move_buffer = ActorMoveBuffer::default();
+            state.next_waypoint_hint = self.current_waypoint_hint();
             return;
         }
 
-        // Bot-on-bot collisions bounce elastically around the contact normal.
+        // Bot-on-bot bump response. Only **head-on** (front/side) contacts
+        // provoke a reaction — a rear bump (blocker behind the heading) is
+        // ignored, no bounce/step/detour. On a head-on bump the bot bounces, then
+        // either routes a subtile detour (`bot_detour_chance`) or steps aside and
+        // pauses 1–3 s. The step is usually straight back to the previous cell,
+        // but `bot_strafe_chance` of the time it strafes left/right instead.
         if let Some(ActorMovementError::BlockedByOccupancy {
             world_subtile_x,
             world_subtile_y,
         }) = state.last_movement_error.clone()
         {
-            let normal = occupancy_collision_normal(center, world_subtile_x, world_subtile_y);
-            self.velocity = reflect_velocity(self.velocity, normal);
-            if self.velocity.length_squared() > 1e-8 {
-                self.direction = self.velocity.normalize();
+            let heading = if self.velocity.length_squared() > 1e-8 {
+                self.velocity
             } else {
-                self.direction = -self.direction;
-            }
-            // Skip achieved-vs-planned clamping this frame so reflection is preserved.
-            self.prev_center = None;
-
-            // A fresh bump invalidates any in-progress subtile detour (the world
-            // moved out from under it); drop it before rolling a new response.
-            self.detour.clear();
-            self.detour_index = 0;
-            self.detour_timer = 0.0;
-
-            // Roll one bot-on-bot response: a single-tile step-away, a short
-            // pause, a size-aware subtile detour around the blocker, or (the
-            // remaining probability) just the elastic bounce above.
-            let roll = rng.gen_range(0.0_f32..1.0);
-            if roll < t.bot_reroute_chance {
-                let distance = rng.gen_range(1..=2) as f32;
-                let d = self.direction;
-                // Back, strafe-left, strafe-right — shuffled so each can win first.
-                let mut candidates = [-d, Vec2::new(-d.y, d.x), Vec2::new(d.y, -d.x)];
-                for i in (1..3).rev() {
-                    let j = rng.gen_range(0..=i);
-                    candidates.swap(i, j);
+                self.direction
+            };
+            if is_front_collision(center, heading, world_subtile_x, world_subtile_y) {
+                let normal = occupancy_collision_normal(center, world_subtile_x, world_subtile_y);
+                self.velocity = reflect_velocity(self.velocity, normal);
+                if self.velocity.length_squared() > 1e-8 {
+                    self.direction = self.velocity.normalize();
+                } else {
+                    self.direction = -self.direction;
                 }
-                let cur = ctx.main_tile;
-                for escape_dir in candidates {
-                    let escape = (
-                        (cur.x as f32 + escape_dir.x * distance).round() as i32,
-                        (cur.y as f32 + escape_dir.y * distance).round() as i32,
-                    );
-                    if escape != (cur.x, cur.y) && world_tile_walkable(ctx.passability, escape.0, escape.1) {
+                // Skip achieved-vs-planned clamping this frame so reflection is preserved.
+                self.prev_center = None;
+
+                // A fresh bump invalidates any in-progress detour or pending pause
+                // (the world moved out from under them) before re-deciding.
+                self.detour.clear();
+                self.detour_index = 0;
+                self.detour_timer = 0.0;
+                self.pending_wait = None;
+
+                let step = self.step_target(ctx, heading, rng, t);
+                let want_detour =
+                    step.is_none() || rng.gen_range(0.0_f32..1.0) < t.bot_detour_chance;
+                let detoured = want_detour && self.try_begin_detour(state, ctx);
+                if !detoured {
+                    if let Some(target) = step {
                         let insert_idx = self.index.min(self.path.len());
-                        self.path.insert(insert_idx, escape);
-                        // Force heading recalculation toward the escape tile this frame.
+                        self.path.insert(insert_idx, target);
+                        // Force heading recalculation toward the step-aside tile.
                         self.stuck_waypoint_index = usize::MAX;
-                        break;
+                        let secs = rng.gen_range(STEP_BACK_WAIT_MIN_SECS..=STEP_BACK_WAIT_MAX_SECS);
+                        self.pending_wait = Some((target, secs));
                     }
-                }
-            } else if roll < t.bot_reroute_chance + t.bot_wait_chance {
-                self.contact_wait_s = t.bot_wait_secs;
-                self.pause_in_place(state);
-                return;
-            } else if roll < t.bot_reroute_chance + t.bot_wait_chance + t.bot_subtile_detour_chance {
-                if let Some(detour) = self.plan_subtile_detour(state, ctx) {
-                    self.detour = detour;
-                    self.detour_index = 0;
-                    self.detour_timer = 0.0;
                 }
             }
         }
@@ -428,6 +497,20 @@ impl LowLevelAction for FollowPath {
         }
 
         self.advance_past_reached(center, t.waypoint_eps);
+
+        // Begin the post-step-aside pause once the bot has reached the cell it
+        // retreated/strafed into, so it stops *there* rather than mid-bump.
+        if let Some((cell, secs)) = self.pending_wait {
+            if reached_waypoint(center, cell, t.waypoint_eps) {
+                self.contact_wait_s = secs;
+                self.pending_wait = None;
+                self.velocity = Vec2::ZERO;
+                self.prev_center = None;
+                state.move_buffer = ActorMoveBuffer::default();
+                state.next_waypoint_hint = self.current_waypoint_hint();
+                return;
+            }
+        }
 
         if self.index >= self.path.len() {
             // Exhausted: coast to a stop (the high-level re-plans next frame).
@@ -486,6 +569,8 @@ impl LowLevelAction for FollowPath {
     fn halt(&mut self) {
         self.velocity = Vec2::ZERO;
         self.prev_center = None;
+        self.contact_wait_s = 0.0;
+        self.pending_wait = None;
     }
 
     fn label(&self) -> String {
@@ -710,10 +795,24 @@ mod tests {
     }
 
     #[test]
-    fn follow_path_contact_reroute_inserts_escape_waypoint() {
+    fn track_tiles_remembers_previous_distinct_cell() {
+        let mut fp = FollowPath::new(vec![(9, 5)]);
+        fp.track_tiles(IVec2::new(4, 5));
+        assert_eq!(fp.prev_tile, None, "first observation has no predecessor");
+        fp.track_tiles(IVec2::new(4, 5));
+        assert_eq!(fp.prev_tile, None, "staying in the same cell does not shift");
+        fp.track_tiles(IVec2::new(5, 5));
+        assert_eq!(fp.prev_tile, Some(IVec2::new(4, 5)), "crossing a boundary records the cell left");
+        assert_eq!(fp.last_tile, Some(IVec2::new(5, 5)));
+    }
+
+    #[test]
+    fn follow_path_steps_back_to_previous_cell_on_bot_bump() {
         let mut fp = FollowPath::new(vec![(8, 5)]);
         fp.velocity = Vec2::new(1.0, 0.0);
         fp.direction = Vec2::new(1.0, 0.0);
+        // The bot arrived at (5,5) from (4,5); a bump must retreat there.
+        fp.prev_tile = Some(IVec2::new(4, 5));
 
         let mut state = ActorState {
             center: Vec2::new(5.0, 5.0),
@@ -748,17 +847,251 @@ mod tests {
             avoidance: None,
         };
         let mut rng = StdRng::seed_from_u64(2);
-        let mut tuning = FollowTuning::default();
-        tuning.bot_reroute_chance = 1.0;
-        tuning.bot_wait_chance = 0.0;
+        // Force a straight step-back (no detour, no strafe) so the target is exact.
+        let tuning = FollowTuning {
+            bot_detour_chance: 0.0,
+            bot_strafe_chance: 0.0,
+            ..FollowTuning::default()
+        };
         let original_len = fp.path.len();
 
         fp.execute(&mut state, &ctx, &mut rng, &tuning);
 
         assert!(
             fp.path.len() > original_len,
-            "bot collision reroute should insert an escape waypoint"
+            "bot bump should insert a step-back waypoint"
         );
+        assert_eq!(
+            fp.path[fp.index], (4, 5),
+            "the inserted waypoint must be the previously occupied cell"
+        );
+    }
+
+    /// Bump context with a clear avoidance map and a valid step-back cell, so the
+    /// chance roll is the only thing deciding detour vs. step-back.
+    fn detour_or_stepback_fixture() -> (FollowPath, ActorState) {
+        let mut fp = FollowPath::new(vec![(8, 5)]);
+        fp.velocity = Vec2::new(1.0, 0.0);
+        fp.direction = Vec2::new(1.0, 0.0);
+        fp.prev_tile = Some(IVec2::new(4, 5)); // a valid step-back cell exists
+        (fp, detour_state(IVec2::new(25, 25), IVec2::new(27, 25)))
+    }
+
+    #[test]
+    fn follow_path_detours_on_bot_bump_at_full_chance() {
+        use crate::actor::brain::AvoidanceViews;
+        use crate::map::passability::{
+            DynamicPassabilityMap, SubtilePassability, FLAG_BLOCKED, FLAG_VOID,
+        };
+
+        let dynamic = DynamicPassabilityMap::new();
+        let static_subtiles: Hypermap<SubtilePassability> = Hypermap::new(SubtilePassability::EMPTY);
+        let (mut fp, mut state) = detour_or_stepback_fixture();
+        let passability = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let ctx = BrainContext {
+            entity: Entity::PLACEHOLDER,
+            dt: 0.1,
+            center: state.center,
+            main_tile: IVec2::new(5, 5),
+            main_tile_changed: false,
+            floor: 0,
+            charge: 1.0,
+            missing_charge_pct: 0.0,
+            depleted: false,
+            broken: false,
+            passability: &passability,
+            interactive: &interactive,
+            avoidance: Some(AvoidanceViews {
+                dynamic: &dynamic,
+                static_subtiles: &static_subtiles,
+                blocked_flags: FLAG_BLOCKED | FLAG_VOID,
+            }),
+        };
+        let mut rng = StdRng::seed_from_u64(5);
+        // chance 1.0: a bump must detour even though a step-back cell exists.
+        let tuning = FollowTuning { bot_detour_chance: 1.0, ..FollowTuning::default() };
+
+        fp.execute(&mut state, &ctx, &mut rng, &tuning);
+
+        assert!(!fp.detour.is_empty(), "a full-chance bump must route a detour");
+    }
+
+    #[test]
+    fn follow_path_steps_back_on_bot_bump_at_zero_chance() {
+        use crate::actor::brain::AvoidanceViews;
+        use crate::map::passability::{
+            DynamicPassabilityMap, SubtilePassability, FLAG_BLOCKED, FLAG_VOID,
+        };
+
+        let dynamic = DynamicPassabilityMap::new();
+        let static_subtiles: Hypermap<SubtilePassability> = Hypermap::new(SubtilePassability::EMPTY);
+        let (mut fp, mut state) = detour_or_stepback_fixture();
+        let passability = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let ctx = BrainContext {
+            entity: Entity::PLACEHOLDER,
+            dt: 0.1,
+            center: state.center,
+            main_tile: IVec2::new(5, 5),
+            main_tile_changed: false,
+            floor: 0,
+            charge: 1.0,
+            missing_charge_pct: 0.0,
+            depleted: false,
+            broken: false,
+            passability: &passability,
+            interactive: &interactive,
+            avoidance: Some(AvoidanceViews {
+                dynamic: &dynamic,
+                static_subtiles: &static_subtiles,
+                blocked_flags: FLAG_BLOCKED | FLAG_VOID,
+            }),
+        };
+        let mut rng = StdRng::seed_from_u64(5);
+        let original_len = fp.path.len();
+        // chance 0.0 + no strafe: a bump must step straight back, never detour.
+        let tuning = FollowTuning {
+            bot_detour_chance: 0.0,
+            bot_strafe_chance: 0.0,
+            ..FollowTuning::default()
+        };
+
+        fp.execute(&mut state, &ctx, &mut rng, &tuning);
+
+        assert!(fp.detour.is_empty(), "zero-chance bump must not detour");
+        assert!(fp.path.len() > original_len, "zero-chance bump must step back");
+        assert_eq!(fp.path[fp.index], (4, 5), "step-back targets the previous cell");
+    }
+
+    /// Builds a bump `BrainContext`/`ActorState` with the bot heading +X and the
+    /// blocker at `blocker_subtile`. `avoidance` is `None`, so the only response
+    /// available is a step (no detour) — convenient for asserting front/back gating.
+    fn bump_ctx_state(
+        blocker_subtile: IVec2,
+    ) -> (ActorState, Hypermap<f32>, InteractiveEntityMap) {
+        let state = ActorState {
+            center: Vec2::new(5.0, 5.0),
+            radius_subtiles: 2,
+            rotation: 0.0,
+            move_buffer: ActorMoveBuffer::default(),
+            last_movement_error: Some(ActorMovementError::BlockedByOccupancy {
+                world_subtile_x: blocker_subtile.x,
+                world_subtile_y: blocker_subtile.y,
+            }),
+            last_accepted_center_subtile: Some(IVec2::new(25, 25)),
+            last_accepted_radius_subtiles: 2,
+            next_waypoint_hint: None,
+            field_main_tile: None,
+            dirtiness: 0.0,
+        };
+        (state, Hypermap::new(1.0), InteractiveEntityMap::new())
+    }
+
+    fn bump_ctx<'a>(
+        state: &ActorState,
+        passability: &'a Hypermap<f32>,
+        interactive: &'a InteractiveEntityMap,
+    ) -> BrainContext<'a> {
+        BrainContext {
+            entity: Entity::PLACEHOLDER,
+            dt: 0.1,
+            center: state.center,
+            main_tile: IVec2::new(5, 5),
+            main_tile_changed: false,
+            floor: 0,
+            charge: 1.0,
+            missing_charge_pct: 0.0,
+            depleted: false,
+            broken: false,
+            passability,
+            interactive,
+            avoidance: None,
+        }
+    }
+
+    #[test]
+    fn follow_path_ignores_rear_bot_collision() {
+        // Heading +X, blocker just behind on -X → a rear bump, which must be
+        // ignored entirely: no bounce, no step, no detour — even with a valid
+        // step-back cell available.
+        let mut fp = FollowPath::new(vec![(8, 5)]);
+        fp.velocity = Vec2::new(1.0, 0.0);
+        fp.direction = Vec2::new(1.0, 0.0);
+        fp.prev_tile = Some(IVec2::new(4, 5));
+
+        let (mut state, passability, interactive) = bump_ctx_state(IVec2::new(24, 25));
+        let ctx = bump_ctx(&state, &passability, &interactive);
+        let mut rng = StdRng::seed_from_u64(7);
+        let original_len = fp.path.len();
+
+        fp.execute(&mut state, &ctx, &mut rng, &FollowTuning::default());
+
+        assert_eq!(fp.path.len(), original_len, "rear bump must not insert a step");
+        assert!(fp.detour.is_empty(), "rear bump must not detour");
+        assert!(fp.velocity.x > 0.0, "rear bump must not reflect forward velocity");
+    }
+
+    #[test]
+    fn follow_path_strafes_sideways_on_bot_bump() {
+        // Front bump, full strafe chance, zero detour chance → the step must be a
+        // side tile relative to the +X heading, not the straight-back cell.
+        let mut fp = FollowPath::new(vec![(8, 5)]);
+        fp.velocity = Vec2::new(1.0, 0.0);
+        fp.direction = Vec2::new(1.0, 0.0);
+        fp.prev_tile = Some(IVec2::new(4, 5));
+
+        let (mut state, passability, interactive) = bump_ctx_state(IVec2::new(26, 25));
+        let ctx = bump_ctx(&state, &passability, &interactive);
+        let mut rng = StdRng::seed_from_u64(8);
+        let tuning = FollowTuning {
+            bot_detour_chance: 0.0,
+            bot_strafe_chance: 1.0,
+            ..FollowTuning::default()
+        };
+
+        fp.execute(&mut state, &ctx, &mut rng, &tuning);
+
+        let stepped = fp.path[fp.index];
+        assert!(
+            stepped == (5, 6) || stepped == (5, 4),
+            "strafe must step to a side tile relative to heading, got {stepped:?}"
+        );
+    }
+
+    #[test]
+    fn follow_path_waits_after_reaching_step_aside_cell() {
+        // Front bump → step straight back to (4,5) with a pending pause. The pause
+        // only starts once the bot actually reaches that cell, then it holds.
+        let mut fp = FollowPath::new(vec![(8, 5)]);
+        fp.velocity = Vec2::new(1.0, 0.0);
+        fp.direction = Vec2::new(1.0, 0.0);
+        fp.prev_tile = Some(IVec2::new(4, 5));
+
+        let (mut state, passability, interactive) = bump_ctx_state(IVec2::new(26, 25));
+        let mut rng = StdRng::seed_from_u64(9);
+        let tuning = FollowTuning {
+            bot_detour_chance: 0.0,
+            bot_strafe_chance: 0.0,
+            ..FollowTuning::default()
+        };
+
+        // Bump frame: insert step-back, arm the pending pause (not started yet).
+        let ctx = bump_ctx(&state, &passability, &interactive);
+        fp.execute(&mut state, &ctx, &mut rng, &tuning);
+        assert!(fp.contact_wait_s <= 0.0, "pause must not start before arrival");
+
+        // Arrive at the step-back cell (4,5): the pause begins and holds position.
+        state.center = Vec2::new(4.5, 5.5);
+        state.last_movement_error = None;
+        let ctx = bump_ctx(&state, &passability, &interactive);
+        fp.execute(&mut state, &ctx, &mut rng, &tuning);
+        assert!(
+            (STEP_BACK_WAIT_MIN_SECS..=STEP_BACK_WAIT_MAX_SECS).contains(&fp.contact_wait_s),
+            "reaching the step-aside cell starts a 1-3s pause, got {}",
+            fp.contact_wait_s
+        );
+        assert_eq!(state.move_buffer.tile_delta, Vec2::ZERO, "bot holds position while paused");
     }
 
     #[test]
@@ -909,10 +1242,10 @@ mod tests {
             }),
         };
         let mut rng = StdRng::seed_from_u64(3);
+        // Force the detour branch (no strafe step) to exercise detour planning.
         let tuning = FollowTuning {
-            bot_reroute_chance: 0.0,
-            bot_wait_chance: 0.0,
-            bot_subtile_detour_chance: 1.0,
+            bot_detour_chance: 1.0,
+            bot_strafe_chance: 0.0,
             ..FollowTuning::default()
         };
 
@@ -976,10 +1309,10 @@ mod tests {
             }),
         };
         let mut rng = StdRng::seed_from_u64(4);
+        // Force the detour branch (no strafe step); it must still find no route.
         let tuning = FollowTuning {
-            bot_reroute_chance: 0.0,
-            bot_wait_chance: 0.0,
-            bot_subtile_detour_chance: 1.0,
+            bot_detour_chance: 1.0,
+            bot_strafe_chance: 0.0,
             ..FollowTuning::default()
         };
 

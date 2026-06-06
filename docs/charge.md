@@ -22,7 +22,7 @@ pub struct Charge {
 | Method | Behavior |
 |--------|----------|
 | `Charge::new(level)` | Clamps `level` into `[0.0, 1.0]`. The only constructor — `level` is never set raw, so the invariant holds everywhere. |
-| `Charge::random(rng)` | Starting charge drawn uniformly from `[SPAWN_CHARGE_MIN, SPAWN_CHARGE_MAX]` = `[0.4, 1.0]`. Takes the same seeded `StdRng` the spawner already threads, so spawns stay deterministic. |
+| `Charge::random(rng)` | Starting charge drawn uniformly from `[SPAWN_CHARGE_MIN, SPAWN_CHARGE_MAX]` = `[0.3, 1.0]`. Takes the same seeded `StdRng` the spawner already threads, so spawns stay deterministic. |
 | `Charge::is_depleted()` | `true` iff `level <= 0.0`. The single source of truth for "can't move". |
 
 ## Lifecycle
@@ -31,7 +31,7 @@ pub struct Charge {
 
 | Path | Starting charge |
 |------|-----------------|
-| Editor spawn ([`spawn_glitch_bot`](../src/actor/glitch_bot.rs) / [`spawn_black_bot`](../src/actor/black_bot.rs)) | `Charge::random` → `0.4..=1.0` |
+| Editor spawn ([`spawn_glitch_bot`](../src/actor/glitch_bot.rs) / [`spawn_black_bot`](../src/actor/black_bot.rs)) | `Charge::random` → `0.3..=1.0` |
 | Snapshot load ([`spawn_level_actors`](../src/actor/snapshot.rs)) | Restores the saved `charge`; a missing field defaults to full (`1.0`) |
 
 ### Discharge
@@ -40,7 +40,7 @@ pub struct Charge {
 while `GameState::InGame` **and** not [`Paused`](../src/actor/mod.rs):
 
 ```text
-level -= DISCHARGE_PER_S * dt        // DISCHARGE_PER_S = 0.02 → ~50 s full→empty
+level -= DISCHARGE_PER_S * dt        // DISCHARGE_PER_S = 0.002 → ~500 s full→empty
 level  = level.max(0.0)              // clamp at 0.0; never goes negative
 ```
 
@@ -95,8 +95,8 @@ so pre-charge save files still load. See
 
 | Constant | Value | Meaning |
 |----------|-------|---------|
-| `DISCHARGE_PER_S` | `0.02` | Fraction of full charge drained per second (~50 s full→empty) |
-| `SPAWN_CHARGE_MIN` | `0.4` | Lower bound of random spawn charge |
+| `DISCHARGE_PER_S` | `0.002` | Fraction of full charge drained per second (~500 s full→empty) |
+| `SPAWN_CHARGE_MIN` | `0.3` | Lower bound of random spawn charge |
 | `SPAWN_CHARGE_MAX` | `1.0` | Upper bound of random spawn charge |
 
 All three live in [`src/actor/charge.rs`](../src/actor/charge.rs).

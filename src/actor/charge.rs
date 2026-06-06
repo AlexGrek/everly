@@ -15,11 +15,11 @@ use crate::actor::is_paused;
 use crate::menu::main_menu::GameState;
 
 /// Fraction of full charge drained per second while the simulation runs.
-/// At this rate a fully charged bot takes 2500 s to deplete.
-const DISCHARGE_PER_S: f32 = 0.004;
+/// At this rate a fully charged bot takes ~500 s (≈8 min) to deplete.
+const DISCHARGE_PER_S: f32 = 0.002;
 
 /// Inclusive bounds for a freshly spawned bot's random starting charge.
-const SPAWN_CHARGE_MIN: f32 = 0.4;
+const SPAWN_CHARGE_MIN: f32 = 0.3;
 const SPAWN_CHARGE_MAX: f32 = 1.0;
 
 /// Per-bot battery level in `[0.0, 1.0]`. A bot at `0.0` cannot move.

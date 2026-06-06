@@ -595,6 +595,31 @@ impl InteractiveEntityMap {
         self.queues.remove(&coords);
     }
 
+    /// Removes `actor` from **every** station's wanting and waiting queues and
+    /// releases it as the occupant of any charger it holds. Used when a bot goes
+    /// non-operational (broken / depleted) so it stops occupying a charger or
+    /// hogging queue slots it can no longer act on. Returns `true` if anything
+    /// was changed (the actor was found in at least one queue or charger).
+    pub fn evict_actor_everywhere(&mut self, actor: Entity) -> bool {
+        let mut changed = false;
+        self.queues.retain(|_, queue| {
+            let before = queue.wanting.len() + queue.waiting.len();
+            queue.wanting.retain(|queued| *queued != actor);
+            queue.waiting.retain(|queued| *queued != actor);
+            changed |= queue.wanting.len() + queue.waiting.len() != before;
+            !(queue.wanting.is_empty() && queue.waiting.is_empty())
+        });
+        for entry in self.iter_mut() {
+            if let Some(charger) = entry.entity.as_charger_mut() {
+                if charger.occupant() == Some(actor) {
+                    charger.set_occupant(None);
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
     /// Number of actors currently waiting near station `coords`.
     pub fn waiting_len(&self, coords: EntityCoordinates) -> usize {
         self.queues.get(&coords).map_or(0, |q| q.waiting.len())
@@ -965,6 +990,34 @@ mod tests {
         map.remove_waiting(coords, b);
         assert_eq!(map.waiting_queue(coords), vec![a]);
         assert!(map.is_waiting_front(coords, a));
+    }
+
+    #[test]
+    fn evict_everywhere_clears_queues_and_releases_charger() {
+        let mut map = InteractiveEntityMap::new();
+        let station_a = EntityCoordinates::ground(3, 3);
+        let station_b = EntityCoordinates::ground(7, 7);
+        let bot = Entity::from_bits(100);
+        let other = Entity::from_bits(101);
+
+        // Bot occupies charger A and is queued (waiting at A, wanting at B);
+        // another bot shares those queues and must be left untouched.
+        let mut charger = ChargerEntity::new(station_a, ChargerFacing::North);
+        charger.set_occupant(Some(bot));
+        map.insert(InteractiveEntity::Charger(charger));
+        map.add_waiting(station_a, bot);
+        map.add_waiting(station_a, other);
+        map.add_wanting(station_b, bot);
+
+        assert!(map.evict_actor_everywhere(bot));
+
+        assert_eq!(map.waiting_queue(station_a), vec![other], "only the evicted bot leaves");
+        assert_eq!(map.wanting_queue(station_b), Vec::<Entity>::new(), "wanting slot freed and pruned");
+        let charger = map.entities_at(station_a)[0].entity.as_charger().unwrap();
+        assert_eq!(charger.occupant(), None, "charger released");
+        assert!(!charger.is_used());
+
+        assert!(!map.evict_actor_everywhere(bot), "second eviction is a no-op");
     }
 
     #[test]
