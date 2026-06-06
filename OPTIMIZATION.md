@@ -197,3 +197,32 @@ Follow-up optimization for the new stuck/broken color sync in
 
 Verified green: `cargo test -p everly` (183 passed, 0 failed, 2 ignored) and
 `cargo check -p everly` warning-clean.
+
+### BlackBot stuck check — O(1) queue-membership lookup (2026-06)
+
+The overhauled BlackBot stuck detection in
+[`FollowPath::execute`](src/actor/brain/low_level.rs) gates the stuck timer on
+"is this bot waiting in any charger queue?" via
+`InteractiveEntityMap::is_in_any_queue`. That query is called **once per moving
+BlackBot per frame** (the path follower's hot path).
+
+- **Issue (rules 2/4):** the first implementation scanned **every** station's
+  `wanting`/`waiting` `VecDeque`s with a linear `contains`, so the per-frame cost
+  was `bots × stations × queue_len`. The common case — a wandering bot, never
+  enqueued — paid the full map scan only to return `false` every frame, scaling
+  badly with station count.
+- **Fix:** added a ref-counted reverse index `queued_actors: HashMap<Entity, u32>`
+  to [`InteractiveEntityMap`](src/map/interactive_entity.rs) counting each actor's
+  `(station, queue)` memberships. `is_in_any_queue` is now a single
+  `contains_key` (O(1)). The count is maintained only at the cold queue-mutation
+  sites (`add_wanting`/`add_waiting`/`remove_*`/`remove_actor_from_queues`/
+  `clear_queues_at`/`evict_actor_everywhere`/`clear`), each adjusting the index by
+  exactly the number of memberships it actually added/removed.
+- **Semantics (rule 8):** membership answers are identical to the old scan;
+  `queued_actors` is not serialized and rebuilds empty on load, matching the
+  already-non-persisted queues. Pinned by
+  `is_in_any_queue_tracks_membership_across_operations` (promotion, multi-station,
+  eviction, per-station clear).
+
+Verified green: `cargo test -p everly` (201 passed, 0 failed, 2 ignored) and
+`cargo check -p everly` warning-clean.

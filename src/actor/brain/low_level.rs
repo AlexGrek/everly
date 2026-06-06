@@ -203,8 +203,7 @@ pub struct FollowPath {
     /// Last frame's center, used to bleed momentum lost to wall collisions.
     prev_center: Option<Vec2>,
     stuck_timer: f32,
-    closest_approach: f32,
-    stuck_waypoint_index: usize,
+    stuck_reference_pos: Option<Vec2>,
     /// Current main tile, tracked across frames so a bot-on-bot bump can retreat
     /// to [`prev_tile`](Self::prev_tile) — the cell it stood in just before.
     last_tile: Option<IVec2>,
@@ -235,8 +234,7 @@ impl FollowPath {
             velocity: Vec2::ZERO,
             prev_center: None,
             stuck_timer: 0.0,
-            closest_approach: f32::MAX,
-            stuck_waypoint_index: 0,
+            stuck_reference_pos: None,
             last_tile: None,
             prev_tile: None,
             contact_wait_s: 0.0,
@@ -453,7 +451,8 @@ impl LowLevelAction for FollowPath {
                         let insert_idx = self.index.min(self.path.len());
                         self.path.insert(insert_idx, target);
                         // Force heading recalculation toward the step-aside tile.
-                        self.stuck_waypoint_index = usize::MAX;
+                        self.stuck_timer = 0.0;
+                        self.stuck_reference_pos = None;
                         let secs = rng.gen_range(STEP_BACK_WAIT_MIN_SECS..=STEP_BACK_WAIT_MAX_SECS);
                         self.pending_wait = Some((target, secs));
                     }
@@ -525,19 +524,29 @@ impl LowLevelAction for FollowPath {
             self.direction = to_wp.normalize();
         }
 
-        // Stuck detection: abandon the path if no progress toward the waypoint.
-        if self.stuck_waypoint_index != self.index {
+        // Stuck detection: abandon the path if the bot is not in a queue, has a far waypoint,
+        // and cannot move away from its reference position for a long time.
+        let in_queue = ctx.interactive.is_in_any_queue(ctx.entity);
+        let dist_to_wp = to_wp.length();
+        let far_waypoint = dist_to_wp > 1.0;
+
+        if in_queue || !far_waypoint {
             self.stuck_timer = 0.0;
-            self.closest_approach = f32::MAX;
-            self.stuck_waypoint_index = self.index;
-        }
-        let dist = to_wp.length();
-        if dist < self.closest_approach - t.stuck_progress_eps {
-            self.closest_approach = dist;
-            self.stuck_timer = 0.0;
+            self.stuck_reference_pos = Some(center);
         } else {
-            self.stuck_timer += dt;
+            if let Some(ref_pos) = self.stuck_reference_pos {
+                if (center - ref_pos).length() > 0.5 {
+                    self.stuck_reference_pos = Some(center);
+                    self.stuck_timer = 0.0;
+                } else {
+                    self.stuck_timer += dt;
+                }
+            } else {
+                self.stuck_reference_pos = Some(center);
+                self.stuck_timer = 0.0;
+            }
         }
+
         if self.stuck_timer >= t.stuck_repath_secs {
             self.abandoned = true;
             self.velocity = Vec2::ZERO;
@@ -550,7 +559,7 @@ impl LowLevelAction for FollowPath {
         // Braking profile: as we approach the waypoint, cap target speed to the
         // maximum speed that can stop within remaining distance (v^2 = 2 a d).
         // This prevents late, floaty overshoot and makes slowdown feel snappier.
-        let brake_limited_speed = (2.0 * t.decel * dist).sqrt();
+        let brake_limited_speed = (2.0 * t.decel * dist_to_wp).sqrt();
         let desired_speed = t.max_speed.min(brake_limited_speed);
         let desired = self.direction * desired_speed;
         let steer_rate = if self.velocity.length() > desired_speed {

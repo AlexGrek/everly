@@ -378,6 +378,12 @@ pub struct ActorQueueState {
 pub struct InteractiveEntityMap {
     tiles: HashMap<EntityCoordinates, InteractiveEntityHypertileList>,
     queues: HashMap<EntityCoordinates, ActorQueueState>,
+    /// Reverse index: how many `(station, queue)` memberships each actor holds
+    /// across all stations. Lets [`is_in_any_queue`](Self::is_in_any_queue) — a
+    /// per-bot, per-frame query in the path follower's stuck check — be an O(1)
+    /// lookup instead of scanning every station's queues. Maintained only at the
+    /// (cold) queue-mutation sites; an entry exists iff its count is `> 0`.
+    queued_actors: HashMap<Entity, u32>,
 }
 
 impl InteractiveEntityMap {
@@ -459,6 +465,7 @@ impl InteractiveEntityMap {
     pub fn clear(&mut self) {
         self.tiles.clear();
         self.queues.clear();
+        self.queued_actors.clear();
     }
 
     /// Iterates every entity entry across all hypertiles. Order is unspecified.
@@ -551,11 +558,32 @@ impl InteractiveEntityMap {
             .collect()
     }
 
+    /// Records one new queue membership for `actor` in the reverse index.
+    fn index_add(&mut self, actor: Entity) {
+        *self.queued_actors.entry(actor).or_insert(0) += 1;
+    }
+
+    /// Drops one queue membership for `actor`, removing the entry at zero.
+    fn index_remove(&mut self, actor: Entity) {
+        if let Some(count) = self.queued_actors.get_mut(&actor) {
+            *count -= 1;
+            if *count == 0 {
+                self.queued_actors.remove(&actor);
+            }
+        }
+    }
+
     /// Adds `actor` to the wanting queue for `coords` (no duplicates).
     pub fn add_wanting(&mut self, coords: EntityCoordinates, actor: Entity) {
         let queue = self.queues.entry(coords).or_default();
-        if !queue.wanting.contains(&actor) {
+        let added = if !queue.wanting.contains(&actor) {
             queue.wanting.push_back(actor);
+            true
+        } else {
+            false
+        };
+        if added {
+            self.index_add(actor);
         }
     }
 
@@ -568,10 +596,21 @@ impl InteractiveEntityMap {
     /// removes it from wanting on the same tile.
     pub fn add_waiting(&mut self, coords: EntityCoordinates, actor: Entity) {
         let queue = self.queues.entry(coords).or_default();
-        if !queue.waiting.contains(&actor) {
+        let added_waiting = if !queue.waiting.contains(&actor) {
             queue.waiting.push_back(actor);
-        }
+            true
+        } else {
+            false
+        };
+        let before = queue.wanting.len();
         queue.wanting.retain(|queued| *queued != actor);
+        let removed_wanting = queue.wanting.len() != before;
+        if added_waiting {
+            self.index_add(actor);
+        }
+        if removed_wanting {
+            self.index_remove(actor);
+        }
     }
 
     /// Removes `actor` from the waiting queue for `coords`.
@@ -581,18 +620,30 @@ impl InteractiveEntityMap {
 
     /// Removes `actor` from both queues for `coords`.
     pub fn remove_actor_from_queues(&mut self, coords: EntityCoordinates, actor: Entity) {
+        let mut removed = 0u32;
         if let Some(queue) = self.queues.get_mut(&coords) {
+            let before = queue.wanting.len() + queue.waiting.len();
             queue.wanting.retain(|queued| *queued != actor);
             queue.waiting.retain(|queued| *queued != actor);
+            removed = (before - (queue.wanting.len() + queue.waiting.len())) as u32;
             if queue.wanting.is_empty() && queue.waiting.is_empty() {
                 self.queues.remove(&coords);
             }
+        }
+        for _ in 0..removed {
+            self.index_remove(actor);
         }
     }
 
     /// Drops all queue state for `coords` (used when a station is rebuilt/removed).
     pub fn clear_queues_at(&mut self, coords: EntityCoordinates) {
-        self.queues.remove(&coords);
+        if let Some(queue) = self.queues.remove(&coords) {
+            let members: Vec<Entity> =
+                queue.wanting.iter().chain(queue.waiting.iter()).copied().collect();
+            for actor in members {
+                self.index_remove(actor);
+            }
+        }
     }
 
     /// Removes `actor` from **every** station's wanting and waiting queues and
@@ -609,6 +660,8 @@ impl InteractiveEntityMap {
             changed |= queue.wanting.len() + queue.waiting.len() != before;
             !(queue.wanting.is_empty() && queue.waiting.is_empty())
         });
+        // The actor is gone from every queue, so drop its whole index entry.
+        self.queued_actors.remove(&actor);
         for entry in self.iter_mut() {
             if let Some(charger) = entry.entity.as_charger_mut() {
                 if charger.occupant() == Some(actor) {
@@ -633,6 +686,12 @@ impl InteractiveEntityMap {
             .is_some_and(|front| *front == actor)
     }
 
+    /// `true` if `actor` is in any wanting or waiting queue. O(1) via the
+    /// `queued_actors` reverse index — safe to call per bot, per frame.
+    pub fn is_in_any_queue(&self, actor: Entity) -> bool {
+        self.queued_actors.contains_key(&actor)
+    }
+
     /// Snapshot the wanting queue in order.
     pub fn wanting_queue(&self, coords: EntityCoordinates) -> Vec<Entity> {
         self.queues
@@ -648,15 +707,18 @@ impl InteractiveEntityMap {
     }
 
     fn remove_from_queue(&mut self, coords: EntityCoordinates, actor: Entity, waiting: bool) {
+        let mut removed = false;
         if let Some(queue) = self.queues.get_mut(&coords) {
-            if waiting {
-                queue.waiting.retain(|queued| *queued != actor);
-            } else {
-                queue.wanting.retain(|queued| *queued != actor);
-            }
+            let target = if waiting { &mut queue.waiting } else { &mut queue.wanting };
+            let before = target.len();
+            target.retain(|queued| *queued != actor);
+            removed = target.len() != before;
             if queue.wanting.is_empty() && queue.waiting.is_empty() {
                 self.queues.remove(&coords);
             }
+        }
+        if removed {
+            self.index_remove(actor);
         }
     }
 }
@@ -1018,6 +1080,41 @@ mod tests {
         assert!(!charger.is_used());
 
         assert!(!map.evict_actor_everywhere(bot), "second eviction is a no-op");
+    }
+
+    #[test]
+    fn is_in_any_queue_tracks_membership_across_operations() {
+        let mut map = InteractiveEntityMap::new();
+        let a = EntityCoordinates::ground(1, 1);
+        let b = EntityCoordinates::ground(9, 9);
+        let bot = Entity::from_bits(7);
+
+        assert!(!map.is_in_any_queue(bot), "untracked bot is in no queue");
+
+        // Wanting at one station, then promoted to waiting (same station) — the
+        // promotion moves the membership, it does not double-count.
+        map.add_wanting(a, bot);
+        assert!(map.is_in_any_queue(bot));
+        map.add_waiting(a, bot);
+        assert!(map.is_in_any_queue(bot));
+        map.remove_waiting(a, bot);
+        assert!(!map.is_in_any_queue(bot), "leaving the only queue clears membership");
+
+        // Membership across two distinct stations: must survive until *both* drop.
+        map.add_wanting(a, bot);
+        map.add_waiting(b, bot);
+        assert!(map.is_in_any_queue(bot));
+        map.remove_actor_from_queues(a, bot);
+        assert!(map.is_in_any_queue(bot), "still waiting at the other station");
+        map.clear_queues_at(b);
+        assert!(!map.is_in_any_queue(bot), "clearing the last station clears membership");
+
+        // Eviction wipes every membership at once.
+        map.add_wanting(a, bot);
+        map.add_waiting(b, bot);
+        assert!(map.is_in_any_queue(bot));
+        map.evict_actor_everywhere(bot);
+        assert!(!map.is_in_any_queue(bot), "eviction drops the index entry");
     }
 
     #[test]
