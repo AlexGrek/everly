@@ -186,7 +186,16 @@ impl HighLevelAction for GoToChargeStation {
                 HighLevelOutcome::running()
             }
             ChargePhase::Traveling => {
-                if low.is_finished() {
+                // Dock as soon as the bot is standing on the charger tile — don't
+                // wait for `FollowPath` to settle within `waypoint_eps`. Steering
+                // inertia can leave a lone bot orbiting the exact tile center it
+                // can never land on, so gating the dock on sub-tile arrival makes
+                // it circle forever instead of charging. Tile occupancy (`round`
+                // of the float center) is the forgiving, correct dock condition.
+                let on_charger_tile = self.charger.is_some_and(|c| {
+                    c.floor == ctx.floor && ctx.main_tile.x == c.x && ctx.main_tile.y == c.y
+                });
+                if low.is_finished() || on_charger_tile {
                     if let Some(c) = self.charger {
                         if charger_free_for(ctx.interactive, c, ctx.entity) {
                             self.phase = ChargePhase::Charging;
@@ -383,6 +392,35 @@ mod tests {
         let out = action.update(&ctx(&passability, &interactive, 1.0, (4, 0)), &mut low, &mut rng);
         assert!(matches!(out.status, HighLevelStatus::Done));
         assert_eq!(out.effects.undock, Some(EntityCoordinates::ground(4, 0)));
+    }
+
+    #[test]
+    fn charge_station_docks_on_charger_tile_even_if_path_unsettled() {
+        // Bot is standing on the charger tile but its `FollowPath` has not
+        // settled within `waypoint_eps`. Tile occupancy must dock it anyway — a
+        // lone bot can orbit the exact tile center indefinitely, so gating the
+        // dock on sub-tile arrival would make it circle forever instead of charge.
+        let passability: Hypermap<f32> = Hypermap::new(0.0);
+        passability.set(4, 0, 1.0);
+        let mut interactive = InteractiveEntityMap::new();
+        interactive.insert(InteractiveEntity::Charger(ChargerEntity::new(
+            EntityCoordinates::ground(4, 0),
+            ChargerFacing::North,
+        )));
+
+        let mut action = GoToChargeStation::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = StdRng::seed_from_u64(0);
+
+        // Seeking → Traveling, installs a route to the charger tile.
+        let out = action.update(&ctx(&passability, &interactive, 0.1, (4, 0)), &mut low, &mut rng);
+        assert!(matches!(out.status, HighLevelStatus::Running));
+        assert!(low.path().is_some(), "must be routing to the charger");
+        assert!(!low.is_finished(), "precondition: path not settled (no execute ran)");
+
+        // Standing on the charger tile with the path still unsettled → tile dock.
+        let out = action.update(&ctx(&passability, &interactive, 0.1, (4, 0)), &mut low, &mut rng);
+        assert_eq!(out.effects.dock, Some(EntityCoordinates::ground(4, 0)));
     }
 
     #[test]

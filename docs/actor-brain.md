@@ -42,8 +42,12 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
 - **[`LowLevelAction`](../src/actor/brain/low_level.rs)** — what the bot is
   physically doing this frame: `Idle`, `Wait(time)`, or `FollowPath(path)`.
   `execute` writes `move_buffer`. **All of BlackBot's movement feel lives in
-  `FollowPath`** (mass/inertia, wall-momentum bleed, stuck-repath, bot-on-bot
-  reroute/wait — tuned by [`FollowTuning`]).
+  `FollowPath`** (mass/inertia, wall-momentum bleed, arrival braking on the final
+  waypoint, stuck-repath, bot-on-bot reroute/wait — tuned by [`FollowTuning`]).
+  Arrival braking (`FollowTuning::arrival_radius`) ramps the target speed toward
+  zero as the bot nears its *last* waypoint so it settles on the goal instead of
+  orbiting the exact tile center under its own inertia — a failure most visible on
+  a lone bot, which has no bot-on-bot bump to bleed the momentum.
 
 ## Tick (`Brain::tick`)
 
@@ -90,7 +94,10 @@ only on a re-path).
   - find the nearest *accessible, unoccupied* charger
     ([`InteractiveEntityMap::find_accessible_within`](../src/map/interactive_entity.rs))
     and follow a path to its (passable) tile;
-  - on arrival, request `dock` and `Wait`;
+  - dock as soon as the bot's **main tile** is the charger tile (`Traveling` →
+    `Charging`), *not* only when `FollowPath` settles within `waypoint_eps` —
+    gating the dock on sub-tile arrival lets a lone bot orbit the center forever
+    instead of charging. On dock, request `dock` and `Wait`;
   - while charging, request `recharge` (`RECHARGE_PER_S`, an **infinite station** —
     the charger's stored energy is intentionally ignored) until full, then request
     `undock` and report `Done`.

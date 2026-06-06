@@ -34,6 +34,12 @@ pub struct FollowTuning {
     pub decel: f32,
     /// Distance (tiles) within which a waypoint counts as reached.
     pub waypoint_eps: f32,
+    /// Distance (tiles) from the **final** waypoint at which the bot starts
+    /// ramping its target speed down toward zero (arrival braking). Without it a
+    /// bot steers at full speed right up to the goal and its inertia carries it
+    /// into an orbit it can never settle out of — most visible on a lone bot,
+    /// which has no bot-on-bot bump to bleed the momentum.
+    pub arrival_radius: f32,
     /// Seconds without progress toward the active waypoint before abandoning the path.
     pub stuck_repath_secs: f32,
     /// Minimum closest-approach reduction (tiles) that resets the stuck timer.
@@ -53,6 +59,7 @@ impl Default for FollowTuning {
             accel: 2.5,
             decel: 4.0,
             waypoint_eps: 0.05,
+            arrival_radius: 0.6,
             stuck_repath_secs: 2.0,
             stuck_progress_eps: 0.05,
             bot_reroute_chance: 0.20,
@@ -327,8 +334,20 @@ impl LowLevelAction for FollowPath {
             return;
         }
 
-        let desired = self.direction * t.max_speed;
-        self.drive(state, center, desired, t.accel, dt);
+        // Arrival braking on the final waypoint: ramp the target speed down with
+        // remaining distance so the bot settles on the goal instead of orbiting
+        // it under its own inertia. Intermediate waypoints stay full-speed
+        // pass-throughs. Braking (slowing toward a lower target) uses the
+        // stronger `decel`; otherwise the usual `accel`.
+        let is_final = self.index + 1 == self.path.len();
+        let (desired, rate) = if is_final {
+            let speed = (t.max_speed * dist / t.arrival_radius).min(t.max_speed);
+            let rate = if speed * speed < self.velocity.length_squared() { t.decel } else { t.accel };
+            (self.direction * speed, rate)
+        } else {
+            (self.direction * t.max_speed, t.accel)
+        };
+        self.drive(state, center, desired, rate, dt);
         state.next_waypoint_hint = Some(wp);
     }
 
@@ -439,5 +458,38 @@ mod tests {
     fn empty_path_is_finished() {
         let fp = FollowPath::new(Vec::new());
         assert!(fp.is_finished());
+    }
+
+    #[test]
+    fn follow_path_settles_on_final_waypoint_without_orbiting() {
+        use crate::actor::brain::test_support::{ctx_with_charge, test_state};
+        use rand::SeedableRng;
+
+        // Open space (no collision): integrate the emitted `tile_delta` straight
+        // into the center each frame and confirm the bot reaches the goal tile
+        // rather than circling it. Without arrival braking a lone bot orbits ~0.5
+        // tiles out and only ever stops by abandoning the path (an orbit, not an
+        // arrival), so we assert it lands *on* the goal.
+        let goal = (5, 0);
+        let mut fp = FollowPath::new(vec![(0, 0), goal]);
+        let tuning = FollowTuning::default();
+        let ctx = ctx_with_charge(1.0);
+        let mut rng = StdRng::seed_from_u64(0);
+        let mut state = test_state(); // center (0.5, 0.5)
+
+        for _ in 0..1200 {
+            fp.execute(&mut state, &ctx, &mut rng, &tuning);
+            state.center += state.move_buffer.tile_delta;
+            if fp.is_finished() {
+                break;
+            }
+        }
+
+        assert!(fp.is_finished(), "path never completed — bot is still orbiting");
+        let miss = (state.center - waypoint_center(goal)).length();
+        assert!(
+            miss < tuning.waypoint_eps * 2.0,
+            "settled {miss} tiles from the goal — that is an orbit, not an arrival",
+        );
     }
 }
