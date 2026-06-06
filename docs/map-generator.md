@@ -28,6 +28,24 @@ Generation runs on a [`MapDraft`](../../src/map/map_generator/draft.rs) grid (`D
 
 Do **not** stamp per-rectangle [`perimeter_wall_mask`](../../src/map/world_map.rs) loops on overlapping rects (that recreates inner walls). Convex outer corners stay multi-bit wall cells only (no separate pillars there).
 
+## Reusable building generation (editor "House" tool)
+
+Steps 4–10 above (everything after houses are known) are factored into
+`MapDraft::build_house_structures`, shared by the procedural pipeline and a
+single-house entry point [`generate_house_tiles`](../../src/map/map_generator/mod.rs):
+
+1. The map editor **House** brush (see [`map-editor.md`](map-editor.md)) drags a boundary rectangle.
+2. On commit, `generate_house_tiles(width, height, seed)` builds a padded `MapDraft`
+   pre-filled with `Open` road (so doors find exterior road on every side), seeds **one**
+   [`House`](../../src/map/map_generator/house.rs) (`House::from_single_rect`) filling the
+   boundary, runs `build_house_structures`, then returns the boundary-rectangle slice of
+   finished `CellType` + `TileStyle` tiles (`HouseToolTiles`). Boundaries below
+   `MIN_HOUSE_TOOL_SIDE` (`10`) on either side return `None`.
+3. The editor writes those tiles into the live hypermap at the selected world offset.
+
+This guarantees the hand-placed building uses the **same** shell/door/inner-room/charger
+geometry as procedural chunks — no divergent copy of the wall logic.
+
 ## Metadata (`GeneratedChunkMetadata`, version 3)
 
 After generation, reference data is stored in [`HypermapRuntime::procedural_metadata`](../../src/map/hypermap_world.rs) (chunk-local tile coords) and saved as `levels/level_{name}/metadata/{x}_{y}.yaml` on **Save**.

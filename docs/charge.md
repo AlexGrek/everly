@@ -67,8 +67,9 @@ A depleted bot (`is_depleted()`) is stopped **in its think system**, not in
 
 Because the buffer is empty, `process_actors`/`try_move` re-stamp the bot's
 existing footprint in place: it holds position and keeps its dynamic-occupancy
-cell. There is **no recharge mechanic yet** — once a bot hits `0.0` it stays put
-(see [Not yet wired](#not-yet-wired)).
+cell. Recharge is handled by BlackBot brain logic (`GoToChargeStation`) which
+seeks accessible chargers from `InteractiveEntityMap`, docks, and applies
+`RECHARGE_PER_S` while charging.
 
 ## Inspector display
 
@@ -102,12 +103,6 @@ All three live in [`src/actor/charge.rs`](../src/actor/charge.rs).
 
 ## Not yet wired
 
-- **No recharge.** Nothing refills `level`. The map already has
-  [`Charger`](interactive-entities.md) interactive entities (a docking pad with a
-  `charge_level`), but actors do not yet seek them or draw charge from them. The
-  natural next step is a high-level behavior that routes a low-charge bot to the
-  nearest accessible charger (`find_accessible_within`) and tops up its `Charge`
-  while docked.
 - **Uniform drain.** Every bot discharges at the same rate regardless of class,
   speed, or activity. Per-class rates would live as a field on `Charge` or a
   small per-class lookup, not a single global constant.

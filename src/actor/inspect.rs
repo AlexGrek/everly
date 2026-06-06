@@ -45,6 +45,7 @@ pub fn black_bot_rows(brain: &Brain, main_tile: IVec2) -> Vec<InspectRow> {
         .unwrap_or_else(|| "—".to_string());
     vec![
         InspectRow { label: "main_tile", value: format!("({}, {})", main_tile.x, main_tile.y) },
+        InspectRow { label: "stuck", value: brain.is_stuck().to_string() },
         InspectRow { label: "priority", value: priority },
         InspectRow { label: "high_level", value: brain.high_level_label() },
         InspectRow { label: "low_level", value: brain.low_level_label() },

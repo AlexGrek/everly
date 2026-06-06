@@ -27,17 +27,23 @@ use rand::{Rng, SeedableRng};
 
 use crate::actor::actor_name::random_actor_name;
 use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
-use crate::actor::brain::{make_high_level, Brain, BrainContext, BrainEffects, ChargeSelfKeeper, RandomWalker};
+use crate::actor::brain::{
+    make_high_level, AvoidanceViews, Brain, BrainContext, BrainEffects, ChargeSelfKeeper,
+    RandomWalker,
+};
 use crate::actor::charge::Charge;
 use crate::actor::snapshot::{BreakablePartSnap, BreakableSnap};
 use crate::actor::{
-    actor_main_tile, is_paused, process_actors, Actor, ActorMoveBuffer, ActorMovementError,
-    ActorObject, ActorState, OffScreenActor,
+    actor_main_tile, flush_actor_occupancy, is_paused, process_actors, Actor, ActorMoveBuffer,
+    ActorMovementError, ActorObject, ActorState, OffScreenActor,
 };
 use crate::map::chunk_overlay::{ChunkOverlayState, OVERLAY_RES};
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap};
-use crate::map::hypermap_world::HypermapRuntime;
-use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
+use crate::map::hypermap_world::{HypermapChunkRemeshQueue, HypermapRuntime};
+use crate::map::interactive_entity::{
+    sync_chargers_for_chunks, EntityCoordinates, InteractiveEntityMap,
+};
+use crate::map::level::LevelName;
 use crate::map::passability::{
     DynamicPassabilityMap, SubtilePassability, TryUpdateFootprintError, SUBTILE_COUNT,
 };
@@ -341,14 +347,23 @@ impl Plugin for BlackBotPlugin {
         app.init_resource::<BlackBotRng>().add_systems(
             Update,
             (
-                black_bot_brain.before(process_actors).run_if(not(is_paused)),
+                black_bot_brain
+                    .after(flush_actor_occupancy)
+                    .before(process_actors)
+                    .run_if(not(is_paused)),
                 sync_black_bot_transforms.after(process_actors),
-                sync_black_bot_broken_visual.after(process_actors),
+                sync_black_bot_status_visual.after(process_actors),
                 paint_black_bot_targets.after(process_actors),
             )
                 .run_if(in_state(GameState::InGame)),
         );
     }
+}
+
+#[derive(Default)]
+struct IndexedChargerChunks {
+    level: String,
+    chunks: HashSet<ChunkCoord>,
 }
 
 /// Runs each BlackBot's [`Brain`] once per frame (before `process_actors`),
@@ -358,8 +373,12 @@ impl Plugin for BlackBotPlugin {
 /// the per-bot RNG lives in the brain, so it must not run on `par_iter`.
 fn black_bot_brain(
     time: Res<Time>,
+    level_name: Res<LevelName>,
     hypermap: Res<HypermapRuntime>,
+    dynamic: Res<DynamicPassabilityMap>,
+    remesh: Res<HypermapChunkRemeshQueue>,
     mut interactive: ResMut<InteractiveEntityMap>,
+    mut indexed: Local<IndexedChargerChunks>,
     mut query: Query<(
         Entity,
         &mut ActorObject,
@@ -371,8 +390,17 @@ fn black_bot_brain(
 ) {
     let dt = time.delta_secs();
     let passability = &*hypermap.static_passability_map;
+    let static_subtiles = &*hypermap.static_subtile_cache;
+    refresh_charger_index(
+        &hypermap.map,
+        &mut interactive,
+        &mut indexed,
+        &level_name,
+        &remesh,
+    );
 
     for (entity, mut obj, mut brain, mut vis, mut charge, mut breakable) in &mut query {
+        let blocked_flags = obj.inner.blocked_flags();
         let state = obj.inner.state_mut();
 
         let current_tile = actor_main_tile(state.center);
@@ -406,6 +434,7 @@ fn black_bot_brain(
                 dt,
                 center: state.center,
                 main_tile: current_tile,
+                main_tile_changed: tile_changed,
                 floor: 0,
                 charge: charge_level,
                 missing_charge_pct: (1.0 - charge_level) * 100.0,
@@ -413,6 +442,11 @@ fn black_bot_brain(
                 broken,
                 passability,
                 interactive: &interactive,
+                avoidance: Some(AvoidanceViews {
+                    dynamic: &dynamic,
+                    static_subtiles,
+                    blocked_flags,
+                }),
             };
             brain.tick(&ctx, state)
         };
@@ -428,6 +462,38 @@ fn black_bot_brain(
     }
 }
 
+fn refresh_charger_index(
+    map: &Hypermap<crate::map::world_map::CellType>,
+    interactive: &mut InteractiveEntityMap,
+    indexed: &mut IndexedChargerChunks,
+    level_name: &LevelName,
+    remesh: &HypermapChunkRemeshQueue,
+) {
+    if indexed.level != level_name.0 {
+        indexed.level = level_name.0.clone();
+        indexed.chunks.clear();
+        interactive.clear();
+    }
+
+    let loaded_chunks = map.loaded_chunks();
+    let loaded_set: HashSet<ChunkCoord> = loaded_chunks.iter().copied().collect();
+
+    let mut sync_chunks: HashSet<ChunkCoord> = loaded_set
+        .difference(&indexed.chunks)
+        .copied()
+        .collect();
+    sync_chunks.extend(remesh.0.iter().copied());
+    if interactive.is_empty() {
+        sync_chunks.extend(loaded_chunks.iter().copied());
+    }
+
+    if !sync_chunks.is_empty() {
+        sync_chargers_for_chunks(map, interactive, sync_chunks.iter().copied());
+        indexed.chunks.extend(sync_chunks);
+    }
+    indexed.chunks.retain(|chunk| loaded_set.contains(chunk));
+}
+
 /// Applies a brain tick's [`BrainEffects`] to the world: charger docking and
 /// battery recharge.
 fn apply_brain_effects(
@@ -436,7 +502,20 @@ fn apply_brain_effects(
     interactive: &mut InteractiveEntityMap,
     charge: Option<&mut Charge>,
 ) {
+    if let Some(coords) = effects.queue_unwant {
+        interactive.remove_wanting(coords, entity);
+    }
+    if let Some(coords) = effects.queue_want {
+        interactive.add_wanting(coords, entity);
+    }
+    if let Some(coords) = effects.queue_wait {
+        interactive.add_waiting(coords, entity);
+    }
+    if let Some(coords) = effects.queue_unwait {
+        interactive.remove_waiting(coords, entity);
+    }
     if let Some(coords) = effects.dock {
+        interactive.remove_waiting(coords, entity);
         set_charger_occupant(interactive, coords, Some(entity));
     }
     if let Some(coords) = effects.undock {
@@ -444,6 +523,7 @@ fn apply_brain_effects(
         if charger_occupant(interactive, coords) == Some(entity) {
             set_charger_occupant(interactive, coords, None);
         }
+        interactive.remove_actor_from_queues(coords, entity);
     }
     if effects.recharge > 0.0 {
         if let Some(c) = charge {
@@ -492,24 +572,32 @@ fn sync_black_bot_transforms(
     }
 }
 
-/// Applies material color changes triggered by breakable state transitions.
-/// Runs only when a bot's control-plane broken flag flips (tracked via `Local`).
-fn sync_black_bot_broken_visual(
-    bots: Query<(Entity, &Breakable, &Children), With<BlackBotVisual>>,
+/// Applies material color changes for BlackBot runtime status.
+///
+/// Priority order:
+/// 1. Broken control plane => white
+/// 2. Stuck while trying to route => red
+/// 3. Healthy => default black
+fn sync_black_bot_status_visual(
+    bots: Query<(Entity, &Breakable, &Brain, &Children), With<BlackBotVisual>>,
     pick_meshes: Query<&MeshMaterial3d<StandardMaterial>, With<ActorPickMesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut last_cp_broken: Local<std::collections::HashMap<Entity, bool>>,
+    mut last_status: Local<std::collections::HashMap<Entity, (bool, bool)>>,
 ) {
-    for (entity, b, children) in &bots {
+    for (entity, b, brain, children) in &bots {
         let cp_broken = b.control_plane.broken;
-        let last = last_cp_broken.get(&entity).copied().unwrap_or(false);
-        if cp_broken == last {
+        let stuck = brain.is_stuck();
+        let status = (cp_broken, stuck);
+        let last = last_status.get(&entity).copied().unwrap_or((false, false));
+        if status == last {
             continue;
         }
-        last_cp_broken.insert(entity, cp_broken);
+        last_status.insert(entity, status);
 
         let target_color = if cp_broken {
             Color::srgb(1.0, 1.0, 1.0)
+        } else if stuck {
+            Color::srgb(0.95, 0.15, 0.15)
         } else {
             Color::srgb(0.02, 0.02, 0.02)
         };
@@ -519,6 +607,10 @@ fn sync_black_bot_broken_visual(
             mat.base_color = target_color;
         }
     }
+
+    // Keep cache bounded to currently alive bots so long sessions with
+    // spawn/despawn churn don't accumulate dead-entity entries forever.
+    last_status.retain(|entity, _| bots.get(*entity).is_ok());
 }
 
 const TARGET_COLOR: [u8; 4] = [180, 40, 220, 160];

@@ -23,9 +23,11 @@
 //! start/end with `>A` / `>B` via
 //! [`WorldMapFloor::from_ascii_with_path_markers`](crate::map::world_map::WorldMapFloor::from_ascii_with_path_markers).
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
+use bevy::math::IVec2;
 use pathfinding::directed::astar::astar;
 
 use crate::map::hypermap::Hypermap;
@@ -496,6 +498,80 @@ pub fn explore_walkable_tiles_limited(
     }
 }
 
+/// Bounded 4-neighbour A\* on the **subtile** grid (`1 tile = SUBTILE_COUNT
+/// subtiles`), used for short, local bot-on-bot detours around other actors.
+///
+/// Unlike the tile-level world A\*, a subtile is "walkable" only when the
+/// caller-supplied `is_free(subtile)` returns `true`. The intended predicate
+/// tests whether the moving actor's **whole circular footprint** (its size)
+/// centered on that subtile is clear of static geometry *and* other creatures —
+/// e.g. `DynamicPassabilityMap::probe_footprint(...).is_ok()`. That makes the
+/// route account for actor size and steer around existing obstacles.
+///
+/// The search is deliberately cheap and local:
+/// - it returns `None` immediately if the Manhattan span from `start` to `goal`
+///   exceeds `max_span` subtiles (the detour is only for short distances);
+/// - expansion is confined to the bounding box of `start`/`goal` grown by `pad`
+///   subtiles on every side;
+/// - it stops after `max_expanded` node expansions.
+///
+/// `start` is assumed already occupiable (it is where the actor stands) and is
+/// never passed to `is_free`; `goal` must be `is_free` to be reachable. Returns
+/// the subtile path including both endpoints, or `None` when no route fits the
+/// bounds.
+pub fn astar_subtile_detour(
+    start: IVec2,
+    goal: IVec2,
+    pad: i32,
+    max_span: i32,
+    max_expanded: usize,
+    is_free: impl Fn(IVec2) -> bool,
+) -> Option<Vec<IVec2>> {
+    if start == goal {
+        return Some(vec![start]);
+    }
+    if (start.x - goal.x).abs() + (start.y - goal.y).abs() > max_span {
+        return None;
+    }
+
+    let min = IVec2::new(start.x.min(goal.x) - pad, start.y.min(goal.y) - pad);
+    let max = IVec2::new(start.x.max(goal.x) + pad, start.y.max(goal.y) + pad);
+    let expanded = Cell::new(0usize);
+
+    let result = astar(
+        &start,
+        |&p| {
+            let mut out: Vec<(IVec2, u32)> = Vec::with_capacity(4);
+            let n = expanded.get();
+            if n > max_expanded {
+                return out; // hard stop: starve the frontier so the search ends
+            }
+            expanded.set(n + 1);
+            for d in [
+                IVec2::new(1, 0),
+                IVec2::new(-1, 0),
+                IVec2::new(0, 1),
+                IVec2::new(0, -1),
+            ] {
+                let np = p + d;
+                if np.x < min.x || np.x > max.x || np.y < min.y || np.y > max.y {
+                    continue;
+                }
+                // `start` is the only node never gated (the actor stands there);
+                // every neighbour — goal included — must clear the footprint test.
+                if !is_free(np) {
+                    continue;
+                }
+                out.push((np, 1));
+            }
+            out
+        },
+        |&p| ((p.x - goal.x).abs() + (p.y - goal.y).abs()) as u32,
+        |&p| p == goal,
+    );
+    result.map(|(path, _)| path)
+}
+
 fn floor_walkable(floor: &WorldMapFloor, x: usize, y: usize) -> bool {
     floor
         .get(x, y)
@@ -820,6 +896,62 @@ mod tests {
         assert!(
             simplified.len() >= 3,
             "must keep a corner waypoint rather than cut the diagonal: {simplified:?}",
+        );
+    }
+
+    #[test]
+    fn subtile_detour_routes_around_a_blocked_subtile() {
+        use std::collections::HashSet;
+        // Block a vertical strip of subtiles between start and goal; the detour
+        // must step around it rather than straight through.
+        let mut blocked: HashSet<IVec2> = HashSet::new();
+        for y in -1..=1 {
+            blocked.insert(IVec2::new(2, y));
+        }
+        let start = IVec2::new(0, 0);
+        let goal = IVec2::new(4, 0);
+        let path = astar_subtile_detour(start, goal, 4, 40, 4096, |s| !blocked.contains(&s))
+            .expect("a detour exists around the strip");
+        assert_eq!(path.first().copied(), Some(start));
+        assert_eq!(path.last().copied(), Some(goal));
+        assert!(
+            path.iter().all(|p| !blocked.contains(p)),
+            "detour must avoid every blocked subtile: {path:?}"
+        );
+        assert!(
+            path.iter().any(|p| p.y != 0),
+            "detour must leave the straight line to get around the strip: {path:?}"
+        );
+    }
+
+    #[test]
+    fn subtile_detour_rejects_long_spans() {
+        let start = IVec2::new(0, 0);
+        let goal = IVec2::new(100, 0);
+        assert!(
+            astar_subtile_detour(start, goal, 4, 40, 4096, |_| true).is_none(),
+            "spans beyond max_span must be rejected as not a short detour"
+        );
+    }
+
+    #[test]
+    fn subtile_detour_none_when_goal_walled_off() {
+        use std::collections::HashSet;
+        // Fully enclose the goal so no footprint-free route reaches it.
+        let goal = IVec2::new(4, 0);
+        let mut blocked: HashSet<IVec2> = HashSet::new();
+        for d in [
+            IVec2::new(1, 0),
+            IVec2::new(-1, 0),
+            IVec2::new(0, 1),
+            IVec2::new(0, -1),
+        ] {
+            blocked.insert(goal + d);
+        }
+        let start = IVec2::new(0, 0);
+        assert!(
+            astar_subtile_detour(start, goal, 4, 40, 4096, |s| !blocked.contains(&s)).is_none(),
+            "an unreachable goal yields no detour"
         );
     }
 

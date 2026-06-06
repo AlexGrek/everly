@@ -35,10 +35,13 @@ use serde::de::Deserializer;
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
-use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap, HypermapChunkHandle};
+use crate::map::hypermap::{
+    world_to_chunk_local, ChunkCoord, Hypermap, HypermapChunkHandle, LocalCoord,
+    HYPERMAP_CHUNK_SIZE, HYPERMAP_FLOOR_COUNT,
+};
 use crate::map::hypermap_pathfind::passability_walkable;
 use crate::map::hypermap_world::rendered_chunks_around;
-use crate::map::world_map::ChargerFacing;
+use crate::map::world_map::{CellType, ChargerFacing};
 
 /// Property key whose presence marks an entity as "in use" (occupied/active).
 /// Stored as a typed field on each entity, *not* in the free-form props map, but
@@ -352,6 +355,15 @@ impl<T> HypertileList<T> {
 /// Concrete per-hypertile list of interactive entities.
 pub type InteractiveEntityHypertileList = HypertileList<InteractiveEntityEntry>;
 
+/// Runtime queue state for one interactive-entity tile. `wanting` tracks actors
+/// that selected this station as a target; `waiting` tracks actors that entered
+/// the near-station queue and are waiting for dock turn.
+#[derive(Debug, Clone, Default)]
+pub struct ActorQueueState {
+    wanting: VecDeque<Entity>,
+    waiting: VecDeque<Entity>,
+}
+
 /// Sparse map from a hypertile to the interactive entities standing on it.
 ///
 /// Stored as a `HashMap` (not a dense [`Hypermap`](crate::map::hypermap::Hypermap))
@@ -365,6 +377,7 @@ pub type InteractiveEntityHypertileList = HypertileList<InteractiveEntityEntry>;
 #[derive(Debug, Default, Resource)]
 pub struct InteractiveEntityMap {
     tiles: HashMap<EntityCoordinates, InteractiveEntityHypertileList>,
+    queues: HashMap<EntityCoordinates, ActorQueueState>,
 }
 
 impl InteractiveEntityMap {
@@ -445,6 +458,7 @@ impl InteractiveEntityMap {
     /// Drops every entity in the map.
     pub fn clear(&mut self) {
         self.tiles.clear();
+        self.queues.clear();
     }
 
     /// Iterates every entity entry across all hypertiles. Order is unspecified.
@@ -535,6 +549,144 @@ impl InteractiveEntityMap {
                 tile_or_neighbor_reachable(&reachable, (entry.coordinates.x, entry.coordinates.y))
             })
             .collect()
+    }
+
+    /// Adds `actor` to the wanting queue for `coords` (no duplicates).
+    pub fn add_wanting(&mut self, coords: EntityCoordinates, actor: Entity) {
+        let queue = self.queues.entry(coords).or_default();
+        if !queue.wanting.contains(&actor) {
+            queue.wanting.push_back(actor);
+        }
+    }
+
+    /// Removes `actor` from the wanting queue for `coords`.
+    pub fn remove_wanting(&mut self, coords: EntityCoordinates, actor: Entity) {
+        self.remove_from_queue(coords, actor, false);
+    }
+
+    /// Adds `actor` to the waiting queue for `coords` (no duplicates), and
+    /// removes it from wanting on the same tile.
+    pub fn add_waiting(&mut self, coords: EntityCoordinates, actor: Entity) {
+        let queue = self.queues.entry(coords).or_default();
+        if !queue.waiting.contains(&actor) {
+            queue.waiting.push_back(actor);
+        }
+        queue.wanting.retain(|queued| *queued != actor);
+    }
+
+    /// Removes `actor` from the waiting queue for `coords`.
+    pub fn remove_waiting(&mut self, coords: EntityCoordinates, actor: Entity) {
+        self.remove_from_queue(coords, actor, true);
+    }
+
+    /// Removes `actor` from both queues for `coords`.
+    pub fn remove_actor_from_queues(&mut self, coords: EntityCoordinates, actor: Entity) {
+        if let Some(queue) = self.queues.get_mut(&coords) {
+            queue.wanting.retain(|queued| *queued != actor);
+            queue.waiting.retain(|queued| *queued != actor);
+            if queue.wanting.is_empty() && queue.waiting.is_empty() {
+                self.queues.remove(&coords);
+            }
+        }
+    }
+
+    /// Drops all queue state for `coords` (used when a station is rebuilt/removed).
+    pub fn clear_queues_at(&mut self, coords: EntityCoordinates) {
+        self.queues.remove(&coords);
+    }
+
+    /// Number of actors currently waiting near station `coords`.
+    pub fn waiting_len(&self, coords: EntityCoordinates) -> usize {
+        self.queues.get(&coords).map_or(0, |q| q.waiting.len())
+    }
+
+    /// `true` when `actor` is first in waiting queue for `coords`.
+    pub fn is_waiting_front(&self, coords: EntityCoordinates, actor: Entity) -> bool {
+        self.queues
+            .get(&coords)
+            .and_then(|q| q.waiting.front())
+            .is_some_and(|front| *front == actor)
+    }
+
+    /// Snapshot the wanting queue in order.
+    pub fn wanting_queue(&self, coords: EntityCoordinates) -> Vec<Entity> {
+        self.queues
+            .get(&coords)
+            .map_or_else(Vec::new, |q| q.wanting.iter().copied().collect())
+    }
+
+    /// Snapshot the waiting queue in order.
+    pub fn waiting_queue(&self, coords: EntityCoordinates) -> Vec<Entity> {
+        self.queues
+            .get(&coords)
+            .map_or_else(Vec::new, |q| q.waiting.iter().copied().collect())
+    }
+
+    fn remove_from_queue(&mut self, coords: EntityCoordinates, actor: Entity, waiting: bool) {
+        if let Some(queue) = self.queues.get_mut(&coords) {
+            if waiting {
+                queue.waiting.retain(|queued| *queued != actor);
+            } else {
+                queue.wanting.retain(|queued| *queued != actor);
+            }
+            if queue.wanting.is_empty() && queue.waiting.is_empty() {
+                self.queues.remove(&coords);
+            }
+        }
+    }
+}
+
+/// Rebuilds charger entities for the given world chunks from authored cell data.
+///
+/// For each chunk in `chunks`, existing [`EntityType::Charger`] entries in that
+/// chunk are removed, then re-inserted from `map` by scanning every local cell
+/// on every floor for [`CellType::Charger`].
+///
+/// This keeps the sparse interactive-entity index in sync with map generation
+/// and edits while preserving non-charger interactive entities elsewhere.
+pub fn sync_chargers_for_chunks(
+    map: &Hypermap<CellType>,
+    entities: &mut InteractiveEntityMap,
+    chunks: impl IntoIterator<Item = ChunkCoord>,
+) {
+    let chunk_set: HashSet<ChunkCoord> = chunks.into_iter().collect();
+    if chunk_set.is_empty() {
+        return;
+    }
+
+    let stale: Vec<EntityCoordinates> = entities
+        .iter()
+        .filter(|entry| entry.entity_type == EntityType::Charger)
+        .map(|entry| entry.coordinates)
+        .filter(|coords| {
+            let (chunk, _) = world_to_chunk_local(coords.x, coords.y);
+            chunk_set.contains(&chunk)
+        })
+        .collect();
+    for coords in stale {
+        entities.remove_of_type_at(coords, EntityType::Charger);
+        entities.clear_queues_at(coords);
+    }
+
+    for coord in chunk_set {
+        let _ = map.with_chunk_read(coord, |chunk| {
+            for floor in 0..HYPERMAP_FLOOR_COUNT as i32 {
+                for y in 0..HYPERMAP_CHUNK_SIZE {
+                    for x in 0..HYPERMAP_CHUNK_SIZE {
+                        let local = LocalCoord::new(x, y);
+                        let CellType::Charger(facing) = *chunk.get_local_floor(local, floor) else {
+                            continue;
+                        };
+                        let wx = coord.x * HYPERMAP_CHUNK_SIZE + x;
+                        let wy = coord.y * HYPERMAP_CHUNK_SIZE + y;
+                        entities.insert(InteractiveEntity::Charger(ChargerEntity::new(
+                            EntityCoordinates::new(wx, wy, floor),
+                            facing,
+                        )));
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -786,5 +938,47 @@ mod tests {
 
         let found = map.find_accessible_within(&passability, (0, 0), 0, 3, None);
         assert_eq!(found.len(), 2, "direct hit plus adjacency, far one excluded");
+    }
+
+    #[test]
+    fn wanting_and_waiting_queues_are_ordered_and_unique() {
+        let mut map = InteractiveEntityMap::new();
+        let coords = EntityCoordinates::ground(6, 6);
+        let a = Entity::from_bits(10);
+        let b = Entity::from_bits(11);
+
+        map.add_wanting(coords, a);
+        map.add_wanting(coords, a);
+        map.add_wanting(coords, b);
+        assert_eq!(map.wanting_queue(coords), vec![a, b], "wanting queue keeps insertion order");
+
+        map.add_waiting(coords, b);
+        assert_eq!(map.wanting_queue(coords), vec![a], "moving to waiting removes from wanting");
+        assert_eq!(map.waiting_queue(coords), vec![b]);
+        assert!(map.is_waiting_front(coords, b));
+
+        map.add_waiting(coords, a);
+        assert_eq!(map.waiting_queue(coords), vec![b, a]);
+        assert_eq!(map.waiting_len(coords), 2);
+        assert!(!map.is_waiting_front(coords, a));
+
+        map.remove_waiting(coords, b);
+        assert_eq!(map.waiting_queue(coords), vec![a]);
+        assert!(map.is_waiting_front(coords, a));
+    }
+
+    #[test]
+    fn queue_cleanup_drops_empty_entries() {
+        let mut map = InteractiveEntityMap::new();
+        let coords = EntityCoordinates::ground(8, 2);
+        let actor = Entity::from_bits(42);
+
+        map.add_wanting(coords, actor);
+        map.remove_wanting(coords, actor);
+        assert_eq!(map.wanting_queue(coords), Vec::<Entity>::new());
+
+        map.add_waiting(coords, actor);
+        map.remove_actor_from_queues(coords, actor);
+        assert_eq!(map.waiting_queue(coords), Vec::<Entity>::new());
     }
 }
