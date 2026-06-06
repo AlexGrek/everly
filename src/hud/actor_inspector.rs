@@ -1,5 +1,6 @@
 //! Actor hover label and click-to-inspect modal (mesh picking).
 
+use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::picking::prelude::*;
 use bevy::prelude::*;
 use bevy::ui::widget::Button;
@@ -32,6 +33,9 @@ const TAB_ACTIVE_BG: Color = Color::srgba(0.48, 0.78, 0.96, 0.15);
 const TAB_ACTIVE_BORDER: Color = Color::srgba(0.48, 0.78, 0.96, 0.7);
 const TAB_INACTIVE_BG: Color = Color::srgba(0.12, 0.14, 0.18, 0.7);
 
+/// Logical pixels per mouse-wheel line (matches Bevy UI scroll example).
+const SCROLL_LINE_HEIGHT: f32 = 21.0;
+
 /// Which tab is currently active in the actor inspector modal.
 #[derive(Resource, Default, PartialEq, Clone, Copy, Debug)]
 pub enum InspectorTab {
@@ -48,8 +52,8 @@ struct HoveredActor {
 }
 
 #[derive(Resource, Default)]
-struct ActorInspectorModal {
-    open: bool,
+pub struct ActorInspectorModal {
+    pub open: bool,
     actor: Option<Entity>,
     /// Bumped when modal body (rows/actions) should rebuild while staying open.
     content_stamp: u32,
@@ -125,6 +129,7 @@ impl Plugin for ActorInspectorPlugin {
                     sync_actor_inspector_modal,
                     animate_actor_inspector,
                     actor_inspector_close_input,
+                    actor_inspector_wheel_scroll,
                 )
                     .run_if(in_state(GameState::InGame)),
             )
@@ -304,6 +309,7 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                             row_gap: Val::Px(14.0),
                             border: UiRect::all(Val::Px(1.0)),
                             border_radius: BorderRadius::all(Val::Px(12.0)),
+                            overflow: Overflow::clip(),
                             ..default()
                         },
                         BackgroundColor(CARD_BG),
@@ -410,10 +416,14 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                             Node {
                                 width: Val::Percent(100.0),
                                 flex_direction: FlexDirection::Column,
+                                flex_grow: 1.0,
+                                flex_shrink: 1.0,
+                                min_height: Val::Px(0.0),
                                 row_gap: Val::Px(8.0),
                                 overflow: Overflow::scroll_y(),
                                 ..default()
                             },
+                            ScrollPosition(Vec2::ZERO),
                         ));
                     });
             });
@@ -455,6 +465,65 @@ fn close_modal_on_scrim_click(
 ) {
     modal.open = false;
     modal.actor = None;
+}
+
+fn actor_inspector_wheel_scroll(
+    modal: Res<ActorInspectorModal>,
+    mut wheel: MessageReader<MouseWheel>,
+    window: Query<&Window>,
+    camera: Query<&Camera, With<StrategyCameraRig>>,
+    card: Query<(&ComputedNode, &UiGlobalTransform), With<ActorInspectorCard>>,
+    mut rows: Query<(&mut ScrollPosition, &Node, &ComputedNode), With<ActorInspectorRowsHost>>,
+) {
+    if !modal.open {
+        return;
+    }
+
+    let Ok(window) = window.single() else {
+        return;
+    };
+    let Some(cursor) = window.physical_cursor_position() else {
+        return;
+    };
+
+    let Ok(camera) = camera.single() else {
+        return;
+    };
+    let Ok((card_node, card_tf)) = card.single() else {
+        return;
+    };
+
+    let Some(viewport) = camera.physical_viewport_rect() else {
+        return;
+    };
+    let cursor_in_card = card_node.contains_point(*card_tf, cursor - viewport.min.as_vec2());
+    if !cursor_in_card {
+        return;
+    }
+
+    let Ok((mut scroll_position, node, computed)) = rows.single_mut() else {
+        return;
+    };
+    if node.overflow.y != OverflowAxis::Scroll {
+        return;
+    }
+
+    let max_offset =
+        (computed.content_size() - computed.size()) * computed.inverse_scale_factor();
+    if max_offset.y <= 0.0 {
+        return;
+    }
+
+    for ev in wheel.read() {
+        let mut delta = -Vec2::new(ev.x, ev.y);
+        if ev.unit == MouseScrollUnit::Line {
+            delta *= SCROLL_LINE_HEIGHT;
+        }
+        if delta.y == 0.0 {
+            continue;
+        }
+        scroll_position.y = (scroll_position.y + delta.y).clamp(0.0, max_offset.y);
+    }
 }
 
 fn actor_inspector_close_input(

@@ -10,10 +10,11 @@ use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::render::view::Hdr;
 
+use crate::edit::map_edit::{MapEditState, MapTileKind};
+use crate::hud::actor_inspector::ActorInspectorModal;
 use crate::map::floor_level::{
     ActiveFloorLevel, CAMERA_FLOOR_Y_SMOOTH_PER_S, HYPERMAP_FLOOR_HEIGHT,
 };
-use crate::edit::map_edit::{MapEditState, MapTileKind};
 use crate::menu::main_menu::GameState;
 
 /// Tilt used for the normal RTS-style view (degrees → radians in [`StrategyCamera::default`]).
@@ -229,9 +230,14 @@ fn pan_camera(keys: Res<ButtonInput<KeyCode>>, time: Res<Time>, mut cameras: Que
 
 fn zoom_camera(
     map_edit: Option<Res<MapEditState>>,
+    inspector: Option<Res<ActorInspectorModal>>,
     mut wheel_messages: MessageReader<MouseWheel>,
     mut cameras: Query<&mut StrategyCamera>,
 ) {
+    if inspector.as_ref().is_some_and(|m| m.open) {
+        return;
+    }
+
     if map_edit.as_ref().is_some_and(|s| {
         matches!(
             s.placement_tile,
