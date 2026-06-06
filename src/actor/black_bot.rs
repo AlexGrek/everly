@@ -445,11 +445,13 @@ fn black_bot_brain(
             .as_ref()
             .map_or(false, |b| b.movement_engine.broken || b.control_plane.broken);
 
-        // Depleted or broken bots are immobilized: cancel movement, hold
-        // position, and release every charger queue slot / occupancy they hold
-        // (once, on the offline transition) so they stop blocking working bots.
+        // Depleted or broken bots are immobilized: wipe the plan (routes/targets),
+        // cancel movement, and release every charger queue slot / occupancy they
+        // hold (once, on the offline transition) so they stop blocking working bots.
         if depleted || broken {
-            brain.halt(state);
+            brain.reset();
+            state.move_buffer = ActorMoveBuffer::default();
+            state.next_waypoint_hint = None;
             if !vis.offline_released {
                 interactive.evict_actor_everywhere(entity);
                 vis.offline_released = true;
@@ -683,6 +685,15 @@ const TARGET_HALO_COLOR: [u8; 4] = [180, 40, 220, 60];
 /// route a bot will follow is visible alongside its destination.
 const PATH_NODE_COLOR: [u8; 4] = [60, 200, 255, 180];
 
+/// `true` when a BlackBot is depleted or broken enough to skip brain ticks and
+/// route overlays (matches the gate in `black_bot_brain`).
+fn black_bot_offline(charge: Option<&Charge>, breakable: Option<&Breakable>) -> bool {
+    if charge.is_some_and(Charge::is_depleted) {
+        return true;
+    }
+    breakable.map_or(false, |b| b.movement_engine.broken || b.control_plane.broken)
+}
+
 /// Stamps a single tile at `(tx, ty)` with `color`. Only overwrites pixels
 /// whose existing alpha is lower than the new alpha so a brighter mark from
 /// another bot is not erased. Returns the chunk this tile lives in.
@@ -722,7 +733,7 @@ fn paint_black_bot_targets(
     overlay: Res<ChunkOverlayState>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    bots: Query<&Brain, With<BlackBotVisual>>,
+    bots: Query<(&Brain, Option<&Charge>, Option<&Breakable>), With<BlackBotVisual>>,
 ) {
     let mut touched_chunks: HashSet<ChunkCoord> = HashSet::new();
 
@@ -739,7 +750,10 @@ fn paint_black_bot_targets(
 
     // Paint upcoming path waypoints first; targets paint on top so the
     // destination always wins where both overlap.
-    for brain in bots.iter() {
+    for (brain, charge, breakable) in &bots {
+        if black_bot_offline(charge, breakable) {
+            continue;
+        }
         if let Some((path, idx)) = brain.path() {
             for &(tx, ty) in path.get(idx..).unwrap_or(&[]) {
                 if let Some(c) = stamp_tile(&overlay, &mut images, tx, ty, PATH_NODE_COLOR, 1) {
@@ -750,7 +764,10 @@ fn paint_black_bot_targets(
     }
 
     // Paint each target as a highlighted tile with a 1-tile halo.
-    for brain in bots.iter() {
+    for (brain, charge, breakable) in &bots {
+        if black_bot_offline(charge, breakable) {
+            continue;
+        }
         let Some((wx, wy)) = brain.target_tile() else { continue };
         for dy in -1i32..=1 {
             for dx in -1i32..=1 {

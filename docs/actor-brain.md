@@ -139,10 +139,11 @@ only on a re-path).
 - Spawns carry a [`Brain`] with behaviors `[RandomWalker, ChargeSelfKeeper]`, the
   default `make_high_level` factory, and a seeded `StdRng`.
 - `black_bot_brain` (runs `.after(flush_actor_occupancy).before(process_actors)`,
-  sequential) ticks each brain, gates depleted/broken bots (`brain.halt`), ticks
-  wear/break, and applies effects via `apply_brain_effects`. It runs after the
-  occupancy flush so the bot-on-bot subtile detour reads the same dynamic
-  passability snapshot `process_actors` will use this frame.
+  sequential) ticks each brain, gates depleted/broken bots (`brain.reset` — wipes
+  the plan and clears movement intent), ticks wear/break, and applies effects via
+  `apply_brain_effects`. It runs after the occupancy flush so the bot-on-bot
+  subtile detour reads the same dynamic passability snapshot `process_actors` will
+  use this frame.
   - **Offline eviction:** when a bot first becomes non-operational
     (depleted or broken), the gate calls
     `InteractiveEntityMap::evict_actor_everywhere`, dropping it from every
