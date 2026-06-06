@@ -264,7 +264,16 @@ impl HighLevelAction for GoToChargeStation {
                     return HighLevelOutcome::running();
                 };
 
-                if ctx.main_tile_changed && in_waiting_zone(ctx, charger) {
+                // Join the waiting queue once, on first arrival in the zone. Once
+                // we are already in this charger's waiting queue we have been
+                // cleared by `WaitingQueue` to approach and dock, so we must keep
+                // traveling — re-entering here on every tile boundary inside the
+                // zone is what makes the bot stop-and-go at each step near the
+                // charger.
+                if ctx.main_tile_changed
+                    && in_waiting_zone(ctx, charger)
+                    && self.queued_waiting != Some(charger)
+                {
                     let mut effects = BrainEffects::default();
                     self.enter_waiting_queue(charger, &mut effects);
                     *low = Box::new(Wait::new(short_wait_recheck_s(rng)));
@@ -593,6 +602,49 @@ mod tests {
         let out = action.update(&ctx(&passability, &interactive, 1.0, (4, 0)), &mut low, &mut rng);
         assert!(matches!(out.status, HighLevelStatus::Done));
         assert_eq!(out.effects.undock, Some(EntityCoordinates::ground(4, 0)));
+    }
+
+    #[test]
+    fn traveling_does_not_restop_each_tile_inside_waiting_zone() {
+        // Regression: once a bot has joined a charger's waiting queue and been
+        // cleared to approach, the Traveling phase must not bounce it back into a
+        // WaitingQueue `Wait` on every tile boundary inside the zone — that is the
+        // "stop and go at every step near the charger" stutter.
+        let passability: Hypermap<f32> = Hypermap::new(0.0);
+        for x in 0..=10 {
+            passability.set(x, 0, 1.0);
+        }
+        let charger = EntityCoordinates::ground(10, 0);
+        let mut interactive = InteractiveEntityMap::new();
+        interactive.insert(InteractiveEntity::Charger(ChargerEntity::new(
+            charger,
+            ChargerFacing::North,
+        )));
+
+        let mut action = GoToChargeStation::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = StdRng::seed_from_u64(0);
+
+        // Seeking → Traveling: joins the *wanting* queue and routes to the charger.
+        let _ = action.update(&ctx(&passability, &interactive, 0.1, (0, 0)), &mut low, &mut rng);
+        assert!(low.path().is_some(), "routing to the charger");
+
+        // First entry into the waiting zone joins the *waiting* queue (one stop).
+        let out = action.update(&ctx(&passability, &interactive, 0.1, (7, 0)), &mut low, &mut rng);
+        assert_eq!(out.effects.queue_wait, Some(charger), "joins waiting queue once");
+        interactive.add_waiting(charger, Entity::PLACEHOLDER);
+
+        // Cleared to approach: WaitingQueue → Traveling with a fresh route.
+        low = Box::new(Idle); // the short waiting recheck is "finished"
+        let _ = action.update(&ctx(&passability, &interactive, 0.1, (7, 0)), &mut low, &mut rng);
+        assert!(low.path().is_some(), "approaching the charger again");
+
+        // Crossing more tiles still inside the zone must NOT re-stop the bot.
+        for tile in [(8, 0), (9, 0)] {
+            let out = action.update(&ctx(&passability, &interactive, 0.1, tile), &mut low, &mut rng);
+            assert_eq!(out.effects.queue_wait, None, "must not re-join waiting queue at {tile:?}");
+            assert!(low.path().is_some(), "must keep following the approach path at {tile:?}, not stop");
+        }
     }
 
     #[test]

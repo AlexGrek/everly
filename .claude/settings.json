@@ -22,7 +22,10 @@
       "Bash(perl -e 'alarm 25; exec @ARGV' ./target/debug/everly)",
       "Bash(perl -e 'alarm 35; exec @ARGV' cargo run)",
       "Bash(shasum src/actor/snapshot.rs)",
-      "Bash(tee /tmp/everly_check.log)"
+      "Bash(tee /tmp/everly_check.log)",
+      "Bash(git fetch *)",
+      "Bash(git merge *)",
+      "Bash(git add *)"
     ],
     "additionalDirectories": [
       "/tmp"
