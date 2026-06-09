@@ -469,6 +469,9 @@ impl Plugin for BlackBotPlugin {
                     .after(flush_actor_occupancy)
                     .before(process_actors)
                     .run_if(not(is_paused)),
+                reconcile_charger_occupancy
+                    .after(black_bot_brain)
+                    .before(crate::map::hypermap_world::SyncChargerVisualsSet),
                 sync_black_bot_transforms.after(process_actors),
                 sync_black_bot_status_visual.after(process_actors),
                 paint_black_bot_targets.after(process_actors).run_if(|e: Res<crate::map::chunk_overlay::PathOverlayEnabled>| e.0),
@@ -775,6 +778,31 @@ fn set_charger_occupant(
             if let Some(charger) = entry.entity.as_charger_mut() {
                 charger.set_occupant(occupant);
             }
+        }
+    }
+}
+
+/// Clears charger `occupant` entries that no longer match reality: the entity
+/// was despawned, or the bot has left the station tile without undocking.
+pub(crate) fn reconcile_charger_occupancy(
+    mut interactive: ResMut<InteractiveEntityMap>,
+    actors: Query<(Entity, &ActorObject)>,
+) {
+    for entry in interactive.iter_mut() {
+        let Some(charger) = entry.entity.as_charger_mut() else {
+            continue;
+        };
+        let Some(occupant) = charger.occupant() else {
+            continue;
+        };
+        let Ok((_, obj)) = actors.get(occupant) else {
+            charger.set_occupant(None);
+            continue;
+        };
+        let tile = actor_main_tile(obj.inner.state().center);
+        let coords = entry.coordinates;
+        if tile.x != coords.x || tile.y != coords.y {
+            charger.set_occupant(None);
         }
     }
 }

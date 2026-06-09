@@ -300,3 +300,49 @@ path:
 
 Verified green: `cargo test -p everly` (217 passed, 0 failed, 2 ignored;
 including 5 new `game_log` tests) and `cargo check` warning-clean.
+
+### Stuck / escape replan — rising edge, no per-frame A\* storm (2026-06)
+
+Follow-up to the stuck-detection overhaul and escape-before-reschedule maneuver in
+[`src/actor/brain/low_level.rs`](src/actor/brain/low_level.rs) /
+[`src/actor/brain/high_level.rs`](src/actor/brain/high_level.rs).
+
+- **Issue (rules 4/7 — repeated expensive probe on a per-frame path):**
+  `Wait::retry` reports both `is_stuck()` and `is_finished()` for every frame
+  once its stall timer fires. `GoToPatrol`, `GoToRandomPoints`, and the
+  `GoToChargeStation` stuck handler all keyed replanning on
+  `low.is_stuck() || low.is_finished()` with **no rising edge**, so a single
+  trapped patrol bot re-ran up to `PATROL_LOOP_LEN` tile A\* searches (or
+  `MAX_TARGET_ATTEMPTS` wander searches, or a full nearby-charger scan) **every
+  frame** while stalled. `black_bot_brain` is intentionally sequential (per-bot
+  RNG + `InteractiveEntityMap` mutation), so one wedged bot serialized the entire
+  brain loop and made every other bot's movement appear slower even at a steady
+  FPS.
+- **Fix:** added `low_level_needs_replan` — replan only on the **rising edge**
+  of stuck or finished (`(stuck && !prev_stuck) || (finished && !prev_finished)`).
+  `GoToPatrol`, `GoToRandomPoints`, and `GoToChargeStation` each latch the
+  previous low-level stuck/finished flags across ticks. Sustained
+  `Wait::retry` stall now triggers one replan attempt per episode; the wait /
+  retry timers are no longer reset every frame by a failed replan reinstall.
+- **Semantics (rule 8):** normal path completion and the first frame of a new
+  stuck episode still replan immediately; only the sustained-stuck / sustained-
+  finished spam is removed. Escape (`find_escape_cell` + `run_escape`) is
+  unchanged — it runs once on stall trigger (cold path, ≤81 footprint probes in
+  a 9×9 tile window).
+
+Verified green: `cargo test -p everly` (223 passed, 0 failed, 2 ignored) and
+`cargo check -p everly` warning-clean.
+
+**Follow-up micro-opts** on the same escape path:
+
+- **`find_escape_cell` ring scan (rule 7):** replaced the full 9×9 brute-force
+  loop with Chebyshev-ring expansion (`for_each_chebyshev_ring`) and early exit
+  once the best free cell on an inner ring is closer than
+  `min_dist2_to_chebyshev_ring` on the next ring. Typical case (current tile
+  free via self-bypass) probes **one** footprint instead of up to 81.
+- **`run_escape` single `sqrt` (rule 8):** `to_wp.length()` is computed once and
+  reused for heading (`to_wp / dist`) and braking — same pattern as
+  `approach_velocity`.
+
+Verified green: `cargo test -p everly` (226 passed, 0 failed, 2 ignored) and
+`cargo check -p everly` warning-clean.

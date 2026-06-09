@@ -99,6 +99,30 @@ pub struct BrainEffects {
     pub recharge: f32,
 }
 
+fn merge_brain_effects(into: &mut BrainEffects, add: BrainEffects) {
+    if let Some(v) = add.queue_want {
+        into.queue_want = Some(v);
+    }
+    if let Some(v) = add.queue_unwant {
+        into.queue_unwant = Some(v);
+    }
+    if let Some(v) = add.queue_wait {
+        into.queue_wait = Some(v);
+    }
+    if let Some(v) = add.queue_unwait {
+        into.queue_unwait = Some(v);
+    }
+    if let Some(v) = add.dock {
+        into.dock = Some(v);
+    }
+    if let Some(v) = add.undock {
+        into.undock = Some(v);
+    }
+    if add.recharge > 0.0 {
+        into.recharge += add.recharge;
+    }
+}
+
 /// Maps a winning [`PriorityKind`] to the high-level action that serves it.
 pub type HighLevelFactory = fn(PriorityKind) -> Box<dyn HighLevelAction>;
 
@@ -163,22 +187,30 @@ impl Brain {
         }
 
         // Select / pre-empt the high-level action from the dominant wish.
+        let mut effects = BrainEffects::default();
         match self.priorities.top() {
             Some(top) => {
                 let needs_switch = self.current.as_ref().map(|a| a.kind()) != Some(top.kind);
                 if needs_switch {
+                    if let Some(action) = self.current.as_mut() {
+                        merge_brain_effects(&mut effects, action.preempt(ctx));
+                    }
                     self.current = Some((self.factory)(top.kind));
                     self.low_level = Box::new(Idle); // fresh action plans from scratch
                 }
             }
-            None => self.current = None,
+            None => {
+                if let Some(action) = self.current.as_mut() {
+                    merge_brain_effects(&mut effects, action.preempt(ctx));
+                }
+                self.current = None;
+            }
         }
 
-        let mut effects = BrainEffects::default();
         let mut done = false;
         if let Some(action) = self.current.as_mut() {
             let outcome = action.update(ctx, &mut self.low_level, &mut self.rng);
-            effects = outcome.effects;
+            merge_brain_effects(&mut effects, outcome.effects);
             done = matches!(outcome.status, HighLevelStatus::Done);
         }
         if done {

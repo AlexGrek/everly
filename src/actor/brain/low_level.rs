@@ -444,8 +444,8 @@ impl FollowPath {
         let center = state.center;
 
         let mut best: Option<((i32, i32), f32)> = None;
-        for dy in -ESCAPE_SEARCH_TILES..=ESCAPE_SEARCH_TILES {
-            for dx in -ESCAPE_SEARCH_TILES..=ESCAPE_SEARCH_TILES {
+        for ring in 0..=ESCAPE_SEARCH_TILES {
+            for_each_chebyshev_ring(ring, |dx, dy| {
                 let tile = (here.x + dx, here.y + dy);
                 let goal_center = IVec2::new(tile.0 * sc + sc / 2, tile.1 * sc + sc / 2);
                 if dynamic
@@ -456,6 +456,13 @@ impl FollowPath {
                     if best.map_or(true, |(_, bd)| d2 < bd) {
                         best = Some((tile, d2));
                     }
+                }
+            });
+            if let Some((_, bd)) = best {
+                if ring < ESCAPE_SEARCH_TILES
+                    && min_dist2_to_chebyshev_ring(center, here, ring + 1) > bd
+                {
+                    break;
                 }
             }
         }
@@ -493,10 +500,10 @@ impl FollowPath {
 
         let target_pos = waypoint_center(target);
         let to_wp = target_pos - center;
-        if to_wp.length_squared() > 1e-12 {
-            self.direction = to_wp.normalize();
-        }
         let dist = to_wp.length();
+        if dist > 1e-6 {
+            self.direction = to_wp / dist;
+        }
         let brake_limited_speed = (2.0 * t.decel * dist).sqrt();
         let desired_speed = t.max_speed.min(brake_limited_speed);
         let desired = self.direction * desired_speed;
@@ -881,6 +888,36 @@ fn tick_stall_timer(
     }
 }
 
+/// Visits each `(dx, dy)` on the Chebyshev ring `ring` around the origin.
+fn for_each_chebyshev_ring(ring: i32, mut f: impl FnMut(i32, i32)) {
+    if ring == 0 {
+        f(0, 0);
+        return;
+    }
+    for dy in -ring..=ring {
+        for dx in -ring..=ring {
+            if dx.abs().max(dy.abs()) == ring {
+                f(dx, dy);
+            }
+        }
+    }
+}
+
+/// Minimum squared distance from `center` to any tile center on Chebyshev ring
+/// `ring` around `here`. Used to stop the escape search once a free cell on an
+/// inner ring is closer than every unsearched outer ring can be.
+fn min_dist2_to_chebyshev_ring(center: Vec2, here: IVec2, ring: i32) -> f32 {
+    let mut min_d2 = f32::MAX;
+    for_each_chebyshev_ring(ring, |dx, dy| {
+        let tile = (here.x + dx, here.y + dy);
+        let d2 = (waypoint_center(tile) - center).length_squared();
+        if d2 < min_d2 {
+            min_d2 = d2;
+        }
+    });
+    min_d2
+}
+
 /// Subtile coordinate that contains `pos` (floor of `pos * SUBTILE_COUNT`).
 #[inline]
 pub fn float_subtile(pos: Vec2) -> IVec2 {
@@ -947,6 +984,31 @@ mod tests {
         assert!(!reached_waypoint(wp + Vec2::new(0.2, 0.0), tile, eps));
         assert!(reached_waypoint(wp, tile, eps));
         assert!(reached_waypoint(wp + Vec2::splat(eps * 0.5), tile, eps));
+    }
+
+    #[test]
+    fn chebyshev_ring_zero_is_anchor_only() {
+        let mut count = 0;
+        for_each_chebyshev_ring(0, |_, _| count += 1);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn chebyshev_ring_one_is_eight_neighbors() {
+        let mut count = 0;
+        for_each_chebyshev_ring(1, |_, _| count += 1);
+        assert_eq!(count, 8);
+    }
+
+    #[test]
+    fn min_dist2_to_chebyshev_ring_picks_closest_tile_center() {
+        let here = IVec2::ZERO;
+        let center = Vec2::new(0.5, 0.5);
+        let d2 = min_dist2_to_chebyshev_ring(center, here, 1);
+        assert!(
+            (d2 - 1.0).abs() < 1e-5,
+            "axis neighbor center is 1 tile away, got {d2}"
+        );
     }
 
     #[test]

@@ -58,8 +58,10 @@ const CHARGER_GLOW_EMISSIVE_ACTIVE: LinearRgba = LinearRgba::rgb(0.20, 3.2, 0.45
 /// Point-light tints matched to the glow-cube emissive read (idle blue, active green).
 const CHARGER_LIGHT_COLOR_IDLE: Color = Color::srgb(0.35, 0.82, 1.0);
 const CHARGER_LIGHT_COLOR_ACTIVE: Color = Color::srgb(0.40, 1.0, 0.50);
-const CHARGER_LIGHT_INTENSITY: f32 = 12_000.0;
-const CHARGER_LIGHT_RANGE: f32 = 6.0;
+/// Idle stations rely on emissive mesh only; point light turns on when docked.
+const CHARGER_LIGHT_INTENSITY_IDLE: f32 = 0.0;
+const CHARGER_LIGHT_INTENSITY_ACTIVE: f32 = 12_000.0;
+const CHARGER_LIGHT_RANGE: f32 = 4.0;
 /// Nudge the point light slightly past the room-facing cube face so it reads as surface emission.
 const CHARGER_LIGHT_FACE_NUDGE: f32 = 0.04;
 /// Connector: a chunky black "transformer" box, **larger** than the glowing cube,
@@ -121,9 +123,13 @@ struct RenderedChunkChargerLight;
 
 /// Per-charger runtime visual (glow mesh + point light); keyed to [`InteractiveEntityMap`].
 #[derive(Component)]
-struct ChargerVisualMarker {
+struct ChargerVisual {
     coords: EntityCoordinates,
+    glow_material: Handle<StandardMaterial>,
 }
+
+#[derive(Component)]
+struct ChargerVisualLight;
 
 #[derive(Component)]
 struct RenderedChunkUpperChargerLights;
@@ -299,13 +305,17 @@ struct HypermapRenderAssets {
     glass_wall_material: Handle<StandardMaterial>,
     // ── Charging-station materials ─────────────────────────────────────────────
     charger_metal_material: Handle<StandardMaterial>,
+    /// Template only — each live charger visual clones its own [`StandardMaterial`].
     charger_glow_idle_material: Handle<StandardMaterial>,
-    charger_glow_active_material: Handle<StandardMaterial>,
     charger_connector_material: Handle<StandardMaterial>,
     water_material: Handle<StandardWaterMaterial>,
 }
 
 pub struct HypermapWorldPlugin;
+
+/// Runs after charger occupancy is reconciled against live actor positions.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SyncChargerVisualsSet;
 
 impl Plugin for HypermapWorldPlugin {
     fn build(&self, app: &mut App) {
@@ -334,9 +344,15 @@ impl Plugin for HypermapWorldPlugin {
                     .run_if(in_state(GameState::InGame))
                     .run_if(resource_changed::<WaterRenderingEnabled>),
             )
+            .configure_sets(
+                Update,
+                SyncChargerVisualsSet.run_if(in_state(GameState::InGame)),
+            )
             .add_systems(
                 Update,
-                sync_charger_visuals.run_if(in_state(GameState::InGame)),
+                sync_charger_visuals
+                    .in_set(SyncChargerVisualsSet)
+                    .run_if(in_state(GameState::InGame)),
             );
     }
 }
@@ -441,14 +457,6 @@ fn setup_hypermap_assets(
         cull_mode: None,
         ..default()
     });
-    let charger_glow_active_material = materials.add(StandardMaterial {
-        base_color: CHARGER_GLOW_BASE_ACTIVE,
-        emissive: CHARGER_GLOW_EMISSIVE_ACTIVE,
-        perceptual_roughness: 0.30,
-        metallic: 0.0,
-        cull_mode: None,
-        ..default()
-    });
     // Bulky matte-black transformer box that anchors the charger to the wall.
     let charger_connector_material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.03, 0.03, 0.04),
@@ -494,7 +502,6 @@ fn setup_hypermap_assets(
         glass_wall_material,
         charger_metal_material,
         charger_glow_idle_material,
-        charger_glow_active_material,
         charger_connector_material,
         water_material,
     });
@@ -506,6 +513,7 @@ fn refresh_chunk_upper_layers_on_floor_change(
     mut prev_floor: Local<Option<i32>>,
     mut runtime: ResMut<HypermapRuntime>,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     assets: Res<HypermapRenderAssets>,
     mut commands: Commands,
 ) {
@@ -618,7 +626,7 @@ fn refresh_chunk_upper_layers_on_floor_change(
         let charger_lights = spawn_upper_charger_lights(
             &mut commands,
             &mut meshes,
-            &assets,
+            &mut materials,
             runtime.chunk_roots[&coord],
             &prepared.upper_charger_cells,
             ox,
@@ -755,6 +763,7 @@ fn render_chunks_30fps(
     mut cadence: ResMut<ChunkRenderCadence>,
     settings: Res<WaterSettings>,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     assets: Res<HypermapRenderAssets>,
     mut runtime: ResMut<HypermapRuntime>,
     mut remesh: ResMut<HypermapChunkRemeshQueue>,
@@ -849,6 +858,7 @@ fn render_chunks_30fps(
             &mut commands,
             chunk_root,
             &mut meshes,
+            &mut materials,
             &prepared,
             chunk_origin_x,
             chunk_origin_y,
@@ -1143,6 +1153,7 @@ fn spawn_chunk_meshes(
     commands: &mut Commands,
     chunk_root: Entity,
     meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
     prepared: &PreparedChunkRender,
     origin_x: i32,
     origin_y: i32,
@@ -1320,7 +1331,7 @@ fn spawn_chunk_meshes(
     spawn_floor0_charger_lights(
         commands,
         meshes,
-        assets,
+        materials,
         chunk_root,
         &prepared.floor0_charger_cells,
         ox,
@@ -1456,7 +1467,7 @@ fn spawn_chunk_meshes(
     let upper_charger_lights = spawn_upper_charger_lights(
         commands,
         meshes,
-        assets,
+        materials,
         chunk_root,
         &prepared.upper_charger_cells,
         ox,
@@ -1798,10 +1809,26 @@ fn build_single_charger_glow_mesh(
         .expect("single charger glow cube")
 }
 
+fn new_charger_glow_material(materials: &mut Assets<StandardMaterial>, active: bool) -> Handle<StandardMaterial> {
+    let (base_color, emissive) = if active {
+        (CHARGER_GLOW_BASE_ACTIVE, CHARGER_GLOW_EMISSIVE_ACTIVE)
+    } else {
+        (CHARGER_GLOW_BASE_IDLE, CHARGER_GLOW_EMISSIVE_IDLE)
+    };
+    materials.add(StandardMaterial {
+        base_color,
+        emissive,
+        perceptual_roughness: 0.30,
+        metallic: 0.0,
+        cull_mode: None,
+        ..default()
+    })
+}
+
 fn spawn_charger_visual(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
-    assets: &HypermapRenderAssets,
+    materials: &mut Assets<StandardMaterial>,
     parent: Entity,
     cx: f32,
     cz: f32,
@@ -1812,15 +1839,19 @@ fn spawn_charger_visual(
 ) -> Entity {
     let light_pos = charger_glow_light_position(cx, cz, y_base, facing);
     let glow_mesh = meshes.add(build_single_charger_glow_mesh(cx, cz, y_base, facing));
+    let glow_material = new_charger_glow_material(materials, false);
 
     // Mesh vertices carry absolute world XZ (same as batched chunk meshes); keep identity transform.
     let root = commands
         .spawn((
             Name::new(format!("Charger visual {label}")),
             RenderedChunkChargerLight,
-            ChargerVisualMarker { coords },
+            ChargerVisual {
+                coords,
+                glow_material: glow_material.clone(),
+            },
             Mesh3d(glow_mesh),
-            MeshMaterial3d(assets.charger_glow_idle_material.clone()),
+            MeshMaterial3d(glow_material),
             Transform::default(),
             Visibility::Inherited,
             Pickable::IGNORE,
@@ -1828,10 +1859,10 @@ fn spawn_charger_visual(
         .with_children(|child| {
             child.spawn((
                 Name::new(format!("Charger light {label}")),
-                ChargerVisualMarker { coords },
+                ChargerVisualLight,
                 PointLight {
                     color: CHARGER_LIGHT_COLOR_IDLE,
-                    intensity: CHARGER_LIGHT_INTENSITY,
+                    intensity: CHARGER_LIGHT_INTENSITY_IDLE,
                     range: CHARGER_LIGHT_RANGE,
                     shadows_enabled: false,
                     ..default()
@@ -1853,33 +1884,40 @@ fn charger_in_use(map: &InteractiveEntityMap, coords: EntityCoordinates) -> bool
 
 fn sync_charger_visuals(
     interactive: Res<InteractiveEntityMap>,
-    assets: Res<HypermapRenderAssets>,
-    mut lights: Query<(&ChargerVisualMarker, &mut PointLight), Without<Mesh3d>>,
-    mut glow_mats: Query<
-        (&ChargerVisualMarker, &mut MeshMaterial3d<StandardMaterial>),
-        (With<RenderedChunkChargerLight>, With<Mesh3d>),
-    >,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut visuals: Query<(&ChargerVisual, &Children)>,
+    mut lights: Query<&mut PointLight, With<ChargerVisualLight>>,
 ) {
-    for (marker, mut light) in &mut lights {
-        let active = charger_in_use(&interactive, marker.coords);
-        let target_color = if active {
-            CHARGER_LIGHT_COLOR_ACTIVE
-        } else {
-            CHARGER_LIGHT_COLOR_IDLE
-        };
-        if light.color != target_color {
-            light.color = target_color;
+    for (visual, children) in &mut visuals {
+        let active = charger_in_use(&interactive, visual.coords);
+        if let Some(mat) = materials.get_mut(&visual.glow_material) {
+            let (base_color, emissive) = if active {
+                (CHARGER_GLOW_BASE_ACTIVE, CHARGER_GLOW_EMISSIVE_ACTIVE)
+            } else {
+                (CHARGER_GLOW_BASE_IDLE, CHARGER_GLOW_EMISSIVE_IDLE)
+            };
+            if mat.base_color != base_color {
+                mat.base_color = base_color;
+            }
+            if mat.emissive != emissive {
+                mat.emissive = emissive;
+            }
         }
-    }
-    for (marker, mut mat) in &mut glow_mats {
-        let active = charger_in_use(&interactive, marker.coords);
-        let target = if active {
-            assets.charger_glow_active_material.clone()
+        let (target_color, target_intensity) = if active {
+            (CHARGER_LIGHT_COLOR_ACTIVE, CHARGER_LIGHT_INTENSITY_ACTIVE)
         } else {
-            assets.charger_glow_idle_material.clone()
+            (CHARGER_LIGHT_COLOR_IDLE, CHARGER_LIGHT_INTENSITY_IDLE)
         };
-        if mat.0 != target {
-            mat.0 = target;
+        for child in children.iter() {
+            let Ok(mut light) = lights.get_mut(child) else {
+                continue;
+            };
+            if light.color != target_color {
+                light.color = target_color;
+            }
+            if light.intensity != target_intensity {
+                light.intensity = target_intensity;
+            }
         }
     }
 }
@@ -1887,7 +1925,7 @@ fn sync_charger_visuals(
 fn spawn_floor0_charger_lights(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
-    assets: &HypermapRenderAssets,
+    materials: &mut Assets<StandardMaterial>,
     chunk_root: Entity,
     cells: &[(i32, i32, CellType)],
     origin_x: i32,
@@ -1905,7 +1943,7 @@ fn spawn_floor0_charger_lights(
         spawn_charger_visual(
             commands,
             meshes,
-            assets,
+            materials,
             chunk_root,
             cx,
             cz,
@@ -1920,7 +1958,7 @@ fn spawn_floor0_charger_lights(
 fn spawn_upper_charger_lights(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
-    assets: &HypermapRenderAssets,
+    materials: &mut Assets<StandardMaterial>,
     chunk_root: Entity,
     cells: &[(i32, i32, i32, CellType)],
     origin_x: i32,
@@ -1948,7 +1986,7 @@ fn spawn_upper_charger_lights(
         spawn_charger_visual(
             commands,
             meshes,
-            assets,
+            materials,
             parent,
             cx,
             cz,

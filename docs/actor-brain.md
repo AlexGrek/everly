@@ -73,6 +73,11 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
   during the escape, plus the no-avoidance-data fallback (headless tests),
   abandons in place so the maneuver can never loop forever.
 
+  High-level replan (`GoToPatrol`, `GoToRandomPoints`, recharge stuck handler)
+  runs only on the **rising edge** of `is_stuck` / `is_finished`, not every
+  frame while `Wait::retry` stays stalled — so one trapped bot cannot serialize
+  the sequential brain loop with a per-frame A\* storm.
+
 ### BlackBot status colors
 
 `sync_black_bot_status_visual` (in `black_bot.rs`, runs `.after(process_actors)`)

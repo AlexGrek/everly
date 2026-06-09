@@ -28,6 +28,15 @@ const MAX_TARGET_ATTEMPTS: u32 = 8;
 const PATH_CORNER_BUFFER: usize = 1;
 /// Retry delay when no wander target / charger could be found.
 const RETRY_S: f32 = 0.5;
+
+/// `true` on the first frame the low-level action reports stuck or finished
+/// since the previous tick it did not (rising edge). Prevents re-running
+/// expensive A\* / charger scans every frame while `Wait::retry` stays stalled.
+fn low_level_needs_replan(low: &dyn LowLevelAction, prev_stuck: bool, prev_finished: bool) -> bool {
+    let stuck = low.is_stuck();
+    let finished = low.is_finished();
+    (stuck && !prev_stuck) || (finished && !prev_finished)
+}
 /// Number of waypoints in a freshly generated [`GoToPatrol`] loop.
 const PATROL_LOOP_LEN: usize = 5;
 /// Radius (tiles) within which patrol-loop waypoints are sampled around the anchor.
@@ -89,13 +98,19 @@ pub trait HighLevelAction: Send + Sync {
         low: &mut Box<dyn LowLevelAction>,
         rng: &mut StdRng,
     ) -> HighLevelOutcome;
+
+    /// Release world side effects when this action is dropped without a normal
+    /// [`HighLevelStatus::Done`] (priority pre-emption, plan cleared, etc.).
+    fn preempt(&mut self, _ctx: &BrainContext) -> BrainEffects {
+        BrainEffects::default()
+    }
 }
 
 /// Default mapping from a priority kind to the action that serves it. A brain
 /// may supply a different factory, but this covers BlackBot.
 pub fn make_high_level(kind: PriorityKind) -> Box<dyn HighLevelAction> {
     match kind {
-        PriorityKind::RandomWalking => Box::new(GoToRandomPoints),
+        PriorityKind::RandomWalking => Box::new(GoToRandomPoints::default()),
         PriorityKind::Patrolling => Box::new(GoToPatrol::new()),
         PriorityKind::RechargeYourself => Box::new(GoToChargeStation::new()),
     }
@@ -107,7 +122,11 @@ pub fn make_high_level(kind: PriorityKind) -> Box<dyn HighLevelAction> {
 
 /// Perpetual wander: whenever the current path finishes, pick a new random
 /// reachable target and follow it. Never reports `Done`.
-pub struct GoToRandomPoints;
+#[derive(Default)]
+pub struct GoToRandomPoints {
+    prev_low_stuck: bool,
+    prev_low_finished: bool,
+}
 
 impl HighLevelAction for GoToRandomPoints {
     fn kind(&self) -> PriorityKind {
@@ -122,14 +141,15 @@ impl HighLevelAction for GoToRandomPoints {
         low: &mut Box<dyn LowLevelAction>,
         rng: &mut StdRng,
     ) -> HighLevelOutcome {
-        let needs_new_target = low.is_stuck() || low.is_finished();
-        if needs_new_target {
+        if low_level_needs_replan(low.as_ref(), self.prev_low_stuck, self.prev_low_finished) {
             let here = (ctx.main_tile.x, ctx.main_tile.y);
             match pick_random_target(rng, here, ctx.passability) {
                 Some(path) => *low = Box::new(FollowPath::new(path)),
                 None => *low = Box::new(Wait::retry(RETRY_S)),
             }
         }
+        self.prev_low_stuck = low.is_stuck();
+        self.prev_low_finished = low.is_finished();
         HighLevelOutcome::running()
     }
 }
@@ -158,11 +178,18 @@ pub struct GoToPatrol {
     /// the "advance to the next waypoint on arrival" step so the first leg heads
     /// to the nearest waypoint instead of skipping past it.
     engaged: bool,
+    prev_low_stuck: bool,
+    prev_low_finished: bool,
 }
 
 impl GoToPatrol {
     pub fn new() -> Self {
-        Self { cursor: None, engaged: false }
+        Self {
+            cursor: None,
+            engaged: false,
+            prev_low_stuck: false,
+            prev_low_finished: false,
+        }
     }
 }
 
@@ -187,9 +214,11 @@ impl HighLevelAction for GoToPatrol {
     ) -> HighLevelOutcome {
         // No usable route yet (loop still generating, or not a patrol bot): hold.
         let Some(loop_tiles) = ctx.patrol_loop.filter(|l| !l.is_empty()) else {
-            if low.is_finished() {
+            if low_level_needs_replan(low.as_ref(), self.prev_low_stuck, self.prev_low_finished) {
                 *low = Box::new(Wait::retry(RETRY_S));
             }
+            self.prev_low_stuck = low.is_stuck();
+            self.prev_low_finished = low.is_finished();
             return HighLevelOutcome::running();
         };
 
@@ -205,7 +234,7 @@ impl HighLevelAction for GoToPatrol {
             }
         };
 
-        if low.is_stuck() || low.is_finished() {
+        if low_level_needs_replan(low.as_ref(), self.prev_low_stuck, self.prev_low_finished) {
             // Once we have reached (or abandoned) the waypoint we were heading to,
             // move on to the next; the first engaged leg keeps the nearest one.
             if self.engaged {
@@ -232,6 +261,8 @@ impl HighLevelAction for GoToPatrol {
             }
         }
 
+        self.prev_low_stuck = low.is_stuck();
+        self.prev_low_finished = low.is_finished();
         self.cursor = Some(cursor);
         HighLevelOutcome::running()
     }
@@ -332,6 +363,7 @@ pub struct GoToChargeStation {
     charger: Option<EntityCoordinates>,
     queued_wanting: Option<EntityCoordinates>,
     queued_waiting: Option<EntityCoordinates>,
+    prev_low_stuck: bool,
 }
 
 impl GoToChargeStation {
@@ -341,6 +373,7 @@ impl GoToChargeStation {
             charger: None,
             queued_wanting: None,
             queued_waiting: None,
+            prev_low_stuck: false,
         }
     }
 
@@ -399,15 +432,26 @@ impl HighLevelAction for GoToChargeStation {
             ChargePhase::Charging => "GoToChargeStation (charging)".to_string(),
         }
     }
+    fn preempt(&mut self, _ctx: &BrainContext) -> BrainEffects {
+        let mut effects = BrainEffects::default();
+        if self.phase == ChargePhase::Charging {
+            effects.undock = self.charger;
+        }
+        self.clear_queues(&mut effects);
+        self.charger = None;
+        self.phase = ChargePhase::Seeking;
+        effects
+    }
     fn update(
         &mut self,
         ctx: &BrainContext,
         low: &mut Box<dyn LowLevelAction>,
         rng: &mut StdRng,
     ) -> HighLevelOutcome {
-        if low.is_stuck() && self.phase != ChargePhase::Charging {
-            // Handler for "need charge but got stuck": immediately restart charger
-            // selection instead of progressing the previous phase state machine.
+        let low_stuck = low.is_stuck();
+        if low_stuck && !self.prev_low_stuck && self.phase != ChargePhase::Charging {
+            // Handler for "need charge but got stuck": restart charger selection
+            // on the rising edge only — not every frame while stalled.
             let mut effects = BrainEffects::default();
             self.clear_queues(&mut effects);
             self.charger = None;
@@ -421,8 +465,10 @@ impl HighLevelAction for GoToChargeStation {
                     *low = Box::new(Wait::new(CHARGE_RETRY_S));
                 }
             }
+            self.prev_low_stuck = low.is_stuck();
             return HighLevelOutcome::running_with(effects);
         }
+        self.prev_low_stuck = low_stuck;
 
         match self.phase {
             ChargePhase::Seeking => {
@@ -951,10 +997,18 @@ mod tests {
     }
 
     #[test]
+    fn replan_rising_edge_only_on_transition() {
+        let stuck = StuckLowAction;
+        assert!(low_level_needs_replan(&stuck, false, false));
+        assert!(!low_level_needs_replan(&stuck, true, false));
+        assert!(!low_level_needs_replan(&stuck, true, true));
+    }
+
+    #[test]
     fn random_walker_stuck_handler_retargets() {
         let passability: Hypermap<f32> = Hypermap::new(1.0);
         let interactive = InteractiveEntityMap::new();
-        let mut action = GoToRandomPoints;
+        let mut action = GoToRandomPoints::default();
         let mut low: Box<dyn LowLevelAction> = Box::new(StuckLowAction);
         let mut rng = StdRng::seed_from_u64(42);
 
