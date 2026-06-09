@@ -48,6 +48,7 @@ use crate::map::level::LevelName;
 use crate::map::passability::{
     DynamicPassabilityMap, SubtilePassability, TryUpdateFootprintError, SUBTILE_COUNT,
 };
+use crate::hud::game_log::{GameLog, LogEntry};
 use crate::menu::main_menu::GameState;
 
 /// Epsilon kept inside the passable subtile when snapping the float center to
@@ -188,6 +189,11 @@ pub struct BlackBotVisual {
     /// map-wide eviction to the offline *transition* so it never repeats every
     /// frame; cleared when the bot is operational again.
     offline_released: bool,
+    /// `true` while the bot is in a head-on collision episode that has already
+    /// been logged, so [`log_black_bot_reroutes`] emits one reroute log per
+    /// collision (rising edge) rather than every frame the bots stay pressed
+    /// together. Cleared once the bot is no longer colliding head-on.
+    reroute_logged: bool,
 }
 
 impl BlackBotVisual {
@@ -457,6 +463,7 @@ impl Plugin for BlackBotPlugin {
                     .run_if(not(is_paused)),
                 sync_black_bot_transforms.after(process_actors),
                 sync_black_bot_status_visual.after(process_actors),
+                log_black_bot_reroutes.after(process_actors),
                 paint_black_bot_targets.after(process_actors),
             )
                 .run_if(in_state(GameState::InGame)),
@@ -482,9 +489,11 @@ fn black_bot_brain(
     dynamic: Res<DynamicPassabilityMap>,
     remesh: Res<HypermapChunkRemeshQueue>,
     mut interactive: ResMut<InteractiveEntityMap>,
+    game_log: Res<GameLog>,
     mut indexed: Local<IndexedChargerChunks>,
     mut query: Query<(
         Entity,
+        &Name,
         &mut ActorObject,
         &mut Brain,
         &mut BlackBotVisual,
@@ -504,7 +513,9 @@ fn black_bot_brain(
         &remesh,
     );
 
-    for (entity, mut obj, mut brain, mut vis, mut charge, mut breakable, mut patrol) in &mut query {
+    for (entity, name, mut obj, mut brain, mut vis, mut charge, mut breakable, mut patrol) in
+        &mut query
+    {
         let blocked_flags = obj.inner.blocked_flags();
         let state = obj.inner.state_mut();
 
@@ -593,6 +604,23 @@ fn black_bot_brain(
             if let Some(b) = breakable.as_mut() {
                 b.movement_engine.tick(dt, MOVEMENT_ENGINE_WEAR_RATE, tile_changed, brain.rng_mut());
             }
+        }
+
+        // Charging lifecycle events. `dock`/`undock` are one-shot phase
+        // transitions (entering `Charging` / reaching full), so each logs once.
+        if effects.dock.is_some() {
+            game_log.push_world(
+                current_tile.x,
+                current_tile.y,
+                LogEntry::ChargingStarted { name: name.to_string() },
+            );
+        }
+        if effects.undock.is_some() {
+            game_log.push_world(
+                current_tile.x,
+                current_tile.y,
+                LogEntry::ChargingDone { name: name.to_string() },
+            );
         }
 
         apply_brain_effects(entity, &effects, &mut interactive, charge.as_deref_mut());
@@ -779,6 +807,37 @@ fn sync_black_bot_status_visual(
 
         if vis.collision_flash > 0.0 {
             vis.collision_flash = (vis.collision_flash - dt / COLLISION_FLASH_FADE_SECS).max(0.0);
+        }
+    }
+}
+
+/// Logs "rerouting after collision" once per head-on bot-on-bot collision
+/// episode. The head-on `BlockedByOccupancy` condition tested here is exactly
+/// what triggers the bounce/detour in [`FollowPath`], so a rising edge marks a
+/// genuine reroute; the [`BlackBotVisual::reroute_logged`] latch suppresses the
+/// repeat logs that would otherwise fire every frame two bots stay pressed
+/// together. Wall grazes (`BlockedByStatic`) slide rather than reroute and are
+/// not logged. Runs `.after(process_actors)` so `last_movement_error` and the
+/// brain velocity reflect this frame's movement outcome.
+fn log_black_bot_reroutes(
+    game_log: Res<GameLog>,
+    mut bots: Query<(&ActorObject, &Brain, &Name, &mut BlackBotVisual)>,
+) {
+    for (obj, brain, name, mut vis) in &mut bots {
+        let state = obj.inner.state();
+        let head_on = matches!(
+            state.last_movement_error,
+            Some(ActorMovementError::BlockedByOccupancy { world_subtile_x, world_subtile_y })
+                if is_front_collision(state.center, brain.velocity(), world_subtile_x, world_subtile_y)
+        );
+        if head_on {
+            if !vis.reroute_logged {
+                vis.reroute_logged = true;
+                let tile = actor_main_tile(state.center);
+                game_log.push_world(tile.x, tile.y, LogEntry::BotReroute { name: name.to_string() });
+            }
+        } else {
+            vis.reroute_logged = false;
         }
     }
 }
@@ -976,6 +1035,7 @@ pub fn spawn_black_bot_from_snapshot(
                 collision_flash: 0.0,
                 applied_color: None,
                 offline_released: false,
+                reroute_logged: false,
             },
             spec.build_brain(rng_seed),
             ActorObject::new(Box::new(bot)),
@@ -1026,6 +1086,7 @@ pub fn spawn_black_bot(
                 collision_flash: 0.0,
                 applied_color: None,
                 offline_released: false,
+                reroute_logged: false,
             },
             spec.build_brain(brain_seed),
             ActorObject::new(Box::new(bot)),

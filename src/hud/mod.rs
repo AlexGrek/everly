@@ -2,4 +2,5 @@
 
 pub mod actor_inspector;
 pub mod game_hud;
+pub mod game_log;
 pub mod panel_anim;

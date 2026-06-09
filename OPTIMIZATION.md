@@ -270,3 +270,33 @@ re-ran [`generate_patrol_loop`](src/actor/brain/high_level.rs) whenever
 
 Verified green: `cargo test -p everly` (212 passed, 0 failed, 2 ignored) and
 `cargo check -p everly --all-targets` warning-clean.
+
+### In-game event log — hypertile-local queues, deferred rendering (2026-06)
+
+New event-log overlay ([`src/hud/game_log.rs`](src/hud/game_log.rs),
+`docs/game-log.md`) records gameplay events (bot reroute, charging) and shows
+them top-left. Designed against the rules so logging never taxes the actor hot
+path:
+
+- **Rule 1/6 (no global hot-path lock; finest granularity, briefly held):**
+  `GameLog` stores per-hypertile queues in
+  `RwLock<HashMap<ChunkCoord, Mutex<ChunkLog>>>`. The warm push (queue already
+  exists) takes only the **read** lock to reach the chunk's `Mutex`, held just
+  for the single push; the **write** lock is taken only on the cold path that
+  first creates a hypertile's queue. `enabled` is an `AtomicBool`, so the whole
+  resource is reached through a shared `Res<GameLog>` and can be written from any
+  system (the charging push lives in the sequential `black_bot_brain`; the design
+  also admits parallel callers without exclusive access).
+- **Rule 2 (hypertile-local):** events are grouped by `ChunkCoord`; only the
+  queue for the hypertile the camera is on is ever rendered. Every other chunk's
+  events stay as structs and age out unrendered.
+- **Rule 4 (allocation-free push / deferred string work):** `push` stores a
+  plain `LogEntry` struct (copied values) — **no `format!` at push time**.
+  Strings are produced by `LogEntry::render` only when actually displayed, then
+  cached on the entry so they are never re-rendered. While the panel is disabled
+  (default) nothing is rendered; the UI rebuilds only when the shown chunk's
+  queue changed or the camera crossed into a new hypertile. Queues are capped
+  (`MAX_LOGS_PER_CHUNK`) so a busy/off-screen chunk can't grow unbounded.
+
+Verified green: `cargo test -p everly` (217 passed, 0 failed, 2 ignored;
+including 5 new `game_log` tests) and `cargo check` warning-clean.

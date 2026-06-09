@@ -17,6 +17,7 @@ use crate::map::hypermap_world::{HypermapChunkRemeshQueue, HypermapRuntime, Wate
 use crate::map::temperature::TemperatureMap;
 use crate::map::temperature_overlay::TemperatureOverlayEnabled;
 use crate::map::floor_level::{ActiveFloorLevel, HYPERMAP_FLOOR_MAX};
+use crate::hud::game_log::GameLog;
 use crate::hud::panel_anim::PanelAnim;
 use crate::menu::main_menu::GameState;
 
@@ -65,6 +66,12 @@ struct WaterToggleButton;
 struct WaterToggleLabel;
 
 #[derive(Component)]
+struct LogToggleButton;
+
+#[derive(Component)]
+struct LogToggleLabel;
+
+#[derive(Component)]
 struct RedrawAllButton;
 
 #[derive(Component)]
@@ -108,6 +115,8 @@ impl Plugin for GameHudPlugin {
                 sync_heatmap_toggle_label,
                 water_toggle_button,
                 sync_water_toggle_label,
+                log_toggle_button,
+                sync_log_toggle_label,
                 redraw_all_button,
                 floor_level_buttons,
                 update_floor_level_readout,
@@ -331,6 +340,33 @@ pub(crate) fn spawn_bottom_hud(mut commands: Commands, camera: Query<Entity, Wit
                     p.spawn((
                         WaterToggleLabel,
                         Text::new("Water: On"),
+                        TextFont::from_font_size(17.0),
+                        TextColor(TEXT_MAIN),
+                    ));
+                });
+
+            parent
+                .spawn((
+                    Name::new("HUD log toggle"),
+                    LogToggleButton,
+                    Button,
+                    Node {
+                        min_width: Val::Px(92.0),
+                        height: Val::Px(36.0),
+                        padding: UiRect::horizontal(Val::Px(12.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(1.0)),
+                        border_radius: BorderRadius::all(Val::Px(6.0)),
+                        ..default()
+                    },
+                    BorderColor::all(BTN_BORDER),
+                    BackgroundColor(BTN_BG),
+                ))
+                .with_children(|p| {
+                    p.spawn((
+                        LogToggleLabel,
+                        Text::new("Log: Off"),
                         TextFont::from_font_size(17.0),
                         TextColor(TEXT_MAIN),
                     ));
@@ -771,6 +807,36 @@ fn sync_water_toggle_label(
         return;
     }
     let label = if enabled.0 { "Water: On" } else { "Water: Off" };
+    for mut text in &mut texts {
+        **text = label.to_string();
+    }
+}
+
+fn log_toggle_button(
+    interactions: Query<&Interaction, (With<LogToggleButton>, Changed<Interaction>)>,
+    log: Res<GameLog>,
+) {
+    for interaction in &interactions {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        log.toggle();
+    }
+}
+
+fn sync_log_toggle_label(
+    log: Res<GameLog>,
+    mut last: Local<Option<bool>>,
+    mut texts: Query<&mut Text, With<LogToggleLabel>>,
+) {
+    // `GameLog::enabled` is an interior atomic, so `Res::is_changed` never fires;
+    // track the last shown state and rewrite only on an actual change.
+    let enabled = log.is_enabled();
+    if *last == Some(enabled) {
+        return;
+    }
+    *last = Some(enabled);
+    let label = if enabled { "Log: On" } else { "Log: Off" };
     for mut text in &mut texts {
         **text = label.to_string();
     }

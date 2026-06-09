@@ -56,6 +56,7 @@ impl Plugin for GamePlugin {
             ))
             .add_plugins((
                 hud::panel_anim::PanelAnimPlugin,
+                hud::game_log::GameLogPlugin,
                 map::temperature::TemperatureMapPlugin,
                 map::temperature_diffusion::TemperatureDiffusionPlugin,
                 map::temperature_overlay::TemperatureOverlayPlugin,
