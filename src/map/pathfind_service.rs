@@ -13,7 +13,7 @@
 //! **only** into [`PathfindResults`]. This keeps the hot physics / collision /
 //! movement systems free of the heavy search work.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
@@ -69,8 +69,7 @@ pub enum PathKind {
     },
 }
 
-/// Why a particular route was requested. Attached to every queued entry so
-/// duplicate-entity diagnostics can show what each request was for.
+/// Why a particular route was requested.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PathfindReason {
     WanderNewGoal,
@@ -135,20 +134,6 @@ impl PathfindQueue {
             .expect("pathfind queue poisoned")
             .pop_front()
             .map(|(id, kind, _entity, _reason)| (id, kind))
-    }
-
-    /// Returns entities that have more than one request pending, with all their
-    /// request ids and reasons. Used by the backlog warning to diagnose duplicate enqueues.
-    fn find_duplicate_entities(&self) -> Vec<(Entity, Vec<(RequestId, PathfindReason)>)> {
-        let pending = self.pending.lock().expect("pathfind queue poisoned");
-        let mut by_entity: HashMap<Entity, Vec<(RequestId, PathfindReason)>> = HashMap::new();
-        for (id, _kind, entity, reason) in pending.iter() {
-            by_entity.entry(*entity).or_default().push((*id, *reason));
-        }
-        by_entity
-            .into_iter()
-            .filter(|(_, reqs)| reqs.len() > 1)
-            .collect()
     }
 
     /// Test helper: drains every pending request without running dispatch.
@@ -318,18 +303,6 @@ fn pathfind_dispatch(
             },
             false,
         );
-        for (entity, reqs) in queue.find_duplicate_entities() {
-            let details: Vec<String> = reqs
-                .iter()
-                .map(|(id, r)| format!("{id:?}={r:?}"))
-                .collect();
-            error!(
-                "pathfind backlog: entity {:?} has {} pending requests: {}",
-                entity,
-                reqs.len(),
-                details.join(", ")
-            );
-        }
     }
 }
 

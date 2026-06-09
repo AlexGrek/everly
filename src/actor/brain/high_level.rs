@@ -105,6 +105,11 @@ const WAITING_QUEUE_ENTER_DISTANCE: i32 = 4;
 const WAITING_RECHECK_MIN_S: f32 = 0.1;
 const WAITING_RECHECK_MAX_S: f32 = 0.4;
 
+/// Maximum charger candidates to route-test in one seek pass. Capped to avoid
+/// flooding the pathfind queue (one A* per candidate) when many chargers are
+/// nearby — pick the N closest by Manhattan distance.
+const MAX_CHARGER_CANDIDATES: usize = 5;
+
 /// Result of a [`HighLevelAction::update`].
 pub enum HighLevelStatus {
     Running,
@@ -956,6 +961,12 @@ fn gather_charger_candidates(ctx: &BrainContext) -> Vec<EntityCoordinates> {
             continue;
         }
         out.push(entry.coordinates);
+    }
+    // Keep only the N nearest by Manhattan distance to avoid flooding the
+    // pathfind queue — one A* request is enqueued per candidate.
+    if out.len() > MAX_CHARGER_CANDIDATES {
+        out.sort_by_key(|c| (c.x - here.0).abs() + (c.y - here.1).abs());
+        out.truncate(MAX_CHARGER_CANDIDATES);
     }
     out
 }
