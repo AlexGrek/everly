@@ -600,15 +600,21 @@ pub(crate) fn process_actors(
     let reentering: Parallel<Vec<Entity>> = Parallel::default();
 
     {
-    let _t = timings.scope(TimedSystem::ParallelPass);
+    let _t = timings.scope(TimedSystem::ThinkPass);
+    actors.par_iter_mut().for_each(|(_, mut actor_obj, _)| {
+        let actor = actor_obj.inner.as_mut();
+        actor.state_mut().last_movement_error = None;
+        actor.think_low_level();
+        actor.prepare_movement();
+    });
+    } // end ThinkPass
+
+    {
+    let _t = timings.scope(TimedSystem::MovePass);
     actors
         .par_iter_mut()
         .for_each(|(entity, mut actor_obj, off_screen)| {
             let actor = actor_obj.inner.as_mut();
-            actor.state_mut().last_movement_error = None;
-            actor.think_low_level();
-            actor.prepare_movement();
-
             let center = actor.state().center;
             let is_rendered =
                 hypermap.is_world_pos_rendered(center.x.floor() as i32, center.y.floor() as i32);
@@ -635,7 +641,7 @@ pub(crate) fn process_actors(
                 actor.advance_unchecked();
             }
         });
-    } // end ParallelPass
+    } // end MovePass
 
     {
     let _t = timings.scope(TimedSystem::ReentryPass);

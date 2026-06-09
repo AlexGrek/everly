@@ -1,15 +1,15 @@
 //! Lock-free sub-section timers for `process_actors`, shown beneath the FPS counter.
 //!
-//! `process_actors` spiked to ~24 ms during bot-slowdown episodes. Two timers
-//! split the function into its two sequential halves so we can tell which one
-//! is responsible:
+//! Three timers split `process_actors` into its three sequential phases:
 //!
-//! - `ParallelPass` -- the `par_iter_mut` block (think + move + collision for
-//!   all on-screen actors in parallel).
-//! - `ReentryPass`  -- the sequential re-entry placement loop (actors crossing
-//!   from off-screen to on-screen this frame).
+//! - `ThinkPass`    -- first `par_iter_mut`: `think_low_level` + `prepare_movement`
+//!                     (brain logic, path-following, state machines).
+//! - `MovePass`     -- second `par_iter_mut`: `try_move` / `advance_unchecked`
+//!                     (passability lookup + footprint stamping).
+//! - `ReentryPass`  -- sequential re-entry placement for actors crossing
+//!                     from off-screen to on-screen this frame.
 //!
-//! Storage is two pairs of atomics; instrumented code calls `timings.scope()`
+//! Storage is three pairs of atomics; instrumented code calls `timings.scope()`
 //! for a lock-free RAII record (one relaxed store + one `fetch_max` on drop).
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,13 +23,14 @@ use crate::scene::camera::{spawn_camera, StrategyCameraRig};
 
 #[derive(Clone, Copy)]
 pub enum TimedSystem {
-    ParallelPass,
+    ThinkPass,
+    MovePass,
     ReentryPass,
 }
 
 impl TimedSystem {
-    pub const COUNT: usize = 2;
-    const LABELS: [&'static str; Self::COUNT] = ["par_pass", "reentry_pass"];
+    pub const COUNT: usize = 3;
+    const LABELS: [&'static str; Self::COUNT] = ["think_pass", "move_pass", "reentry_pass"];
 }
 
 #[derive(Resource)]

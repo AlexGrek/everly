@@ -425,7 +425,7 @@ fn setup_hypermap_assets(
     let empty_mesh = meshes.add(PlaneMeshBuilder::from_size(Vec2::splat(0.02)));
 
     let road_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.10, 0.10, 0.12),
+        base_color: Color::srgb(0.92, 0.92, 0.90),
         perceptual_roughness: 0.96,
         metallic: 0.0,
         ..default()
