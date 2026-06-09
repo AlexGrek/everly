@@ -11,6 +11,8 @@ paths:
   - "src/map/field_interactions.rs"
   - "docs/actor.md"
   - "docs/actor-brain.md"
+  - "docs/pathfind-service.md"
+  - "src/map/pathfind_service.rs"
   - "docs/field-interactions.md"
   - "src/lib.rs"
 ---
@@ -39,10 +41,15 @@ Use this skill for:
   - A BlackBot's **specialization** (`BotSpecialization` in `black_bot.rs`) is a
     named behavior set + ring color, rolled at spawn (`PATROL` 1/4, else
     `DO_NOTHING`) and persisted in `actors.yaml`. `PATROL` adds the `Patrol`
-    component (a fixed loop, generated lazily and surfaced via
-    `BrainContext::patrol_loop`). Per-bot planning state the brain tick needs but
-    that must outlive a `HighLevelAction` (which the brain rebuilds on
-    pre-emption) belongs on a component, read through `BrainContext`.
+    component (a fixed loop, generated lazily via async reachability checks and
+    surfaced via `BrainContext::patrol_loop`). Per-bot planning state the brain
+    tick needs but that must outlive a `HighLevelAction` (which the brain
+    rebuilds on pre-emption) belongs on a component, read through `BrainContext`.
+  - **Async routing:** high-level actions enqueue on `PathfindQueue` and poll
+    `PathfindResults` through `BrainContext::pathfind` (`PathfindAccess`). While
+    awaiting, the low-level action is `PendingPath::with_velocity(...)` so inertia
+    is preserved. Never call `astar_*` inline from `HighLevelAction::update`.
+    Read **`docs/pathfind-service.md`** before touching queue or await logic.
 
 For generic Bevy API usage, still read `.claude/SKILLS/bevy-engineer/SKILL.md` first.
 
@@ -106,10 +113,14 @@ The callback is built fresh inside `try_move` from `self`, so it always reflects
    - try move
    - flush passability
    - field interactions (e.g. dirt) — see `.claude/SKILLS/field-interactions/SKILL.md`
-5. Add/update unit tests in touched modules.
+5. Add/update unit tests in touched modules. **Brain tests assert pathfind
+   requests** (enqueued `PathKind`, `PendingPath`, injected `PathOutcome`), not
+   real route geometry. Path quality tests belong in `pathfind_service` or
+   `hypermap_pathfind`.
 6. Run `cargo check` and targeted tests:
    - `cargo test -p everly -- actor`
    - `cargo test -p everly -- passability`
+   - `cargo test -p everly -- pathfind_service`
 
 ## Common pitfalls
 
@@ -131,5 +142,7 @@ The callback is built fresh inside `try_move` from `self`, so it always reflects
 When actor behavior changes, update:
 
 - `docs/actor.md` (primary reference).
+- `docs/actor-brain.md` / `docs/pathfind-service.md` when brain routing or the
+  async queue changes.
 - Follow `docs/actor.md#new-actor-checklist` for onboarding new actor classes.
 - `docs/README.md` if scope/discoverability changed.

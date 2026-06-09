@@ -11,10 +11,11 @@
 
 use std::collections::HashSet;
 
-use rand::Rng;
+use crate::rng;
 
 use crate::map::world_map::{MASK_NORTH, MASK_WEST};
 
+use super::draft::{DraftTile, MapDraft};
 use super::step_door::house_entry_wall_cells;
 use super::types::MIN_HOUSE_AREA_FOR_CENTER_WAVE;
 
@@ -107,7 +108,7 @@ impl MapDraft {
         if candidates.is_empty() {
             return None;
         }
-        Some(candidates[self.rng.gen_range(0..candidates.len())])
+        Some(*rng::pick(&mut self.rng, &candidates))
     }
 
     fn stamp_horizontal_inner_wall(&mut self, house_idx: usize, zw: i32) {

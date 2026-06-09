@@ -229,7 +229,7 @@ fn spawn_overlays_ui(mut commands: Commands, camera: Query<Entity, With<Strategy
                                 ))
                                 .with_children(|btn| {
                                     btn.spawn((
-                                        Text::new("×"),
+                                        Text::new("X"),
                                         TextFont::from_font_size(18.0),
                                         TextColor(TEXT_MUTED),
                                     ));

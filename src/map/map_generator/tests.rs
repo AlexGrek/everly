@@ -395,6 +395,7 @@ fn small_house_skips_center_glass_wave() {
         z1: 7,
         footprint_area: 9,
         entry: None,
+        entry2: None,
     }];
     assert!(!draft.houses[0].supports_center_glass_wave());
     draft.step_init_carpet();
@@ -441,13 +442,16 @@ fn home_crawler_glass_wave_from_house_center() {
         };
         for z in house.z0..=house.z1 {
             for x in house.x0..=house.x1 {
+                if !house.contains(x, z) {
+                    continue;
+                }
                 if draft.floor_styles[z as usize][x as usize] != TileStyle::FLOOR_GLASS {
                     continue;
                 }
                 glass_found = true;
                 assert!(
                     manhattan((x, z), center) <= HOME_CRAWLER_WAVE_MAX,
-                    "glass at ({x},{z}) exceeds max wave radius from center"
+                    "glass at ({x},{z}) exceeds max wave radius from center {center:?}"
                 );
             }
         }
@@ -1058,4 +1062,80 @@ fn inner_doors_make_all_rooms_accessible_with_wide_doors() {
             }
         }
     }
+}
+
+#[test]
+fn second_door_appears_on_about_half_of_houses() {
+    let mut with_second = 0u32;
+    let mut eligible = 0u32;
+    for seed in 0..512u64 {
+        let mut draft = MapDraft::new(MapGeneratorConfig {
+            seed,
+            ..Default::default()
+        });
+        draft.run_pipeline();
+        for house in &draft.houses {
+            if house.entry.is_none() {
+                continue;
+            }
+            eligible += 1;
+            if house.entry2.is_some() {
+                with_second += 1;
+            }
+        }
+    }
+    assert!(eligible > 50, "expected many houses across seeds");
+    let ratio = with_second as f32 / eligible as f32;
+    assert!(
+        (0.35..=0.65).contains(&ratio),
+        "expected ~50% second doors, got {with_second}/{eligible} ({ratio:.2})"
+    );
+}
+
+#[test]
+fn houses_place_up_to_three_chargers() {
+    use std::collections::HashMap;
+
+    let mut max_per_house: u32 = 0;
+    let mut houses_with_multiple = 0u32;
+    for seed in 0..128u64 {
+        let mut draft = MapDraft::new(MapGeneratorConfig {
+            seed,
+            ..Default::default()
+        });
+        draft.run_pipeline();
+
+        let mut per_house: HashMap<usize, u32> = HashMap::new();
+        for z in 0..draft.size {
+            for x in 0..draft.size {
+                if !matches!(draft.get(x, z), DraftTile::Charger(_)) {
+                    continue;
+                }
+                for (hi, house) in draft.houses.iter().enumerate() {
+                    if house.contains(x, z) {
+                        *per_house.entry(hi).or_insert(0) += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        for count in per_house.values() {
+            max_per_house = max_per_house.max(*count);
+            if *count > 1 {
+                houses_with_multiple += 1;
+            }
+        }
+    }
+    assert!(
+        max_per_house >= 2,
+        "expected at least one house with 2+ chargers across seeds, max was {max_per_house}"
+    );
+    assert!(
+        max_per_house <= 3,
+        "never more than 3 chargers per house, got {max_per_house}"
+    );
+    assert!(
+        houses_with_multiple > 0,
+        "expected some houses with multiple chargers"
+    );
 }

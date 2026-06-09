@@ -8,8 +8,7 @@
 //! never drains below `0.0`.
 
 use bevy::prelude::*;
-use rand::rngs::StdRng;
-use rand::Rng;
+use crate::rng::{self, StdRng};
 
 use crate::actor::is_paused;
 use crate::menu::main_menu::GameState;
@@ -42,7 +41,7 @@ impl Charge {
 
     /// Random starting charge in `[SPAWN_CHARGE_MIN, SPAWN_CHARGE_MAX]`.
     pub fn random(rng: &mut StdRng) -> Self {
-        Self::new(rng.gen_range(SPAWN_CHARGE_MIN..=SPAWN_CHARGE_MAX))
+        Self::new(rng::range(rng, SPAWN_CHARGE_MIN..=SPAWN_CHARGE_MAX))
     }
 
     /// `true` when the bot has no charge left and must not move.
@@ -81,8 +80,6 @@ fn discharge_actors(time: Res<Time>, mut charges: Query<&mut Charge>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
-
     #[test]
     fn new_clamps_out_of_range() {
         assert_eq!(Charge::new(1.5).level, 1.0);
@@ -99,7 +96,7 @@ mod tests {
 
     #[test]
     fn random_charge_within_spawn_bounds() {
-        let mut rng = StdRng::seed_from_u64(7);
+        let mut rng = rng::seeded(7);
         for _ in 0..256 {
             let c = Charge::random(&mut rng);
             assert!(

@@ -588,7 +588,7 @@ fn sync_overlays_toggle_label(
     if !panel.is_changed() {
         return;
     }
-    let label = if panel.open { "Overlays ✓" } else { "Overlays" };
+    let label = if panel.open { "Overlays *" } else { "Overlays" };
     for mut text in &mut texts {
         **text = label.to_string();
     }

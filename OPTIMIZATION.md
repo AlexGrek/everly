@@ -346,3 +346,32 @@ Verified green: `cargo test -p everly` (223 passed, 0 failed, 2 ignored) and
 
 Verified green: `cargo test -p everly` (226 passed, 0 failed, 2 ignored) and
 `cargo check -p everly` warning-clean.
+
+### Async pathfinding queue — offload A\* from brain tick (2026-06)
+
+[`src/map/pathfind_service.rs`](src/map/pathfind_service.rs) /
+[`src/actor/brain/high_level.rs`](src/actor/brain/high_level.rs) /
+[`src/actor/brain/low_level.rs`](src/actor/brain/low_level.rs).
+
+- **Issue (rules 4/5 — per-frame allocation + sequential hot-path work):**
+  Tile-level routes (wander, patrol legs, multi-charger scans, patrol-loop
+  generation) and subtile bot-on-bot detours all ran synchronous `astar_*` inside
+  the sequential `black_bot_brain` loop. One replanning bot blocked every other
+  bot's movement cadence even when FPS stayed high.
+- **Fix:** `PathfindQueue` + `PathfindInFlight` (cap
+  [`MAX_IN_FLIGHT`](src/map/pathfind_service.rs) = 10 on `AsyncComputeTaskPool`)
+  + `PathfindResults`. Bots enqueue a [`PathKind`](src/map/pathfind_service.rs),
+  park in [`PendingPath`](src/actor/brain/low_level.rs) (inertial coast), and
+  `take` outcomes by `RequestId`. Workers **read only** `Arc`-shared
+  passability / occupancy snapshots; they write **only** finished outcomes back
+  through `pathfind_collect`. Schedule:
+  `Collect → black_bot_brain → Dispatch`.
+- **Semantics (rule 8):** route geometry unchanged (same `compute_world_route` /
+  `compute_subtile_detour` helpers as before). Bot RNG stays sequential;
+  **frame-exact arrival timing** of async results is not deterministic across
+  runs — documented in [`docs/pathfind-service.md`](docs/pathfind-service.md).
+- **Tests:** brain suite asserts enqueued requests + injected results; service +
+  `hypermap_pathfind` suites assert actual paths.
+
+Verified green: `cargo test -p everly` (239 passed, 0 failed, 2 ignored) and
+`cargo check -p everly` warning-clean.

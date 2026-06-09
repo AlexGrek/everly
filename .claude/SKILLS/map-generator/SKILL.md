@@ -73,9 +73,9 @@ paths:
 Order in `MapDraft::generate` / `run_into_chunk` — **do not reorder** without revisiting doors and overlap:
 
 1. `step_init_carpet` — `Open` (road) inside margin
-2. `step_place_primary_seeds` — 3–5 random centers
+2. `step_place_primary_seeds` — 8–12 random centers
 3. `step_separate_primary_seeds` — push apart (`MIN_SEED_DISTANCE`, `BORDER_CLEARANCE`)
-4. `step_spawn_subseeds` — 1–3 offsets per primary (`growth_centers`)
+4. `step_spawn_subseeds` — 3–6 offsets per primary (`growth_centers`)
 5. `step_grow_rooms` — axis-aligned rects from **`subseed_centers` only** (`area >= 4`; internal `room_records`)
 6. `step_cluster_houses` — merge touching / overlapping rects into [`House`](../../src/map/map_generator/house.rs) footprints (subseed data dropped)
 7. `step_paint_union_interior` — all house tiles → `Open` (no walls)
@@ -144,8 +144,9 @@ Union shell uses `union_perimeter_wall_mask` in `union.rs` (not per-room `perime
 
 ## House count
 
-- Primaries: `PRIMARY_SEED_COUNT_MIN`–`MAX` (5–8). Subseeds per primary: 2–4.
+- Primaries: `PRIMARY_SEED_COUNT_MIN`–`MAX` (8–12). Subseeds per primary: 3–6.
 - Clustering merges **overlapping** rects only; edge-touching subseed rooms become separate houses.
+- Smaller subseed rooms and tighter seed spacing (`MIN_SEED_DISTANCE` 12) help distinct footprints fit without merging as often.
 
 ## Overlapping rooms
 

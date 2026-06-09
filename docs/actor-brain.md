@@ -14,10 +14,13 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
                      High-level action  (exactly one, exclusive)
                               │ dictates
                               ▼
-                     Low-level action   (Wait / FollowPath)
+                     Low-level action   (Wait / PendingPath / FollowPath)
                               │ execute()
                               ▼
                      ActorState.move_buffer  ──▶ process_actors → try_move
+                              ▲
+                     PathfindQueue ──▶ AsyncComputeTaskPool ──▶ PathfindResults
+                     (enqueue)         (≤10 in flight)         (take by RequestId)
 ```
 
 - **[`Behavior`](../src/actor/brain/behavior/mod.rs)** — a rule that runs every
@@ -44,11 +47,14 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
   (via the brain's factory); a different dominant kind **pre-empts** it. It
   `update`s the low-level action and may request [`BrainEffects`].
 - **[`LowLevelAction`](../src/actor/brain/low_level.rs)** — what the bot is
-  physically doing this frame: `Idle`, `Wait(time)`, or `FollowPath(path)`.
-  `execute` writes `move_buffer`. **All of BlackBot's movement feel lives in
-  `FollowPath`** (mass/inertia, wall-momentum bleed, stuck-repath, and the
-  head-on bot-on-bot response — elastic bounce then either a detour or a
+  physically doing this frame: `Idle`, `Wait(time)`, [`PendingPath`]
+  (waiting-for-path hold), or `FollowPath(path)`. `execute` writes
+  `move_buffer`. **All of BlackBot's movement feel lives in `FollowPath`**
+  (mass/inertia, wall-momentum bleed, stuck-repath, and the head-on bot-on-bot
+  response — elastic bounce then either a queued subtile detour or a
   step-aside-and-pause; rear bumps ignored — tuned by [`FollowTuning`]).
+  [`PendingPath`] coasts under inertia (`with_velocity`) while a high-level
+  action awaits a [`PathfindResults`] outcome; it never finishes on its own.
   When `FollowPath` abandons an unfinished route due to no progress, the brain
   exposes a `stuck` status (`Brain::is_stuck`) and the bot mesh flashes yellow,
   then eases back to black over a few seconds. The stall trigger fires when the
@@ -75,8 +81,16 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
 
   High-level replan (`GoToPatrol`, `GoToRandomPoints`, recharge stuck handler)
   runs only on the **rising edge** of `is_stuck` / `is_finished`, not every
-  frame while `Wait::retry` stays stalled — so one trapped bot cannot serialize
-  the sequential brain loop with a per-frame A\* storm.
+  frame while `Wait::retry` stays stalled — so one trapped bot cannot spam
+  pathfind requests every frame.
+
+  **Async routing.** Tile-level routes and subtile detours are **not** computed
+  inline during `update`. High-level actions enqueue a [`PathKind`] on
+  [`PathfindQueue`], park the bot in [`PendingPath`], and `take` the matching
+  [`PathOutcome`] from [`PathfindResults`] when the background worker finishes
+  (or reissue after **3 s** if nothing arrives). See
+  [`pathfind-service.md`](pathfind-service.md) for the full queue, scheduling,
+  and determinism caveats.
 
 ### BlackBot status colors
 
@@ -105,8 +119,9 @@ route around other (moving) bots. When a step is rejected with
    cases — degenerate normal or a stationary bot — count as front.)
 2. **Bounce** the velocity elastically off the contact normal (recoil; feel only).
 3. **Roll the response (`FollowTuning::bot_detour_chance`, default `0.5`).**
-   - *Detour* → plan a **subtile-level detour** around the blocker (see below)
-     toward the next path node.
+   - *Detour* → enqueue a **subtile-level detour** search (see below) toward the
+     next path node and hold until the result lands (or step aside on `NoPath` /
+     timeout).
    - *Step aside + pause* → step to an adjacent cell and hold there for a random
      0.5–1.5 s (`STEP_BACK_WAIT_*_SECS`). The step is usually **straight back** to the
      previously occupied cell (`track_tiles` records `prev_tile`), but
@@ -123,8 +138,10 @@ route around other (moving) bots. When a step is rejected with
 This applies to bot-on-bot bumps only; a wall graze (`BlockedByStatic`) is left
 to the normal wall-slide / stuck-repath path.
 
-The subtile detour is a *second, finer* pathfinding pass for short distances:
-[`astar_subtile_detour`](../src/map/hypermap_pathfind.rs) runs a bounded
+The subtile detour is a *second, finer* pathfinding pass for short distances.
+[`FollowPath`](../src/actor/brain/low_level.rs) enqueues
+[`PathKind::SubtileDetour`](../src/map/pathfind_service.rs); the worker runs
+[`astar_subtile_detour`](../src/map/hypermap_pathfind.rs) — a bounded
 4-neighbour A\* on the subtile grid (`1 tile = SUBTILE_COUNT subtiles`) from the
 bot's current subtile to the **next already-calculated path node**. Each
 candidate subtile is accepted only when the bot's whole circular footprint —
@@ -133,23 +150,27 @@ other creatures, tested via
 [`DynamicPassabilityMap::probe_footprint`](../src/map/passability.rs). The
 search is kept local: it is skipped past `DETOUR_MAX_SPAN_SUBTILES`, confined to
 the start/goal bounding box grown by `DETOUR_PAD_SUBTILES`, and capped at
-`DETOUR_MAX_EXPANDED` expansions. The resulting subtile staircase is collapsed
-to its corners and followed (in tile-space float coordinates) until the bot
-reaches that next node, then the normal tile path resumes. A detour is dropped
-if a **fresh** head-on bump invalidates it (a new blocker subtile, or contact
-after a frame with no occupancy error) or it runs longer than
-`stuck_repath_secs`. While two bots stay pressed together the movement error
-persists every frame, but the response runs only on the **rising edge** — the
-same rising-edge latch pattern as the game-log stuck event — so an in-flight
-detour is not wiped and replanned each tick. Choosing a detour also removes any unreached
-step-aside waypoint that was inserted by an earlier bump on the same path.
+`DETOUR_MAX_EXPANDED` expansions. While `detour_request` is set the bot holds
+with inertial braking; on success the subtile staircase is collapsed to corners
+and followed (in tile-space float coordinates) until the bot reaches that next
+node, then the normal tile path resumes. A detour is dropped if a **fresh**
+head-on bump invalidates it (a new blocker subtile, or contact after a frame with
+no occupancy error) or it runs longer than `stuck_repath_secs`. While two bots
+stay pressed together the movement error persists every frame, but the response
+runs only on the **rising edge** — the same rising-edge latch pattern as the
+game-log stuck event — so an in-flight detour is not wiped and replanned each
+tick. Choosing a detour also removes any unreached step-aside waypoint that was
+inserted by an earlier bump on the same path.
 
 This needs occupancy data the rest of the brain doesn't: `BrainContext` carries
 an optional [`AvoidanceViews`](../src/actor/brain/mod.rs) (the dynamic map, the
-static subtile cache, and the actor's `blocked_flags`). It is `Some` only in the
-live `black_bot_brain` system (which runs after `flush_actor_occupancy` so it
-reads the current occupancy snapshot) and `None` everywhere else, which disables
-the detour.
+static subtile cache, and the actor's `blocked_flags`) and, for enqueueing,
+[`PathfindAccess`](../src/actor/brain/mod.rs) (`PathfindQueue` +
+`PathfindResults`). Both are `Some` only in the live `black_bot_brain` system
+(which runs after `flush_actor_occupancy` and between
+`PathfindSet::Collect` / `PathfindSet::Dispatch` — see
+[`pathfind-service.md`](pathfind-service.md)) and `None` everywhere else, which
+disables the detour.
 
 ## Tick (`Brain::tick`)
 
@@ -166,8 +187,9 @@ Each frame, the owning ECS system builds a `BrainContext` and calls
 
 `tick` returns the [`BrainEffects`]; it never touches ECS resources itself. The
 owning system applies them. Steady-state ticks allocate nothing (`Priorities`
-reuses its buffer; effects are a fixed-size struct; a path `Vec` is allocated
-only on a re-path).
+reuses its buffer; effects are a fixed-size struct). A `FollowPath` `Vec` is
+allocated when a finished route is **taken** from `PathfindResults`; enqueueing
+a search does not block the tick on A\*.
 
 ## Specializations
 
@@ -198,12 +220,14 @@ The specialization is **persisted** (see [Persistence](#persistence)); the patro
 - Spawns carry a [`Brain`] whose behavior set is chosen by the bot's
   [specialization](#specializations) (`BotSpecialization::build_brain`), the
   default `make_high_level` factory, and a seeded `StdRng`.
-- `black_bot_brain` (runs `.after(flush_actor_occupancy).before(process_actors)`,
+- `black_bot_brain` (runs
+  `.after(flush_actor_occupancy).after(PathfindSet::Collect).before(PathfindSet::Dispatch).before(process_actors)`,
   sequential) ticks each brain, gates depleted/broken bots (`brain.reset` — wipes
   the plan and clears movement intent), ticks wear/break, and applies effects via
   `apply_brain_effects`. It runs after the occupancy flush so the bot-on-bot
   subtile detour reads the same dynamic passability snapshot `process_actors` will
-  use this frame.
+  use this frame, and between pathfind collect/dispatch so bots can enqueue and
+  consume route results in the same frame cadence.
   - **Offline eviction:** when a bot first becomes non-operational
     (depleted or broken), the gate calls
     `InteractiveEntityMap::evict_actor_everywhere`, dropping it from every
@@ -228,25 +252,27 @@ shared routine wish value lives in `behavior_utils.rs`.
 
 ### High-level actions
 
-- **`GoToRandomPoints`** (serves `RandomWalking`) — whenever the path finishes,
-  pick a new random reachable target and follow it. Perpetual. If the low-level
-  route reports `stuck`, this handler immediately retargets to a different
-  random point.
+- **`GoToRandomPoints`** (serves `RandomWalking`) — samples a random walkable
+  tile, enqueues a `WorldRoute`, parks in `PendingPath`, installs `FollowPath`
+  when the result lands (or resamples on `NoPath` / 3 s timeout). Perpetual. On
+  `stuck` rising edge, immediately enqueues a fresh target.
 - **`GoToPatrol`** (serves `Patrolling`) — walks a *fixed* loop of cells forever.
-  The loop lives on the bot's `Patrol` component (generated once, lazily, by
-  `black_bot_brain` via `generate_patrol_loop` from the spawn tile, then never
-  changed) and is surfaced to the action through `BrainContext::patrol_loop`. The
-  action itself is transient — the brain rebuilds it whenever `Patrolling`
-  becomes dominant again (e.g. after a recharge pre-empts it) — so on (re)creation
-  it snaps its cursor to the loop waypoint **nearest the bot**, resuming "where it
-  stopped". On `stuck`, it skips the unreachable waypoint and tries the next.
-  Perpetual.
+  The loop lives on the bot's `Patrol` component (generated lazily by
+  `black_bot_brain` via `enqueue_patrol_candidates` + `assemble_patrol_loop` from
+  the spawn tile, then never changed) and is surfaced to the action through
+  `BrainContext::patrol_loop`. Each leg enqueues a `WorldRoute` to the next
+  waypoint (skipping the tile the bot stands on). The action itself is transient
+  — the brain rebuilds it whenever `Patrolling` becomes dominant again (e.g.
+  after a recharge pre-empts it) — so on (re)creation it snaps its cursor to
+  the loop waypoint **nearest the bot**, resuming "where it stopped". On `stuck`,
+  it skips the unreachable waypoint and tries the next. Perpetual.
 - **`GoToChargeStation`** (serves `RechargeYourself`) — `Seeking` → `Traveling` →
   `WaitingQueue` → `Charging`:
-  - scan chargers in the bot's 4 nearest hypertiles (current chunk + nearest X/Y
-    neighbors + diagonal), rank by reachable path length, then apply queue policy:
-    prefer stations with `< 2` waiting bots; if all candidates are busier, pick
-    `2nd`/`3rd`/... nearest based on the nearest station's waiting depth;
+  - gather chargers in the bot's 4 nearest hypertiles (current chunk + nearest X/Y
+    neighbors + diagonal), enqueue a `WorldRoute` to **each** candidate, rank
+    resolved routes by path cost, then apply queue policy: prefer stations with
+    `< 2` waiting bots; if all candidates are busier, pick `2nd`/`3rd`/... nearest
+    based on the nearest station's waiting depth;
   - queue-selection and "enter waiting zone" transitions are evaluated on main-tile
     changes (the actor-brain integration's usual coarse cadence);
   - on selection, join that station's **wanting** queue;
@@ -289,8 +315,12 @@ and [`level-persistence.md`](level-persistence.md).
 3. Implement a `HighLevelAction` that serves it (`high_level.rs`) and map the kind
    in `make_high_level`.
 4. Reuse `FollowPath` / `Wait`, or add a new `LowLevelAction` (`low_level.rs`).
-5. Add unit tests in the touched module (small hand-built `Hypermap<f32>` /
-   `InteractiveEntityMap` — see existing tests).
+5. Add unit tests in the touched module. **Brain tests assert pathfind
+   requests** (enqueued `PathKind`, `PendingPath` state, injected results) — not
+   real A\* geometry. Route quality belongs in
+   [`pathfind_service.rs`](../src/map/pathfind_service.rs) or
+   [`hypermap_pathfind.rs`](../src/map/hypermap_pathfind.rs) tests. See
+   [`pathfind-service.md`](pathfind-service.md).
 
 To add a new **specialization** instead, extend `BotSpecialization` in
 `black_bot.rs` (a behavior set + ring color), roll it in `BotSpecialization::roll`,
@@ -301,4 +331,9 @@ and add a `#[serde(default)]`-friendly variant — persistence is automatic.
 [`BrainEffects`]: ../src/actor/brain/mod.rs
 [`Priorities`]: ../src/actor/brain/priority.rs
 [`FollowTuning`]: ../src/actor/brain/low_level.rs
+[`PendingPath`]: ../src/actor/brain/low_level.rs
+[`PathfindQueue`]: ../src/map/pathfind_service.rs
+[`PathfindResults`]: ../src/map/pathfind_service.rs
+[`PathKind`]: ../src/map/pathfind_service.rs
+[`PathOutcome`]: ../src/map/pathfind_service.rs
 [`ChargerEntity`]: ../src/map/interactive_entity.rs

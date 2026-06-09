@@ -9,8 +9,7 @@
 //! (diameter ≈ 5 subtiles ≈ 1 tile).
 
 use bevy::prelude::*;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use crate::rng::{self, StdRng};
 
 use crate::actor::actor_name::random_actor_name;
 use crate::actor::actor_pick::{ActorForceLogs, ActorInspectable, ActorPickMesh};
@@ -84,7 +83,7 @@ impl GlitchBotVisual {
             collision_streak: snap.collision_streak,
             depleted_logged: false,
             rng_seed: snap.rng_seed,
-            rng: StdRng::seed_from_u64(snap.rng_seed),
+            rng: rng::seeded(snap.rng_seed),
         }
     }
 
@@ -103,7 +102,7 @@ pub struct GlitchBotRng(pub StdRng);
 
 impl Default for GlitchBotRng {
     fn default() -> Self {
-        Self(StdRng::seed_from_u64(0xB07_CAFE))
+        Self(rng::seeded(0xB07_CAFE))
     }
 }
 
@@ -161,8 +160,8 @@ impl Actor for GlitchBot {
 }
 
 fn random_direction(rng: &mut StdRng) -> Vec2 {
-    let angle: f32 = rng.gen_range(0.0..std::f32::consts::TAU);
-    Vec2::new(angle.cos(), angle.sin())
+    let a = rng::angle(rng);
+    Vec2::new(a.cos(), a.sin())
 }
 
 fn direction_color(direction: Vec2) -> Color {
@@ -245,7 +244,7 @@ fn glitch_bot_think(
                     vis.direction = match vis.collision_streak {
                         1 => -vis.direction,
                         2 => {
-                            let turn_left = vis.rng.gen_range(0..2) == 0;
+                            let turn_left = rng::coin_flip(&mut vis.rng);
                             if turn_left {
                                 Vec2::new(-vis.direction.y, vis.direction.x)
                             } else {
@@ -268,7 +267,7 @@ fn glitch_bot_think(
         if vis.dir_timer >= vis.dir_interval {
             vis.direction = random_direction(&mut vis.rng);
             vis.dir_timer = 0.0;
-            vis.dir_interval = vis.rng.gen_range(DIR_CHANGE_MIN_S..DIR_CHANGE_MAX_S);
+            vis.dir_interval = rng::range(&mut vis.rng, DIR_CHANGE_MIN_S..DIR_CHANGE_MAX_S);
             vis.accumulator = Vec2::ZERO;
         }
 
@@ -421,8 +420,8 @@ pub fn spawn_glitch_bot(
     rng: &mut StdRng,
     center: Vec2,
 ) -> Entity {
-    let vis_seed: u64 = rng.gen_range(0..u64::MAX);
-    let mut vis_rng = StdRng::seed_from_u64(vis_seed);
+    let vis_seed: u64 = rng::range(rng, 0..u64::MAX);
+    let mut vis_rng = rng::seeded(vis_seed);
     let initial_dir = random_direction(&mut vis_rng);
     let color = direction_color(initial_dir);
     let bot = GlitchBot::new(center);
@@ -454,7 +453,7 @@ pub fn spawn_glitch_bot(
                 direction: initial_dir,
                 accumulator,
                 dir_timer: 0.0,
-                dir_interval: vis_rng.gen_range(DIR_CHANGE_MIN_S..DIR_CHANGE_MAX_S),
+                dir_interval: rng::range(&mut vis_rng, DIR_CHANGE_MIN_S..DIR_CHANGE_MAX_S),
                 collision_streak: 0,
                 depleted_logged: false,
                 rng_seed: vis_seed,

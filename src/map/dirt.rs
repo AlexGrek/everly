@@ -6,8 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use bevy::prelude::*;
-use rand::{Rng, SeedableRng};
-use rand::rngs::StdRng;
+use crate::rng;
 
 use crate::map::hypermap::{random_rng_seed, ChunkCoord, Hypermap, LocalCoord, HYPERMAP_CHUNK_SIZE};
 use crate::map::hypermap_pathfind::{
@@ -110,7 +109,7 @@ impl DirtMap {
 
         if !from_bin {
             let seed = dirt_chunk_seed(coord);
-            let mut rng = StdRng::seed_from_u64(seed);
+            let mut rng = rng::seeded(seed);
 
             let chunk_origin_x = coord.x * HYPERMAP_CHUNK_SIZE;
             let chunk_origin_y = coord.y * HYPERMAP_CHUNK_SIZE;
@@ -138,7 +137,7 @@ impl DirtMap {
                     passable_tiles.clone()
                 } else {
                     (0..SAMPLE_COUNT)
-                        .map(|_| passable_tiles[rng.gen_range(0..passable_tiles.len())])
+                        .map(|_| *rng::pick(&mut rng, &passable_tiles))
                         .collect()
                 };
 
@@ -146,8 +145,8 @@ impl DirtMap {
                 let mut hit_counts: HashMap<(i32, i32), f32> = HashMap::new();
 
                 for _ in 0..PATH_COUNT {
-                    let start = samples[rng.gen_range(0..samples.len())];
-                    let goal = samples[rng.gen_range(0..samples.len())];
+                    let start = *rng::pick(&mut rng, &samples);
+                    let goal = *rng::pick(&mut rng, &samples);
                     if start == goal {
                         continue;
                     }

@@ -1,7 +1,6 @@
 //! Working grid (`MapDraft`) and geometry helpers used across pipeline steps.
 
-use rand::rngs::StdRng;
-use rand::SeedableRng;
+use crate::rng::{self, StdRng};
 
 use crate::map::hypermap::{HypermapChunk, LocalCoord};
 use crate::map::world_map::{CellType, ChargerFacing, TileStyle, WallCorner, WallMask};
@@ -93,7 +92,7 @@ impl MapDraft {
             size,
             margin,
             bounds,
-            rng: StdRng::seed_from_u64(config.seed),
+            rng: rng::seeded(config.seed),
             cells: vec![vec![DraftTile::Void; sz]; sz],
             floor_styles: vec![vec![TileStyle::DEFAULT; sz]; sz],
             primary_seeds: Vec::new(),

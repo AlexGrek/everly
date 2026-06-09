@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use rand::Rng;
+use crate::rng;
 
 use super::draft::{DraftTile, MapDraft};
 use super::house::{house_contains, house_on_perimeter, House};
@@ -17,7 +17,7 @@ const NEIGHBORS: [(i32, i32, u8); 4] = [
 ];
 
 /// Probability of placing a second exterior door on the opposite/other wall run.
-const SECOND_DOOR_PROBABILITY: f32 = 0.5;
+const SECOND_DOOR_PROBABILITY: f64 = 0.5;
 
 impl MapDraft {
     /// At least one door per house; a second door is placed with [`SECOND_DOOR_PROBABILITY`].
@@ -30,7 +30,7 @@ impl MapDraft {
             };
             self.houses[index].entry = Some(primary);
 
-            if self.rng.gen::<f32>() < SECOND_DOOR_PROBABILITY {
+            if rng::chance_f64(&mut self.rng, SECOND_DOOR_PROBABILITY) {
                 let reserved: HashSet<(i32, i32)> =
                     entrypoint_reserved_cells(self.houses[index].entry.as_ref().unwrap())
                         .into_iter()
@@ -63,9 +63,9 @@ impl MapDraft {
             })
             .collect();
         let pick = if !widenable.is_empty() {
-            widenable[self.rng.gen_range(0..widenable.len())]
+            *rng::pick(&mut self.rng, &widenable)
         } else {
-            valid[self.rng.gen_range(0..valid.len())]
+            *rng::pick(&mut self.rng, &valid)
         };
         open_doorway(self, pick.0, pick.1, pick.2);
         let companion = find_wide_companion(self, house_index, pick.0, pick.1, pick.2)

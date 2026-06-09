@@ -16,7 +16,7 @@ Generation runs on a [`MapDraft`](../../src/map/map_generator/draft.rs) grid (`D
 ## Building footprint
 
 1. **Subseed rooms** — axis-aligned rectangles grow only from subseed centers (internal to the pipeline).
-2. **Houses** — only **overlapping** subseed rects merge into one [`House`](../../src/map/map_generator/house.rs) (edge-touching rects stay separate; subseed identity discarded). More primaries and subseeds per chunk increase house count.
+2. **Houses** — only **overlapping** subseed rects merge into one [`House`](../../src/map/map_generator/house.rs) (edge-touching rects stay separate; subseed identity discarded). Each chunk places **8–12** primary seeds and **3–6** subseeds per primary (up from 5–8 / 2–4), with tighter seed spacing (`MIN_SEED_DISTANCE` 12), so more distinct buildings appear per chunk.
 3. **Union interior** — every tile inside any house is painted `Open` (road); merged footprints share one outer shell with **no inner walls** between overlapping parts.
 4. **Outer shell** — union perimeter wall bitmasks (same rules as the editor **Room** brush).
 5. **Inner corner pillars** — [`corner_pillars.rs`](../src/map/map_generator/corner_pillars.rs) + [`step_corners.rs`](../src/map/map_generator/step_corners.rs). See **[`corners.md`](corners.md)**.

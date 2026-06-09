@@ -13,7 +13,7 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use rand::Rng;
+use crate::rng;
 
 use crate::map::world_map::{MASK_EAST, MASK_NORTH, MASK_SOUTH, MASK_WEST};
 
@@ -53,8 +53,7 @@ impl MapDraft {
             if candidates.is_empty() {
                 break;
             }
-            let (x, z, nx, nz, this_bit, nbr_bit) =
-                candidates[self.rng.gen_range(0..candidates.len())];
+            let (x, z, nx, nz, this_bit, nbr_bit) = *rng::pick(&mut self.rng, &candidates);
             clear_edge_bit(self, x, z, this_bit);
             clear_edge_bit(self, nx, nz, nbr_bit);
             // Widen to 2 tiles: clear the parallel adjacent edge one step along the wall run.

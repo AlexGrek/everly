@@ -2,7 +2,7 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use rand::Rng;
+use crate::rng;
 
 use super::draft::{DraftTile, MapDraft};
 use super::house::house_contains;
@@ -103,9 +103,10 @@ fn wave_house(draft: &mut MapDraft, house: &House, start: (i32, i32), style: Til
     if draft.get(start.0, start.1) != DraftTile::Open {
         return;
     }
-    let max_dist = draft
-        .rng
-        .gen_range(HOME_CRAWLER_WAVE_MIN..=HOME_CRAWLER_WAVE_MAX);
+    let max_dist = rng::range(
+        &mut draft.rng,
+        HOME_CRAWLER_WAVE_MIN..=HOME_CRAWLER_WAVE_MAX,
+    );
     let mut queue = VecDeque::from([(start.0, start.1, 0)]);
     let mut visited = HashSet::from([start]);
 

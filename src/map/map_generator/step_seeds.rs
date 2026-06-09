@@ -1,6 +1,6 @@
 //! Steps 2–4: primary seeds, separation, subseed spawn.
 
-use rand::Rng;
+use crate::rng;
 
 use super::draft::MapDraft;
 use super::types::{
@@ -10,16 +10,21 @@ use super::types::{
 
 impl MapDraft {
     pub fn step_place_primary_seeds(&mut self) {
-        let count = self
-            .rng
-            .gen_range(PRIMARY_SEED_COUNT_MIN..=PRIMARY_SEED_COUNT_MAX);
+        let count = rng::range(
+            &mut self.rng,
+            PRIMARY_SEED_COUNT_MIN..=PRIMARY_SEED_COUNT_MAX,
+        );
         self.primary_seeds = (0..count)
             .map(|_| {
                 (
-                    self.rng
-                        .gen_range(self.bounds.place_lo..=self.bounds.place_hi),
-                    self.rng
-                        .gen_range(self.bounds.place_lo..=self.bounds.place_hi),
+                    rng::range(
+                        &mut self.rng,
+                        self.bounds.place_lo..=self.bounds.place_hi,
+                    ),
+                    rng::range(
+                        &mut self.rng,
+                        self.bounds.place_lo..=self.bounds.place_hi,
+                    ),
                 )
             })
             .collect();
@@ -40,12 +45,13 @@ impl MapDraft {
         self.subseed_centers.clear();
         let seeds = self.primary_seeds.clone();
         for &(sx, sz_seed) in &seeds {
-            let sub_count = self
-                .rng
-                .gen_range(SUBSEEDS_PER_PRIMARY_MIN..=SUBSEEDS_PER_PRIMARY_MAX);
+            let sub_count = rng::range(
+                &mut self.rng,
+                SUBSEEDS_PER_PRIMARY_MIN..=SUBSEEDS_PER_PRIMARY_MAX,
+            );
             for _ in 0..sub_count {
-                let dist = self.rng.gen_range(2..=6);
-                let dir = self.rng.gen_range(0..8);
+                let dist = rng::range(&mut self.rng, 2..=6);
+                let dir = rng::range(&mut self.rng, 0..8);
                 let (dx, dz) = subseed_offset(dir, dist);
                 let x = (sx + dx).clamp(self.bounds.place_lo, self.bounds.place_hi);
                 let z = (sz_seed + dz).clamp(self.bounds.place_lo, self.bounds.place_hi);

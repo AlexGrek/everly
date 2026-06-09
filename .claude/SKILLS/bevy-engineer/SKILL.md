@@ -12,6 +12,9 @@ paths:
   - "docs/corners.md"
   - "docs/tilemap.md"
   - "docs/map-generator.md"
+  - "docs/pathfind-service.md"
+  - "docs/actor-brain.md"
+  - "src/map/pathfind_service.rs"
 ---
 
 # Bevy engineer (v0.18)
@@ -116,19 +119,38 @@ To paint the generic layer from any system:
 
 Full docs: **`docs/chunk-overlay.md`**. Source: **`src/map/chunk_overlay.rs`**.
 
-## Pathfinding (`src/map/hypermap_pathfind.rs`)
+## Pathfinding
+
+Two layers — do not call `astar_*` from a per-frame brain tick; enqueue instead.
+
+### Pure algorithms (`src/map/hypermap_pathfind.rs`)
 
 A* on the static passability hypermap (`Hypermap<f32>`, tile walkable iff `> 0.0`). 4-neighbor grid, unit step cost, Manhattan heuristic.
 
 Key functions:
 
 - `astar_shortest_world_path(map, start, goal, limits) -> HypermapPathResult` — bounded A* returning `Found { path, expansions }`, `NoPath`, or `LimitExceeded`. Path includes start and goal as `(i32, i32)` world tile coords.
+- `simplify_path_line_of_sight` — corner-preserving string-pull after A*.
+- `astar_subtile_detour` — bounded subtile-grid detour for bot-on-bot avoidance.
 - `explore_walkable_tiles_limited(map, start, limits) -> HypermapExploreResult` — uniform-cost flood from a tile.
 - `HypermapSearchLimits { max_expanded }` — caps node expansions (default 50 000).
 
 Access the static passability map from ECS via `Res<HypermapRuntime>` → `hypermap.static_passability_map`.
 
-Full docs: see pathfinding tests in source. Source: **`src/map/hypermap_pathfind.rs`**.
+Tests for geometry live here. Source: **`src/map/hypermap_pathfind.rs`**.
+
+### Async service (`src/map/pathfind_service.rs`)
+
+Bots never block on the helpers above at runtime. They enqueue [`PathKind`] on
+[`PathfindQueue`], poll [`PathfindResults`] by [`RequestId`], and park in
+[`PendingPath`] while waiting.
+
+- `PathfindServicePlugin` — resources + `pathfind_collect` / `pathfind_dispatch`.
+- `PathfindSet::Collect` runs **before** `black_bot_brain`; `PathfindSet::Dispatch` **after**.
+- `MAX_IN_FLIGHT = 10`; backlog warning when queue > 10.
+- Workers read `Arc`-cloned `Hypermap` / occupancy snapshots only; write outcomes via collect.
+
+Full docs: **`docs/pathfind-service.md`**. Brain integration: **`docs/actor-brain.md`**.
 
 ## Actors (`src/actor/`)
 

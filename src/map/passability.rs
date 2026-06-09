@@ -130,6 +130,22 @@ impl DynamicPassabilityMap {
         &self.inner
     }
 
+    /// Clones the shared `Arc` to the double-buffered occupancy grid so a
+    /// background pathfinding task can **read** it (through the per-chunk
+    /// `RwLock`s) while the main thread keeps writing the same buffers. The
+    /// worker must only call read accessors — see
+    /// [`crate::map::pathfind_service`].
+    pub fn share_inner(&self) -> Arc<DoubleBufferedHypermap<SubtilePassability>> {
+        self.inner.clone()
+    }
+
+    /// Wraps an already-shared occupancy grid in a `DynamicPassabilityMap` view
+    /// so existing collision helpers (e.g. [`Self::probe_footprint`]) can run
+    /// against the shared `Arc` inside a background task.
+    pub fn from_inner(inner: Arc<DoubleBufferedHypermap<SubtilePassability>>) -> Self {
+        Self { inner }
+    }
+
     pub fn flush(&self) {
         self.inner.flush();
     }

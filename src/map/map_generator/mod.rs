@@ -66,7 +66,7 @@ impl MapDraft {
     }
 
     /// Turns already-populated `self.houses` (sitting on an `Open` carpet) into
-    /// finished buildings: outer shell walls, inner corner pillars, one door per
+    /// finished buildings: outer shell walls, inner corner pillars, one or two doors per
     /// house, inner room walls + doors, floor-style crawlers, and chargers.
     ///
     /// Shared by the procedural pipeline (after seed clustering) and the editor

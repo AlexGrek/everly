@@ -3,17 +3,17 @@
 use crate::map::hypermap::HYPERMAP_CHUNK_SIZE;
 
 /// Minimum Manhattan distance between primary seed positions after separation.
-pub const MIN_SEED_DISTANCE: i32 = 15;
+pub const MIN_SEED_DISTANCE: i32 = 12;
 /// Seeds closer than this to the playable border are pushed inward.
-pub const BORDER_CLEARANCE: i32 = 15;
+pub const BORDER_CLEARANCE: i32 = 12;
 /// Void ring at chunk edges (road carpet starts inside this inset).
 pub const CHUNK_VOID_MARGIN: i32 = 2;
 /// Primary building seeds placed per chunk (inclusive range).
-pub const PRIMARY_SEED_COUNT_MIN: i32 = 5;
-pub const PRIMARY_SEED_COUNT_MAX: i32 = 8;
+pub const PRIMARY_SEED_COUNT_MIN: i32 = 8;
+pub const PRIMARY_SEED_COUNT_MAX: i32 = 12;
 /// Subseed room sprouts per primary (inclusive range).
-pub const SUBSEEDS_PER_PRIMARY_MIN: i32 = 2;
-pub const SUBSEEDS_PER_PRIMARY_MAX: i32 = 4;
+pub const SUBSEEDS_PER_PRIMARY_MIN: i32 = 3;
+pub const SUBSEEDS_PER_PRIMARY_MAX: i32 = 6;
 /// Minimum house footprint (1 m² cells) for the center glass floor wave.
 pub const MIN_HOUSE_AREA_FOR_CENTER_WAVE: i32 = 30;
 

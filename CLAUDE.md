@@ -45,6 +45,10 @@ and `docs/map-generator.md` first. For inner corner pillars (`c*`,
 When editing actor runtime code (`src/actor/`) or actor/passability movement
 integration, read `.claude/SKILLS/actor-engineer/SKILL.md` first.
 
+When editing bot routing, the async pathfinding service
+(`src/map/pathfind_service.rs`), or brain enqueue/await state machines, read
+`docs/pathfind-service.md` and `docs/actor-brain.md` first.
+
 When editing hypermap fields (dirt, actor deposits, field overlays), read
 `.claude/SKILLS/field-interactions/SKILL.md` and `docs/field-interactions.md` first.
 
@@ -101,7 +105,8 @@ everly/
     │   ├── world_map.rs          #   `.txt` parser, CellType, wall masks, TileStyle
     │   ├── level.rs              #   LevelPlugin + level save/load (`docs/level-persistence.md`)
     │   ├── hypermap_world.rs     #   HypermapWorldPlugin (chunk meshing + water)
-    │   ├── hypermap_pathfind.rs  #   A* over hypermap floors
+    │   ├── hypermap_pathfind.rs  #   A* over hypermap floors (pure helpers)
+    │   ├── pathfind_service.rs   #   async pathfind queue (bots enqueue; ≤10 in flight)
     │   ├── passability.rs        #   DynamicPassabilityMap (double-buffered subtile grid)
     │   ├── dirt.rs               #   DirtMapPlugin + DirtMap
     │   ├── temperature.rs        #   TemperatureMapPlugin + TemperatureMap
@@ -144,7 +149,11 @@ everly/
 - **Names matter.** Every spawned entity gets a `Name::new(...)` so
   the world is readable in inspector tooling.
 - **Determinism by default.** Anything random uses a seeded `StdRng`,
-  never `thread_rng`, so scenes are reproducible.
+  never `thread_rng`, so scenes are reproducible. **Exception:** async
+  pathfinding (`PathfindServicePlugin`) may deliver route results on different
+  frames across runs depending on task-pool scheduling; bot RNG and movement
+  physics remain deterministic, but do not golden-test exact frame of path
+  installation — see `docs/pathfind-service.md`.
 
 ## Bevy 0.18 specifics worth remembering
 

@@ -6,28 +6,30 @@
 //! effects ([`BrainEffects`]). When an action reports
 //! [`HighLevelStatus::Done`] the brain drops it and re-plans next tick.
 
-use rand::rngs::StdRng;
-use rand::Rng;
+use crate::rng::{self, StdRng};
 
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap, HYPERMAP_CHUNK_SIZE};
-use crate::map::hypermap_pathfind::{
-    astar_shortest_world_path, simplify_path_line_of_sight, HypermapPathResult, HypermapSearchLimits,
-};
+use crate::map::hypermap_pathfind::world_tile_walkable;
 use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
+use crate::map::pathfind_service::{PathKind, PathOutcome, RequestId};
 
-use super::low_level::{FollowPath, LowLevelAction, Wait};
+use super::low_level::{FollowPath, LowLevelAction, PendingPath, Wait};
 use super::priority::PriorityKind;
-use super::{BrainContext, BrainEffects};
+use super::{BrainContext, BrainEffects, PathfindAccess};
 
 /// Wander radius (tiles) for [`GoToRandomPoints`].
 const WANDER_RADIUS: f32 = 15.0;
 /// Random-target sampling attempts before giving up for this tick.
 const MAX_TARGET_ATTEMPTS: u32 = 8;
-/// Tiles kept on each side of a bend during path simplification (see
-/// [`simplify_path_line_of_sight`]).
+/// Tiles kept on each side of a bend during path simplification.
 const PATH_CORNER_BUFFER: usize = 1;
 /// Retry delay when no wander target / charger could be found.
 const RETRY_S: f32 = 0.25;
+/// A* expansion cap for a wander / patrol-leg world route.
+const WANDER_SEARCH_LIMIT: usize = 2000;
+/// Seconds a bot waits on a queued route request before reissuing it (the
+/// "waiting-for-path" timeout from the async pathfinding design).
+const PATH_WAIT_RETRY_S: f32 = 3.0;
 
 /// `true` on the first frame the low-level action reports stuck or finished
 /// since the previous tick it did not (rising edge). Prevents re-running
@@ -43,6 +45,10 @@ const PATROL_LOOP_LEN: usize = 5;
 const PATROL_RADIUS: f32 = 12.0;
 /// Sampling attempts before accepting a (possibly shorter) patrol loop.
 const PATROL_GEN_ATTEMPTS: u32 = 64;
+/// Maximum distinct candidate tiles to enqueue per patrol-loop generation pass.
+/// Twice the loop length leaves headroom for unreachable candidates without
+/// flooding the pathfind queue.
+const PATROL_CANDIDATES: usize = PATROL_LOOP_LEN * 2;
 /// A* expansion cap for charger routes.
 const SEARCH_LIMIT: usize = 5000;
 
@@ -122,10 +128,49 @@ pub fn make_high_level(kind: PriorityKind) -> Box<dyn HighLevelAction> {
 
 /// Perpetual wander: whenever the current path finishes, pick a new random
 /// reachable target and follow it. Never reports `Done`.
+///
+/// Routing is asynchronous: the action samples a goal, enqueues a `WorldRoute`,
+/// and parks the bot in a [`PendingPath`] hold until the result lands (or the
+/// 3 s retry fires), then installs a [`FollowPath`].
 #[derive(Default)]
 pub struct GoToRandomPoints {
+    /// In-flight route request id while awaiting a path.
+    awaiting: Option<RequestId>,
+    /// Seconds awaited so far (drives the [`PATH_WAIT_RETRY_S`] reissue).
+    await_elapsed: f32,
     prev_low_stuck: bool,
     prev_low_finished: bool,
+}
+
+impl GoToRandomPoints {
+    /// Samples a fresh wander goal, enqueues a route request, and parks the bot.
+    /// Falls back to a short retry `Wait` when no candidate / queue is available.
+    fn request_target(
+        &mut self,
+        pf: PathfindAccess,
+        ctx: &BrainContext,
+        low: &mut Box<dyn LowLevelAction>,
+        rng: &mut StdRng,
+    ) {
+        let here = (ctx.main_tile.x, ctx.main_tile.y);
+        match sample_wander_goal(rng, here, ctx.passability) {
+            Some(goal) => {
+                let id = pf.queue.enqueue(PathKind::WorldRoute {
+                    start: here,
+                    goal,
+                    max_expanded: WANDER_SEARCH_LIMIT,
+                    simplify_buffer: PATH_CORNER_BUFFER,
+                });
+                self.awaiting = Some(id);
+                self.await_elapsed = 0.0;
+                *low = Box::new(PendingPath::with_velocity(low.velocity()));
+            }
+            None => {
+                self.awaiting = None;
+                *low = Box::new(Wait::retry(RETRY_S));
+            }
+        }
+    }
 }
 
 impl HighLevelAction for GoToRandomPoints {
@@ -141,12 +186,30 @@ impl HighLevelAction for GoToRandomPoints {
         low: &mut Box<dyn LowLevelAction>,
         rng: &mut StdRng,
     ) -> HighLevelOutcome {
-        if low_level_needs_replan(low.as_ref(), self.prev_low_stuck, self.prev_low_finished) {
-            let here = (ctx.main_tile.x, ctx.main_tile.y);
-            match pick_random_target(rng, here, ctx.passability) {
-                Some(path) => *low = Box::new(FollowPath::new(path)),
-                None => *low = Box::new(Wait::retry(RETRY_S)),
+        let Some(pf) = ctx.pathfind else {
+            return HighLevelOutcome::running();
+        };
+
+        if let Some(id) = self.awaiting {
+            self.await_elapsed += ctx.dt;
+            if let Some(outcome) = pf.results.take(id) {
+                self.awaiting = None;
+                match outcome {
+                    PathOutcome::Route { path, raw_len } if raw_len > 1 => {
+                        *low = Box::new(FollowPath::new(path));
+                    }
+                    _ => self.request_target(pf, ctx, low, rng),
+                }
+            } else if self.await_elapsed >= PATH_WAIT_RETRY_S {
+                self.request_target(pf, ctx, low, rng);
             }
+            self.prev_low_stuck = low.is_stuck();
+            self.prev_low_finished = low.is_finished();
+            return HighLevelOutcome::running();
+        }
+
+        if low_level_needs_replan(low.as_ref(), self.prev_low_stuck, self.prev_low_finished) {
+            self.request_target(pf, ctx, low, rng);
         }
         self.prev_low_stuck = low.is_stuck();
         self.prev_low_finished = low.is_finished();
@@ -178,6 +241,11 @@ pub struct GoToPatrol {
     /// the "advance to the next waypoint on arrival" step so the first leg heads
     /// to the nearest waypoint instead of skipping past it.
     engaged: bool,
+    /// In-flight route request id while awaiting a leg's path.
+    awaiting: Option<RequestId>,
+    await_elapsed: f32,
+    /// Consecutive unreachable legs tried this round (bounds the async retry).
+    legs_tried: usize,
     prev_low_stuck: bool,
     prev_low_finished: bool,
 }
@@ -187,9 +255,45 @@ impl GoToPatrol {
         Self {
             cursor: None,
             engaged: false,
+            awaiting: None,
+            await_elapsed: 0.0,
+            legs_tried: 0,
             prev_low_stuck: false,
             prev_low_finished: false,
         }
+    }
+
+    /// Enqueues a route to the next loop waypoint that isn't the bot's own tile,
+    /// advancing `cursor` to it and parking the bot. Falls back to a retry `Wait`
+    /// when every waypoint is the current tile.
+    fn request_leg(
+        &mut self,
+        pf: PathfindAccess,
+        loop_tiles: &[(i32, i32)],
+        here: (i32, i32),
+        cursor: &mut usize,
+        low: &mut Box<dyn LowLevelAction>,
+    ) {
+        let len = loop_tiles.len();
+        for _ in 0..len {
+            let target = loop_tiles[*cursor];
+            if target != here {
+                let id = pf.queue.enqueue(PathKind::WorldRoute {
+                    start: here,
+                    goal: target,
+                    max_expanded: WANDER_SEARCH_LIMIT,
+                    simplify_buffer: PATH_CORNER_BUFFER,
+                });
+                self.awaiting = Some(id);
+                self.await_elapsed = 0.0;
+                *low = Box::new(PendingPath::with_velocity(low.velocity()));
+                return;
+            }
+            *cursor = (*cursor + 1) % len;
+        }
+        self.awaiting = None;
+        self.engaged = false;
+        *low = Box::new(Wait::retry(RETRY_S));
     }
 }
 
@@ -221,6 +325,9 @@ impl HighLevelAction for GoToPatrol {
             self.prev_low_finished = low.is_finished();
             return HighLevelOutcome::running();
         };
+        let Some(pf) = ctx.pathfind else {
+            return HighLevelOutcome::running();
+        };
 
         let here = (ctx.main_tile.x, ctx.main_tile.y);
         let len = loop_tiles.len();
@@ -234,31 +341,48 @@ impl HighLevelAction for GoToPatrol {
             }
         };
 
+        if let Some(id) = self.awaiting {
+            self.await_elapsed += ctx.dt;
+            if let Some(outcome) = pf.results.take(id) {
+                self.awaiting = None;
+                match outcome {
+                    PathOutcome::Route { path, raw_len } if raw_len > 1 => {
+                        *low = Box::new(FollowPath::new(path));
+                        self.engaged = true;
+                        self.legs_tried = 0;
+                    }
+                    _ => {
+                        // This leg is unreachable: advance and try the next, bounded
+                        // by the loop length so we don't spin forever.
+                        self.legs_tried += 1;
+                        if self.legs_tried >= len {
+                            self.legs_tried = 0;
+                            self.engaged = false;
+                            self.awaiting = None;
+                            *low = Box::new(Wait::retry(RETRY_S));
+                        } else {
+                            cursor = (cursor + 1) % len;
+                            self.request_leg(pf, loop_tiles, here, &mut cursor, low);
+                        }
+                    }
+                }
+            } else if self.await_elapsed >= PATH_WAIT_RETRY_S {
+                self.request_leg(pf, loop_tiles, here, &mut cursor, low);
+            }
+            self.prev_low_stuck = low.is_stuck();
+            self.prev_low_finished = low.is_finished();
+            self.cursor = Some(cursor);
+            return HighLevelOutcome::running();
+        }
+
         if low_level_needs_replan(low.as_ref(), self.prev_low_stuck, self.prev_low_finished) {
             // Once we have reached (or abandoned) the waypoint we were heading to,
             // move on to the next; the first engaged leg keeps the nearest one.
             if self.engaged {
                 cursor = (cursor + 1) % len;
             }
-            let mut installed = false;
-            for _ in 0..len {
-                let target = loop_tiles[cursor];
-                if target != here {
-                    if let Some(path) = patrol_path(ctx.passability, here, target) {
-                        *low = Box::new(FollowPath::new(path));
-                        self.engaged = true;
-                        installed = true;
-                        break;
-                    }
-                }
-                cursor = (cursor + 1) % len;
-            }
-            if !installed {
-                // Nothing reachable this tick (or already standing on the only
-                // distinct waypoint) — wait briefly and retry.
-                *low = Box::new(Wait::retry(RETRY_S));
-                self.engaged = false;
-            }
+            self.legs_tried = 0;
+            self.request_leg(pf, loop_tiles, here, &mut cursor, low);
         }
 
         self.prev_low_stuck = low.is_stuck();
@@ -282,62 +406,60 @@ fn nearest_loop_index(loop_tiles: &[(i32, i32)], here: (i32, i32)) -> usize {
         .unwrap_or(0)
 }
 
-/// Simplified A* path from `from` to `to`, or `None` when unreachable / already
-/// there (single-waypoint result).
-fn patrol_path(
-    passability: &Hypermap<f32>,
-    from: (i32, i32),
-    to: (i32, i32),
-) -> Option<Vec<(i32, i32)>> {
-    match astar_shortest_world_path(
-        passability,
-        from,
-        to,
-        HypermapSearchLimits { max_expanded: 2000 },
-    ) {
-        HypermapPathResult::Found { path, .. } if path.len() > 1 => {
-            Some(simplify_path_line_of_sight(passability, &path, PATH_CORNER_BUFFER))
-        }
-        _ => None,
-    }
-}
-
-/// Builds a fixed patrol loop: up to [`PATROL_LOOP_LEN`] distinct cells, each
-/// reachable from `anchor`, sampled within [`PATROL_RADIUS`]. Following them
-/// cyclically (with A* between, via [`GoToPatrol`]) is the patrol circuit.
+/// Samples up to [`PATROL_CANDIDATES`] distinct walkable tiles within
+/// [`PATROL_RADIUS`] of `anchor` and enqueues an `anchor -> tile` reachability
+/// route for each. Returns the `(request id, tile)` pairs in sample order; the
+/// caller resolves them and assembles the loop with [`assemble_patrol_loop`].
 ///
-/// May return fewer than [`PATROL_LOOP_LEN`] — or zero, when the area around
-/// `anchor` is unreachable — in which case the caller retries while the loop is
-/// empty. Reachability from a common anchor keeps consecutive waypoints mutually
+/// Reachability from a common anchor keeps consecutive waypoints mutually
 /// reachable within the connected region, so the cycle never strands the bot.
-pub fn generate_patrol_loop(
+pub fn enqueue_patrol_candidates(
     rng: &mut StdRng,
     anchor: (i32, i32),
     passability: &Hypermap<f32>,
-) -> Vec<(i32, i32)> {
-    let mut loop_tiles: Vec<(i32, i32)> = Vec::new();
+    queue: &crate::map::pathfind_service::PathfindQueue,
+) -> Vec<(RequestId, (i32, i32))> {
+    let mut tiles: Vec<(i32, i32)> = Vec::new();
     for _ in 0..PATROL_GEN_ATTEMPTS {
-        if loop_tiles.len() >= PATROL_LOOP_LEN {
+        if tiles.len() >= PATROL_CANDIDATES {
             break;
         }
-        let dx: f32 = rng.gen_range(-PATROL_RADIUS..PATROL_RADIUS);
-        let dy: f32 = rng.gen_range(-PATROL_RADIUS..PATROL_RADIUS);
+        let dx: f32 = rng::range(rng, -PATROL_RADIUS..PATROL_RADIUS);
+        let dy: f32 = rng::range(rng, -PATROL_RADIUS..PATROL_RADIUS);
         if dx * dx + dy * dy > PATROL_RADIUS * PATROL_RADIUS {
             continue;
         }
         let tile = (anchor.0 + dx.round() as i32, anchor.1 + dy.round() as i32);
-        if tile == anchor || loop_tiles.contains(&tile) {
+        if tile == anchor || tiles.contains(&tile) {
             continue;
         }
-        if matches!(
-            astar_shortest_world_path(
-                passability,
-                anchor,
-                tile,
-                HypermapSearchLimits { max_expanded: 2000 },
-            ),
-            HypermapPathResult::Found { ref path, .. } if path.len() > 1
-        ) {
+        if world_tile_walkable(passability, tile.0, tile.1) {
+            tiles.push(tile);
+        }
+    }
+    tiles
+        .into_iter()
+        .map(|tile| {
+            let id = queue.enqueue(PathKind::WorldRoute {
+                start: anchor,
+                goal: tile,
+                max_expanded: WANDER_SEARCH_LIMIT,
+                simplify_buffer: PATH_CORNER_BUFFER,
+            });
+            (id, tile)
+        })
+        .collect()
+}
+
+/// Builds the fixed patrol loop from resolved candidates `(tile, reachable)` in
+/// sample order: keeps up to [`PATROL_LOOP_LEN`] distinct reachable tiles.
+pub fn assemble_patrol_loop(resolved: &[((i32, i32), bool)]) -> Vec<(i32, i32)> {
+    let mut loop_tiles: Vec<(i32, i32)> = Vec::new();
+    for &(tile, reachable) in resolved {
+        if loop_tiles.len() >= PATROL_LOOP_LEN {
+            break;
+        }
+        if reachable && !loop_tiles.contains(&tile) {
             loop_tiles.push(tile);
         }
     }
@@ -356,14 +478,29 @@ enum ChargePhase {
     Charging,
 }
 
+/// In-flight charger-selection scan: a `WorldRoute` request per candidate
+/// charger, accumulating resolved routes until all return (or the wait times
+/// out), then ranked by [`rank_charger_candidates`].
+struct ChargerSeek {
+    pending: Vec<(EntityCoordinates, RequestId)>,
+    resolved: Vec<ChargerCandidate>,
+    elapsed: f32,
+}
+
 /// Path to the nearest accessible, unoccupied charger, dock, charge to full,
-/// then report `Done`.
+/// then report `Done`. All route searches are queued through the async
+/// pathfinding service; the bot parks in a [`PendingPath`] while awaiting them.
 pub struct GoToChargeStation {
     phase: ChargePhase,
     charger: Option<EntityCoordinates>,
     queued_wanting: Option<EntityCoordinates>,
     queued_waiting: Option<EntityCoordinates>,
     prev_low_stuck: bool,
+    /// Active multi-route charger scan (Seeking phase).
+    seek: Option<ChargerSeek>,
+    /// In-flight dock-approach route id (WaitingQueue → dock / re-approach).
+    dock_route: Option<RequestId>,
+    dock_elapsed: f32,
 }
 
 impl GoToChargeStation {
@@ -374,7 +511,95 @@ impl GoToChargeStation {
             queued_wanting: None,
             queued_waiting: None,
             prev_low_stuck: false,
+            seek: None,
+            dock_route: None,
+            dock_elapsed: 0.0,
         }
+    }
+
+    /// Starts a charger scan: gather candidates, enqueue a route to each, and
+    /// park the bot. Falls back to a retry `Wait` when there are no candidates.
+    fn begin_seek_into(
+        &mut self,
+        pf: PathfindAccess,
+        ctx: &BrainContext,
+        low: &mut Box<dyn LowLevelAction>,
+        effects: &mut BrainEffects,
+    ) {
+        self.phase = ChargePhase::Seeking;
+        self.seek = None;
+        let here = (ctx.main_tile.x, ctx.main_tile.y);
+        let candidates = gather_charger_candidates(ctx);
+        if candidates.is_empty() {
+            self.clear_queues(effects);
+            self.charger = None;
+            *low = Box::new(Wait::new(CHARGE_RETRY_S));
+            return;
+        }
+        let mut pending = Vec::with_capacity(candidates.len());
+        for coords in candidates {
+            let id = pf.queue.enqueue(PathKind::WorldRoute {
+                start: here,
+                goal: (coords.x, coords.y),
+                max_expanded: SEARCH_LIMIT,
+                simplify_buffer: PATH_CORNER_BUFFER,
+            });
+            pending.push((coords, id));
+        }
+        self.seek = Some(ChargerSeek {
+            pending,
+            resolved: Vec::new(),
+            elapsed: 0.0,
+        });
+        *low = Box::new(PendingPath::with_velocity(low.velocity()));
+    }
+
+    /// Polls outstanding charger-scan routes; once all resolve (or the wait
+    /// times out) ranks them and installs the winning route / a retry `Wait`.
+    fn poll_seek(
+        &mut self,
+        pf: PathfindAccess,
+        ctx: &BrainContext,
+        low: &mut Box<dyn LowLevelAction>,
+    ) -> HighLevelOutcome {
+        let mut seek = match self.seek.take() {
+            Some(s) => s,
+            None => return HighLevelOutcome::running(),
+        };
+        seek.elapsed += ctx.dt;
+        let mut still = Vec::new();
+        for (coords, id) in seek.pending.drain(..) {
+            if let Some(outcome) = pf.results.take(id) {
+                if let PathOutcome::Route { path, raw_len } = outcome {
+                    let waiting_len = ctx.interactive.waiting_len(coords);
+                    seek.resolved.push((coords, path, waiting_len, raw_len));
+                }
+            } else {
+                still.push((coords, id));
+            }
+        }
+        seek.pending = still;
+
+        let timed_out = seek.elapsed >= PATH_WAIT_RETRY_S;
+        if !seek.pending.is_empty() && !timed_out {
+            self.seek = Some(seek);
+            return HighLevelOutcome::running();
+        }
+
+        let mut effects = BrainEffects::default();
+        match rank_charger_candidates(std::mem::take(&mut seek.resolved)) {
+            Some((coords, path)) => {
+                self.retarget(coords, &mut effects);
+                *low = Box::new(FollowPath::new(path));
+            }
+            None => {
+                self.clear_queues(&mut effects);
+                self.charger = None;
+                *low = Box::new(Wait::new(CHARGE_RETRY_S));
+            }
+        }
+        self.seek = None;
+        HighLevelOutcome::running_with(effects)
     }
 
     fn clear_queues(&mut self, effects: &mut BrainEffects) {
@@ -439,6 +664,8 @@ impl HighLevelAction for GoToChargeStation {
         }
         self.clear_queues(&mut effects);
         self.charger = None;
+        self.seek = None;
+        self.dock_route = None;
         self.phase = ChargePhase::Seeking;
         effects
     }
@@ -448,6 +675,10 @@ impl HighLevelAction for GoToChargeStation {
         low: &mut Box<dyn LowLevelAction>,
         rng: &mut StdRng,
     ) -> HighLevelOutcome {
+        let Some(pf) = ctx.pathfind else {
+            return HighLevelOutcome::running();
+        };
+
         let low_stuck = low.is_stuck();
         if low_stuck && !self.prev_low_stuck && self.phase != ChargePhase::Charging {
             // Handler for "need charge but got stuck": restart charger selection
@@ -455,16 +686,8 @@ impl HighLevelAction for GoToChargeStation {
             let mut effects = BrainEffects::default();
             self.clear_queues(&mut effects);
             self.charger = None;
-            self.phase = ChargePhase::Seeking;
-            match find_best_charger(ctx) {
-                Some((coords, path)) => {
-                    self.retarget(coords, &mut effects);
-                    *low = Box::new(FollowPath::new(path));
-                }
-                None => {
-                    *low = Box::new(Wait::new(CHARGE_RETRY_S));
-                }
-            }
+            self.dock_route = None;
+            self.begin_seek_into(pf, ctx, low, &mut effects);
             self.prev_low_stuck = low.is_stuck();
             return HighLevelOutcome::running_with(effects);
         }
@@ -472,22 +695,14 @@ impl HighLevelAction for GoToChargeStation {
 
         match self.phase {
             ChargePhase::Seeking => {
+                if self.seek.is_some() {
+                    return self.poll_seek(pf, ctx, low);
+                }
                 if !ctx.main_tile_changed && !low.is_finished() {
                     return HighLevelOutcome::running();
                 }
-
                 let mut effects = BrainEffects::default();
-                match find_best_charger(ctx) {
-                    Some((coords, path)) => {
-                        self.retarget(coords, &mut effects);
-                        *low = Box::new(FollowPath::new(path));
-                    }
-                    None => {
-                        self.clear_queues(&mut effects);
-                        self.charger = None;
-                        *low = Box::new(Wait::new(CHARGE_RETRY_S));
-                    }
-                }
+                self.begin_seek_into(pf, ctx, low, &mut effects);
                 HighLevelOutcome::running_with(effects)
             }
             ChargePhase::Traveling => {
@@ -537,17 +752,14 @@ impl HighLevelAction for GoToChargeStation {
                     return HighLevelOutcome::running();
                 };
 
-                if low.is_finished() {
-                    if dock_allowed_for(ctx, self.queued_waiting, charger) {
-                        let here = (ctx.main_tile.x, ctx.main_tile.y);
-                        let goal = (charger.x, charger.y);
-                        match astar_shortest_world_path(
-                            ctx.passability,
-                            here,
-                            goal,
-                            HypermapSearchLimits { max_expanded: SEARCH_LIMIT },
-                        ) {
-                            HypermapPathResult::Found { path, .. } if path.len() <= 1 => {
+                // Awaiting the queued dock-approach route.
+                if let Some(id) = self.dock_route {
+                    self.dock_elapsed += ctx.dt;
+                    if let Some(outcome) = pf.results.take(id) {
+                        self.dock_route = None;
+                        match outcome {
+                            PathOutcome::Route { raw_len, .. } if raw_len <= 1 => {
+                                // Already on the charger tile: dock.
                                 self.phase = ChargePhase::Charging;
                                 *low = Box::new(Wait::new(f32::INFINITY));
                                 let mut effects = BrainEffects::default();
@@ -555,20 +767,35 @@ impl HighLevelAction for GoToChargeStation {
                                 effects.dock = Some(charger);
                                 return HighLevelOutcome::running_with(effects);
                             }
-                            HypermapPathResult::Found { path, .. } => {
-                                let simplified = simplify_path_line_of_sight(
-                                    ctx.passability,
-                                    &path,
-                                    PATH_CORNER_BUFFER,
-                                );
+                            PathOutcome::Route { path, .. } => {
                                 self.phase = ChargePhase::Traveling;
-                                *low = Box::new(FollowPath::new(simplified));
+                                *low = Box::new(FollowPath::new(path));
                             }
                             _ => {
                                 self.phase = ChargePhase::Seeking;
                                 self.charger = None;
                             }
                         }
+                    } else if self.dock_elapsed >= PATH_WAIT_RETRY_S {
+                        // The approach route never came back: drop it and recheck.
+                        self.dock_route = None;
+                        *low = Box::new(Wait::new(short_wait_recheck_s(rng)));
+                    }
+                    return HighLevelOutcome::running();
+                }
+
+                if low.is_finished() {
+                    if dock_allowed_for(ctx, self.queued_waiting, charger) {
+                        let here = (ctx.main_tile.x, ctx.main_tile.y);
+                        let id = pf.queue.enqueue(PathKind::WorldRoute {
+                            start: here,
+                            goal: (charger.x, charger.y),
+                            max_expanded: SEARCH_LIMIT,
+                            simplify_buffer: PATH_CORNER_BUFFER,
+                        });
+                        self.dock_route = Some(id);
+                        self.dock_elapsed = 0.0;
+                        *low = Box::new(PendingPath::with_velocity(low.velocity()));
                     } else {
                         *low = Box::new(Wait::new(short_wait_recheck_s(rng)));
                     }
@@ -591,16 +818,19 @@ impl HighLevelAction for GoToChargeStation {
     }
 }
 
-/// Picks a random reachable tile within [`WANDER_RADIUS`] and returns a
-/// simplified A* path to it (start + bends + goal), or `None`.
-pub fn pick_random_target(
+/// Picks a random *walkable* tile within [`WANDER_RADIUS`] of `current_tile` to
+/// route to, or `None` when no candidate was found this tick. Reachability is
+/// validated asynchronously by the route request the caller enqueues for the
+/// returned goal — a candidate that turns out unreachable just yields `NoPath`
+/// and the caller samples again.
+pub fn sample_wander_goal(
     rng: &mut StdRng,
     current_tile: (i32, i32),
     passability: &Hypermap<f32>,
-) -> Option<Vec<(i32, i32)>> {
+) -> Option<(i32, i32)> {
     for _ in 0..MAX_TARGET_ATTEMPTS {
-        let dx: f32 = rng.gen_range(-WANDER_RADIUS..WANDER_RADIUS);
-        let dy: f32 = rng.gen_range(-WANDER_RADIUS..WANDER_RADIUS);
+        let dx: f32 = rng::range(rng, -WANDER_RADIUS..WANDER_RADIUS);
+        let dy: f32 = rng::range(rng, -WANDER_RADIUS..WANDER_RADIUS);
         if dx * dx + dy * dy > WANDER_RADIUS * WANDER_RADIUS {
             continue;
         }
@@ -608,29 +838,20 @@ pub fn pick_random_target(
         if target == current_tile {
             continue;
         }
-        let result = astar_shortest_world_path(
-            passability,
-            current_tile,
-            target,
-            HypermapSearchLimits { max_expanded: 2000 },
-        );
-        if let HypermapPathResult::Found { path, .. } = result {
-            if path.len() > 1 {
-                return Some(simplify_path_line_of_sight(passability, &path, PATH_CORNER_BUFFER));
-            }
+        if world_tile_walkable(passability, target.0, target.1) {
+            return Some(target);
         }
     }
     None
 }
 
-/// Finds a charger in the nearest 4 hypertiles using queue-aware selection:
-/// prefer waiting queues with <2 actors; when all are busier, bias toward
-/// farther-ranked stations (`2nd nearest`, `3rd nearest`, ...).
-fn find_best_charger(ctx: &BrainContext) -> Option<(EntityCoordinates, Vec<(i32, i32)>)> {
+/// Coordinates of every charger in the nearest 4 hypertiles on the bot's floor.
+/// The reachability / path-cost ranking happens later from the async route
+/// results (see [`rank_charger_candidates`]).
+fn gather_charger_candidates(ctx: &BrainContext) -> Vec<EntityCoordinates> {
     let here = (ctx.main_tile.x, ctx.main_tile.y);
     let nearby_chunks = nearest_hypertiles_4(here);
-
-    let mut candidates: Vec<(EntityCoordinates, Vec<(i32, i32)>, usize, usize)> = Vec::new();
+    let mut out = Vec::new();
     for entry in ctx.interactive.iter().filter(|e| e.coordinates.floor == ctx.floor) {
         let (chunk, _) = world_to_chunk_local(entry.coordinates.x, entry.coordinates.y);
         if !nearby_chunks.contains(&chunk) {
@@ -639,31 +860,26 @@ fn find_best_charger(ctx: &BrainContext) -> Option<(EntityCoordinates, Vec<(i32,
         if entry.entity.as_charger().is_none() {
             continue;
         }
-        let goal = (entry.coordinates.x, entry.coordinates.y);
-        let (path_cost, path) = match astar_shortest_world_path(
-            ctx.passability,
-            here,
-            goal,
-            HypermapSearchLimits { max_expanded: SEARCH_LIMIT },
-        ) {
-            HypermapPathResult::Found { path, .. } if path.len() > 1 => {
-                (
-                    path.len(),
-                    simplify_path_line_of_sight(ctx.passability, &path, PATH_CORNER_BUFFER),
-                )
-            }
-            // Already on/at the charger tile — a single-waypoint path arrives at once.
-            HypermapPathResult::Found { path, .. } => (path.len(), path),
-            _ => continue,
-        };
-        let waiting_len = ctx.interactive.waiting_len(entry.coordinates);
-        candidates.push((entry.coordinates, path, waiting_len, path_cost));
+        out.push(entry.coordinates);
     }
+    out
+}
 
+/// One resolved charger candidate: its coordinates, the (simplified) route to
+/// it, the route cost (raw tile-path length), and the station's waiting-queue
+/// length.
+type ChargerCandidate = (EntityCoordinates, Vec<(i32, i32)>, usize, usize);
+
+/// Queue-aware charger selection over resolved candidates: prefer the cheapest
+/// route whose waiting queue has < 2 actors; when all are busier, bias toward
+/// farther-ranked stations (`2nd nearest`, `3rd nearest`, ...). Mirrors the old
+/// synchronous `find_best_charger` ranking.
+fn rank_charger_candidates(
+    mut candidates: Vec<ChargerCandidate>,
+) -> Option<(EntityCoordinates, Vec<(i32, i32)>)> {
     if candidates.is_empty() {
         return None;
     }
-
     candidates.sort_by_key(|(_, _, _, path_cost)| *path_cost);
     if let Some((coords, path, _, _)) = candidates
         .iter()
@@ -672,7 +888,6 @@ fn find_best_charger(ctx: &BrainContext) -> Option<(EntityCoordinates, Vec<(i32,
     {
         return Some((coords, path));
     }
-
     let closest_waiting = candidates[0].2;
     let rank = closest_waiting.saturating_sub(1);
     let idx = rank.min(candidates.len().saturating_sub(1));
@@ -728,21 +943,42 @@ fn dock_allowed_for(
 }
 
 fn short_wait_recheck_s(rng: &mut StdRng) -> f32 {
-    rng.gen_range(WAITING_RECHECK_MIN_S..WAITING_RECHECK_MAX_S)
+    rng::range(rng, WAITING_RECHECK_MIN_S..WAITING_RECHECK_MAX_S)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::actor::brain::low_level::{FollowTuning, Idle};
-    use crate::actor::brain::test_support::test_state;
     use crate::map::interactive_entity::{ChargerEntity, InteractiveEntity};
+    use crate::map::pathfind_service::{PathfindQueue, PathfindResults};
     use crate::map::world_map::ChargerFacing;
     use bevy::math::{IVec2, Vec2};
     use bevy::prelude::Entity;
-    use rand::SeedableRng;
 
     struct StuckLowAction;
+
+    struct VelocityFinished(Vec2);
+
+    impl LowLevelAction for VelocityFinished {
+        fn execute(
+            &mut self,
+            _state: &mut crate::actor::ActorState,
+            _ctx: &BrainContext,
+            _rng: &mut StdRng,
+            _tuning: &FollowTuning,
+        ) {
+        }
+        fn is_finished(&self) -> bool {
+            true
+        }
+        fn velocity(&self) -> Vec2 {
+            self.0
+        }
+        fn label(&self) -> String {
+            "VelocityFinished".to_string()
+        }
+    }
 
     impl LowLevelAction for StuckLowAction {
         fn execute(
@@ -764,11 +1000,104 @@ mod tests {
         }
     }
 
+    struct PathfindFixture {
+        queue: PathfindQueue,
+        results: PathfindResults,
+    }
+
+    impl PathfindFixture {
+        fn new() -> Self {
+            Self {
+                queue: PathfindQueue::default(),
+                results: PathfindResults::default(),
+            }
+        }
+
+        fn access(&self) -> PathfindAccess<'_> {
+            PathfindAccess {
+                queue: &self.queue,
+                results: &self.results,
+            }
+        }
+
+        fn drain_world_routes(&self) -> Vec<((i32, i32), (i32, i32))> {
+            self.queue
+                .drain_pending()
+                .into_iter()
+                .filter_map(|(_, kind)| match kind {
+                    PathKind::WorldRoute { start, goal, .. } => Some((start, goal)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn resolve_all_routes(&self, path: Vec<(i32, i32)>, raw_len: usize) {
+            for (id, kind) in self.queue.drain_pending() {
+                let outcome = match kind {
+                    PathKind::WorldRoute { goal, .. } => PathOutcome::Route {
+                        path: path.clone(),
+                        raw_len,
+                    }
+                    .with_goal(goal),
+                    other => panic!("unexpected queued kind in brain test: {other:?}"),
+                };
+                self.results.insert_for_test(id, outcome);
+            }
+        }
+
+        fn resolve_routes_with_costs(
+            &self,
+            path: Vec<(i32, i32)>,
+            costs: &[((i32, i32), usize)],
+        ) {
+            for (id, kind) in self.queue.drain_pending() {
+                let PathKind::WorldRoute { goal, .. } = kind else {
+                    panic!("unexpected queued kind in brain test");
+                };
+                let raw_len = costs
+                    .iter()
+                    .find(|(tile, _)| *tile == goal)
+                    .map(|(_, cost)| *cost)
+                    .unwrap_or(1);
+                self.results.insert_for_test(
+                    id,
+                    PathOutcome::Route {
+                        path: path.clone(),
+                        raw_len,
+                    }
+                    .with_goal(goal),
+                );
+            }
+        }
+    }
+
+    trait RouteOutcomeExt {
+        fn with_goal(self, goal: (i32, i32)) -> Self;
+    }
+
+    impl RouteOutcomeExt for PathOutcome {
+        fn with_goal(self, goal: (i32, i32)) -> Self {
+            match self {
+                PathOutcome::Route { mut path, raw_len } => {
+                    if path.is_empty() {
+                        path.push(goal);
+                    } else {
+                        *path.last_mut().expect("route path") = goal;
+                    }
+                    PathOutcome::Route { path, raw_len }
+                }
+                other => other,
+            }
+        }
+    }
+
     fn ctx<'a>(
         passability: &'a Hypermap<f32>,
         interactive: &'a InteractiveEntityMap,
         charge: f32,
         tile: (i32, i32),
+        pf: PathfindAccess<'a>,
+        patrol_loop: Option<&'a [(i32, i32)]>,
     ) -> BrainContext<'a> {
         BrainContext {
             entity: Entity::PLACEHOLDER,
@@ -784,127 +1113,132 @@ mod tests {
             passability,
             interactive,
             avoidance: None,
-            patrol_loop: None,
+            patrol_loop,
+            pathfind: Some(pf),
         }
     }
 
-    /// Like [`ctx`] but carries a patrol loop for [`GoToPatrol`] tests.
-    fn ctx_patrol<'a>(
-        passability: &'a Hypermap<f32>,
-        interactive: &'a InteractiveEntityMap,
-        tile: (i32, i32),
-        patrol_loop: &'a [(i32, i32)],
-    ) -> BrainContext<'a> {
-        let mut c = ctx(passability, interactive, 1.0, tile);
-        c.patrol_loop = Some(patrol_loop);
-        c
+    fn is_pending(low: &dyn LowLevelAction) -> bool {
+        low.label() == "PendingPath"
     }
 
-    /// Bot starts on the charger tile so the route is a single waypoint and the
-    /// phase machine can be driven deterministically without long travel.
     #[test]
-    fn charge_station_seeks_docks_charges_and_finishes() {
-        let passability: Hypermap<f32> = Hypermap::new(0.0);
-        passability.set(4, 0, 1.0);
-        let mut interactive = InteractiveEntityMap::new();
-        interactive.insert(InteractiveEntity::Charger(ChargerEntity::new(
-            EntityCoordinates::ground(4, 0),
-            ChargerFacing::North,
-        )));
+    fn replan_rising_edge_only_on_transition() {
+        let stuck = StuckLowAction;
+        assert!(low_level_needs_replan(&stuck, false, false));
+        assert!(!low_level_needs_replan(&stuck, true, false));
+        assert!(!low_level_needs_replan(&stuck, true, true));
+    }
 
-        let mut action = GoToChargeStation::new();
-        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
-        let mut rng = StdRng::seed_from_u64(0);
+    #[test]
+    fn random_walker_enqueues_world_route_on_replan() {
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let pf = PathfindFixture::new();
+        let mut action = GoToRandomPoints::default();
+        let mut low: Box<dyn LowLevelAction> = Box::new(StuckLowAction);
+        let mut rng = rng::seeded(42);
+
+        let out = action.update(
+            &ctx(&passability, &interactive, 1.0, (0, 0), pf.access(), None),
+            &mut low,
+            &mut rng,
+        );
+
+        assert!(matches!(out.status, HighLevelStatus::Running));
+        assert!(is_pending(low.as_ref()), "stuck walker must park while awaiting a route");
+        let routes = pf.drain_world_routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].0, (0, 0));
+    }
+
+    #[test]
+    fn random_walker_pending_path_inherits_velocity() {
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let pf = PathfindFixture::new();
+        let mut action = GoToRandomPoints::default();
+        let mut low: Box<dyn LowLevelAction> = Box::new(FollowPath::new(vec![(5, 0)]));
+        let mut rng = rng::seeded(42);
         let tuning = FollowTuning::default();
-        let mut state = test_state();
-        state.center = Vec2::new(4.5, 0.5);
+        let mut state = crate::actor::brain::test_support::test_state();
+        for _ in 0..5 {
+            low.execute(
+                &mut state,
+                &ctx(&passability, &interactive, 1.0, (0, 0), pf.access(), None),
+                &mut rng,
+                &tuning,
+            );
+            state.center += state.move_buffer.tile_delta;
+        }
+        let inherited = low.velocity();
+        assert!(inherited.length_squared() > 0.0, "FollowPath should have built momentum");
+        low = Box::new(VelocityFinished(inherited));
 
-        // Seeking → installs a FollowPath to the charger tile.
-        let out = action.update(&ctx(&passability, &interactive, 0.1, (4, 0)), &mut low, &mut rng);
-        assert!(matches!(out.status, HighLevelStatus::Running));
-        assert!(low.path().is_some(), "must be routing to the charger");
-
-        // One execute reaches the single waypoint (bot is on the tile).
-        low.execute(&mut state, &ctx(&passability, &interactive, 0.1, (4, 0)), &mut rng, &tuning);
-        assert!(low.is_finished(), "single-waypoint route completes on arrival");
-
-        // Traveling near station -> joins waiting queue first.
-        let out = action.update(&ctx(&passability, &interactive, 0.1, (4, 0)), &mut low, &mut rng);
-        assert_eq!(out.effects.queue_wait, Some(EntityCoordinates::ground(4, 0)));
-        interactive.add_waiting(EntityCoordinates::ground(4, 0), Entity::PLACEHOLDER);
-
-        // Next waiting recheck (forced finished low action) -> first in queue and free -> dock.
-        low = Box::new(Idle);
-        let out = action.update(&ctx(&passability, &interactive, 0.1, (4, 0)), &mut low, &mut rng);
-        assert_eq!(out.effects.dock, Some(EntityCoordinates::ground(4, 0)));
-
-        // Charging → recharge requested while not full.
-        let out = action.update(&ctx(&passability, &interactive, 0.5, (4, 0)), &mut low, &mut rng);
-        assert!(out.effects.recharge > 0.0);
-        assert!(matches!(out.status, HighLevelStatus::Running));
-
-        // Full → undock + done.
-        let out = action.update(&ctx(&passability, &interactive, 1.0, (4, 0)), &mut low, &mut rng);
-        assert!(matches!(out.status, HighLevelStatus::Done));
-        assert_eq!(out.effects.undock, Some(EntityCoordinates::ground(4, 0)));
+        action.update(
+            &ctx(&passability, &interactive, 1.0, (0, 0), pf.access(), None),
+            &mut low,
+            &mut rng,
+        );
+        assert!(is_pending(low.as_ref()));
+        assert_eq!(low.velocity(), inherited, "PendingPath must inherit prior velocity");
     }
 
     #[test]
-    fn traveling_does_not_restop_each_tile_inside_waiting_zone() {
-        // Regression: once a bot has joined a charger's waiting queue and been
-        // cleared to approach, the Traveling phase must not bounce it back into a
-        // WaitingQueue `Wait` on every tile boundary inside the zone — that is the
-        // "stop and go at every step near the charger" stutter.
-        let passability: Hypermap<f32> = Hypermap::new(0.0);
-        for x in 0..=10 {
-            passability.set(x, 0, 1.0);
-        }
-        let charger = EntityCoordinates::ground(10, 0);
-        let mut interactive = InteractiveEntityMap::new();
-        interactive.insert(InteractiveEntity::Charger(ChargerEntity::new(
-            charger,
-            ChargerFacing::North,
-        )));
-
-        let mut action = GoToChargeStation::new();
-        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
-        let mut rng = StdRng::seed_from_u64(0);
-
-        // Seeking → Traveling: joins the *wanting* queue and routes to the charger.
-        let _ = action.update(&ctx(&passability, &interactive, 0.1, (0, 0)), &mut low, &mut rng);
-        assert!(low.path().is_some(), "routing to the charger");
-
-        // First entry into the waiting zone joins the *waiting* queue (one stop).
-        let out = action.update(&ctx(&passability, &interactive, 0.1, (7, 0)), &mut low, &mut rng);
-        assert_eq!(out.effects.queue_wait, Some(charger), "joins waiting queue once");
-        interactive.add_waiting(charger, Entity::PLACEHOLDER);
-
-        // Cleared to approach: WaitingQueue → Traveling with a fresh route.
-        low = Box::new(Idle); // the short waiting recheck is "finished"
-        let _ = action.update(&ctx(&passability, &interactive, 0.1, (7, 0)), &mut low, &mut rng);
-        assert!(low.path().is_some(), "approaching the charger again");
-
-        // Crossing more tiles still inside the zone must NOT re-stop the bot.
-        for tile in [(8, 0), (9, 0)] {
-            let out = action.update(&ctx(&passability, &interactive, 0.1, tile), &mut low, &mut rng);
-            assert_eq!(out.effects.queue_wait, None, "must not re-join waiting queue at {tile:?}");
-            assert!(low.path().is_some(), "must keep following the approach path at {tile:?}, not stop");
-        }
-    }
-
-    #[test]
-    fn no_charger_waits_instead_of_routing() {
+    fn no_charger_waits_instead_of_requesting() {
         let passability: Hypermap<f32> = Hypermap::new(0.0);
         passability.set(0, 0, 1.0);
         let interactive = InteractiveEntityMap::new();
+        let pf = PathfindFixture::new();
         let mut action = GoToChargeStation::new();
         let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
-        let mut rng = StdRng::seed_from_u64(0);
+        let mut rng = rng::seeded(0);
 
-        let out = action.update(&ctx(&passability, &interactive, 0.1, (0, 0)), &mut low, &mut rng);
+        let out = action.update(
+            &ctx(&passability, &interactive, 0.1, (0, 0), pf.access(), None),
+            &mut low,
+            &mut rng,
+        );
         assert!(matches!(out.status, HighLevelStatus::Running));
-        assert!(low.path().is_none(), "no charger → should be waiting, not following a path");
+        assert!(!is_pending(low.as_ref()), "no candidates → retry Wait, not PendingPath");
+        assert!(pf.queue.is_empty(), "no charger → must not enqueue pathfind requests");
         assert!(!low.is_finished(), "the retry Wait keeps the action alive");
+    }
+
+    #[test]
+    fn charge_seek_enqueues_route_per_candidate() {
+        let passability: Hypermap<f32> = Hypermap::new(0.0);
+        for x in 0..=8 {
+            passability.set(x, 0, 1.0);
+        }
+        let mut interactive = InteractiveEntityMap::new();
+        interactive.insert(InteractiveEntity::Charger(ChargerEntity::new(
+            EntityCoordinates::ground(2, 0),
+            ChargerFacing::North,
+        )));
+        interactive.insert(InteractiveEntity::Charger(ChargerEntity::new(
+            EntityCoordinates::ground(6, 0),
+            ChargerFacing::North,
+        )));
+
+        let pf = PathfindFixture::new();
+        let mut action = GoToChargeStation::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = rng::seeded(0);
+
+        action.update(
+            &ctx(&passability, &interactive, 0.1, (0, 0), pf.access(), None),
+            &mut low,
+            &mut rng,
+        );
+
+        assert!(is_pending(low.as_ref()));
+        let routes = pf.drain_world_routes();
+        assert_eq!(routes.len(), 2);
+        assert!(routes.iter().all(|(start, _)| *start == (0, 0)));
+        let goals: Vec<(i32, i32)> = routes.into_iter().map(|(_, goal)| goal).collect();
+        assert!(goals.contains(&(2, 0)));
+        assert!(goals.contains(&(6, 0)));
     }
 
     #[test]
@@ -913,30 +1247,37 @@ mod tests {
         for x in -2..=0 {
             passability.set(x, 0, 1.0);
         }
-        // Also make a reachable charger in a far chunk that should be ignored by
-        // the bounded 4-hypertile search from (0, 0).
         for x in 0..=130 {
             passability.set(x, 1, 1.0);
         }
 
         let mut interactive = InteractiveEntityMap::new();
         interactive.insert(InteractiveEntity::Charger(ChargerEntity::new(
-            EntityCoordinates::ground(-2, 0), // chunk (-1, 0), should be considered
+            EntityCoordinates::ground(-2, 0),
             ChargerFacing::North,
         )));
         interactive.insert(InteractiveEntity::Charger(ChargerEntity::new(
-            EntityCoordinates::ground(130, 1), // chunk (1, 0), excluded from nearest 4
+            EntityCoordinates::ground(130, 1),
             ChargerFacing::North,
         )));
 
+        let pf = PathfindFixture::new();
         let mut action = GoToChargeStation::new();
         let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
-        let mut rng = StdRng::seed_from_u64(0);
-        let out = action.update(&ctx(&passability, &interactive, 0.1, (0, 0)), &mut low, &mut rng);
+        let mut rng = rng::seeded(0);
 
-        assert!(matches!(out.status, HighLevelStatus::Running));
-        let (path, _) = low.path().expect("must route to charger in nearest hypertiles");
-        assert_eq!(path.last().copied(), Some((-2, 0)));
+        action.update(
+            &ctx(&passability, &interactive, 0.1, (0, 0), pf.access(), None),
+            &mut low,
+            &mut rng,
+        );
+
+        let goals: Vec<(i32, i32)> = pf
+            .drain_world_routes()
+            .into_iter()
+            .map(|(_, goal)| goal)
+            .collect();
+        assert_eq!(goals, vec![(-2, 0)], "far-chunk charger must be excluded from seek requests");
     }
 
     #[test]
@@ -954,13 +1295,26 @@ mod tests {
         interactive.add_waiting(close, Entity::from_bits(101));
         interactive.add_waiting(farther, Entity::from_bits(200));
 
+        let pf = PathfindFixture::new();
         let mut action = GoToChargeStation::new();
         let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
-        let mut rng = StdRng::seed_from_u64(0);
-        let out = action.update(&ctx(&passability, &interactive, 0.1, (0, 0)), &mut low, &mut rng);
+        let mut rng = rng::seeded(0);
+
+        action.update(
+            &ctx(&passability, &interactive, 0.1, (0, 0), pf.access(), None),
+            &mut low,
+            &mut rng,
+        );
+        pf.resolve_all_routes(vec![(0, 0), (6, 0)], 2);
+        let out = action.update(
+            &ctx(&passability, &interactive, 0.1, (0, 0), pf.access(), None),
+            &mut low,
+            &mut rng,
+        );
 
         assert!(matches!(out.status, HighLevelStatus::Running));
-        let (path, _) = low.path().expect("must pick a charger");
+        assert_eq!(out.effects.queue_want, Some(farther));
+        let (path, _) = low.path().expect("ranking should install a route after injected results");
         assert_eq!(path.last().copied(), Some((6, 0)));
     }
 
@@ -982,43 +1336,34 @@ mod tests {
             interactive.add_waiting(coords, Entity::from_bits(base));
             interactive.add_waiting(coords, Entity::from_bits(base + 1));
         }
-        assert_eq!(interactive.waiting_len(first), 2);
-        assert_eq!(interactive.waiting_len(second), 2);
-        assert_eq!(interactive.waiting_len(third), 2);
 
+        let pf = PathfindFixture::new();
         let mut action = GoToChargeStation::new();
         let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
-        let mut rng = StdRng::seed_from_u64(0);
-        let out = action.update(&ctx(&passability, &interactive, 0.1, (0, 0)), &mut low, &mut rng);
+        let mut rng = rng::seeded(0);
+
+        action.update(
+            &ctx(&passability, &interactive, 0.1, (0, 0), pf.access(), None),
+            &mut low,
+            &mut rng,
+        );
+        pf.resolve_routes_with_costs(
+            vec![(0, 0), (8, 0)],
+            &[((2, 0), 2), ((4, 0), 4), ((8, 0), 8)],
+        );
+        let out = action.update(
+            &ctx(&passability, &interactive, 0.1, (0, 0), pf.access(), None),
+            &mut low,
+            &mut rng,
+        );
 
         assert!(matches!(out.status, HighLevelStatus::Running));
-        let (path, _) = low.path().expect("must pick ranked fallback charger");
-        assert_eq!(path.last().copied(), Some((4, 0)), "closest has 2 waiters, so choose 2nd closest");
+        let (path, _) = low.path().expect("ranked fallback should install a route");
+        assert_eq!(path.last().copied(), Some((4, 0)));
     }
 
     #[test]
-    fn replan_rising_edge_only_on_transition() {
-        let stuck = StuckLowAction;
-        assert!(low_level_needs_replan(&stuck, false, false));
-        assert!(!low_level_needs_replan(&stuck, true, false));
-        assert!(!low_level_needs_replan(&stuck, true, true));
-    }
-
-    #[test]
-    fn random_walker_stuck_handler_retargets() {
-        let passability: Hypermap<f32> = Hypermap::new(1.0);
-        let interactive = InteractiveEntityMap::new();
-        let mut action = GoToRandomPoints::default();
-        let mut low: Box<dyn LowLevelAction> = Box::new(StuckLowAction);
-        let mut rng = StdRng::seed_from_u64(42);
-
-        let out = action.update(&ctx(&passability, &interactive, 1.0, (0, 0)), &mut low, &mut rng);
-        assert!(matches!(out.status, HighLevelStatus::Running));
-        assert!(low.path().is_some(), "stuck random walker should install a new route");
-    }
-
-    #[test]
-    fn recharge_stuck_handler_reruns_charger_search() {
+    fn recharge_stuck_handler_reenqueues_seek() {
         let passability: Hypermap<f32> = Hypermap::new(0.0);
         for x in 0..=6 {
             passability.set(x, 0, 1.0);
@@ -1028,51 +1373,165 @@ mod tests {
             EntityCoordinates::ground(6, 0),
             ChargerFacing::North,
         )));
+
+        let pf = PathfindFixture::new();
         let mut action = GoToChargeStation::new();
         let mut low: Box<dyn LowLevelAction> = Box::new(StuckLowAction);
-        let mut rng = StdRng::seed_from_u64(1);
+        let mut rng = rng::seeded(1);
 
-        let out = action.update(&ctx(&passability, &interactive, 0.2, (0, 0)), &mut low, &mut rng);
-        assert!(matches!(out.status, HighLevelStatus::Running));
-        let (path, _) = low.path().expect("stuck recharge should immediately rerun charger search");
-        assert_eq!(path.last().copied(), Some((6, 0)));
+        action.update(
+            &ctx(&passability, &interactive, 0.2, (0, 0), pf.access(), None),
+            &mut low,
+            &mut rng,
+        );
+
+        assert!(is_pending(low.as_ref()));
+        let routes = pf.drain_world_routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0], ((0, 0), (6, 0)));
     }
 
     #[test]
-    fn generate_patrol_loop_yields_reachable_distinct_tiles() {
-        let passability: Hypermap<f32> = Hypermap::new(1.0); // everything walkable
-        let mut rng = StdRng::seed_from_u64(7);
-        let loop_tiles = generate_patrol_loop(&mut rng, (0, 0), &passability);
+    fn traveling_does_not_restop_each_tile_inside_waiting_zone() {
+        let passability: Hypermap<f32> = Hypermap::new(0.0);
+        for x in 0..=10 {
+            passability.set(x, 0, 1.0);
+        }
+        let charger = EntityCoordinates::ground(10, 0);
+        let mut interactive = InteractiveEntityMap::new();
+        interactive.insert(InteractiveEntity::Charger(ChargerEntity::new(
+            charger,
+            ChargerFacing::North,
+        )));
 
-        assert_eq!(loop_tiles.len(), PATROL_LOOP_LEN, "open map should fill the loop");
-        assert!(!loop_tiles.contains(&(0, 0)), "anchor itself is not a waypoint");
-        let mut sorted = loop_tiles.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), loop_tiles.len(), "waypoints must be distinct");
+        let pf = PathfindFixture::new();
+        let mut action = GoToChargeStation::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = rng::seeded(0);
+
+        action.update(
+            &ctx(&passability, &interactive, 0.1, (0, 0), pf.access(), None),
+            &mut low,
+            &mut rng,
+        );
+        pf.resolve_all_routes(vec![(0, 0), (10, 0)], 11);
+        action.update(
+            &ctx(&passability, &interactive, 0.1, (0, 0), pf.access(), None),
+            &mut low,
+            &mut rng,
+        );
+        assert!(low.path().is_some(), "seek should install a route after injected results");
+
+        let out = action.update(
+            &ctx(&passability, &interactive, 0.1, (7, 0), pf.access(), None),
+            &mut low,
+            &mut rng,
+        );
+        assert_eq!(out.effects.queue_wait, Some(charger), "joins waiting queue once");
+        interactive.add_waiting(charger, Entity::PLACEHOLDER);
+
+        low = Box::new(Idle);
+        action.update(
+            &ctx(&passability, &interactive, 0.1, (7, 0), pf.access(), None),
+            &mut low,
+            &mut rng,
+        );
+        let dock_pending = pf.queue.drain_pending();
+        assert_eq!(dock_pending.len(), 1, "cleared to approach must enqueue one dock route");
+        let PathKind::WorldRoute {
+            start,
+            goal,
+            ..
+        } = &dock_pending[0].1
+        else {
+            panic!("expected a dock WorldRoute request");
+        };
+        assert_eq!((*start, *goal), ((7, 0), (10, 0)));
+
+        for (id, kind) in dock_pending {
+            let PathKind::WorldRoute { goal, .. } = kind else {
+                panic!("unexpected queued kind");
+            };
+            pf.results.insert_for_test(
+                id,
+                PathOutcome::Route {
+                    path: vec![(7, 0), goal],
+                    raw_len: 4,
+                },
+            );
+        }
+        action.update(
+            &ctx(&passability, &interactive, 0.1, (7, 0), pf.access(), None),
+            &mut low,
+            &mut rng,
+        );
+        assert!(low.path().is_some(), "approach route should be installed");
+
+        for tile in [(8, 0), (9, 0)] {
+            let out = action.update(
+                &ctx(&passability, &interactive, 0.1, tile, pf.access(), None),
+                &mut low,
+                &mut rng,
+            );
+            assert_eq!(out.effects.queue_wait, None, "must not re-join waiting queue at {tile:?}");
+            assert!(pf.queue.is_empty(), "must not enqueue more routes while crossing the zone");
+        }
     }
 
     #[test]
-    fn patrol_installs_route_and_cycles_waypoints() {
+    fn enqueue_patrol_candidates_issues_reachability_requests() {
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let queue = PathfindQueue::default();
+        let checks = enqueue_patrol_candidates(&mut rng::seeded(7), (0, 0), &passability, &queue);
+        assert!(!checks.is_empty(), "open map should sample patrol candidates");
+        let routes = queue.drain_pending();
+        assert_eq!(routes.len(), checks.len());
+        for ((id, kind), (check_id, tile)) in routes.iter().zip(checks.iter()) {
+            assert_eq!(*id, *check_id);
+            assert!(matches!(
+                kind,
+                PathKind::WorldRoute {
+                    start: (0, 0),
+                    goal,
+                    ..
+                } if *goal == *tile
+            ));
+        }
+    }
+
+    #[test]
+    fn assemble_patrol_loop_keeps_reachable_distinct_tiles() {
+        let resolved = [
+            ((1, 0), true),
+            ((2, 0), true),
+            ((2, 0), true),
+            ((3, 0), false),
+            ((4, 0), true),
+        ];
+        let loop_tiles = assemble_patrol_loop(&resolved);
+        assert_eq!(loop_tiles, vec![(1, 0), (2, 0), (4, 0)]);
+    }
+
+    #[test]
+    fn patrol_enqueues_route_to_next_waypoint() {
         let passability: Hypermap<f32> = Hypermap::new(1.0);
         let interactive = InteractiveEntityMap::new();
         let route = [(0, 0), (4, 0), (4, 4)];
+        let pf = PathfindFixture::new();
         let mut action = GoToPatrol::new();
         let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
-        let mut rng = StdRng::seed_from_u64(0);
+        let mut rng = rng::seeded(0);
 
-        // Standing on (0,0): nearest waypoint is (0,0) itself, so it heads to the
-        // next reachable distinct one.
-        let out = action.update(&ctx_patrol(&passability, &interactive, (0, 0), &route), &mut low, &mut rng);
+        let out = action.update(
+            &ctx(&passability, &interactive, 1.0, (0, 0), pf.access(), Some(&route)),
+            &mut low,
+            &mut rng,
+        );
         assert!(matches!(out.status, HighLevelStatus::Running));
-        let first = low.path().expect("patrol must install a route").0.last().copied();
-        assert!(first.is_some(), "patrol routes to a loop waypoint");
-
-        // Force "arrived" and tick again: it must advance to a different waypoint.
-        low = Box::new(Idle);
-        action.update(&ctx_patrol(&passability, &interactive, (4, 0), &route), &mut low, &mut rng);
-        let second = low.path().expect("patrol must keep routing").0.last().copied();
-        assert_ne!(second, Some((4, 0)), "must not target the cell it is standing on");
+        assert!(is_pending(low.as_ref()));
+        let routes = pf.drain_world_routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0], ((0, 0), (4, 0)), "must skip the tile the bot stands on");
     }
 
     #[test]
@@ -1080,13 +1539,18 @@ mod tests {
         let passability: Hypermap<f32> = Hypermap::new(1.0);
         let interactive = InteractiveEntityMap::new();
         let route = [(0, 0), (10, 0), (20, 0)];
-        // Fresh action created near (10,0) (e.g. just back from a recharge): it
-        // should resume there rather than restarting at the loop's head.
+        let pf = PathfindFixture::new();
         let mut action = GoToPatrol::new();
         let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
-        let mut rng = StdRng::seed_from_u64(0);
-        action.update(&ctx_patrol(&passability, &interactive, (9, 0), &route), &mut low, &mut rng);
-        let target = low.path().expect("patrol routes after resuming").0.last().copied();
-        assert_eq!(target, Some((10, 0)), "resumes at the nearest loop waypoint");
+        let mut rng = rng::seeded(0);
+
+        action.update(
+            &ctx(&passability, &interactive, 1.0, (9, 0), pf.access(), Some(&route)),
+            &mut low,
+            &mut rng,
+        );
+        let routes = pf.drain_world_routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0], ((9, 0), (10, 0)), "resumes at the nearest loop waypoint");
     }
 }

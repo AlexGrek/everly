@@ -33,7 +33,7 @@ temperature.set_tile_c(wx, wy, celsius);
 temperature.add_tile_c(wx, wy, delta_c);
 ```
 
-Actor dirt deposits: `docs/field-interactions.md`.
+Actor field coupling (dirt deposits, bot occupancy heating): `docs/field-interactions.md`.
 
 ## Persistence
 

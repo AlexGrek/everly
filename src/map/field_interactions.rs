@@ -1,7 +1,9 @@
-//! Actor ↔ hypermap field coupling (dirt today; temperature and others later).
+//! Actor ↔ hypermap field coupling (dirt deposits; bot occupancy heating).
 //!
 //! Runs **after** [`crate::actor::process_actors`] so [`ActorState::center`] reflects
 //! the movement step. See `docs/field-interactions.md`.
+
+use std::collections::HashSet;
 
 use bevy::prelude::*;
 
@@ -9,6 +11,10 @@ use crate::actor::{actor_main_tile, process_actors, ActorObject};
 use crate::map::dirt::{DirtMap, DIRT_TRACK_DEPOSIT};
 use crate::map::hypermap::Hypermap;
 use crate::map::hypermap_world::HypermapRuntime;
+use crate::map::temperature::{
+    flush_temperature_map, TemperatureMap, BOT_OCCUPANCY_HEAT_DELTA_C,
+    BOT_OCCUPANCY_HEAT_INTERVAL_S,
+};
 use crate::map::world_map::CellType;
 use crate::menu::main_menu::GameState;
 
@@ -94,18 +100,37 @@ pub fn exchange_dirt_with_tile(
     }
 }
 
+/// Repeating timer for [`bot_occupancy_heat`].
+#[derive(Resource)]
+struct BotOccupancyHeatTimer(Timer);
+
+impl Default for BotOccupancyHeatTimer {
+    fn default() -> Self {
+        Self(Timer::from_seconds(
+            BOT_OCCUPANCY_HEAT_INTERVAL_S,
+            TimerMode::Repeating,
+        ))
+    }
+}
+
 pub struct FieldInteractionsPlugin;
 
 impl Plugin for FieldInteractionsPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(
-            Update,
-            dirt_actor_interaction
-                .after(process_actors)
-                .before(crate::map::dirt::flush_dirt_map)
-                .run_if(in_state(GameState::InGame))
-                .run_if(not(crate::actor::is_paused)),
-        );
+        app.init_resource::<BotOccupancyHeatTimer>()
+            .add_systems(
+                Update,
+                (
+                    dirt_actor_interaction
+                        .after(process_actors)
+                        .before(crate::map::dirt::flush_dirt_map),
+                    bot_occupancy_heat
+                        .after(process_actors)
+                        .before(flush_temperature_map),
+                )
+                    .run_if(in_state(GameState::InGame))
+                    .run_if(not(crate::actor::is_paused)),
+            );
     }
 }
 
@@ -126,6 +151,45 @@ pub(crate) fn dirt_actor_interaction(
         };
         exchange_dirt_with_tile(&dirt, world, t.left_tile, &mut state.dirtiness);
     }
+}
+
+/// Unique main tiles currently occupied by the given actor centers (one tile per bot).
+pub fn collect_bot_occupied_tiles(centers: impl IntoIterator<Item = Vec2>) -> HashSet<IVec2> {
+    centers
+        .into_iter()
+        .map(actor_main_tile)
+        .collect()
+}
+
+/// Adds [`BOT_OCCUPANCY_HEAT_DELTA_C`] to each non-void main tile occupied by a bot.
+pub fn apply_bot_occupancy_heat_to_tiles(
+    temperature: &TemperatureMap,
+    world: &Hypermap<CellType>,
+    tiles: impl IntoIterator<Item = IVec2>,
+) {
+    for tile in tiles {
+        if matches!(world.get(tile.x, tile.y), CellType::Void) {
+            continue;
+        }
+        temperature.add_tile_c(tile.x, tile.y, BOT_OCCUPANCY_HEAT_DELTA_C);
+    }
+}
+
+/// Every [`BOT_OCCUPANCY_HEAT_INTERVAL_S`], heat each main tile that currently holds a bot.
+fn bot_occupancy_heat(
+    time: Res<Time>,
+    mut timer: ResMut<BotOccupancyHeatTimer>,
+    actors: Query<&ActorObject>,
+    temperature: Res<TemperatureMap>,
+    hypermap: Res<HypermapRuntime>,
+) {
+    timer.0.tick(time.delta());
+    if !timer.0.just_finished() {
+        return;
+    }
+
+    let tiles = collect_bot_occupied_tiles(actors.iter().map(|a| a.inner.state().center));
+    apply_bot_occupancy_heat_to_tiles(&temperature, hypermap.map.as_ref(), tiles);
 }
 
 #[cfg(test)]
@@ -192,5 +256,17 @@ mod tests {
     fn dirt_exchange_gain_clamps_to_one() {
         let (actor, _) = dirt_exchange(1.0, 0.999);
         assert!(actor <= 1.0);
+    }
+
+    #[test]
+    fn collect_bot_occupied_tiles_dedupes_shared_tile() {
+        let tiles = collect_bot_occupied_tiles([
+            Vec2::new(1.2, 2.8),
+            Vec2::new(1.6, 2.1),
+            Vec2::new(5.0, 5.0),
+        ]);
+        assert_eq!(tiles.len(), 2);
+        assert!(tiles.contains(&IVec2::new(1, 2)));
+        assert!(tiles.contains(&IVec2::new(5, 5)));
     }
 }

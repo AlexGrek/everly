@@ -19,7 +19,7 @@ pub fn common_actor_rows(state: &crate::actor::ActorState) -> Vec<InspectRow> {
     let center = format!("({:.3}, {:.3})", state.center.x, state.center.y);
     let last_sub = match state.last_accepted_center_subtile {
         Some(s) => format!("({}, {})", s.x, s.y),
-        None => "—".to_string(),
+        None => "-".to_string(),
     };
     vec![
         InspectRow { label: "center", value: center },
@@ -46,8 +46,8 @@ pub fn black_bot_rows(
     let priority = brain
         .current_priority()
         .map(|p| format!("{:?} ({:.0})", p.kind, p.value))
-        .unwrap_or_else(|| "—".to_string());
-    let specialization = spec.map(|s| s.label()).unwrap_or("—");
+        .unwrap_or_else(|| "-".to_string());
+    let specialization = spec.map(|s| s.label()).unwrap_or("-");
     vec![
         InspectRow { label: "specialization", value: specialization.to_string() },
         InspectRow { label: "main_tile", value: format!("({}, {})", main_tile.x, main_tile.y) },
@@ -107,7 +107,7 @@ pub fn route_rows(brain: &Brain) -> Vec<InspectRow> {
     let target = brain
         .target_tile()
         .map(|(x, y)| format!("({x}, {y})"))
-        .unwrap_or_else(|| "—".to_string());
+        .unwrap_or_else(|| "-".to_string());
     let vel = brain.velocity();
     vec![
         InspectRow { label: "target", value: target },

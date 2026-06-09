@@ -4,8 +4,7 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 use bevy::prelude::*;
-use rand::{Rng, SeedableRng};
-use rand::rngs::StdRng;
+use crate::rng;
 
 use crate::map::hypermap::{random_rng_seed, ChunkCoord, Hypermap, LocalCoord, HYPERMAP_CHUNK_SIZE};
 use crate::map::level::LevelName;
@@ -23,6 +22,11 @@ pub const TEMP_MIN_C: f32 = -30.0;
 pub const TEMP_ZERO_C: f32 = 0.0;
 /// Colormap hot end (°C) — rendered red (via yellow).
 pub const TEMP_MAX_C: f32 = 30.0;
+
+/// How often standing bots heat their current main tile (see `field_interactions`).
+pub const BOT_OCCUPANCY_HEAT_INTERVAL_S: f32 = 1.0;
+/// °C added per interval to each main tile occupied by at least one bot.
+pub const BOT_OCCUPANCY_HEAT_DELTA_C: f32 = 3.0;
 
 const COLD_PATCH_CHANCE: f32 = 0.04;
 const WARM_PATCH_CHANCE: f32 = 0.04;
@@ -146,7 +150,7 @@ impl TemperatureMap {
 
         if !from_bin {
             let seed = temperature_chunk_seed(coord);
-            let mut rng = StdRng::seed_from_u64(seed);
+            let mut rng = rng::seeded(seed);
 
             world.with_chunk_read(coord, |wchunk| {
                 self.field.inner().with_chunk_write(coord, |tchunk| {
@@ -157,13 +161,13 @@ impl TemperatureMap {
                             if matches!(cell, CellType::Void) {
                                 continue;
                             }
-                            let roll = rng.gen_range(0.0..1.0);
-                            let celsius = if roll < COLD_PATCH_CHANCE {
-                                rng.gen_range(-26.0..-6.0)
-                            } else if roll < COLD_PATCH_CHANCE + WARM_PATCH_CHANCE {
-                                rng.gen_range(6.0..26.0)
-                            } else {
-                                TEMP_ZERO_C
+                            let celsius = match rng::categorical(
+                                &mut rng,
+                                &[COLD_PATCH_CHANCE, COLD_PATCH_CHANCE + WARM_PATCH_CHANCE],
+                            ) {
+                                0 => rng::f32_in(&mut rng, -26.0, -6.0),
+                                1 => rng::f32_in(&mut rng, 6.0, 26.0),
+                                _ => TEMP_ZERO_C,
                             };
                             tchunk.set_local(local, celsius);
                         }

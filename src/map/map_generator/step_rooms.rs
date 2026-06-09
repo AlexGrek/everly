@@ -1,6 +1,6 @@
 //! Step 5: grow axis-aligned rooms from subseed centers.
 
-use rand::Rng;
+use crate::rng::{self, StdRng};
 
 use super::draft::{MapDraft, Room, RoomRecord};
 
@@ -19,11 +19,11 @@ impl MapDraft {
 impl Room {
     fn from_center_growth(
         center: (i32, i32),
-        rng: &mut rand::rngs::StdRng,
+        rng: &mut StdRng,
         bounds: super::draft::DraftBounds,
     ) -> Self {
-        let rx = rng.gen_range(3..=6);
-        let rz = rng.gen_range(3..=6);
+        let rx = rng::range(rng, 3..=6);
+        let rz = rng::range(rng, 3..=6);
         let x0 = (center.0 - rx).clamp(bounds.grow_lo, bounds.grow_hi);
         let x1 = (center.0 + rx).clamp(bounds.grow_lo, bounds.grow_hi);
         let z0 = (center.1 - rz).clamp(bounds.grow_lo, bounds.grow_hi);

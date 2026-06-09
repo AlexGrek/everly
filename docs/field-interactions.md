@@ -23,12 +23,14 @@ When `field_main_tile` was `Some(prev)` and `prev != current`, the actor **left*
 
 ```text
 flush_actor_occupancy → process_actors → dirt_actor_interaction → seed_dirt → flush_dirt_map → dirt overlay
+                      → bot_occupancy_heat → seed_temperature → flush_temperature_map → temperature overlay / GPU diffusion
 ```
 
 | Step | What happens |
 |------|----------------|
 | `process_actors` | Think, prepare, try_move / advance_unchecked |
 | `dirt_actor_interaction` | Collect main-tile transitions; exchange dirt between each actor and its left tile |
+| `bot_occupancy_heat` | Every 1 s, +3 °C on each **current** main tile occupied by a bot (write buffer; deduped per tile) |
 | `seed_dirt_for_visible_chunks` | One-time procedural dirt (write buffer) |
 | `flush_dirt_map` | **`flush_merge` only if write buffer has chunks** |
 | `update_dirt_overlay_textures` | Repaint only chunks in `take_dirty_chunks()` |
@@ -75,14 +77,21 @@ See [`level-persistence.md`](level-persistence.md).
 ## Temperature
 
 Temperature is a sibling tile field ([`TemperatureMap`](../src/map/temperature.rs), same
-[`TileFieldMap`](../src/map/tile_field.rs) backing as dirt). Unlike dirt, it is not yet coupled to
-actors, but it **diffuses on the GPU** every frame: heat spreads across tiles (seamlessly over
-chunk borders), insulated by walls/void, relaxing toward ambient. The CPU field stays
-authoritative — results are read back and applied via
+[`TileFieldMap`](../src/map/tile_field.rs) backing as dirt). It **diffuses on the GPU** every frame:
+heat spreads across tiles (seamlessly over chunk borders), insulated by walls/void, relaxing
+toward ambient. The CPU field stays authoritative — results are read back and applied via
 [`TileFieldMap::apply_window_to_read`](../src/map/tile_field.rs), which marks chunks dirty so the
-overlay repaints. See [`temperature-diffusion.md`](temperature-diffusion.md). When adding actor ↔
-temperature coupling, follow the dirt pattern (deposit on the **left** tile after a main-tile
-transition); the diffusion readback and actor deposits both target the same read buffer.
+overlay repaints. See [`temperature-diffusion.md`](temperature-diffusion.md).
+
+### Bot occupancy heating
+
+[`bot_occupancy_heat`](../src/map/field_interactions.rs) runs after [`process_actors`](../src/actor/mod.rs)
+on a **1 s** repeating timer ([`BOT_OCCUPANCY_HEAT_INTERVAL_S`](../src/map/temperature.rs)). Each
+tick adds [`BOT_OCCUPANCY_HEAT_DELTA_C`](../src/map/temperature.rs) (**+3 °C**) to every **current**
+main tile that holds at least one bot ([`actor_main_tile`](../src/actor/mod.rs)); multiple bots on
+the same tile still heat it once. `Void` tiles are skipped. Writes use the temperature **write**
+buffer and are merged by [`flush_temperature_map`](../src/map/temperature.rs) before overlays and
+GPU diffusion read the field.
 
 ## Related docs
 

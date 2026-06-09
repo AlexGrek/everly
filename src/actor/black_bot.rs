@@ -22,15 +22,14 @@ use std::collections::HashSet;
 
 use bevy::picking::prelude::Pickable;
 use bevy::prelude::*;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use crate::rng::{self, StdRng};
 use serde::{Deserialize, Serialize};
 
 use crate::actor::actor_name::random_actor_name;
 use crate::actor::actor_pick::{ActorForceLogs, ActorInspectable, ActorPickMesh};
 use crate::actor::brain::{
-    generate_patrol_loop, make_high_level, AvoidanceViews, Behavior, Brain, BrainContext,
-    BrainEffects, ChargeSelfKeeper, Patroller, RandomWalker,
+    assemble_patrol_loop, enqueue_patrol_candidates, make_high_level, AvoidanceViews, Behavior,
+    Brain, BrainContext, BrainEffects, ChargeSelfKeeper, PathfindAccess, Patroller, RandomWalker,
 };
 use crate::actor::charge::Charge;
 use crate::actor::snapshot::{BreakablePartSnap, BreakableSnap};
@@ -47,6 +46,9 @@ use crate::map::interactive_entity::{
 use crate::map::level::LevelName;
 use crate::map::passability::{
     DynamicPassabilityMap, SubtilePassability, TryUpdateFootprintError, SUBTILE_COUNT,
+};
+use crate::map::pathfind_service::{
+    PathOutcome, PathfindQueue, PathfindResults, PathfindSet, RequestId,
 };
 use crate::hud::game_log::{BreakableSystem, GameLog, LogEntry};
 use crate::menu::main_menu::GameState;
@@ -117,7 +119,7 @@ impl BreakablePartState {
         self.wear += rate * dt;
         if tile_changed {
             let chance = (self.wear * 0.01_f32).min(0.1);
-            if rng.gen_range(0.0_f32..1.0) < chance {
+            if rng::chance(rng, chance) {
                 self.broken = true;
             }
         }
@@ -215,7 +217,7 @@ pub struct BlackBotRng(pub StdRng);
 
 impl Default for BlackBotRng {
     fn default() -> Self {
-        Self(StdRng::seed_from_u64(0xB1AC_B07))
+        Self(rng::seeded(0xB1AC_B07))
     }
 }
 
@@ -239,7 +241,7 @@ impl BotSpecialization {
     /// Rolls a specialization at spawn: [`Patrol`](Self::Patrol) with probability
     /// `1/4`, otherwise [`DoNothing`](Self::DoNothing).
     pub fn roll(rng: &mut StdRng) -> Self {
-        if rng.gen_range(0..4) == 0 {
+        if rng::one_in(rng, 4) {
             Self::Patrol
         } else {
             Self::DoNothing
@@ -284,18 +286,28 @@ impl BotSpecialization {
 pub struct Patrol {
     pub loop_tiles: Vec<(i32, i32)>,
     /// Seconds until the next generation attempt while `loop_tiles` is still
-    /// empty. [`generate_patrol_loop`](crate::actor::brain::generate_patrol_loop)
-    /// runs A\* up to `PATROL_GEN_ATTEMPTS` times, so when the bot's anchor area
-    /// is unreachable (transiently while a chunk streams in, or permanently for a
-    /// boxed-in bot) we back off for [`PATROL_RETRY_COOLDOWN_SECS`] instead of
-    /// re-running that whole search every frame. `0.0` (the `Default`) attempts
-    /// immediately, so a normal bot fills its loop on the first operational frame.
+    /// empty. Loop generation enqueues reachability routes for several candidate
+    /// tiles; when the bot's anchor area is unreachable (transiently while a
+    /// chunk streams in, or permanently for a boxed-in bot) we back off for
+    /// [`PATROL_RETRY_COOLDOWN_SECS`] before sampling again. `0.0` (the
+    /// `Default`) attempts immediately, so a normal bot starts generating on its
+    /// first operational frame.
     retry_cooldown: f32,
+    /// In-flight reachability checks for the current generation pass:
+    /// `(request id, candidate tile, resolved reachability)`. Empty when no pass
+    /// is running.
+    gen_checks: Vec<(RequestId, (i32, i32), Option<bool>)>,
+    /// Seconds the current generation pass has been awaiting results; bounds it
+    /// so a pruned / never-returned result can't stall generation forever.
+    gen_elapsed: f32,
 }
 
 /// Backoff between empty [`Patrol::loop_tiles`] generation attempts — see
 /// [`Patrol::retry_cooldown`].
 const PATROL_RETRY_COOLDOWN_SECS: f32 = 0.5;
+/// Max seconds a patrol-loop generation pass waits for its reachability routes
+/// before assembling from whatever resolved (unresolved = unreachable).
+const PATROL_GEN_TIMEOUT_S: f32 = 5.0;
 
 pub struct BlackBot {
     state: ActorState,
@@ -468,6 +480,8 @@ impl Plugin for BlackBotPlugin {
                 black_bot_brain
                     .after(flush_actor_occupancy)
                     .before(process_actors)
+                    .after(PathfindSet::Collect)
+                    .before(PathfindSet::Dispatch)
                     .run_if(not(is_paused)),
                 reconcile_charger_occupancy
                     .after(black_bot_brain)
@@ -498,6 +512,8 @@ fn black_bot_brain(
     hypermap: Res<HypermapRuntime>,
     dynamic: Res<DynamicPassabilityMap>,
     remesh: Res<HypermapChunkRemeshQueue>,
+    pathfind_queue: Res<PathfindQueue>,
+    pathfind_results: Res<PathfindResults>,
     mut interactive: ResMut<InteractiveEntityMap>,
     game_log: Res<GameLog>,
     mut indexed: Local<IndexedChargerChunks>,
@@ -598,21 +614,53 @@ fn black_bot_brain(
         vis.offline_released = false;
 
         // Generate the patrol loop once, lazily, from the bot's current (spawn)
-        // tile. It then never changes — the bot sticks to it forever. If a bot's
-        // surroundings yield no reachable waypoint the result is empty; back off
-        // before retrying so we don't re-run the full A* sweep every frame.
+        // tile. It then never changes — the bot sticks to it forever. Generation
+        // enqueues reachability routes for several candidate tiles (off-thread)
+        // and assembles the loop once they resolve; an empty result backs off
+        // before sampling again so we don't re-flood the queue every frame.
         if let Some(p) = patrol.as_mut() {
             if p.loop_tiles.is_empty() {
-                if p.retry_cooldown > 0.0 {
+                if !p.gen_checks.is_empty() {
+                    p.gen_elapsed += dt;
+                    for (id, _tile, reach) in p.gen_checks.iter_mut() {
+                        if reach.is_none() {
+                            if let Some(outcome) = pathfind_results.take(*id) {
+                                *reach = Some(matches!(
+                                    outcome,
+                                    PathOutcome::Route { raw_len, .. } if raw_len > 1
+                                ));
+                            }
+                        }
+                    }
+                    let timed_out = p.gen_elapsed >= PATROL_GEN_TIMEOUT_S;
+                    if timed_out || p.gen_checks.iter().all(|(_, _, r)| r.is_some()) {
+                        let resolved: Vec<((i32, i32), bool)> = p
+                            .gen_checks
+                            .iter()
+                            .map(|(_, tile, r)| (*tile, r.unwrap_or(false)))
+                            .collect();
+                        p.loop_tiles = assemble_patrol_loop(&resolved);
+                        p.gen_checks.clear();
+                        p.gen_elapsed = 0.0;
+                        if p.loop_tiles.is_empty() {
+                            p.retry_cooldown = PATROL_RETRY_COOLDOWN_SECS;
+                        }
+                    }
+                } else if p.retry_cooldown > 0.0 {
                     p.retry_cooldown -= dt;
                 } else {
-                    p.loop_tiles = generate_patrol_loop(
+                    let candidates = enqueue_patrol_candidates(
                         brain.rng_mut(),
                         (current_tile.x, current_tile.y),
                         passability,
+                        &pathfind_queue,
                     );
-                    if p.loop_tiles.is_empty() {
+                    if candidates.is_empty() {
                         p.retry_cooldown = PATROL_RETRY_COOLDOWN_SECS;
+                    } else {
+                        p.gen_checks =
+                            candidates.into_iter().map(|(id, tile)| (id, tile, None)).collect();
+                        p.gen_elapsed = 0.0;
                     }
                 }
             }
@@ -640,6 +688,10 @@ fn black_bot_brain(
                     blocked_flags,
                 }),
                 patrol_loop,
+                pathfind: Some(PathfindAccess {
+                    queue: &pathfind_queue,
+                    results: &pathfind_results,
+                }),
             };
             brain.tick(&ctx, state)
         };
@@ -1172,7 +1224,7 @@ pub fn spawn_black_bot(
     center: Vec2,
 ) -> Entity {
     let spec = BotSpecialization::roll(rng);
-    let brain_seed: u64 = rng.gen_range(0..u64::MAX);
+    let brain_seed: u64 = rng::range(rng, 0..u64::MAX);
     let bot = BlackBot::new(center);
 
     let mat = black_bot_material(materials);

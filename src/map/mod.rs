@@ -25,6 +25,7 @@ pub mod map_generator;
 pub mod hypermap_pathfind;
 pub mod hypermap_world;
 pub mod passability;
+pub mod pathfind_service;
 #[cfg(test)]
 pub mod test_world;
 pub mod world_map;

@@ -116,6 +116,13 @@ pub enum LogEntry {
     ChargingDone { name: String },
     /// A free-form message with an explicit level.
     Message { level: LogLevel, text: String },
+    /// Pathfind queue is deeper than the dispatch cap can drain this frame.
+    PathfindBacklog {
+        queued: usize,
+        in_flight: usize,
+        cached: usize,
+        threshold: usize,
+    },
 }
 
 impl LogEntry {
@@ -128,6 +135,7 @@ impl LogEntry {
             LogEntry::ChargingStarted { .. } => LogLevel::Info,
             LogEntry::ChargingDone { .. } => LogLevel::Success,
             LogEntry::Message { level, .. } => *level,
+            LogEntry::PathfindBacklog { .. } => LogLevel::Warn,
         }
     }
 
@@ -143,6 +151,14 @@ impl LogEntry {
             LogEntry::ChargingStarted { name } => format!("{name} started charging"),
             LogEntry::ChargingDone { name } => format!("{name} finished charging"),
             LogEntry::Message { text, .. } => text.clone(),
+            LogEntry::PathfindBacklog {
+                queued,
+                in_flight,
+                cached,
+                threshold,
+            } => format!(
+                "pathfind backlog: {queued} queued (> {threshold}); {in_flight} in flight, {cached} cached"
+            ),
         }
     }
 }

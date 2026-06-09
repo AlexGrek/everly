@@ -23,20 +23,20 @@ pub mod low_level;
 pub mod priority;
 
 use bevy::prelude::*;
-use rand::rngs::StdRng;
-use rand::SeedableRng;
+use crate::rng::{self, StdRng};
 
 use crate::actor::{ActorMoveBuffer, ActorState};
 use crate::map::hypermap::Hypermap;
 use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
 use crate::map::passability::{DynamicPassabilityMap, SubtilePassability};
+use crate::map::pathfind_service::{PathfindQueue, PathfindResults};
 
 pub use behavior::{Behavior, ChargeSelfKeeper, Patroller, RandomWalker};
 pub use high_level::{
-    generate_patrol_loop, make_high_level, GoToChargeStation, GoToPatrol, GoToRandomPoints,
-    HighLevelAction, HighLevelStatus, RECHARGE_PER_S,
+    assemble_patrol_loop, enqueue_patrol_candidates, make_high_level, GoToChargeStation,
+    GoToPatrol, GoToRandomPoints, HighLevelAction, HighLevelStatus, RECHARGE_PER_S,
 };
-pub use low_level::{FollowPath, FollowTuning, Idle, LowLevelAction, Wait};
+pub use low_level::{FollowPath, FollowTuning, Idle, LowLevelAction, PendingPath, Wait};
 pub use priority::{Priorities, Priority, PriorityKind};
 
 /// Read-only views the low-level subtile bot-on-bot detour needs: the actor's
@@ -53,6 +53,15 @@ pub struct AvoidanceViews<'a> {
     pub static_subtiles: &'a Hypermap<SubtilePassability>,
     /// Flag bits this actor treats as impassable (size-aware footprint test).
     pub blocked_flags: u64,
+}
+
+/// Handles a high-level action uses to drive the async pathfinding service:
+/// enqueue a query and read its result back by id. Both are interior-mutable so
+/// they're usable through the shared `&BrainContext`.
+#[derive(Clone, Copy)]
+pub struct PathfindAccess<'a> {
+    pub queue: &'a PathfindQueue,
+    pub results: &'a PathfindResults,
 }
 
 /// Read-only snapshot of every bot property a behavior / high-level action may
@@ -77,6 +86,9 @@ pub struct BrainContext<'a> {
     /// [`GoToPatrol`](high_level::GoToPatrol). `None` (or empty) for non-patrol
     /// bots and most tests, which disables patrolling.
     pub patrol_loop: Option<&'a [(i32, i32)]>,
+    /// Async pathfinding handles. `None` disables route requests (most unit
+    /// tests that exercise only movement / priority selection).
+    pub pathfind: Option<PathfindAccess<'a>>,
 }
 
 /// Side effects a high-level action requests, applied by the owning ECS system
@@ -149,7 +161,7 @@ impl Brain {
             low_level: Box::new(Idle),
             factory,
             tuning: FollowTuning::default(),
-            rng: StdRng::seed_from_u64(rng_seed),
+            rng: rng::seeded(rng_seed),
             rng_seed,
         }
     }
@@ -232,7 +244,7 @@ impl Brain {
     }
 
     pub fn high_level_label(&self) -> String {
-        self.current.as_ref().map(|a| a.label()).unwrap_or_else(|| "—".to_string())
+        self.current.as_ref().map(|a| a.label()).unwrap_or_else(|| "-".to_string())
     }
 
     pub fn low_level_label(&self) -> String {
@@ -301,6 +313,7 @@ pub(crate) mod test_support {
             interactive: empty_interactive(),
             avoidance: None,
             patrol_loop: None,
+            pathfind: None,
         }
     }
 

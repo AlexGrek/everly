@@ -349,7 +349,7 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                                     ));
                                     titles.spawn((
                                         ActorInspectorTitle,
-                                        Text::new("—"),
+                                        Text::new("-"),
                                         TextFont::from_font_size(24.0),
                                         TextColor(TEXT_BRIGHT),
                                     ));
@@ -375,7 +375,7 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                                 ))
                                 .with_children(|btn| {
                                     btn.spawn((
-                                        Text::new("×"),
+                                        Text::new("X"),
                                         TextFont::from_font_size(20.0),
                                         TextColor(TEXT_MUTED),
                                     ));

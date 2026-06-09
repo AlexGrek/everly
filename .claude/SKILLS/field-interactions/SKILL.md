@@ -73,10 +73,13 @@ paths:
 [`TemperatureMap`](../../src/map/temperature.rs) exists with seed + overlay **and GPU diffusion**
 ([`src/map/temperature_diffusion.rs`](../../src/map/temperature_diffusion.rs),
 `docs/temperature-diffusion.md`): heat spreads on the GPU each frame and is read back into the CPU
-field (still the source of truth). No actor coupling yet — add it via the dirt pattern above.
-The diffusion readback writes the field's **read** buffer directly
-([`TileFieldMap::apply_window_to_read`](../../src/map/tile_field.rs)); actor deposits should keep
-using the write buffer + flush.
+field (still the source of truth). **Bot occupancy heating**
+([`bot_occupancy_heat`](../../src/map/field_interactions.rs)): every
+[`BOT_OCCUPANCY_HEAT_INTERVAL_S`](../../src/map/temperature.rs) (1 s), +[`BOT_OCCUPANCY_HEAT_DELTA_C`](../../src/map/temperature.rs)
+(3 °C) on each **current** main tile occupied by a bot (deduped; skips `Void`). Uses write buffer +
+[`flush_temperature_map`](../../src/map/temperature.rs). The diffusion readback writes the field's
+**read** buffer directly ([`TileFieldMap::apply_window_to_read`](../../src/map/tile_field.rs));
+actor-driven writes should keep using the write buffer + flush.
 
 ## Pitfalls
 

@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 
-use rand::Rng;
+use crate::rng;
 
 use super::draft::{DraftTile, MapDraft};
 use super::step_door::entrypoint_reserved_cells;
@@ -29,7 +29,7 @@ const SIDES: [(i32, i32, ChargerFacing); 4] = [
 impl MapDraft {
     pub fn step_place_charging_stations(&mut self) {
         for index in 0..self.houses.len() {
-            let target = self.rng.gen_range(1..=MAX_CHARGERS_PER_HOUSE);
+            let target = rng::range(&mut self.rng, 1..=MAX_CHARGERS_PER_HOUSE);
             let mut used = HashSet::new();
             for _ in 0..target {
                 let Some((x, z, facing)) = self.pick_charger_site(index, &used) else {
@@ -92,6 +92,6 @@ impl MapDraft {
         if candidates.is_empty() {
             return None;
         }
-        Some(candidates[self.rng.gen_range(0..candidates.len())])
+        Some(*rng::pick(&mut self.rng, &candidates))
     }
 }

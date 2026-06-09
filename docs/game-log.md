@@ -63,6 +63,7 @@ log without exclusive access:
 | `<name> <system> broken` | `err` | `black_bot_brain` when a [`Breakable`](../src/actor/black_bot.rs) part newly breaks (`movement engine`, `control plane`, `sensory system`) |
 | `<name> started charging` | `info` | `black_bot_brain` when `BrainEffects::dock` fires (entering the `Charging` phase) |
 | `<name> finished charging` | `success` | `black_bot_brain` when `BrainEffects::undock` fires (charge reached full) |
+| `pathfind backlog: N queued (> T); …` | `warn` | `pathfind_dispatch` every frame while the pathfind queue depth exceeds `BACKLOG_WARN` (10) |
 
 To add an event: add a `LogEntry` variant with its `level()` and `render()`, then
 `game_log.push_world(world_x, world_y, entry, force)` from the relevant system

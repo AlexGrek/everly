@@ -26,11 +26,11 @@ impl ChunkCoord {
     }
 }
 
-/// Random `u64` for [`rand::SeedableRng::seed_from_u64`] when a chunk is first filled procedurally.
+/// Random `u64` for [`crate::rng::seeded`] when a chunk is first filled procedurally.
 ///
 /// Not derived from chunk coordinates — each first-time generation pass gets a fresh layout.
 pub fn random_rng_seed() -> u64 {
-    rand::random()
+    crate::rng::fresh_seed()
 }
 
 /// Local coordinate inside one 128x128 chunk. Components are `i32` so

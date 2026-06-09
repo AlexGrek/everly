@@ -14,10 +14,12 @@ Current behavior docs:
 - `docs/interactive-entities.md` — sparse per-tile store of stateful reference-type objects (chargers), the `InteractiveEntity` trait/enum, and the `InteractiveEntityMap` resource.
 - `docs/corners.md` — inner `c*` corner pillars (concave union elbows, detection algorithm).
 - `docs/actor.md` — actor trait runtime loop, movement buffer, footprint collision flow, **main tile** (`round(center)`), and usage examples.
+- `docs/actor-brain.md` — BlackBot brain: behaviors, priorities, high/low-level actions, stuck/escape, async routing integration.
+- `docs/pathfind-service.md` — async pathfinding queue (`PathfindQueue` / `PathfindResults`), scheduling, bot enqueue/await flow, test split.
 - `docs/charge.md` — bot **battery charge**: `Charge` component, discharge system, depletion → movement disabled, inspector display, persistence.
 - `docs/chunk-overlay.md` — per-chunk RGBA overlays: temperature heatmap (F5), dirt, generic/paths layer (F6), occupancy debug (F4).
 - `docs/tile-fields.md` — tile-resolution scalar fields (dirt, temperature) and shared `TileFieldMap`.
 - `docs/field-interactions.md` — actor main-tile tracking and dirt deposits on tiles actors leave.
 - `docs/test-world.md` — **shared `TestWorld` fixture** (6×6-chunk generated world) that every game-logic unit test should load.
 
-Agent skills (repo): `.claude/SKILLS/map-creator/SKILL.md` (tilemaps + scale), `.claude/SKILLS/map-generator/SKILL.md` (procedural chunks + room walls), `.claude/SKILLS/bevy-engineer/SKILL.md` (Bevy 0.18 + Everly map constants).
+Agent skills (repo): `.claude/SKILLS/map-creator/SKILL.md` (tilemaps + scale), `.claude/SKILLS/map-generator/SKILL.md` (procedural chunks + room walls), `.claude/SKILLS/bevy-engineer/SKILL.md` (Bevy 0.18 + Everly map constants), `.claude/SKILLS/actor-engineer/SKILL.md` (actor runtime + brain routing).

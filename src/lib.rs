@@ -15,6 +15,7 @@ pub mod edit;
 pub mod hud;
 pub mod map;
 pub mod menu;
+pub mod rng;
 pub mod scene;
 
 /// Aggregates every gameplay subsystem of Everly.
@@ -72,6 +73,7 @@ impl Plugin for GamePlugin {
                 edit::map_selection::MapSelectionPlugin,
             ))
             .add_plugins(hud::overlays::OverlaysPlugin)
+            .add_plugins(map::pathfind_service::PathfindServicePlugin)
             .add_systems(
                 OnEnter(menu::main_menu::GameState::InGame),
                 (
