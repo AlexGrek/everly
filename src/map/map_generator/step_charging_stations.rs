@@ -1,18 +1,22 @@
-//! Step 12: one charging station per house, set against an interior wall.
+//! Step 12: up to three charging stations per house, set against interior walls.
 //!
 //! A charging station ([`DraftTile::Charger`]) is a walkable metal pad whose
 //! glowing cube hangs on the wall behind it. Placement rules mirror the user
 //! intent: inside the house, **backing onto a wall** (the cube's wall), and
 //! **not in a corner**. Concretely a candidate is an interior `Open` cell with
 //! **exactly one** orthogonal neighbor that is a wall of this house — that lone
-//! wall side becomes the charger's [`ChargerFacing`]. The doorway's inner tile
-//! is excluded so the entry stays clear.
+//! wall side becomes the charger's [`ChargerFacing`]. Doorway tiles are excluded.
+
+use std::collections::HashSet;
 
 use rand::Rng;
 
 use super::draft::{DraftTile, MapDraft};
-use super::step_door::entrypoint_inward_tile;
+use super::step_door::entrypoint_reserved_cells;
 use crate::map::world_map::ChargerFacing;
+
+/// Maximum charging stations placed in one house (actual count is random `1..=MAX`).
+const MAX_CHARGERS_PER_HOUSE: i32 = 3;
 
 /// Neighbor deltas paired with the facing they imply (the wall the back faces).
 const SIDES: [(i32, i32, ChargerFacing); 4] = [
@@ -25,33 +29,38 @@ const SIDES: [(i32, i32, ChargerFacing); 4] = [
 impl MapDraft {
     pub fn step_place_charging_stations(&mut self) {
         for index in 0..self.houses.len() {
-            if let Some((x, z, facing)) = self.pick_charger_site(index) {
+            let target = self.rng.gen_range(1..=MAX_CHARGERS_PER_HOUSE);
+            let mut used = HashSet::new();
+            for _ in 0..target {
+                let Some((x, z, facing)) = self.pick_charger_site(index, &used) else {
+                    break;
+                };
                 self.set(x, z, DraftTile::Charger(facing));
+                used.insert((x, z));
             }
         }
     }
 
-    fn pick_charger_site(&mut self, house_index: usize) -> Option<(i32, i32, ChargerFacing)> {
+    fn pick_charger_site(
+        &mut self,
+        house_index: usize,
+        used: &HashSet<(i32, i32)>,
+    ) -> Option<(i32, i32, ChargerFacing)> {
         let (x0, z0, x1, z1) = {
             let h = &self.houses[house_index];
             (h.x0, h.z0, h.x1, h.z1)
         };
 
-        let forbidden: Vec<(i32, i32)> = self.houses[house_index]
-            .entry
-            .as_ref()
-            .map(|e| {
-                let mut cells = vec![
-                    (e.wall_x, e.wall_z),
-                    entrypoint_inward_tile(e.wall_x, e.wall_z, e.outward_edge),
-                ];
-                if let Some((wx2, wz2)) = e.wall2 {
-                    cells.push((wx2, wz2));
-                    cells.push(entrypoint_inward_tile(wx2, wz2, e.outward_edge));
-                }
-                cells
-            })
-            .unwrap_or_default();
+        let mut forbidden: HashSet<(i32, i32)> = HashSet::new();
+        for ep in [
+            self.houses[house_index].entry.as_ref(),
+            self.houses[house_index].entry2.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            forbidden.extend(entrypoint_reserved_cells(ep));
+        }
 
         let mut candidates: Vec<(i32, i32, ChargerFacing)> = Vec::new();
         for z in z0..=z1 {
@@ -62,7 +71,7 @@ impl MapDraft {
                 if !self.houses[house_index].contains(x, z) {
                     continue;
                 }
-                if forbidden.contains(&(x, z)) {
+                if forbidden.contains(&(x, z)) || used.contains(&(x, z)) {
                     continue;
                 }
 

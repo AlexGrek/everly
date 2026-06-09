@@ -295,7 +295,7 @@ pub struct Patrol {
 
 /// Backoff between empty [`Patrol::loop_tiles`] generation attempts — see
 /// [`Patrol::retry_cooldown`].
-const PATROL_RETRY_COOLDOWN_SECS: f32 = 1.0;
+const PATROL_RETRY_COOLDOWN_SECS: f32 = 0.5;
 
 pub struct BlackBot {
     state: ActorState,

@@ -27,7 +27,7 @@ const MAX_TARGET_ATTEMPTS: u32 = 8;
 /// [`simplify_path_line_of_sight`]).
 const PATH_CORNER_BUFFER: usize = 1;
 /// Retry delay when no wander target / charger could be found.
-const RETRY_S: f32 = 0.5;
+const RETRY_S: f32 = 0.25;
 
 /// `true` on the first frame the low-level action reports stuck or finished
 /// since the previous tick it did not (rising edge). Prevents re-running
@@ -52,12 +52,12 @@ pub const RECHARGE_PER_S: f32 = 0.05;
 /// Charge level treated as "full" (undock threshold).
 const CHARGE_FULL: f32 = 0.999;
 /// Retry delay while seeking a charger that isn't currently reachable/free.
-const CHARGE_RETRY_S: f32 = 1.0;
+const CHARGE_RETRY_S: f32 = 0.5;
 /// Enter waiting queue once Manhattan distance to the station is < 5.
 const WAITING_QUEUE_ENTER_DISTANCE: i32 = 4;
 /// Random backoff while holding a waiting-queue slot near a station.
-const WAITING_RECHECK_MIN_S: f32 = 0.2;
-const WAITING_RECHECK_MAX_S: f32 = 0.8;
+const WAITING_RECHECK_MIN_S: f32 = 0.1;
+const WAITING_RECHECK_MAX_S: f32 = 0.4;
 
 /// Result of a [`HighLevelAction::update`].
 pub enum HighLevelStatus {

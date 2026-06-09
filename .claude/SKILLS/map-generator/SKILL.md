@@ -81,11 +81,11 @@ Order in `MapDraft::generate` / `run_into_chunk` — **do not reorder** without 
 7. `step_paint_union_interior` — all house tiles → `Open` (no walls)
 8. `step_build_union_outer_walls` — **`union_perimeter_wall_mask`** on the combined outer shell only
 9. `step_stamp_union_inner_corner_pillars` — [`detect_corner_pillars`](../../src/map/map_generator/corner_pillars.rs) (see **`docs/corners.md`**)
-10. `step_place_house_doors` — **one door per house** (`clear_wall_edge` / fallback carve)
+10. `step_place_house_doors` — **at least one** door per house; **50%** chance of a second non-overlapping door (`step_door.rs`). Each opening prefers 2-wide when geometry allows.
 11. `step_split_houses_into_rooms` — skipped when `footprint_area < 30`. Budget `floor(area / 80)` cuts (ceiling-to-H, floor-to-V, ≤3 each) per house (`step_inner_walls.rs`). Rule: min sub-room area 6, min dim 2, min distance 2 to any parallel wall (outer **and** inner). Stamps `MASK_NORTH` / `MASK_WEST`; skips Corner pillars, concave voids, and the outer door cell. Rooms isolated, no inner doors.
 12. `step_place_inner_doors` — opens one inner-wall slab edge at a time until every walkable house cell is reachable from the entry (`step_inner_doors.rs`). **Edge-based** connectivity: `Wall(bits)` is walkable floor with edge slabs, so a door is a single shared edge with its slab bits cleared (not a whole cell opened). Only interior edges (both cells in-house) are opened — outer shell stays intact.
 13. `step_home_crawlers` — marble wave from main entry; glass center wave only if `footprint_area >= MIN_HOUSE_AREA_FOR_CENTER_WAVE` (30)
-14. `step_place_charging_stations` — **one** `Charger` per house (`step_charging_stations.rs`). Picks an interior `Open` cell with **exactly one** orthogonal wall neighbor (back to wall, not a corner), skipping the door cell + its inner tile; the lone wall side sets the `ChargerFacing`. Runs **after** crawlers (waves only touch `Open`) and chargers stay passable.
+14. `step_place_charging_stations` — **1–3** `Charger` tiles per house, random count (`step_charging_stations.rs`). Each picks an interior `Open` cell with **exactly one** orthogonal wall neighbor (back to wall, not a corner), skipping reserved door tiles; the lone wall side sets `ChargerFacing`. Runs **after** crawlers; chargers stay passable.
 15. `finish` / `write_chunk_floor0_and_styles` — `DraftTile` → `CellType` + `TileStyle` chunk
 16. `build_metadata` → [`GeneratedChunkMetadata`](../../src/map/chunk_metadata.rs) v2 (`houses[]` with embedded `entry`)
 
@@ -135,9 +135,9 @@ Union shell uses `union_perimeter_wall_mask` in `union.rs` (not per-room `perime
 ## Doors
 
 - `is_valid_door_site` — walk tile is exterior road (not inside any house), inward is open floor, single-bit wall only (no L-corner slabs), must not face another house’s wall.
-- `step_place_house_doors` — prefers a widenable site (a valid neighbor along the wall run), opens **both** cells to make a **2-tile-wide doorway**. Falls back to 1-wide when no widenable site exists. The second cell is stored in `HouseEntrypoint.wall2` (chunk metadata v4).
-- Inner walls (`step_inner_walls.rs`) skip **both** door cells (`wall_x/wall_z` and `wall2`).
-- Charger placement (`step_charging_stations.rs`) excludes **both** door cells and both inward tiles.
+- `step_place_house_doors` — always places a primary door; **50%** chance of a second door on a non-overlapping site. Prefers widenable sites for **2-tile-wide** openings. Optional second entry is `GeneratedHouse.entry2`.
+- Inner walls (`step_inner_walls.rs`) skip every outer door wall cell (primary + optional second entry, including each `wall2`).
+- Charger placement (`step_charging_stations.rs`) excludes reserved cells around **all** outer doors and never reuses a charger tile.
 - `step_place_inner_doors` also widens each inner door to 2 tiles: after clearing an edge, it clears the parallel adjacent edge one step along the wall run if both neighbour cells are in-house and blocked.
 - `is_doorway_tile` in `hypermap_pathfind.rs` recognizes both 1- and **2-wide** gaps (band-based check with a widening guard to reject corridors).
 - Crawlers never modify walls.

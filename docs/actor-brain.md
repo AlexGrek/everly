@@ -108,7 +108,7 @@ route around other (moving) bots. When a step is rejected with
    - *Detour* → plan a **subtile-level detour** around the blocker (see below)
      toward the next path node.
    - *Step aside + pause* → step to an adjacent cell and hold there for a random
-     1–3 s (`STEP_BACK_WAIT_*_SECS`). The step is usually **straight back** to the
+     0.5–1.5 s (`STEP_BACK_WAIT_*_SECS`). The step is usually **straight back** to the
      previously occupied cell (`track_tiles` records `prev_tile`), but
      `FollowTuning::bot_strafe_chance` (default `0.3`) of the time it **strafes
      left/right** relative to the heading instead (falling back to straight-back

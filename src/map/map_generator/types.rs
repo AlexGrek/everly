@@ -48,6 +48,9 @@ pub struct GeneratedHouse {
     /// Footprint size in 1×1 m cells (union of rects, no connectivity).
     pub area: i32,
     pub entry: HouseEntrypoint,
+    /// Second exterior doorway when the generator rolls one (≈50%).
+    #[serde(default)]
+    pub entry2: Option<HouseEntrypoint>,
 }
 
 /// Procedural layout reference data for one chunk (persisted as `metadata/{x}_{y}.yaml`).

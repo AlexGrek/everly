@@ -259,13 +259,13 @@ re-ran [`generate_patrol_loop`](src/actor/brain/high_level.rs) whenever
   sweep re-ran **every frame, forever** — a per-frame A\* storm scaling with the
   number of trapped patrol bots.
 - **Fix:** added `Patrol::retry_cooldown` (`f32`, `Default` `0.0`). An empty
-  result sets it to [`PATROL_RETRY_COOLDOWN_SECS`] (1.0 s); while positive it just
-  decrements by `dt` and skips generation. So a stuck bot retries ~once/second
+  result sets it to [`PATROL_RETRY_COOLDOWN_SECS`] (0.5 s); while positive it just
+  decrements by `dt` and skips generation. So a stuck bot retries ~twice/second
   instead of ~60×/second (≈60× fewer A\* sweeps on that degenerate path).
 - **Semantics (rule 8):** the normal case is **identical** — `retry_cooldown`
   starts at `0.0`, so the first frame attempts immediately and a reachable anchor
   fills the loop with no retry ever. Only the unreachable-anchor path changes,
-  and only in *timing* (loop appears up to 1 s later once the area becomes
+  and only in *timing* (loop appears up to 0.5 s later once the area becomes
   reachable). `Patrol` is not serialized, so the new field needs no migration.
 
 Verified green: `cargo test -p everly` (212 passed, 0 failed, 2 ignored) and
@@ -293,8 +293,8 @@ path:
 - **Rule 4 (allocation-free push / deferred string work):** `push` stores a
   plain `LogEntry` struct (copied values) — **no `format!` at push time**.
   Strings are produced by `LogEntry::render` only when actually displayed, then
-  cached on the entry so they are never re-rendered. While the panel is disabled
-  (default) nothing is rendered; the UI rebuilds only when the shown chunk's
+  cached on the entry so they are never re-rendered. While the panel is off,
+  only FORCE-flagged lines are rendered; the UI rebuilds only when the shown chunk's
   queue changed or the camera crossed into a new hypertile. Queues are capped
   (`MAX_LOGS_PER_CHUNK`) so a busy/off-screen chunk can't grow unbounded.
 

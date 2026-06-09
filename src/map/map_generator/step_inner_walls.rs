@@ -9,11 +9,13 @@
 //!   3. the cut is at least [`MIN_PARALLEL_WALL_DISTANCE`] cells away from any
 //!      existing parallel wall — outer perimeter or inner wall placed earlier.
 
+use std::collections::HashSet;
+
 use rand::Rng;
 
 use crate::map::world_map::{MASK_NORTH, MASK_WEST};
 
-use super::draft::{DraftTile, MapDraft};
+use super::step_door::house_entry_wall_cells;
 use super::types::MIN_HOUSE_AREA_FOR_CENTER_WAVE;
 
 /// One inner wall is permitted per this many cells of house footprint area.
@@ -113,17 +115,13 @@ impl MapDraft {
             let h = &self.houses[house_idx];
             (h.x0, h.x1)
         };
-        let (door_cell, door_cell2) = self.houses[house_idx]
-            .entry
-            .as_ref()
-            .map(|e| (Some((e.wall_x, e.wall_z)), e.wall2))
-            .unwrap_or((None, None));
+        let door_cells: HashSet<(i32, i32)> =
+            house_entry_wall_cells(&self.houses[house_idx]).into_iter().collect();
         for x in x0..=x1 {
             if !self.houses[house_idx].contains(x, zw) {
                 continue;
             }
-            // Don't re-seal either outer door cell with an inner wall slab.
-            if door_cell == Some((x, zw)) || door_cell2 == Some((x, zw)) {
+            if door_cells.contains(&(x, zw)) {
                 continue;
             }
             add_wall_bit(self, x, zw, MASK_NORTH);
@@ -135,16 +133,13 @@ impl MapDraft {
             let h = &self.houses[house_idx];
             (h.z0, h.z1)
         };
-        let (door_cell, door_cell2) = self.houses[house_idx]
-            .entry
-            .as_ref()
-            .map(|e| (Some((e.wall_x, e.wall_z)), e.wall2))
-            .unwrap_or((None, None));
+        let door_cells: HashSet<(i32, i32)> =
+            house_entry_wall_cells(&self.houses[house_idx]).into_iter().collect();
         for z in z0..=z1 {
             if !self.houses[house_idx].contains(xw, z) {
                 continue;
             }
-            if door_cell == Some((xw, z)) || door_cell2 == Some((xw, z)) {
+            if door_cells.contains(&(xw, z)) {
                 continue;
             }
             add_wall_bit(self, xw, z, MASK_WEST);

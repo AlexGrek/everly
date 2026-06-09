@@ -1,13 +1,15 @@
 # In-game event log
 
 A top-left overlay that surfaces gameplay events (stuck bots, breakage, charge,
-charging) as short-lived colored lines. Toggled from the **Overlays** panel (opened by the "Overlays" button in the bottom HUD) or its "Log" entry inside, **off by default**. The F-keys and direct buttons for other overlays live in the same panel. Source: [`src/hud/game_log.rs`](../src/hud/game_log.rs).
+charging) as short-lived colored lines. Toggled from the **Overlays** panel (opened by the "Overlays" button in the bottom HUD) or its "Log" entry inside, **on by default**. The F-keys and direct buttons for other overlays live in the same panel. Source: [`src/hud/game_log.rs`](../src/hud/game_log.rs).
 
 ## Behavior
 
-- **Toggle.** The "Log" entry inside the **Overlays** panel (or the old direct "Log" button when it existed) flips `GameLog.enabled`. Default off: events
-  are still recorded; only lines with the **FORCE** flag are displayed until the
-  panel is turned on. The F4/F5/F6 equivalents for other overlays are also collected in the Overlays panel (opened from the bottom HUD "Overlays" button).
+- **Toggle.** The "Log" entry inside the **Overlays** panel (or the old direct "Log" button when it existed) flips `GameLog.enabled`. Default on: all
+  events on the camera's hypertile are shown. When off, events are still
+  recorded but only lines with the **FORCE** flag are displayed. The F4/F5/F6
+  equivalents for other overlays are also collected in the Overlays panel (opened
+  from the bottom HUD "Overlays" button).
 - **FORCE.** Every push carries a `force` bit. When an actor's
   [`ActorForceLogs`](../src/actor/actor_pick.rs) is enabled (inspector **Debug**
   tab → "Force logs"), its events are pushed with `force: true` and remain

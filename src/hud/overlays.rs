@@ -260,7 +260,7 @@ fn spawn_overlays_ui(mut commands: Commands, camera: Query<Entity, With<Strategy
                             spawn_vis_button(ctrls, OverlaysHeatmapButton, OverlaysHeatmapLabel, "Heat: Off");
                             spawn_vis_button(ctrls, OverlaysPathButton, OverlaysPathLabel, "Path: Off");
                             spawn_vis_button(ctrls, OverlaysWaterButton, OverlaysWaterLabel, "Water: On");
-                            spawn_vis_button(ctrls, OverlaysLogButton, OverlaysLogLabel, "Log: Off");
+                            spawn_vis_button(ctrls, OverlaysLogButton, OverlaysLogLabel, "Log: On");
                         });
                     });
             });

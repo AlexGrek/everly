@@ -15,6 +15,8 @@ pub(crate) struct House {
     /// Union of rect cells in the bounding box (1 m² per cell); not connectivity-based.
     pub footprint_area: i32,
     pub entry: Option<HouseEntrypoint>,
+    /// Optional second exterior doorway (50% chance during generation).
+    pub entry2: Option<HouseEntrypoint>,
 }
 
 impl House {
@@ -32,6 +34,7 @@ impl House {
             z1: rect.z1,
             footprint_area: 0,
             entry: None,
+            entry2: None,
         };
         House {
             footprint_area: footprint_cell_area(&house),
@@ -63,6 +66,7 @@ impl House {
             center_z,
             area: self.footprint_area,
             entry: self.entry.clone().expect("house must have entry before metadata"),
+            entry2: self.entry2.clone(),
         }
     }
 }
@@ -109,6 +113,7 @@ pub(crate) fn cluster_houses(room_records: &[RoomRecord]) -> Vec<House> {
                 z1,
                 footprint_area: 0,
                 entry: None,
+                entry2: None,
             };
             House {
                 footprint_area: footprint_cell_area(&house),

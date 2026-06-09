@@ -40,8 +40,8 @@ const DETOUR_MAX_EXPANDED: usize = 1024;
 
 /// Inclusive bounds (seconds) of the pause a bot holds after stepping aside from
 /// a head-on bot-on-bot bump.
-const STEP_BACK_WAIT_MIN_SECS: f32 = 1.0;
-const STEP_BACK_WAIT_MAX_SECS: f32 = 3.0;
+const STEP_BACK_WAIT_MIN_SECS: f32 = 0.5;
+const STEP_BACK_WAIT_MAX_SECS: f32 = 1.5;
 /// Speed (tiles/s) below which a post-step-aside hold counts as "stopped".
 const CONTACT_WAIT_STOP_SPEED: f32 = 0.08;
 /// Half-width (tiles) of the square scanned for a free cell when a stalled bot
@@ -82,7 +82,7 @@ impl Default for FollowTuning {
             accel: 2.5,
             decel: 6.0,
             waypoint_eps: 0.05,
-            stuck_repath_secs: 2.0,
+            stuck_repath_secs: 1.0,
             stuck_progress_eps: 0.05,
             bot_detour_chance: 0.5,
             bot_strafe_chance: 0.3,

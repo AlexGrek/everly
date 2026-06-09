@@ -1,9 +1,11 @@
-//! Step 9: one functional doorway per house onto exterior road (not another building).
+//! Step 9: one or two functional doorways per house onto exterior road.
+
+use std::collections::HashSet;
 
 use rand::Rng;
 
 use super::draft::{DraftTile, MapDraft};
-use super::house::{house_contains, house_on_perimeter};
+use super::house::{house_contains, house_on_perimeter, House};
 use super::types::HouseEntrypoint;
 use crate::map::world_map::{MASK_EAST, MASK_NORTH, MASK_SOUTH, MASK_WEST};
 
@@ -14,45 +16,72 @@ const NEIGHBORS: [(i32, i32, u8); 4] = [
     (-1, 0, MASK_WEST),
 ];
 
+/// Probability of placing a second exterior door on the opposite/other wall run.
+const SECOND_DOOR_PROBABILITY: f32 = 0.5;
+
 impl MapDraft {
-    /// Exactly one door per house; only accepts sites that open onto road, not other houses.
+    /// At least one door per house; a second door is placed with [`SECOND_DOOR_PROBABILITY`].
     /// Doors are widened to 2 tiles when a valid neighbor along the wall run exists.
     pub fn step_place_house_doors(&mut self) {
         let house_count = self.houses.len();
         for index in 0..house_count {
-            let mut valid = collect_valid_door_sites(self, index);
-            if valid.is_empty() {
-                valid = collect_force_door_sites(self, index);
-            }
-            if valid.is_empty() {
+            let Some(primary) = self.place_one_house_door(index, &HashSet::new()) else {
                 continue;
-            }
-            // Prefer a site that can be widened to 2 tiles.
-            let widenable: Vec<_> = valid
-                .iter()
-                .copied()
-                .filter(|&(x, z, edge)| find_wide_companion(self, index, x, z, edge).is_some())
-                .collect();
-            let pick = if !widenable.is_empty() {
-                widenable[self.rng.gen_range(0..widenable.len())]
-            } else {
-                valid[self.rng.gen_range(0..valid.len())]
             };
-            open_doorway(self, pick.0, pick.1, pick.2);
-            let companion = find_wide_companion(self, index, pick.0, pick.1, pick.2);
-            if let Some((cx, cz)) = companion {
-                open_doorway(self, cx, cz, pick.2);
+            self.houses[index].entry = Some(primary);
+
+            if self.rng.gen::<f32>() < SECOND_DOOR_PROBABILITY {
+                let reserved: HashSet<(i32, i32)> =
+                    entrypoint_reserved_cells(self.houses[index].entry.as_ref().unwrap())
+                        .into_iter()
+                        .collect();
+                if let Some(second) = self.place_one_house_door(index, &reserved) {
+                    self.houses[index].entry2 = Some(second);
+                }
             }
-            let (walk_x, walk_z) = entrypoint_walk_tile(pick.0, pick.1, pick.2);
-            self.houses[index].entry = Some(HouseEntrypoint {
-                walk_x,
-                walk_z,
-                wall_x: pick.0,
-                wall_z: pick.1,
-                outward_edge: pick.2,
-                wall2: companion,
-            });
         }
+    }
+
+    fn place_one_house_door(
+        &mut self,
+        house_index: usize,
+        exclude: &HashSet<(i32, i32)>,
+    ) -> Option<HouseEntrypoint> {
+        let mut valid = filter_door_sites(collect_valid_door_sites(self, house_index), exclude);
+        if valid.is_empty() {
+            valid = filter_door_sites(collect_force_door_sites(self, house_index), exclude);
+        }
+        if valid.is_empty() {
+            return None;
+        }
+        let widenable: Vec<_> = valid
+            .iter()
+            .copied()
+            .filter(|&(x, z, edge)| {
+                find_wide_companion(self, house_index, x, z, edge)
+                    .is_some_and(|comp| !exclude.contains(&comp))
+            })
+            .collect();
+        let pick = if !widenable.is_empty() {
+            widenable[self.rng.gen_range(0..widenable.len())]
+        } else {
+            valid[self.rng.gen_range(0..valid.len())]
+        };
+        open_doorway(self, pick.0, pick.1, pick.2);
+        let companion = find_wide_companion(self, house_index, pick.0, pick.1, pick.2)
+            .filter(|comp| !exclude.contains(comp));
+        if let Some((cx, cz)) = companion {
+            open_doorway(self, cx, cz, pick.2);
+        }
+        let (walk_x, walk_z) = entrypoint_walk_tile(pick.0, pick.1, pick.2);
+        Some(HouseEntrypoint {
+            walk_x,
+            walk_z,
+            wall_x: pick.0,
+            wall_z: pick.1,
+            outward_edge: pick.2,
+            wall2: companion,
+        })
     }
 }
 
@@ -66,6 +95,42 @@ pub(crate) fn entrypoint_walk_tile(wall_x: i32, wall_z: i32, outward_edge: u8) -
 pub(crate) fn entrypoint_inward_tile(wall_x: i32, wall_z: i32, outward_edge: u8) -> (i32, i32) {
     let (dx, dz) = outward_delta(outward_edge);
     (wall_x - dx, wall_z - dz)
+}
+
+/// Tiles reserved around one doorway so a second door does not overlap it.
+pub(crate) fn entrypoint_reserved_cells(ep: &HouseEntrypoint) -> Vec<(i32, i32)> {
+    let mut cells = vec![
+        (ep.wall_x, ep.wall_z),
+        entrypoint_walk_tile(ep.wall_x, ep.wall_z, ep.outward_edge),
+        entrypoint_inward_tile(ep.wall_x, ep.wall_z, ep.outward_edge),
+    ];
+    if let Some((wx2, wz2)) = ep.wall2 {
+        cells.push((wx2, wz2));
+        cells.push(entrypoint_inward_tile(wx2, wz2, ep.outward_edge));
+    }
+    cells
+}
+
+/// Every outer door wall cell for a house (primary + optional second entry).
+pub(crate) fn house_entry_wall_cells(house: &House) -> Vec<(i32, i32)> {
+    let mut cells = Vec::new();
+    for ep in [house.entry.as_ref(), house.entry2.as_ref()].into_iter().flatten() {
+        cells.push((ep.wall_x, ep.wall_z));
+        if let Some(w2) = ep.wall2 {
+            cells.push(w2);
+        }
+    }
+    cells
+}
+
+fn filter_door_sites(
+    sites: Vec<(i32, i32, u8)>,
+    exclude: &HashSet<(i32, i32)>,
+) -> Vec<(i32, i32, u8)> {
+    sites
+        .into_iter()
+        .filter(|&(x, z, _)| !exclude.contains(&(x, z)))
+        .collect()
 }
 
 fn outward_delta(outward_edge: u8) -> (i32, i32) {

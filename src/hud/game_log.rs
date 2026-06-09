@@ -22,7 +22,7 @@
 //! that string is cached on the [`StoredLog`] so it is never re-rendered. We
 //! only ever render the queue for **the hypertile the camera is currently on**;
 //! every other chunk's events stay as structs and age out unrendered. While the
-//! panel is disabled (the default), only FORCE-flagged lines are rendered.
+//! panel is disabled, only FORCE-flagged lines are rendered.
 //!
 //! ## Lifetime
 //! Every line lives [`LOG_LIFETIME_SECS`] seconds and then disappears.
@@ -193,18 +193,26 @@ impl ChunkLog {
 
 /// The event-log store and display toggle.
 ///
-/// Disabled by default: events are still recorded (as structs, grouped per
-/// hypertile), they are simply never rendered or shown until the panel is
-/// enabled from the bottom HUD. Accessed through a shared [`Res<GameLog>`] — all
-/// mutation goes through interior locks/atomics, so any system (parallel or not)
-/// can log without exclusive access.
-#[derive(Resource, Default)]
+/// Enabled by default. When off, events are still recorded (as structs, grouped
+/// per hypertile) but only FORCE-flagged lines are rendered. Accessed through a
+/// shared [`Res<GameLog>`] — all mutation goes through interior locks/atomics,
+/// so any system (parallel or not) can log without exclusive access.
+#[derive(Resource)]
 pub struct GameLog {
-    /// When `false`, events are stored but never rendered or displayed.
+    /// When `false`, only FORCE-flagged lines are rendered.
     enabled: AtomicBool,
     /// Per-hypertile queues. Read-locked on the warm push path; write-locked
     /// only to create a new chunk's queue.
     chunks: RwLock<HashMap<ChunkCoord, Mutex<ChunkLog>>>,
+}
+
+impl Default for GameLog {
+    fn default() -> Self {
+        Self {
+            enabled: AtomicBool::new(true),
+            chunks: RwLock::new(HashMap::new()),
+        }
+    }
 }
 
 impl GameLog {
