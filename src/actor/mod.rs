@@ -32,9 +32,8 @@ pub mod inspect;
 pub mod resurrect;
 pub mod snapshot;
 
-use std::sync::Mutex;
-
 use bevy::prelude::*;
+use bevy::utils::Parallel;
 
 use crate::map::hypermap::Hypermap;
 use crate::map::hypermap_world::HypermapRuntime;
@@ -594,10 +593,11 @@ pub(crate) fn process_actors(
     // deferred out of the parallel pass into the sequential one below: re-entry
     // resolution both reads *and* writes the dynamic write buffer, so it must
     // run one actor at a time or two simultaneous re-entrants could be packed
-    // onto the same cell. The lock guards only this rare transition path — never
-    // the steady-state movement path — and stays empty (no allocation) when no
-    // actor re-enters this frame.
-    let reentering: Mutex<Vec<Entity>> = Mutex::new(Vec::new());
+    // onto the same cell. Collected lock-free into per-thread queues (no shared
+    // lock in the parallel pass) and drained + sorted afterward for an
+    // order-independent result. Stays empty (no allocation) when no actor
+    // re-enters this frame.
+    let reentering: Parallel<Vec<Entity>> = Parallel::default();
 
     {
     let _t = timings.scope(TimedSystem::ParallelPass);
@@ -622,7 +622,7 @@ pub(crate) fn process_actors(
                     par_commands.command_scope(|mut commands| {
                         commands.entity(entity).remove::<OffScreenActor>();
                     });
-                    reentering.lock().expect("reentry lock poisoned").push(entity);
+                    reentering.borrow_local_mut().push(entity);
                 } else {
                     actor.try_move(dynamic_passability, static_cache);
                 }
@@ -645,9 +645,11 @@ pub(crate) fn process_actors(
     // so each re-entrant avoids those too. Sorting by entity makes the placement
     // order — and therefore the result — independent of the thread scheduling
     // that filled `reentering`.
-    let mut reentering = reentering.into_inner().expect("reentry lock poisoned");
-    reentering.sort_unstable();
-    for entity in reentering {
+    let mut reentering = reentering;
+    let mut reentered: Vec<Entity> = Vec::new();
+    reentering.drain_into(&mut reentered);
+    reentered.sort_unstable();
+    for entity in reentered {
         if let Ok((_, mut actor_obj, _)) = actors.get_mut(entity) {
             resolve_offscreen_collision(actor_obj.inner.as_mut(), dynamic_passability, static_cache);
         }

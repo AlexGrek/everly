@@ -66,7 +66,9 @@ Then hunt for performance problems, checking each changed/targeted area against
 the `OPTIMIZATION.md` rules. Look specifically for:
 
 - **Global locks on hot paths** — any `Mutex`/`RwLock`/global cache hit per
-  entity, per cell, or per frame (rule 1).
+  entity, per cell, or per frame (rule 1). Treat **every** shared `Mutex`/`RwLock`
+  on a concurrent path as a candidate for a lock-free structure, not just maps —
+  see "Prefer lock-free for every shared structure" below.
 - **Non-hypertile-local access** — per-cell chunk resolution, per-cell global
   table locks, `Arc` clones in a loop over one region (rule 2).
 - **Large-value clones to read one field** — value-returning getters that copy a
@@ -85,6 +87,33 @@ or **minor** (small constant, cold path, or stylistic).
 
 Present the findings ranked, with `file:line` references and the rule each
 violates, before changing anything. Re-run all tests before moving on.
+
+### Prefer lock-free for every shared structure (not only hashmaps)
+
+The default for any data shared across threads on a hot path is a **lock-free**
+representation. Reach for a `Mutex`/`RwLock` only when the access is genuinely
+sequential (single-threaded/main-thread-only) or a rare cold path, and say so.
+Map each locked structure to its lock-free replacement by *what it does*, not by
+its type:
+
+| Locked structure | Lock-free replacement |
+|---|---|
+| `Mutex/RwLock<HashMap>` with concurrent per-entry insert/remove | `papaya::HashMap` (mutate a value through `retain`'s shared `&V` via an `AtomicU*`/atomic field) |
+| `RwLock<Map>` read-mostly + rare **wholesale** replace | `arc-swap::ArcSwap<Arc<Map>>` (lock-free `load`, atomic single-pointer `store` keeps a wholesale swap atomic for readers) |
+| `arc-swap` doesn't fit and order matters | `crossbeam-skiplist` (ordered, lock-free) |
+| `Mutex<Vec>`/`Mutex<VecDeque>` MPSC/MPMC queue across threads | `crossbeam-queue` (`SegQueue`/`ArrayQueue`), or `crossbeam-channel` |
+| `Mutex<Vec>` *collected* from inside a `par_iter_mut` | `bevy::utils::Parallel<T>` (thread-local queues, drain after) |
+| `Mutex<counter>` / `Mutex<bool>` / small POD flag | `AtomicU*`/`AtomicBool`/`AtomicUsize` (`Relaxed` unless an ordering edge is needed) |
+| `Mutex<single value/config snapshot>` swapped occasionally | `arc-swap::ArcSwap<T>` |
+| Per-key cache built once, indexed by a small key | `OnceLock` slot table, or `&'static` baked + leaked (rule 1) |
+
+Rules of thumb: a value mutated through a lock-free container's shared `&V` needs
+interior mutability (an atomic field) — never reach for a lock to do the mutation.
+A wholesale-replace structure must keep the replace **atomic** for concurrent
+readers (single `ArcSwap::store`), or you reintroduce the partial-read race the
+lock was preventing — verify which invariant the original lock provided and
+preserve it (rule 8). `arc-swap` (v1) and `papaya` (v0.2) are already vendored;
+`crossbeam-*` is the next reach if a queue/skiplist is needed.
 
 ## Step 2 — Do the work
 
@@ -132,8 +161,14 @@ entries you added. Surface any minor issues still awaiting a user decision.
 - Tests between every step, baseline included. Never advance on a red or
   warning-dirty tree.
 - Correctness first: a faster-but-different result is a regression, not an
-  optimization.
-- Don't add a new top-level dependency to chase performance; prefer what Bevy /
-  std already provide.
+  optimization. A lock-free swap of a wholesale-replaced structure MUST stay
+  atomic for readers — preserve whatever invariant the original lock provided.
+- Default to lock-free for shared hot-path structures of **every** kind (maps,
+  queues, counters, flags, single values) — see "Prefer lock-free for every
+  shared structure." The established lock-free toolkit (`arc-swap`, `papaya`,
+  std atomics, `bevy::utils::Parallel`, and `crossbeam-*` when a queue/skiplist is
+  needed) is approved; prefer it over a `Mutex`/`RwLock` on any concurrent path.
+- Beyond that toolkit, don't add a new top-level dependency to chase performance;
+  prefer what Bevy / std already provide.
 - Don't micro-optimize cold paths or invent benchmarks the user didn't ask for —
   spend effort where it scales with entities, tiles, or frames.

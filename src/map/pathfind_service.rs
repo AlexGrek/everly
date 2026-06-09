@@ -14,7 +14,7 @@
 //! movement systems free of the heavy search work.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use bevy::math::IVec2;
@@ -163,46 +163,45 @@ impl PathfindQueue {
 }
 
 /// Finished results keyed by [`RequestId`], with an age used for pruning.
+///
+/// A lock-free concurrent map: up to [`MAX_IN_FLIGHT`] async pathfind workers
+/// insert finished outcomes without serializing on a shared `Mutex`, while the
+/// brain reads results back on the main thread. The per-entry age is an
+/// [`AtomicU32`] (holding `f32` bits) so [`age_and_prune`](Self::age_and_prune)
+/// can accumulate `dt` through the shared `&` reference papaya's `retain` hands
+/// out, keeping the original TTL semantics intact.
 #[derive(Resource, Default)]
 pub struct PathfindResults {
-    map: Mutex<HashMap<RequestId, (PathOutcome, f32)>>,
+    map: papaya::HashMap<RequestId, (PathOutcome, AtomicU32)>,
 }
 
 impl PathfindResults {
     fn insert(&self, id: RequestId, outcome: PathOutcome) {
         self.map
-            .lock()
-            .expect("pathfind results poisoned")
-            .insert(id, (outcome, 0.0));
+            .pin()
+            .insert(id, (outcome, AtomicU32::new(0.0f32.to_bits())));
     }
 
     /// Removes and returns the outcome for `id` if it has arrived.
     pub fn take(&self, id: RequestId) -> Option<PathOutcome> {
-        self.map
-            .lock()
-            .expect("pathfind results poisoned")
-            .remove(&id)
-            .map(|(outcome, _)| outcome)
+        self.map.pin().remove(&id).map(|(outcome, _)| outcome.clone())
     }
 
     /// `true` when a result for `id` is available (without consuming it).
     pub fn contains(&self, id: RequestId) -> bool {
-        self.map
-            .lock()
-            .expect("pathfind results poisoned")
-            .contains_key(&id)
+        self.map.pin().contains_key(&id)
     }
 
     fn age_and_prune(&self, dt: f32, ttl: f32) {
-        let mut map = self.map.lock().expect("pathfind results poisoned");
-        map.retain(|_, (_, age)| {
-            *age += dt;
-            *age < ttl
+        self.map.pin().retain(|_, (_, age)| {
+            let aged = f32::from_bits(age.load(AtomicOrdering::Relaxed)) + dt;
+            age.store(aged.to_bits(), AtomicOrdering::Relaxed);
+            aged < ttl
         });
     }
 
     fn len(&self) -> usize {
-        self.map.lock().expect("pathfind results poisoned").len()
+        self.map.pin().len()
     }
 
     /// Test helper: pre-install a finished outcome so brain state-machine tests

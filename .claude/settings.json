@@ -29,7 +29,8 @@
       "Edit(/.claude/skills/map-generator/**)",
       "Bash(\" | head -30)",
       "Bash(cargo fetch *)",
-      "Bash(cargo tree *)"
+      "Bash(cargo tree *)",
+      "Bash(xargs -I{} echo \"errors+warnings: {}\")"
     ],
     "additionalDirectories": [
       "/tmp"

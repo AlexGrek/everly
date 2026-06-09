@@ -18,7 +18,17 @@ that goal.
    work, even when the protected data never changes after first build. Prefer
    lock-free reads: `OnceLock` slot tables indexed by a small key, atomics, or
    immutable `&'static` data baked once and leaked. Keep a lock only for a rare,
-   off-hot-path fallback (e.g. a pathological input size).
+   off-hot-path fallback (e.g. a pathological input size). Even an uncontended
+   `RwLock::read()` does a shared-atomic RMW that cache-line-bounces across cores
+   under many-reader load — for read-mostly tables prefer a lock-free read view.
+   Tools proven here: **`arc-swap::ArcSwap<Arc<Map>>`** for a read-mostly table
+   with rare *wholesale* replacement (lock-free `load`, atomic single-pointer
+   `store` keeps a wholesale swap atomic for concurrent readers — see the
+   hypermap chunk table); **`papaya::HashMap`** for a table with concurrent
+   per-entry inserts/removes from many threads (use an `AtomicU32`/`AtomicU64`
+   field for any value mutated through `retain`'s shared `&V`); and Bevy's
+   **`bevy::utils::Parallel<T>`** (thread-local queues) instead of a `Mutex<Vec>`
+   to collect from inside a `par_iter_mut`.
 
 2. **Be hypertile-local: resolve a chunk once, not once per cell.** Hypermap
    access costs a global chunk-table lock + `HashMap` lookup + `Arc` clone to
@@ -375,3 +385,53 @@ Verified green: `cargo test -p everly` (226 passed, 0 failed, 2 ignored) and
 
 Verified green: `cargo test -p everly` (239 passed, 0 failed, 2 ignored) and
 `cargo check -p everly` warning-clean.
+
+### Lock-free hot-path tables — chunk-table read snapshot, concurrent results map, parallel re-entry queue (2026-06)
+
+Migrated three concurrency-control sites off process-global locks (rule 1), after
+auditing every `Mutex`/`RwLock` in `src/`. New deps: `arc-swap = "1"`,
+`papaya = "0.2"`.
+
+1. **Hypermap chunk table — lock-free reads + atomic wholesale flush**
+   ([`src/map/hypermap.rs`](src/map/hypermap.rs)). `Hypermap<T>.chunks` was a
+   single `RwLock<HashMap<ChunkCoord, Arc<RwLock<Chunk>>>>`: **every** chunk
+   resolution (parallel actors in `process_actors` + the ≤10 async pathfind
+   workers) took the table read lock, and the double-buffered occupancy *write*
+   map — drained every frame by `flush()` — re-created each touched chunk under
+   the table **write** lock inside the `par_iter_mut` pass. Added an
+   `ArcSwap<ChunkTable<T>>` read snapshot beside the authoritative
+   `RwLock<HashMap>`: all reads (`get_chunk` / `has_chunk` / `loaded_chunk_count`
+   / `loaded_chunks`) `load()` the immutable snapshot lock-free; the write lock is
+   taken only on a *structural* change (create / drain / replace), which then
+   `republish`es via a single atomic `snapshot.store`. This keeps the read-side
+   wholesale flush (`replace_chunks`) **atomic** for the concurrent async workers
+   that read the dynamic-occupancy read map across frames — a worker always sees a
+   fully-old or fully-new table, never a partial one (the correctness invariant
+   the original `RwLock` provided). Rules 1, 2, 6.
+
+2. **`PathfindResults` — concurrent lock-free results map**
+   ([`src/map/pathfind_service.rs`](src/map/pathfind_service.rs)). The finished-
+   route store was a `Mutex<HashMap<RequestId, (PathOutcome, f32)>>` that all ≤10
+   async workers serialized on to insert outcomes (plus the brain's per-frame
+   `take` / `age_and_prune`). Now a `papaya::HashMap<RequestId, (PathOutcome,
+   AtomicU32)>`: workers insert lock-free. The age is an `AtomicU32` (holding
+   `f32` bits) so `age_and_prune` still accumulates `dt` in place through the
+   shared `&V` papaya's `retain` hands out — TTL semantics are byte-identical
+   (`results_age_out_after_ttl` unchanged). Rule 1.
+
+3. **`process_actors` re-entry queue — Bevy `Parallel<Vec>`**
+   ([`src/actor/mod.rs`](src/actor/mod.rs)). The off-screen→on-screen re-entry
+   list was a `Mutex<Vec<Entity>>` locked from inside the `par_iter_mut` pass
+   (rare transition path, but a lock in the parallel loop). Replaced with
+   `bevy::utils::Parallel<Vec<Entity>>` (thread-local queues, no shared lock),
+   drained + `sort_unstable`d afterward — the sort already made the result
+   order-independent, so behavior is unchanged. Rule 1/5.
+
+Static standalone `Hypermap`s benefit from the same lock-free reads. Left as-is
+(intentionally): `PathfindQueue.pending` (`Mutex<VecDeque>`, enqueue+pop both
+main-thread/sequential), the tile-field/dirt/temperature `dirty`/`seeded`/
+`hydrated` mutexes (sequential per-frame seed/flush systems), and the radius-≥32
+shadow-cache fallback (documented cold path, never hit).
+
+Verified green: `cargo test -p everly` (246 passed, 0 failed, 2 ignored) and
+`cargo check -p everly --all-targets` warning-clean.
