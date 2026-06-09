@@ -141,9 +141,9 @@ impl ChargerFacing {
     }
 }
 
-/// Which wall slab a lamp cube sits on top of. Token prefix `l`, suffix matches
-/// wall-direction letters (`n/s/e/w`). Directions match the wall bitmask:
-/// north → −Z, south → +Z, east → +X, west → −X.
+/// Which direction a lamp faces — used for both inner sconces (on wall cell,
+/// facing into room) and outer sconces (on road cell, facing toward wall).
+/// Directions: north → −Z, south → +Z, east → +X, west → −X.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LampFacing {
     North,
@@ -153,7 +153,7 @@ pub enum LampFacing {
 }
 
 impl LampFacing {
-    /// Unit XZ direction from cell center toward the slab the lamp sits on.
+    /// Unit XZ direction from this cell toward the wall the lamp is mounted on.
     pub fn slab_dir(self) -> (f32, f32) {
         match self {
             LampFacing::North => (0.0, -1.0),
@@ -162,17 +162,34 @@ impl LampFacing {
             LampFacing::West => (-1.0, 0.0),
         }
     }
+
+    /// Direction opposite to `self` (north↔south, east↔west).
+    pub fn opposite(self) -> Self {
+        match self {
+            LampFacing::North => LampFacing::South,
+            LampFacing::South => LampFacing::North,
+            LampFacing::East => LampFacing::West,
+            LampFacing::West => LampFacing::East,
+        }
+    }
 }
 
 /// Per-cell decoration stored in the decoration map. Default is `None`.
+///
+/// - `Lamp(f)`: inner wall sconce stored on the **wall cell**; `f` is the slab
+///   direction the cube mounts on (cube protrudes into the room).
+/// - `LampOuter(f)`: outer wall sconce stored on the **adjacent road cell**;
+///   `f` is the direction from this road cell toward the wall it hangs from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LampDecoration {
     #[default]
     None,
     Lamp(LampFacing),
+    LampOuter(LampFacing),
 }
 
-/// Parses a 2-character decoration token (`ln`/`ls`/`le`/`lw` or `..`).
+/// Parses a 2-character decoration token.
+/// `ln/ls/le/lw` = inner sconce; `LN/LS/LE/LW` = outer sconce; `..` = none.
 pub(crate) fn parse_lamp_token(token: &str) -> Option<LampDecoration> {
     match token {
         ".." => Some(LampDecoration::None),
@@ -180,6 +197,10 @@ pub(crate) fn parse_lamp_token(token: &str) -> Option<LampDecoration> {
         "ls" => Some(LampDecoration::Lamp(LampFacing::South)),
         "le" => Some(LampDecoration::Lamp(LampFacing::East)),
         "lw" => Some(LampDecoration::Lamp(LampFacing::West)),
+        "LN" => Some(LampDecoration::LampOuter(LampFacing::North)),
+        "LS" => Some(LampDecoration::LampOuter(LampFacing::South)),
+        "LE" => Some(LampDecoration::LampOuter(LampFacing::East)),
+        "LW" => Some(LampDecoration::LampOuter(LampFacing::West)),
         _ => None,
     }
 }
@@ -192,6 +213,10 @@ pub(crate) fn lamp_to_token(d: LampDecoration) -> &'static str {
         LampDecoration::Lamp(LampFacing::South) => "ls",
         LampDecoration::Lamp(LampFacing::East) => "le",
         LampDecoration::Lamp(LampFacing::West) => "lw",
+        LampDecoration::LampOuter(LampFacing::North) => "LN",
+        LampDecoration::LampOuter(LampFacing::South) => "LS",
+        LampDecoration::LampOuter(LampFacing::East) => "LE",
+        LampDecoration::LampOuter(LampFacing::West) => "LW",
     }
 }
 

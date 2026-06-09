@@ -127,22 +127,37 @@ in `src/map/world_map.rs`; meshing lives in `src/map/hypermap_world.rs`
 Procedural placement (one per house, against an interior wall, not in a corner) is in
 `src/map/map_generator/step_charging_stations.rs` — see `docs/map-generator.md`.
 
-### Lamp decoration (`ln` / `ls` / `le` / `lw`)
+### Lamp decoration (`ln`/`ls`/`le`/`lw` · `LN`/`LS`/`LE`/`LW`)
 
 A **lamp** is a glowing cube decoration stored in a **separate** decoration file
 (`levels/level_{name}/decoration_lamp/{x}_{y}.txt`), independent of the geometry
-and style layers. The cube sits **on top of the wall slab** named by the second
-letter, centered on that slab's XZ position. It never affects passability.
+and style layers. It never affects passability. Two variants:
 
-| Token | Wall slab | Cube position (relative to cell center) |
-|-------|-----------|------------------------------------------|
-| `ln`  | North (−Z) | X = 0, Z = −LAMP_SLAB_INSET (= −0.4 m) |
-| `ls`  | South (+Z) | X = 0, Z = +0.4 m |
-| `le`  | East (+X)  | X = +0.4 m, Z = 0 |
-| `lw`  | West (−X)  | X = −0.4 m, Z = 0 |
+**Inner sconce** (`ln`/`ls`/`le`/`lw`) — stored on the **wall cell**; the
+cube mounts flush against the wall's inner face at `LAMP_WALL_HEIGHT` (2.0 m),
+protruding into the room by half the cube depth.
 
-Cube size: `WALL_THICKNESS` (0.2 m) on each side. Center Y: `WALL_HEIGHT + 0.1 m` (3.1 m).
-Each lamp spawns one static warm-white point light above the cube (no shadows).
+| Token | Slab | Cube center (from wall-cell center) |
+|-------|------|-------------------------------------|
+| `ln`  | North (−Z) | X = 0, Z = −`LAMP_WALL_OFFSET` (= −0.2 m) |
+| `ls`  | South (+Z) | X = 0, Z = +0.2 m |
+| `le`  | East (+X)  | X = +0.2 m, Z = 0 |
+| `lw`  | West (−X)  | X = −0.2 m, Z = 0 |
+
+**Outer sconce** (`LN`/`LS`/`LE`/`LW`) — stored on the **road cell** adjacent to
+the wall (outside the building); the letter is the direction from this road cell
+toward the wall it hangs from. The cube mounts flush against the wall's outer face,
+protruding outward.
+
+| Token | Wall direction from road cell | Cube center (from road-cell center) |
+|-------|-------------------------------|-------------------------------------|
+| `LN`  | North (wall to the −Z side)   | Z = −`LAMP_SLAB_INSET` (= −0.4 m) |
+| `LS`  | South                         | Z = +0.4 m |
+| `LE`  | East                          | X = +0.4 m |
+| `LW`  | West                          | X = −0.4 m |
+
+Cube size: `WALL_THICKNESS` (0.2 m) on each side. Center Y: `LAMP_WALL_HEIGHT` (2.0 m).
+Each lamp spawns one static warm-white point light at the cube center (no shadows).
 
 Tokens `..` (no decoration) are the default. Placement is procedurally generated (see
 [`docs/map-generator.md`](map-generator.md)) and can be authored by hand in the decoration file

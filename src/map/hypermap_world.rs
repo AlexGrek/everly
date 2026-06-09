@@ -2156,10 +2156,10 @@ fn append_charger_connector(
 
 /// Builds a batch mesh of all lamp cubes for a chunk (floor 0).
 ///
-/// Each lamp cube is a wall sconce: LAMP_SIZE³ mounted on the inner face of
-/// the wall slab at LAMP_WALL_HEIGHT, offset by LAMP_WALL_OFFSET from the
-/// cell center along the slab direction (flush against the inner face,
-/// protruding into the room by half the cube depth).
+/// Inner sconce (`Lamp`): offset `LAMP_WALL_OFFSET` from wall cell center along
+/// the slab direction (flush against the inner face, protruding into the room).
+/// Outer sconce (`LampOuter`): offset `LAMP_SLAB_INSET` from road cell center
+/// toward the wall (flush against the wall's outer face, protruding outward).
 fn build_floor0_lamp_mesh(
     cells: &[(i32, i32, LampDecoration)],
     origin_x: i32,
@@ -2170,20 +2170,22 @@ fn build_floor0_lamp_mesh(
     let mut uvs = Vec::new();
     let mut indices = Vec::new();
     for &(x, y, decoration) in cells {
-        let LampDecoration::Lamp(facing) = decoration else {
-            continue;
-        };
         let cx = origin_x as f32 + x as f32 + 0.5;
         let cz = origin_y as f32 + y as f32 + 0.5;
+        let (facing, offset) = match decoration {
+            LampDecoration::Lamp(f) => (f, LAMP_WALL_OFFSET),
+            LampDecoration::LampOuter(f) => (f, LAMP_SLAB_INSET),
+            LampDecoration::None => continue,
+        };
         let (dx, dz) = facing.slab_dir();
         append_box(
             &mut positions,
             &mut normals,
             &mut uvs,
             &mut indices,
-            cx + dx * LAMP_WALL_OFFSET,
+            cx + dx * offset,
             LAMP_WALL_HEIGHT,
-            cz + dz * LAMP_WALL_OFFSET,
+            cz + dz * offset,
             LAMP_SIZE,
             LAMP_SIZE,
             LAMP_SIZE,
@@ -2201,14 +2203,14 @@ fn spawn_floor0_lamp_lights(
     origin_y: i32,
 ) {
     for &(x, y, decoration) in cells {
-        let LampDecoration::Lamp(facing) = decoration else {
-            continue;
+        let (facing, offset) = match decoration {
+            LampDecoration::Lamp(f) => (f, LAMP_WALL_OFFSET),
+            LampDecoration::LampOuter(f) => (f, LAMP_SLAB_INSET),
+            LampDecoration::None => continue,
         };
         let (dx, dz) = facing.slab_dir();
-        // Light sits at the lamp cube center, matching the sconce position.
-        let lx = origin_x as f32 + x as f32 + 0.5 + dx * LAMP_WALL_OFFSET;
-        let lz = origin_y as f32 + y as f32 + 0.5 + dz * LAMP_WALL_OFFSET;
-        let light_y = LAMP_WALL_HEIGHT;
+        let lx = origin_x as f32 + x as f32 + 0.5 + dx * offset;
+        let lz = origin_y as f32 + y as f32 + 0.5 + dz * offset;
         let light = commands
             .spawn((
                 Name::new(format!("Lamp light {x},{y}")),
@@ -2219,7 +2221,7 @@ fn spawn_floor0_lamp_lights(
                     shadows_enabled: false,
                     ..default()
                 },
-                Transform::from_xyz(lx, light_y, lz),
+                Transform::from_xyz(lx, LAMP_WALL_HEIGHT, lz),
                 NotShadowCaster,
             ))
             .id();

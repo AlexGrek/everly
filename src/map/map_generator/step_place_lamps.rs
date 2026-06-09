@@ -1,24 +1,27 @@
-//! Step 15: 3–7 lamp decorations per house, placed on wall cells of both inner
-//! and outer walls.
+//! Step 11: 3–7 lamp decorations per house, placed on wall cells (inner sconces)
+//! and on road cells adjacent to outer walls (exterior sconces).
 //!
-//! A lamp sits on top of the wall slab in the given facing direction. Eligibility:
-//! - The cell is a `Wall` tile (not Corner, not Charger, not Open).
-//! - The facing direction is one of the wall's own slab bits.
-//! - At least one neighbour in the facing direction is an `Open` cell (road or
-//!   house interior) — prevents floating lamps on dead walls.
-//! - The cell does not already have a lamp, and is not a charger cell.
+//! Inner sconce (`Lamp`): stored on a Wall cell; the facing bit must exist in
+//! the wall mask; the adjacent cell in that direction must be passable interior.
+//!
+//! Outer sconce (`LampOuter`): stored on a road cell just outside the house;
+//! the facing is the direction FROM the road cell TOWARD the adjacent wall, whose
+//! slab must face back toward the road cell. Prevents floating lamps.
 
 use std::collections::HashSet;
 
 use crate::rng;
 
 use super::draft::{DraftTile, MapDraft};
-use crate::map::world_map::{LampDecoration, LampFacing, MASK_EAST, MASK_NORTH, MASK_SOUTH, MASK_WEST};
+use crate::map::world_map::{
+    LampDecoration, LampFacing, MASK_EAST, MASK_NORTH, MASK_SOUTH, MASK_WEST,
+};
 
 const MIN_LAMPS_PER_HOUSE: i32 = 3;
 const MAX_LAMPS_PER_HOUSE: i32 = 7;
 
-/// (dx, dz, mask_bit, LampFacing)
+/// (dx, dz, mask_bit, LampFacing) — direction of movement, slab bitmask for
+/// an inner wall in that direction, and the facing value stored on the lamp.
 const WALL_DIRS: [(i32, i32, u8, LampFacing); 4] = [
     (0, -1, MASK_NORTH, LampFacing::North),
     (0, 1, MASK_SOUTH, LampFacing::South),
@@ -26,16 +29,28 @@ const WALL_DIRS: [(i32, i32, u8, LampFacing); 4] = [
     (-1, 0, MASK_WEST, LampFacing::West),
 ];
 
+/// Given movement direction (dx, dz) from road cell to wall cell, returns the
+/// slab bitmask the wall must have facing BACK toward the road cell.
+fn slab_bit_toward_road(dx: i32, dz: i32) -> u8 {
+    match (dx, dz) {
+        (0, -1) => MASK_SOUTH, // moved north to wall → wall faces south back to road
+        (0, 1) => MASK_NORTH,
+        (1, 0) => MASK_WEST,
+        (-1, 0) => MASK_EAST,
+        _ => 0,
+    }
+}
+
 impl MapDraft {
     pub fn step_place_lamps(&mut self) {
         for index in 0..self.houses.len() {
             let count = rng::range(&mut self.rng, MIN_LAMPS_PER_HOUSE..=MAX_LAMPS_PER_HOUSE);
             let mut used: HashSet<(i32, i32)> = HashSet::new();
             for _ in 0..count {
-                let Some((x, z, facing)) = self.pick_lamp_site(index, &used) else {
+                let Some((x, z, decoration)) = self.pick_lamp_site(index, &used) else {
                     break;
                 };
-                self.set_lamp(x, z, LampDecoration::Lamp(facing));
+                self.set_lamp(x, z, decoration);
                 used.insert((x, z));
             }
         }
@@ -45,39 +60,31 @@ impl MapDraft {
         &mut self,
         house_index: usize,
         used: &HashSet<(i32, i32)>,
-    ) -> Option<(i32, i32, LampFacing)> {
+    ) -> Option<(i32, i32, LampDecoration)> {
         let (x0, z0, x1, z1) = {
             let h = &self.houses[house_index];
-            // Extend bounds by 1 to also consider outer wall cells just outside the interior.
-            (h.x0 - 1, h.z0 - 1, h.x1 + 1, h.z1 + 1)
+            (h.x0, h.z0, h.x1, h.z1)
         };
 
-        let mut candidates: Vec<(i32, i32, LampFacing)> = Vec::new();
+        let mut candidates: Vec<(i32, i32, LampDecoration)> = Vec::new();
 
-        for z in z0..=z1 {
-            for x in x0..=x1 {
+        // ── Inner lamp candidates ───────────────────────────────────────────
+        // Wall cell with a slab bit whose adjacent cell is interior (Open / Charger).
+        for z in (z0 - 1)..=(z1 + 1) {
+            for x in (x0 - 1)..=(x1 + 1) {
                 if !self.in_bounds(x, z) {
                     continue;
                 }
                 let DraftTile::Wall(mask) = self.get(x, z) else {
                     continue;
                 };
-                if used.contains(&(x, z)) {
+                if used.contains(&(x, z)) || self.get_lamp(x, z) != LampDecoration::None {
                     continue;
                 }
-                // No lamp where a charger already occupies an adjacent cell
-                // (chargers are Open cells next to walls, not the wall itself).
-                // Also skip cells already decorated.
-                if self.get_lamp(x, z) != LampDecoration::None {
-                    continue;
-                }
-
                 for &(dx, dz, bit, facing) in &WALL_DIRS {
                     if mask & bit == 0 {
                         continue;
                     }
-                    // The cell in the slab direction must be passable (Open) — prevents
-                    // lamps hanging over solid or void territory.
                     let nx = x + dx;
                     let nz = z + dz;
                     if !self.in_bounds(nx, nz) {
@@ -86,7 +93,45 @@ impl MapDraft {
                     if !matches!(self.get(nx, nz), DraftTile::Open | DraftTile::Charger(_)) {
                         continue;
                     }
-                    candidates.push((x, z, facing));
+                    if !self.houses[house_index].contains(nx, nz) {
+                        continue;
+                    }
+                    candidates.push((x, z, LampDecoration::Lamp(facing)));
+                }
+            }
+        }
+
+        // ── Outer lamp candidates ───────────────────────────────────────────
+        // Road cell just outside the house adjacent to an outward-facing wall slab.
+        for z in (z0 - 2)..=(z1 + 2) {
+            for x in (x0 - 2)..=(x1 + 2) {
+                if !self.in_bounds(x, z) {
+                    continue;
+                }
+                if self.get(x, z) != DraftTile::Open {
+                    continue;
+                }
+                // Must be exterior — not inside the house footprint.
+                if self.houses[house_index].contains(x, z) {
+                    continue;
+                }
+                if used.contains(&(x, z)) || self.get_lamp(x, z) != LampDecoration::None {
+                    continue;
+                }
+                for &(dx, dz, _bit, facing) in &WALL_DIRS {
+                    let wx = x + dx;
+                    let wz = z + dz;
+                    if !self.in_bounds(wx, wz) {
+                        continue;
+                    }
+                    let DraftTile::Wall(mask) = self.get(wx, wz) else {
+                        continue;
+                    };
+                    // Wall must have the slab that faces back toward this road cell.
+                    if mask & slab_bit_toward_road(dx, dz) == 0 {
+                        continue;
+                    }
+                    candidates.push((x, z, LampDecoration::LampOuter(facing)));
                 }
             }
         }
