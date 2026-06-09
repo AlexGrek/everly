@@ -11,6 +11,7 @@ use bevy::ui::widget::Button;
 
 use crate::actor::black_bot::{self, BlackBotRng};
 use crate::actor::glitch_bot::{self, GlitchBotRng};
+use crate::actor::resurrect::{resurrect_all_button, ResurrectAllButton};
 use crate::edit::map_edit::{
     ray_intersect_horizontal_plane, void_preview_plane, MapEditPaletteRoot, MapEditPreviewMaterial,
     MapEditState,
@@ -40,6 +41,9 @@ const TEXT_MAIN: Color = Color::srgba(0.94, 0.95, 0.97, 0.92);
 const KILL_BTN_BG: Color = Color::srgba(0.22, 0.10, 0.10, 0.85);
 const KILL_BTN_BORDER: Color = Color::srgba(0.75, 0.28, 0.28, 0.6);
 const KILL_TEXT: Color = Color::srgb(0.95, 0.55, 0.55);
+const RESURRECT_BTN_BG: Color = Color::srgba(0.10, 0.22, 0.14, 0.85);
+const RESURRECT_BTN_BORDER: Color = Color::srgba(0.35, 0.78, 0.45, 0.6);
+const RESURRECT_TEXT: Color = Color::srgb(0.55, 0.95, 0.65);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ActorKind {
@@ -105,6 +109,7 @@ impl Plugin for ActorSpawnPlugin {
                     )
                         .chain(),
                     actor_spawn_right_click_cancel,
+                    resurrect_all_button,
                 )
                     .run_if(in_state(GameState::InGame)),
             );
@@ -177,6 +182,30 @@ pub(crate) fn spawn_actor_spawn_palette(
                     ));
                 });
             }
+            row.spawn((
+                Name::new("Actor spawn resurrect all"),
+                ResurrectAllButton,
+                Button,
+                Node {
+                    min_width: Val::Px(108.0),
+                    height: Val::Px(32.0),
+                    padding: UiRect::horizontal(Val::Px(12.0)),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    border: UiRect::all(Val::Px(1.0)),
+                    border_radius: BorderRadius::all(Val::Px(5.0)),
+                    ..default()
+                },
+                BorderColor::all(RESURRECT_BTN_BORDER),
+                BackgroundColor(RESURRECT_BTN_BG),
+            ))
+            .with_children(|p| {
+                p.spawn((
+                    Text::new("Resurrect all"),
+                    TextFont::from_font_size(15.0),
+                    TextColor(RESURRECT_TEXT),
+                ));
+            });
         });
 }
 

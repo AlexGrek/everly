@@ -6,7 +6,7 @@ use bevy::prelude::*;
 use bevy::ui::widget::Button;
 
 use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
-use crate::actor::black_bot::{BotSpecialization, Breakable};
+use crate::actor::black_bot::{BlackBotVisual, BotSpecialization, Breakable};
 use crate::actor::brain::Brain;
 use crate::actor::charge::Charge;
 use crate::actor::glitch_bot::GlitchBotVisual;
@@ -866,7 +866,7 @@ fn sync_actor_inspector_modal(
     existing_rows: Query<Entity, With<ActorInspectorRow>>,
     existing_actions: Query<Entity, With<ActorInspectorActionBtn>>,
     actor_data: Query<(&ActorObject, Option<&Name>), With<ActorInspectable>>,
-    black: Query<(&Brain, Option<&BotSpecialization>)>,
+    black: Query<(&Brain, &BlackBotVisual, Option<&BotSpecialization>)>,
     glitch: Query<&GlitchBotVisual>,
     actor_extras: Query<(Option<&Charge>, Option<&Breakable>)>,
     force_logs: Query<&ActorForceLogs>,
@@ -915,11 +915,18 @@ fn sync_actor_inspector_modal(
 
     let kind_label;
     let rows;
-    if let Ok((brain, spec)) = black.get(actor) {
+    if let Ok((brain, vis, spec)) = black.get(actor) {
         kind_label = "BlackBot";
         let Ok((obj, _)) = actor_data.get(actor) else { return };
         rows = match *tab {
-            InspectorTab::Status => status_rows(obj, charge, Some(brain), None, spec.copied()),
+            InspectorTab::Status => status_rows(
+                obj,
+                charge,
+                Some(brain),
+                None,
+                spec.copied(),
+                Some(vis.collision_pressure()),
+            ),
             InspectorTab::Systems => breakable.map(|b| systems_rows(b)).unwrap_or_default(),
             InspectorTab::Route => route_rows(brain),
             InspectorTab::Debug => debug_rows(force_logs_on),
@@ -928,7 +935,7 @@ fn sync_actor_inspector_modal(
         kind_label = "GlitchBot";
         let Ok((obj, _)) = actor_data.get(actor) else { return };
         rows = match *tab {
-            InspectorTab::Status => status_rows(obj, charge, None, Some(vis), None),
+            InspectorTab::Status => status_rows(obj, charge, None, Some(vis), None, None),
             InspectorTab::Systems | InspectorTab::Route => Vec::new(),
             InspectorTab::Debug => debug_rows(force_logs_on),
         };

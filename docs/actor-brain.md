@@ -106,6 +106,22 @@ ignored, exactly mirroring the movement response below (both call
 [`is_front_collision`](../src/actor/mod.rs)). The material is only rewritten when
 the displayed color changes, so a settled bot costs no per-frame asset writes.
 
+### Collision pressure reset
+
+BlackBots track a per-entity **collision pressure** counter (inspector:
+`collision_pressure`). Each frame after [`process_actors`](../src/actor/mod.rs),
+`track_black_bot_collision_pressure` applies the same collision gate as the red
+flash (wall graze or **head-on** bot-on-bot bump; rear bumps ignored):
+
+- blocked frame → **+5**
+- clear frame → **−1**, floored at **0**
+
+When pressure reaches **50**, the bot is reset: [`Brain::reset`](../src/actor/brain/mod.rs)
+wipes the plan, movement intent is cleared, charger queue slots are released via
+[`InteractiveEntityMap::evict_actor_everywhere`](../src/map/interactive_entity.rs),
+and the in-game log records `<name> reset (collision pressure)`. Pressure is
+zeroed. Depleted and broken bots do not accumulate pressure.
+
 ### Bot-on-bot collision response
 
 `FollowPath`'s tile path is planned on **static** geometry only, so it does not
@@ -255,7 +271,11 @@ shared routine wish value lives in `behavior_utils.rs`.
 - **`GoToRandomPoints`** (serves `RandomWalking`) — samples a random walkable
   tile, enqueues a `WorldRoute`, parks in `PendingPath`, installs `FollowPath`
   when the result lands (or resamples on `NoPath` / 3 s timeout). Perpetual. On
-  `stuck` rising edge, immediately enqueues a fresh target.
+  `stuck` rising edge, immediately enqueues a fresh target. Each leg also carries
+  a travel budget of **initial Manhattan distance × 3 s** (from the tile where
+  the route was requested to the goal); if the bot is still following when the
+  budget expires, it abandons the leg, logs `wander timed out`, and samples a
+  new destination.
 - **`GoToPatrol`** (serves `Patrolling`) — walks a *fixed* loop of cells forever.
   The loop lives on the bot's `Patrol` component (generated lazily by
   `black_bot_brain` via `enqueue_patrol_candidates` + `assemble_patrol_loop` from
@@ -265,7 +285,9 @@ shared routine wish value lives in `behavior_utils.rs`.
   — the brain rebuilds it whenever `Patrolling` becomes dominant again (e.g.
   after a recharge pre-empts it) — so on (re)creation it snaps its cursor to
   the loop waypoint **nearest the bot**, resuming "where it stopped". On `stuck`,
-  it skips the unreachable waypoint and tries the next. Perpetual.
+  it skips the unreachable waypoint and tries the next. Each leg uses the same
+  **initial Manhattan distance × 3 s** travel budget; on expiry the bot logs
+  `skipped patrol waypoint` and advances to the next loop tile. Perpetual.
 - **`GoToChargeStation`** (serves `RechargeYourself`) — `Seeking` → `Traveling` →
   `WaitingQueue` → `Charging`:
   - gather chargers in the bot's 4 nearest hypertiles (current chunk + nearest X/Y

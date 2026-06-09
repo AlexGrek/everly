@@ -29,7 +29,8 @@ use crate::actor::actor_name::random_actor_name;
 use crate::actor::actor_pick::{ActorForceLogs, ActorInspectable, ActorPickMesh};
 use crate::actor::brain::{
     assemble_patrol_loop, enqueue_patrol_candidates, make_high_level, AvoidanceViews, Behavior,
-    Brain, BrainContext, BrainEffects, ChargeSelfKeeper, PathfindAccess, Patroller, RandomWalker,
+    Brain, BrainContext, BrainEffects, BrainLogEvent, ChargeSelfKeeper, PathfindAccess, Patroller,
+    RandomWalker,
 };
 use crate::actor::charge::Charge;
 use crate::actor::snapshot::{BreakablePartSnap, BreakableSnap};
@@ -84,6 +85,12 @@ const BROKEN_WHITE: Color = Color::srgb(1.0, 1.0, 1.0);
 /// Seconds for the red collision flash to fade fully back to black. Short so a
 /// bump reads as a quick blink rather than a lingering state.
 const COLLISION_FLASH_FADE_SECS: f32 = 0.45;
+/// Collision pressure added on a frame whose movement step is blocked.
+const COLLISION_PRESSURE_PER_HIT: u32 = 5;
+/// Collision pressure removed on a frame with no counted collision.
+const COLLISION_PRESSURE_DECAY: u32 = 1;
+/// Collision pressure at which the bot's brain is reset and queues cleared.
+const COLLISION_PRESSURE_RESET: u32 = 50;
 /// Seconds for the yellow stuck flash to fade fully back to black.
 const STUCK_FLASH_FADE_SECS: f32 = 2.5;
 
@@ -141,6 +148,13 @@ pub struct Breakable {
 }
 
 impl Breakable {
+    /// Clears `broken` on every sub-component; wear is unchanged.
+    pub fn repair_all(&mut self) {
+        self.movement_engine.broken = false;
+        self.control_plane.broken = false;
+        self.sensory_system.broken = false;
+    }
+
     pub fn new() -> Self {
         Self {
             movement_engine: BreakablePartState::new(),
@@ -204,11 +218,26 @@ pub struct BlackBotVisual {
     /// `true` once charge depletion has been logged; cleared when charge rises
     /// above zero again.
     depleted_logged: bool,
+    /// Accumulated collision pressure; +5 per blocked frame, −1 per clear frame
+    /// (floored at 0). At [`COLLISION_PRESSURE_RESET`] the brain is reset.
+    collision_pressure: u32,
 }
 
 impl BlackBotVisual {
     pub fn main_tile(&self) -> Option<IVec2> {
         self.main_tile
+    }
+
+    pub fn collision_pressure(&self) -> u32 {
+        self.collision_pressure
+    }
+
+    /// Clears offline / log latches after a palette **Resurrect all**.
+    pub fn on_resurrect(&mut self) {
+        self.offline_released = false;
+        self.depleted_logged = false;
+        self.stuck_logged = false;
+        self.collision_pressure = 0;
     }
 }
 
@@ -487,6 +516,7 @@ impl Plugin for BlackBotPlugin {
                     .after(black_bot_brain)
                     .before(crate::map::hypermap_world::SyncChargerVisualsSet),
                 sync_black_bot_transforms.after(process_actors),
+                track_black_bot_collision_pressure.after(process_actors),
                 sync_black_bot_status_visual.after(process_actors),
                 paint_black_bot_targets.after(process_actors).run_if(|e: Res<crate::map::chunk_overlay::PathOverlayEnabled>| e.0),
             )
@@ -745,6 +775,23 @@ fn black_bot_brain(
                 force,
             );
         }
+        if let Some(log) = effects.log {
+            let entry = match log {
+                BrainLogEvent::WanderDestinationTimedOut { goal } => {
+                    LogEntry::WanderDestinationTimedOut {
+                        name: name.to_string(),
+                        goal_x: goal.0,
+                        goal_y: goal.1,
+                    }
+                }
+                BrainLogEvent::PatrolWaypointSkipped { waypoint } => LogEntry::PatrolWaypointSkipped {
+                    name: name.to_string(),
+                    waypoint_x: waypoint.0,
+                    waypoint_y: waypoint.1,
+                },
+            };
+            game_log.push_world(current_tile.x, current_tile.y, entry, force);
+        }
 
         apply_brain_effects(entity, &effects, &mut interactive, charge.as_deref_mut());
     }
@@ -885,6 +932,84 @@ fn sync_black_bot_transforms(
     }
 }
 
+/// `true` when this frame's movement step counts as a collision for BlackBot
+/// status (wall graze or head-on bot-on-bot bump; rear bumps ignored).
+fn black_bot_frame_collided(state: &ActorState, heading: Vec2) -> bool {
+    match state.last_movement_error {
+        Some(ActorMovementError::BlockedByStatic { .. }) => true,
+        Some(ActorMovementError::BlockedByOccupancy { world_subtile_x, world_subtile_y }) => {
+            is_front_collision(state.center, heading, world_subtile_x, world_subtile_y)
+        }
+        _ => false,
+    }
+}
+
+/// Advances collision pressure for one frame. Returns the new value and whether
+/// the bot should be reset.
+fn tick_collision_pressure(pressure: u32, collided: bool) -> (u32, bool) {
+    if collided {
+        let next = pressure.saturating_add(COLLISION_PRESSURE_PER_HIT);
+        if next >= COLLISION_PRESSURE_RESET {
+            (0, true)
+        } else {
+            (next, false)
+        }
+    } else {
+        (pressure.saturating_sub(COLLISION_PRESSURE_DECAY), false)
+    }
+}
+
+/// Tracks per-frame collision pressure and resets jammed bots once pressure
+/// reaches [`COLLISION_PRESSURE_RESET`]. Runs after [`process_actors`] so
+/// `last_movement_error` reflects the current frame.
+fn track_black_bot_collision_pressure(
+    game_log: Res<GameLog>,
+    mut interactive: ResMut<InteractiveEntityMap>,
+    mut query: Query<(
+        Entity,
+        &Name,
+        &mut ActorObject,
+        &mut Brain,
+        &mut BlackBotVisual,
+        &ActorForceLogs,
+        Option<&Charge>,
+        Option<&Breakable>,
+    )>,
+) {
+    for (entity, name, mut obj, mut brain, mut vis, force_logs, charge, breakable) in &mut query {
+        let depleted = charge.is_some_and(|c| c.is_depleted());
+        let broken = breakable
+            .as_ref()
+            .map_or(false, |b| b.movement_engine.broken || b.control_plane.broken);
+        if depleted || broken {
+            vis.collision_pressure = 0;
+            continue;
+        }
+
+        let state = obj.inner.state();
+        let collided = black_bot_frame_collided(state, brain.velocity());
+        let (next, should_reset) = tick_collision_pressure(vis.collision_pressure, collided);
+        vis.collision_pressure = next;
+
+        if !should_reset {
+            continue;
+        }
+
+        let tile = actor_main_tile(state.center);
+        brain.reset();
+        let state = obj.inner.state_mut();
+        state.move_buffer = ActorMoveBuffer::default();
+        state.next_waypoint_hint = None;
+        interactive.evict_actor_everywhere(entity);
+        game_log.push_world(
+            tile.x,
+            tile.y,
+            LogEntry::BotCollisionReset { name: name.to_string() },
+            force_logs.0,
+        );
+    }
+}
+
 /// Linearly interpolates two colors in sRGB space (`t` clamped to `0.0..=1.0`).
 fn lerp_srgb(a: Color, b: Color, t: f32) -> Color {
     let a = a.to_srgba();
@@ -925,14 +1050,7 @@ fn sync_black_bot_status_visual(
         // counts when it is **head-on** — a rear bump is ignored (mirrors the
         // movement response in `FollowPath`).
         let state = obj.inner.state();
-        let collided = match state.last_movement_error {
-            Some(ActorMovementError::BlockedByStatic { .. }) => true,
-            Some(ActorMovementError::BlockedByOccupancy { world_subtile_x, world_subtile_y }) => {
-                is_front_collision(state.center, brain.velocity(), world_subtile_x, world_subtile_y)
-            }
-            _ => false,
-        };
-        if collided {
+        if black_bot_frame_collided(state, brain.velocity()) {
             vis.collision_flash = 1.0;
         }
 
@@ -1191,6 +1309,7 @@ pub fn spawn_black_bot_from_snapshot(
                 offline_released: false,
                 stuck_logged: false,
                 depleted_logged: false,
+                collision_pressure: 0,
             },
             spec.build_brain(rng_seed),
             ActorObject::new(Box::new(bot)),
@@ -1245,6 +1364,7 @@ pub fn spawn_black_bot(
                 offline_released: false,
                 stuck_logged: false,
                 depleted_logged: false,
+                collision_pressure: 0,
             },
             spec.build_brain(brain_seed),
             ActorObject::new(Box::new(bot)),
@@ -1268,4 +1388,34 @@ pub fn spawn_black_bot(
 
     commands.entity(parent).add_children(&[mesh_child, ring_child]);
     parent
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collision_pressure_grows_on_hit_and_decays_on_clear_frames() {
+        let (p, reset) = tick_collision_pressure(0, true);
+        assert_eq!((p, reset), (5, false));
+
+        let (p, reset) = tick_collision_pressure(p, true);
+        assert_eq!((p, reset), (10, false));
+
+        let (p, reset) = tick_collision_pressure(p, false);
+        assert_eq!((p, reset), (9, false));
+
+        let (p, reset) = tick_collision_pressure(1, false);
+        assert_eq!((p, reset), (0, false));
+    }
+
+    #[test]
+    fn collision_pressure_resets_at_threshold() {
+        let (p, reset) = tick_collision_pressure(45, true);
+        assert_eq!((p, reset), (0, true), "45 + 5 reaches the reset threshold");
+
+        let (p, reset) = tick_collision_pressure(48, true);
+        assert_eq!((p, reset), (0, true), "48 + 5 also crosses the threshold");
+        assert_eq!(p, 0, "pressure is cleared after reset");
+    }
 }

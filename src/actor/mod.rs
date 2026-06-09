@@ -29,6 +29,7 @@ pub mod brain;
 pub mod charge;
 pub mod glitch_bot;
 pub mod inspect;
+pub mod resurrect;
 pub mod snapshot;
 
 use std::sync::Mutex;

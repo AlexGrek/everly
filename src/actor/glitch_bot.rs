@@ -94,6 +94,11 @@ impl GlitchBotVisual {
     pub fn collision_streak(&self) -> u32 {
         self.collision_streak
     }
+
+    /// Clears log latches after a palette **Resurrect all**.
+    pub fn on_resurrect(&mut self) {
+        self.depleted_logged = false;
+    }
 }
 
 /// Seeded RNG resource shared across bot spawns for deterministic colors/seeds.

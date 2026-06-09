@@ -123,6 +123,20 @@ pub enum LogEntry {
         cached: usize,
         threshold: usize,
     },
+    /// A wander bot gave up on its current random destination after the travel budget expired.
+    WanderDestinationTimedOut {
+        name: String,
+        goal_x: i32,
+        goal_y: i32,
+    },
+    /// A patrol bot skipped a loop waypoint after the travel budget expired.
+    PatrolWaypointSkipped {
+        name: String,
+        waypoint_x: i32,
+        waypoint_y: i32,
+    },
+    /// A BlackBot's collision pressure hit the reset threshold; brain replans from scratch.
+    BotCollisionReset { name: String },
 }
 
 impl LogEntry {
@@ -136,6 +150,10 @@ impl LogEntry {
             LogEntry::ChargingDone { .. } => LogLevel::Success,
             LogEntry::Message { level, .. } => *level,
             LogEntry::PathfindBacklog { .. } => LogLevel::Warn,
+            LogEntry::WanderDestinationTimedOut { .. } | LogEntry::PatrolWaypointSkipped { .. } => {
+                LogLevel::Unexpected
+            }
+            LogEntry::BotCollisionReset { .. } => LogLevel::Warn,
         }
     }
 
@@ -159,6 +177,15 @@ impl LogEntry {
             } => format!(
                 "pathfind backlog: {queued} queued (> {threshold}); {in_flight} in flight, {cached} cached"
             ),
+            LogEntry::WanderDestinationTimedOut { name, goal_x, goal_y } => {
+                format!("{name} wander timed out ({goal_x}, {goal_y})")
+            }
+            LogEntry::PatrolWaypointSkipped {
+                name,
+                waypoint_x,
+                waypoint_y,
+            } => format!("{name} skipped patrol waypoint ({waypoint_x}, {waypoint_y})"),
+            LogEntry::BotCollisionReset { name } => format!("{name} reset (collision pressure)"),
         }
     }
 }
@@ -467,6 +494,26 @@ mod tests {
         let e = LogEntry::ChargingDone { name: "Bolt".to_string() };
         assert_eq!(e.level(), LogLevel::Success);
         assert_eq!(e.render(), "Bolt finished charging");
+
+        let e = LogEntry::WanderDestinationTimedOut {
+            name: "Wanderer".to_string(),
+            goal_x: 3,
+            goal_y: -2,
+        };
+        assert_eq!(e.level(), LogLevel::Unexpected);
+        assert_eq!(e.render(), "Wanderer wander timed out (3, -2)");
+
+        let e = LogEntry::PatrolWaypointSkipped {
+            name: "Guard".to_string(),
+            waypoint_x: 10,
+            waypoint_y: 4,
+        };
+        assert_eq!(e.level(), LogLevel::Unexpected);
+        assert_eq!(e.render(), "Guard skipped patrol waypoint (10, 4)");
+
+        let e = LogEntry::BotCollisionReset { name: "Jam".to_string() };
+        assert_eq!(e.level(), LogLevel::Warn);
+        assert_eq!(e.render(), "Jam reset (collision pressure)");
     }
 
     #[test]

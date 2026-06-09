@@ -42,6 +42,7 @@ pub fn black_bot_rows(
     brain: &Brain,
     main_tile: IVec2,
     spec: Option<BotSpecialization>,
+    collision_pressure: Option<u32>,
 ) -> Vec<InspectRow> {
     let priority = brain
         .current_priority()
@@ -56,6 +57,12 @@ pub fn black_bot_rows(
         InspectRow { label: "high_level", value: brain.high_level_label() },
         InspectRow { label: "low_level", value: brain.low_level_label() },
         InspectRow { label: "has_target", value: brain.has_target().to_string() },
+        InspectRow {
+            label: "collision_pressure",
+            value: collision_pressure
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        },
     ]
 }
 
@@ -87,6 +94,7 @@ pub fn status_rows(
     black: Option<&Brain>,
     glitch: Option<&GlitchBotVisual>,
     spec: Option<BotSpecialization>,
+    collision_pressure: Option<u32>,
 ) -> Vec<InspectRow> {
     let mut rows = common_actor_rows(obj.inner.state());
     if let Some(level) = charge {
@@ -94,7 +102,7 @@ pub fn status_rows(
     }
     if let Some(brain) = black {
         let main_tile = actor_main_tile(obj.inner.state().center);
-        rows.extend(black_bot_rows(brain, main_tile, spec));
+        rows.extend(black_bot_rows(brain, main_tile, spec, collision_pressure));
     }
     if let Some(vis) = glitch {
         rows.extend(glitch_bot_rows(vis));

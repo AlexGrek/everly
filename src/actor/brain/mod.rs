@@ -91,6 +91,15 @@ pub struct BrainContext<'a> {
     pub pathfind: Option<PathfindAccess<'a>>,
 }
 
+/// One-shot gameplay event a high-level action wants logged by the owning system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrainLogEvent {
+    /// Wander leg exceeded its Manhattan-distance travel budget.
+    WanderDestinationTimedOut { goal: (i32, i32) },
+    /// Patrol leg exceeded its budget; the waypoint is skipped.
+    PatrolWaypointSkipped { waypoint: (i32, i32) },
+}
+
 /// Side effects a high-level action requests, applied by the owning ECS system
 /// after the tick. Fixed-size — the tick never allocates to report effects.
 #[derive(Debug, Default, Clone, Copy)]
@@ -109,6 +118,8 @@ pub struct BrainEffects {
     pub undock: Option<EntityCoordinates>,
     /// Add this much charge (`0.0..=1.0` units) to the bot this frame.
     pub recharge: f32,
+    /// Optional in-game log line for this tick.
+    pub log: Option<BrainLogEvent>,
 }
 
 fn merge_brain_effects(into: &mut BrainEffects, add: BrainEffects) {
@@ -132,6 +143,9 @@ fn merge_brain_effects(into: &mut BrainEffects, add: BrainEffects) {
     }
     if add.recharge > 0.0 {
         into.recharge += add.recharge;
+    }
+    if let Some(v) = add.log {
+        into.log = Some(v);
     }
 }
 

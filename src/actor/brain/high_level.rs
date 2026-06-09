@@ -9,13 +9,13 @@
 use crate::rng::{self, StdRng};
 
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap, HYPERMAP_CHUNK_SIZE};
-use crate::map::hypermap_pathfind::world_tile_walkable;
+use crate::map::hypermap_pathfind::{manhattan, world_tile_walkable};
 use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
 use crate::map::pathfind_service::{PathKind, PathOutcome, RequestId};
 
 use super::low_level::{FollowPath, LowLevelAction, PendingPath, Wait};
 use super::priority::PriorityKind;
-use super::{BrainContext, BrainEffects, PathfindAccess};
+use super::{BrainContext, BrainEffects, BrainLogEvent, PathfindAccess};
 
 /// Wander radius (tiles) for [`GoToRandomPoints`].
 const WANDER_RADIUS: f32 = 15.0;
@@ -30,6 +30,9 @@ const WANDER_SEARCH_LIMIT: usize = 2000;
 /// Seconds a bot waits on a queued route request before reissuing it (the
 /// "waiting-for-path" timeout from the async pathfinding design).
 const PATH_WAIT_RETRY_S: f32 = 3.0;
+/// Seconds allowed per tile of initial Manhattan distance while following a
+/// wander or patrol leg before the high level abandons it.
+const LEG_TIMEOUT_PER_TILE_S: f32 = 3.0;
 
 /// `true` on the first frame the low-level action reports stuck or finished
 /// since the previous tick it did not (rising edge). Prevents re-running
@@ -38,6 +41,42 @@ fn low_level_needs_replan(low: &dyn LowLevelAction, prev_stuck: bool, prev_finis
     let stuck = low.is_stuck();
     let finished = low.is_finished();
     (stuck && !prev_stuck) || (finished && !prev_finished)
+}
+
+fn leg_timeout_secs(start: (i32, i32), goal: (i32, i32)) -> f32 {
+    manhattan(start, goal) as f32 * LEG_TIMEOUT_PER_TILE_S
+}
+
+fn is_follow_path(low: &dyn LowLevelAction) -> bool {
+    low.label() == "FollowPath"
+}
+
+/// Travel budget for the current wander/patrol leg (Manhattan start→goal × 3 s).
+#[derive(Clone, Copy, Debug)]
+struct LegDeadline {
+    goal: (i32, i32),
+    timeout_s: f32,
+    elapsed_s: f32,
+}
+
+impl LegDeadline {
+    fn new(start: (i32, i32), goal: (i32, i32)) -> Self {
+        Self {
+            goal,
+            timeout_s: leg_timeout_secs(start, goal),
+            elapsed_s: 0.0,
+        }
+    }
+
+    fn reset_elapsed(&mut self) {
+        self.elapsed_s = 0.0;
+    }
+
+    /// Advances the timer; returns `true` when the leg has exceeded its budget.
+    fn tick(&mut self, dt: f32) -> bool {
+        self.elapsed_s += dt;
+        self.elapsed_s >= self.timeout_s
+    }
 }
 /// Number of waypoints in a freshly generated [`GoToPatrol`] loop.
 const PATROL_LOOP_LEN: usize = 5;
@@ -138,6 +177,8 @@ pub struct GoToRandomPoints {
     awaiting: Option<RequestId>,
     /// Seconds awaited so far (drives the [`PATH_WAIT_RETRY_S`] reissue).
     await_elapsed: f32,
+    /// Active leg travel budget while [`FollowPath`] is driving toward a goal.
+    leg: Option<LegDeadline>,
     prev_low_stuck: bool,
     prev_low_finished: bool,
 }
@@ -163,10 +204,12 @@ impl GoToRandomPoints {
                 });
                 self.awaiting = Some(id);
                 self.await_elapsed = 0.0;
+                self.leg = Some(LegDeadline::new(here, goal));
                 *low = Box::new(PendingPath::with_velocity(low.velocity()));
             }
             None => {
                 self.awaiting = None;
+                self.leg = None;
                 *low = Box::new(Wait::retry(RETRY_S));
             }
         }
@@ -196,6 +239,9 @@ impl HighLevelAction for GoToRandomPoints {
                 self.awaiting = None;
                 match outcome {
                     PathOutcome::Route { path, raw_len } if raw_len > 1 => {
+                        if let Some(leg) = &mut self.leg {
+                            leg.reset_elapsed();
+                        }
                         *low = Box::new(FollowPath::new(path));
                     }
                     _ => self.request_target(pf, ctx, low, rng),
@@ -208,7 +254,23 @@ impl HighLevelAction for GoToRandomPoints {
             return HighLevelOutcome::running();
         }
 
+        if let Some(leg) = &mut self.leg {
+            if is_follow_path(low.as_ref()) && !low.is_finished() && leg.tick(ctx.dt) {
+                let goal = leg.goal;
+                self.leg = None;
+                low.halt();
+                self.request_target(pf, ctx, low, rng);
+                self.prev_low_stuck = low.is_stuck();
+                self.prev_low_finished = low.is_finished();
+                return HighLevelOutcome::running_with(BrainEffects {
+                    log: Some(BrainLogEvent::WanderDestinationTimedOut { goal }),
+                    ..BrainEffects::default()
+                });
+            }
+        }
+
         if low_level_needs_replan(low.as_ref(), self.prev_low_stuck, self.prev_low_finished) {
+            self.leg = None;
             self.request_target(pf, ctx, low, rng);
         }
         self.prev_low_stuck = low.is_stuck();
@@ -246,6 +308,8 @@ pub struct GoToPatrol {
     await_elapsed: f32,
     /// Consecutive unreachable legs tried this round (bounds the async retry).
     legs_tried: usize,
+    /// Active leg travel budget while [`FollowPath`] is driving toward a waypoint.
+    leg: Option<LegDeadline>,
     prev_low_stuck: bool,
     prev_low_finished: bool,
 }
@@ -258,6 +322,7 @@ impl GoToPatrol {
             awaiting: None,
             await_elapsed: 0.0,
             legs_tried: 0,
+            leg: None,
             prev_low_stuck: false,
             prev_low_finished: false,
         }
@@ -286,12 +351,14 @@ impl GoToPatrol {
                 });
                 self.awaiting = Some(id);
                 self.await_elapsed = 0.0;
+                self.leg = Some(LegDeadline::new(here, target));
                 *low = Box::new(PendingPath::with_velocity(low.velocity()));
                 return;
             }
             *cursor = (*cursor + 1) % len;
         }
         self.awaiting = None;
+        self.leg = None;
         self.engaged = false;
         *low = Box::new(Wait::retry(RETRY_S));
     }
@@ -347,6 +414,9 @@ impl HighLevelAction for GoToPatrol {
                 self.awaiting = None;
                 match outcome {
                     PathOutcome::Route { path, raw_len } if raw_len > 1 => {
+                        if let Some(leg) = &mut self.leg {
+                            leg.reset_elapsed();
+                        }
                         *low = Box::new(FollowPath::new(path));
                         self.engaged = true;
                         self.legs_tried = 0;
@@ -375,9 +445,29 @@ impl HighLevelAction for GoToPatrol {
             return HighLevelOutcome::running();
         }
 
+        if let Some(leg) = &mut self.leg {
+            if is_follow_path(low.as_ref()) && !low.is_finished() && leg.tick(ctx.dt) {
+                let waypoint = leg.goal;
+                self.leg = None;
+                low.halt();
+                cursor = (cursor + 1) % len;
+                self.engaged = true;
+                self.legs_tried = 0;
+                self.request_leg(pf, loop_tiles, here, &mut cursor, low);
+                self.prev_low_stuck = low.is_stuck();
+                self.prev_low_finished = low.is_finished();
+                self.cursor = Some(cursor);
+                return HighLevelOutcome::running_with(BrainEffects {
+                    log: Some(BrainLogEvent::PatrolWaypointSkipped { waypoint }),
+                    ..BrainEffects::default()
+                });
+            }
+        }
+
         if low_level_needs_replan(low.as_ref(), self.prev_low_stuck, self.prev_low_finished) {
             // Once we have reached (or abandoned) the waypoint we were heading to,
             // move on to the next; the first engaged leg keeps the nearest one.
+            self.leg = None;
             if self.engaged {
                 cursor = (cursor + 1) % len;
             }
@@ -1091,17 +1181,18 @@ mod tests {
         }
     }
 
-    fn ctx<'a>(
+    fn ctx_with_dt<'a>(
         passability: &'a Hypermap<f32>,
         interactive: &'a InteractiveEntityMap,
         charge: f32,
         tile: (i32, i32),
         pf: PathfindAccess<'a>,
         patrol_loop: Option<&'a [(i32, i32)]>,
+        dt: f32,
     ) -> BrainContext<'a> {
         BrainContext {
             entity: Entity::PLACEHOLDER,
-            dt: 1.0 / 60.0,
+            dt,
             center: Vec2::new(tile.0 as f32 + 0.5, tile.1 as f32 + 0.5),
             main_tile: IVec2::new(tile.0, tile.1),
             main_tile_changed: true,
@@ -1115,6 +1206,36 @@ mod tests {
             avoidance: None,
             patrol_loop,
             pathfind: Some(pf),
+        }
+    }
+
+    fn ctx<'a>(
+        passability: &'a Hypermap<f32>,
+        interactive: &'a InteractiveEntityMap,
+        charge: f32,
+        tile: (i32, i32),
+        pf: PathfindAccess<'a>,
+        patrol_loop: Option<&'a [(i32, i32)]>,
+    ) -> BrainContext<'a> {
+        ctx_with_dt(passability, interactive, charge, tile, pf, patrol_loop, 1.0 / 60.0)
+    }
+
+    struct FollowPathNeverDone;
+
+    impl LowLevelAction for FollowPathNeverDone {
+        fn execute(
+            &mut self,
+            _state: &mut crate::actor::ActorState,
+            _ctx: &BrainContext,
+            _rng: &mut StdRng,
+            _tuning: &FollowTuning,
+        ) {
+        }
+        fn is_finished(&self) -> bool {
+            false
+        }
+        fn label(&self) -> String {
+            "FollowPath".to_string()
         }
     }
 
@@ -1532,6 +1653,124 @@ mod tests {
         let routes = pf.drain_world_routes();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0], ((0, 0), (4, 0)), "must skip the tile the bot stands on");
+    }
+
+    #[test]
+    fn wander_times_out_and_picks_new_destination() {
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let pf = PathfindFixture::new();
+        let mut action = GoToRandomPoints::default();
+        let mut low: Box<dyn LowLevelAction> = Box::new(StuckLowAction);
+        let mut rng = rng::seeded(42);
+
+        action.update(
+            &ctx(&passability, &interactive, 1.0, (0, 0), pf.access(), None),
+            &mut low,
+            &mut rng,
+        );
+        let pending = pf.queue.drain_pending();
+        assert_eq!(pending.len(), 1);
+        let (id, kind) = &pending[0];
+        let PathKind::WorldRoute { start, goal, .. } = kind else {
+            panic!("expected wander WorldRoute");
+        };
+        let start = *start;
+        let goal = *goal;
+        assert_eq!(start, (0, 0));
+        pf.results.insert_for_test(
+            *id,
+            PathOutcome::Route {
+                path: vec![start, goal],
+                raw_len: 2,
+            },
+        );
+        action.update(
+            &ctx(&passability, &interactive, 1.0, (0, 0), pf.access(), None),
+            &mut low,
+            &mut rng,
+        );
+        assert_eq!(low.label(), "FollowPath");
+
+        let timeout = leg_timeout_secs(start, goal) + 0.1;
+        let out = action.update(
+            &ctx_with_dt(
+                &passability,
+                &interactive,
+                1.0,
+                (0, 0),
+                pf.access(),
+                None,
+                timeout,
+            ),
+            &mut low,
+            &mut rng,
+        );
+        assert_eq!(
+            out.effects.log,
+            Some(BrainLogEvent::WanderDestinationTimedOut { goal })
+        );
+        assert!(is_pending(low.as_ref()), "timed-out wander must enqueue a fresh route");
+        assert_eq!(pf.drain_world_routes().len(), 1);
+    }
+
+    #[test]
+    fn patrol_times_out_and_skips_waypoint() {
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let route = [(0, 0), (4, 0), (4, 4)];
+        let pf = PathfindFixture::new();
+        let mut action = GoToPatrol::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = rng::seeded(0);
+
+        action.update(
+            &ctx(&passability, &interactive, 1.0, (0, 0), pf.access(), Some(&route)),
+            &mut low,
+            &mut rng,
+        );
+        let pending = pf.queue.drain_pending();
+        assert_eq!(pending.len(), 1);
+        let (id, kind) = &pending[0];
+        let PathKind::WorldRoute { start, goal, .. } = kind else {
+            panic!("expected patrol WorldRoute");
+        };
+        assert_eq!((*start, *goal), ((0, 0), (4, 0)));
+        pf.results.insert_for_test(
+            *id,
+            PathOutcome::Route {
+                path: vec![*start, *goal],
+                raw_len: 2,
+            },
+        );
+        action.update(
+            &ctx(&passability, &interactive, 1.0, (0, 0), pf.access(), Some(&route)),
+            &mut low,
+            &mut rng,
+        );
+        low = Box::new(FollowPathNeverDone);
+
+        let timeout = leg_timeout_secs((0, 0), (4, 0)) + 0.1;
+        let out = action.update(
+            &ctx_with_dt(
+                &passability,
+                &interactive,
+                1.0,
+                (0, 0),
+                pf.access(),
+                Some(&route),
+                timeout,
+            ),
+            &mut low,
+            &mut rng,
+        );
+        assert_eq!(
+            out.effects.log,
+            Some(BrainLogEvent::PatrolWaypointSkipped { waypoint: (4, 0) })
+        );
+        let routes = pf.drain_world_routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0], ((0, 0), (4, 4)), "must skip to the next loop waypoint");
     }
 
     #[test]

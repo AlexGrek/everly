@@ -62,8 +62,8 @@ const CHARGER_LIGHT_COLOR_ACTIVE: Color = Color::srgb(0.40, 1.0, 0.50);
 const CHARGER_LIGHT_INTENSITY_IDLE: f32 = 0.0;
 const CHARGER_LIGHT_INTENSITY_ACTIVE: f32 = 12_000.0;
 const CHARGER_LIGHT_RANGE: f32 = 4.0;
-/// Nudge the point light slightly past the room-facing cube face so it reads as surface emission.
-const CHARGER_LIGHT_FACE_NUDGE: f32 = 0.04;
+/// Point light hangs this far above the metal docking pad top.
+const CHARGER_DOCK_LIGHT_CLEARANCE: f32 = 1.22;
 /// Connector: a chunky black "transformer" box, **larger** than the glowing cube,
 /// that bridges the gap to the backing wall. The wall slab sits on the *outer* edge
 /// of the neighboring cell, so its inner face is one cell minus one slab thickness
@@ -1783,14 +1783,12 @@ fn append_charger_metal(
     );
 }
 
-/// Room-facing glow-cube face — where the point light sits so it reads as surface emission.
-fn charger_glow_light_position(cx: f32, cz: f32, y_base: f32, facing: ChargerFacing) -> Vec3 {
-    let (dx, dz) = facing.wall_dir();
-    let along = 0.5 - CHARGER_CUBE_DEPTH - CHARGER_LIGHT_FACE_NUDGE;
+/// Overhead docking lamp — centered on the metal pad so the beam hits the bot.
+fn charger_dock_light_position(cx: f32, cz: f32, y_base: f32) -> Vec3 {
     Vec3::new(
-        cx + dx * along,
-        y_base + CHARGER_CUBE_CENTER_Y,
-        cz + dz * along,
+        cx,
+        y_base + CHARGER_PAD_HEIGHT + CHARGER_DOCK_LIGHT_CLEARANCE,
+        cz,
     )
 }
 
@@ -1837,7 +1835,7 @@ fn spawn_charger_visual(
     coords: EntityCoordinates,
     label: &str,
 ) -> Entity {
-    let light_pos = charger_glow_light_position(cx, cz, y_base, facing);
+    let light_pos = charger_dock_light_position(cx, cz, y_base);
     let glow_mesh = meshes.add(build_single_charger_glow_mesh(cx, cz, y_base, facing));
     let glow_material = new_charger_glow_material(materials, false);
 

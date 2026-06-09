@@ -10,7 +10,8 @@ wired from `GamePlugin` in `src/lib.rs`. It is **independent** from the tile
 1. Press **Actors** in the bottom HUD (next to **Edit**). The label toggles between
    `Actors` and `Actors *`.
 2. A **palette strip** appears above the map-edit palette (window bottom `92 px`,
-   `40 px` tall): **Bot** (GlitchBot), **Black** (BlackBot), and **Kill**.
+   `40 px` tall): **Bot** (GlitchBot), **Black** (BlackBot), **Kill**, and
+   **Resurrect all**.
 3. Press **Actors** again to close the palette. Closing also clears the active tool.
 
 HUD wiring for the toggle lives in `src/hud/game_hud.rs` (`ActorSpawnToggleButton` /
@@ -37,6 +38,20 @@ HUD wiring for the toggle lives in `src/hud/game_hud.rs` (`ActorSpawnToggleButto
 There is no drag — each click drops one actor. Clicks in the **bottom `120 px`** of the
 window (HUD bar + both palettes) are ignored (`ACTOR_DEAD_ZONE_PX`) so palette/HUD
 buttons never spawn actors underneath.
+
+## Resurrect all
+
+Click **Resurrect all** to recover **every** actor in the world in one shot (no
+brush mode, no world click):
+
+- **Charge** on each actor is raised to at least **30%** (never lowered).
+- **BlackBot** broken sub-components (`movement engine`, `control plane`,
+  `sensory system`) are repaired (`broken` cleared; wear is kept).
+- Every **BlackBot** brain is reset so bots replan on the next tick.
+- Movement intent is cleared on all actors.
+
+Implemented in [`resurrect_all_actors`](../src/actor/resurrect.rs), triggered by
+[`resurrect_all_button`](../src/actor/resurrect.rs) from the palette.
 
 ## Kill workflow
 
@@ -69,6 +84,7 @@ Re-gen in the map editor despawns actors on the regenerated chunk.
 | `ActorKind` | `GlitchBot` / `BlackBot` |
 | `actor_spawn_pointer_click` | Spawns the chosen actor on left-mouse-up (spawn mode only) |
 | `on_actor_pointer_click` (`actor_inspector.rs`) | Despawns the clicked bot when Kill mode is armed |
+| `resurrect_all_button` (`resurrect.rs`) | Bulk-repairs all actors when **Resurrect all** is pressed |
 | `actor_spawn_plane_cell` | Cursor → active-floor tile (reuses `ray_intersect_horizontal_plane`) |
 | `actor_spawn_cell_passable` | Footprint probe via `DynamicPassabilityMap::probe_footprint` (per `ActorKind` blocked flags) |
 
