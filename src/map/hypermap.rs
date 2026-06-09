@@ -7,6 +7,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use arc_swap::ArcSwap;
+
 pub const HYPERMAP_CHUNK_SIZE: i32 = 128;
 const HYPERMAP_CHUNK_AREA: usize = (HYPERMAP_CHUNK_SIZE as usize) * (HYPERMAP_CHUNK_SIZE as usize);
 /// Number of vertical floors per column (indices `0..HYPERMAP_FLOOR_COUNT`).
@@ -96,13 +98,27 @@ where
 
 pub type HypermapChunkHandle<T> = Arc<RwLock<HypermapChunk<T>>>;
 
+type ChunkTable<T> = HashMap<ChunkCoord, HypermapChunkHandle<T>>;
+
 /// Infinite chunked tile map optimized for sparse, large worlds.
+///
+/// The chunk table is published as a **lock-free read snapshot** (`snapshot`)
+/// alongside the authoritative, mutable `chunks` map. All reads
+/// ([`get_chunk`](Self::get_chunk), [`has_chunk`](Self::has_chunk), etc.) load
+/// the immutable snapshot with no lock and no shared-atomic-counter contention,
+/// so many cores (parallel actors + async pathfind workers) resolve chunks
+/// without bouncing a `RwLock` word between caches. The `chunks` write lock is
+/// taken only on a *structural* change (creating, draining, or replacing chunk
+/// handles), which then republishes the snapshot with a single atomic
+/// `ArcSwap::store` — making the wholesale flush (`replace_chunks`) atomic for
+/// concurrent readers (a worker always sees a fully-old or fully-new table).
 #[derive(Debug)]
 pub struct Hypermap<T>
 where
     T: Clone + Send + Sync + 'static,
 {
-    chunks: RwLock<HashMap<ChunkCoord, HypermapChunkHandle<T>>>,
+    chunks: RwLock<ChunkTable<T>>,
+    snapshot: ArcSwap<ChunkTable<T>>,
     default_tile: T,
 }
 
@@ -127,8 +143,16 @@ where
     pub fn new(default_tile: T) -> Self {
         Self {
             chunks: RwLock::new(HashMap::new()),
+            snapshot: ArcSwap::from_pointee(HashMap::new()),
             default_tile,
         }
+    }
+
+    /// Republishes the lock-free read snapshot from the authoritative table.
+    /// Must be called while holding the `chunks` write guard so concurrent
+    /// republishes stay ordered (the passed guard proves that here).
+    fn republish(&self, chunks: &ChunkTable<T>) {
+        self.snapshot.store(Arc::new(chunks.clone()));
     }
 
     /// Returns tile value at world coordinate on **ground floor** (`0`). Missing chunks read as default tile.
@@ -172,32 +196,20 @@ where
     }
 
     pub fn has_chunk(&self, coord: ChunkCoord) -> bool {
-        self.chunks
-            .read()
-            .expect("hypermap lock poisoned")
-            .contains_key(&coord)
+        self.snapshot.load().contains_key(&coord)
     }
 
     pub fn loaded_chunk_count(&self) -> usize {
-        self.chunks.read().expect("hypermap lock poisoned").len()
+        self.snapshot.load().len()
     }
 
     /// Snapshot of every chunk coordinate currently held in memory. Order is unspecified.
     pub fn loaded_chunks(&self) -> Vec<ChunkCoord> {
-        self.chunks
-            .read()
-            .expect("hypermap lock poisoned")
-            .keys()
-            .copied()
-            .collect()
+        self.snapshot.load().keys().copied().collect()
     }
 
     pub fn get_chunk(&self, coord: ChunkCoord) -> Option<HypermapChunkHandle<T>> {
-        self.chunks
-            .read()
-            .expect("hypermap lock poisoned")
-            .get(&coord)
-            .cloned()
+        self.snapshot.load().get(&coord).cloned()
     }
 
     pub fn get_or_create_chunk(&self, coord: ChunkCoord) -> HypermapChunkHandle<T> {
@@ -206,10 +218,12 @@ where
         }
 
         let mut chunks = self.chunks.write().expect("hypermap lock poisoned");
-        chunks
+        let handle = chunks
             .entry(coord)
             .or_insert_with(|| Arc::new(RwLock::new(HypermapChunk::new(&self.default_tile))))
-            .clone()
+            .clone();
+        self.republish(&chunks);
+        handle
     }
 
     /// Applies a closure to one chunk with read access if loaded.
@@ -233,15 +247,21 @@ where
     }
 
     /// Removes and returns all chunk handles, leaving the map empty.
-    fn drain_chunks(&self) -> HashMap<ChunkCoord, HypermapChunkHandle<T>> {
+    fn drain_chunks(&self) -> ChunkTable<T> {
         let mut chunks = self.chunks.write().expect("hypermap lock poisoned");
-        std::mem::take(&mut *chunks)
+        let taken = std::mem::take(&mut *chunks);
+        self.republish(&chunks);
+        taken
     }
 
-    /// Replaces the chunk table wholesale. Previous contents are dropped.
-    fn replace_chunks(&self, new_chunks: HashMap<ChunkCoord, HypermapChunkHandle<T>>) {
+    /// Replaces the chunk table wholesale. Previous contents are dropped. The
+    /// new table is published to readers with a single atomic snapshot store, so
+    /// a concurrent reader never observes a partially-replaced table.
+    fn replace_chunks(&self, new_chunks: ChunkTable<T>) {
+        let published = Arc::new(new_chunks);
         let mut chunks = self.chunks.write().expect("hypermap lock poisoned");
-        *chunks = new_chunks;
+        *chunks = (*published).clone();
+        self.snapshot.store(published);
     }
 }
 

@@ -10,6 +10,7 @@ pub mod grid_fill;
 mod house;
 mod step_carpet;
 mod step_charging_stations;
+mod step_place_lamps;
 mod step_corners;
 mod step_door;
 mod step_home_crawler;
@@ -38,7 +39,7 @@ use house::House;
 
 use crate::map::hypermap::{random_rng_seed, ChunkCoord, Hypermap, HypermapChunk};
 use crate::map::level::encode_chunk_geometry;
-use crate::map::world_map::{CellType, TileStyle};
+use crate::map::world_map::{CellType, LampDecoration, TileStyle};
 
 /// Smallest boundary side (in cells) the editor "House" tool accepts.
 pub const MIN_HOUSE_TOOL_SIDE: i32 = 10;
@@ -81,18 +82,22 @@ impl MapDraft {
         self.step_place_inner_doors();
         self.step_home_crawlers();
         self.step_place_charging_stations();
+        self.step_place_lamps();
     }
 
     fn run_into_chunk(
         mut self,
         chunk: &mut HypermapChunk<CellType>,
         style_floor_map: &Hypermap<TileStyle>,
+        decoration_lamp_map: &Hypermap<LampDecoration>,
         coord: ChunkCoord,
     ) -> GeneratedChunkMetadata {
         self.run_pipeline();
         let meta = self.build_metadata();
         style_floor_map.with_chunk_write(coord, |style_chunk| {
-            self.write_chunk_floor0_and_styles(chunk, style_chunk);
+            decoration_lamp_map.with_chunk_write(coord, |lamp_chunk| {
+                self.write_chunk_floor0_and_styles(chunk, style_chunk, lamp_chunk);
+            });
         });
         meta
     }
@@ -101,6 +106,7 @@ impl MapDraft {
 pub(crate) fn fill_procedural_chunk(
     chunk: &mut HypermapChunk<CellType>,
     style_floor_map: &Hypermap<TileStyle>,
+    decoration_lamp_map: &Hypermap<LampDecoration>,
     coord: ChunkCoord,
     metadata: &mut crate::map::chunk_metadata::ChunkGeneratorMetadata,
 ) -> GeneratedChunkMetadata {
@@ -108,7 +114,7 @@ pub(crate) fn fill_procedural_chunk(
         seed: random_rng_seed(),
         ..Default::default()
     };
-    let meta = MapDraft::new(config).run_into_chunk(chunk, style_floor_map, coord);
+    let meta = MapDraft::new(config).run_into_chunk(chunk, style_floor_map, decoration_lamp_map, coord);
     metadata.insert(coord, meta.clone());
     meta
 }
@@ -185,8 +191,14 @@ pub fn generate_house_tiles(width: i32, height: i32, seed: u64) -> Option<HouseT
 pub fn generate_chunk_geometry(config: &MapGeneratorConfig) -> String {
     let map = Hypermap::new(CellType::Void);
     let style_map = Hypermap::new(TileStyle::DEFAULT);
+    let lamp_map = Hypermap::new(LampDecoration::None);
     map.with_chunk_write(ChunkCoord::new(0, 0), |chunk| {
-        MapDraft::new(config.clone()).run_into_chunk(chunk, &style_map, ChunkCoord::new(0, 0));
+        MapDraft::new(config.clone()).run_into_chunk(
+            chunk,
+            &style_map,
+            &lamp_map,
+            ChunkCoord::new(0, 0),
+        );
     });
     let chunk = map
         .get_chunk(ChunkCoord::new(0, 0))

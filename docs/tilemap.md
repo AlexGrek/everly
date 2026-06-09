@@ -127,6 +127,27 @@ in `src/map/world_map.rs`; meshing lives in `src/map/hypermap_world.rs`
 Procedural placement (one per house, against an interior wall, not in a corner) is in
 `src/map/map_generator/step_charging_stations.rs` — see `docs/map-generator.md`.
 
+### Lamp decoration (`ln` / `ls` / `le` / `lw`)
+
+A **lamp** is a glowing cube decoration stored in a **separate** decoration file
+(`levels/level_{name}/decoration_lamp/{x}_{y}.txt`), independent of the geometry
+and style layers. The cube sits **on top of the wall slab** named by the second
+letter, centered on that slab's XZ position. It never affects passability.
+
+| Token | Wall slab | Cube position (relative to cell center) |
+|-------|-----------|------------------------------------------|
+| `ln`  | North (−Z) | X = 0, Z = −LAMP_SLAB_INSET (= −0.4 m) |
+| `ls`  | South (+Z) | X = 0, Z = +0.4 m |
+| `le`  | East (+X)  | X = +0.4 m, Z = 0 |
+| `lw`  | West (−X)  | X = −0.4 m, Z = 0 |
+
+Cube size: `WALL_THICKNESS` (0.2 m) on each side. Center Y: `WALL_HEIGHT + 0.1 m` (3.1 m).
+Each lamp spawns one static warm-white point light above the cube (no shadows).
+
+Tokens `..` (no decoration) are the default. Placement is procedurally generated (see
+[`docs/map-generator.md`](map-generator.md)) and can be authored by hand in the decoration file
+using the same `# floor 0` section format as style files.
+
 ## Wall Types At Runtime
 
 Parsed cells use `CellType::Wall(WallMask)` or `CellType::Corner(WallCorner)`;

@@ -22,8 +22,9 @@ use crate::map::hypermap::{
     HYPERMAP_FLOOR_COUNT,
 };
 use crate::map::level::{
-    chunk_geometry_path, chunk_style_floor_path, chunk_style_wall_path,
-    try_load_chunk_geometry_file, try_load_chunk_style_file_into_map, LevelName,
+    chunk_decoration_lamp_path, chunk_geometry_path, chunk_style_floor_path, chunk_style_wall_path,
+    try_load_chunk_decoration_lamp_into_map, try_load_chunk_geometry_file,
+    try_load_chunk_style_file_into_map, LevelName,
 };
 use crate::menu::main_menu::GameState;
 use crate::map::dirt::DirtMap;
@@ -33,9 +34,8 @@ use crate::map::chunk_metadata::{try_load_chunk_metadata, ChunkGeneratorMetadata
 use crate::map::map_generator::{fill_procedural_chunk, CHUNK_VOID_MARGIN};
 use crate::map::temperature::TemperatureMap;
 use crate::map::world_map::{
-    cell_passability, for_each_wall_segment, CellType, ChargerFacing, TileStyle, WorldMapFloor,
-    WALL_THICKNESS, WATER_SURFACE_Y,
-    WORLD_MAP_FILE_PATH,
+    cell_passability, for_each_wall_segment, CellType, ChargerFacing, LampDecoration,
+    TileStyle, WorldMapFloor, WALL_THICKNESS, WATER_SURFACE_Y, WORLD_MAP_FILE_PATH,
 };
 use crate::scene::camera::StrategyCamera;
 
@@ -74,6 +74,23 @@ const CHARGER_CONNECTOR_HEIGHT: f32 = 1.3;
 /// Vertical center of the transformer box (a touch lower than the cube so the glowing
 /// cube reads as mounted on its front face).
 const CHARGER_CONNECTOR_CENTER_Y: f32 = 1.2;
+/// Lamp cube: side length equals wall thickness (0.2 m). The cube mounts on the inner face of the
+/// wall slab, protruding into the room — like a wall sconce.
+const LAMP_SIZE: f32 = WALL_THICKNESS;
+/// Inset from the cell center to the slab center (half-cell minus half-slab-thickness).
+const LAMP_SLAB_INSET: f32 = 0.5 - WALL_THICKNESS * 0.5;
+/// Distance from cell center to the lamp cube center along the facing direction.
+/// = slab_inset − half_slab − half_lamp = 0.4 − 0.1 − 0.1 = 0.2 m
+/// (the cube sits flush against the slab inner face, protruding into the room)
+const LAMP_WALL_OFFSET: f32 = LAMP_SLAB_INSET - WALL_THICKNESS * 0.5 - LAMP_SIZE * 0.5;
+/// Height of the lamp cube center on the wall (mounted at ~2/3 of wall height).
+const LAMP_WALL_HEIGHT: f32 = 2.0;
+/// Warm white lamp light.
+const LAMP_LIGHT_COLOR: Color = Color::srgb(1.0, 0.88, 0.60);
+const LAMP_LIGHT_INTENSITY: f32 = 6_000.0;
+const LAMP_LIGHT_RANGE: f32 = 7.0;
+/// Emissive warm-white glow for the lamp cube.
+const LAMP_EMISSIVE: LinearRgba = LinearRgba::rgb(3.5, 2.8, 1.2);
 /// Floor-0 void must fall inside this inset (local cell coords) before a water
 /// plane is spawned; the water mesh is also shrunk by this strip so nothing
 /// renders in the chunk border band.
@@ -108,6 +125,9 @@ struct RenderedChunkFloor0Pavement;
 
 #[derive(Component)]
 struct RenderedChunkFloor0Marble;
+
+#[derive(Component)]
+struct RenderedChunkFloor0LampCubes;
 
 #[derive(Component)]
 struct RenderedChunkFloor0ChargerMetal;
@@ -215,6 +235,8 @@ pub(crate) struct HypermapRuntime {
     /// Per-cell wall slab style. Default is [`TileStyle::DEFAULT`] (regular).
     /// Controls whether wall/corner slabs render as glass or regular material.
     pub(crate) style_wall_map: Arc<Hypermap<TileStyle>>,
+    /// Per-cell lamp decoration (floor 0 only). Default is [`LampDecoration::None`].
+    pub(crate) decoration_lamp_map: Arc<Hypermap<LampDecoration>>,
     /// Per-chunk procedural layout reference (rooms, entrypoint). See `docs/map-generator.md`.
     pub procedural_metadata: ChunkGeneratorMetadata,
     desired_chunks: HashSet<ChunkCoord>,
@@ -235,12 +257,14 @@ impl HypermapRuntime {
         let subtile_cache = self.static_subtile_cache.clone();
         let style_floor_map = self.style_floor_map.clone();
         let style_wall_map = self.style_wall_map.clone();
+        let decoration_lamp_map = self.decoration_lamp_map.clone();
         ensure_chunk_generated(
             &map,
             &passability,
             &subtile_cache,
             &style_floor_map,
             &style_wall_map,
+            &decoration_lamp_map,
             coord,
             level_name,
             &mut self.procedural_metadata,
@@ -274,6 +298,8 @@ struct PreparedChunkRender {
     floor0_glass_cells: Vec<(i32, i32, CellType)>,
     // ── Floor-0 charging stations (metal pad + glowing cube) ─────────────────
     floor0_charger_cells: Vec<(i32, i32, CellType)>,
+    // ── Floor-0 lamp decorations ─────────────────────────────────────────────
+    floor0_lamp_cells: Vec<(i32, i32, LampDecoration)>,
     // ── Upper floor meshes (active_floor at bake time) ───────────────────────
     upper_cells: Vec<(i32, i32, i32, CellType)>,
     upper_glass_cells: Vec<(i32, i32, i32, CellType)>,
@@ -303,6 +329,8 @@ struct HypermapRenderAssets {
     // ── Wall materials ───────────────────────────────────────────────────────
     wall_material: Handle<StandardMaterial>,
     glass_wall_material: Handle<StandardMaterial>,
+    // ── Lamp decoration material ───────────────────────────────────────────────
+    lamp_material: Handle<StandardMaterial>,
     // ── Charging-station materials ─────────────────────────────────────────────
     charger_metal_material: Handle<StandardMaterial>,
     /// Template only — each live charger visual clones its own [`StandardMaterial`].
@@ -368,6 +396,7 @@ pub(crate) fn setup_hypermap_runtime(mut commands: Commands) {
         static_subtile_cache: Arc::new(Hypermap::new(SubtilePassability::EMPTY)),
         style_floor_map: Arc::new(Hypermap::new(TileStyle::DEFAULT)),
         style_wall_map: Arc::new(Hypermap::new(TileStyle::DEFAULT)),
+        decoration_lamp_map: Arc::new(Hypermap::new(LampDecoration::None)),
         procedural_metadata: ChunkGeneratorMetadata::default(),
         desired_chunks: HashSet::new(),
         chunk_roots: HashMap::new(),
@@ -438,6 +467,15 @@ fn setup_hypermap_assets(
         cull_mode: None,
         ..default()
     });
+    // Warm-glowing lamp cube. Emissive HDR warm-white so Bloom turns it into a visible glow.
+    let lamp_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.90, 0.65),
+        emissive: LAMP_EMISSIVE,
+        perceptual_roughness: 0.15,
+        metallic: 0.0,
+        cull_mode: None,
+        ..default()
+    });
     // `cull_mode: None` matches the wall materials: `append_box` winds its ±Z faces
     // inward, so backface culling would otherwise drop them and the boxes look flipped.
     let charger_metal_material = materials.add(StandardMaterial {
@@ -500,6 +538,7 @@ fn setup_hypermap_assets(
         marble_material,
         wall_material,
         glass_wall_material,
+        lamp_material,
         charger_metal_material,
         charger_glow_idle_material,
         charger_connector_material,
@@ -745,12 +784,17 @@ fn update_visible_hypermap_chunks(
         let wall_styles = runtime.style_wall_map
             .with_chunk_read(chunk, clone_styles_for_render_start)
             .unwrap_or_else(|| vec![TileStyle::DEFAULT; n]);
+        let lamp_cells = runtime.decoration_lamp_map
+            .with_chunk_read(chunk, clone_floor0_lamp_data)
+            .unwrap_or_default();
         let snapshot: Vec<(CellType, TileStyle, TileStyle)> = cells.into_iter()
             .zip(floor_styles)
             .zip(wall_styles)
             .map(|((c, fs), ws)| (c, fs, ws))
             .collect();
-        let task = task_pool.spawn(async move { build_chunk_render_data(snapshot, floor_for_render) });
+        let task = task_pool.spawn(async move {
+            build_chunk_render_data(snapshot, floor_for_render, lamp_cells)
+        });
         runtime.pending_renders.insert(chunk, task);
     }
 
@@ -795,13 +839,16 @@ fn render_chunks_30fps(
             let wall_styles = runtime.style_wall_map
                 .with_chunk_read(coord, clone_styles_for_render_start)
                 .unwrap_or_else(|| vec![TileStyle::DEFAULT; n]);
+            let lamp_cells = runtime.decoration_lamp_map
+                .with_chunk_read(coord, clone_floor0_lamp_data)
+                .unwrap_or_default();
             let snapshot: Vec<(CellType, TileStyle, TileStyle)> = cells.into_iter()
                 .zip(floor_styles)
                 .zip(wall_styles)
                 .map(|((c, fs), ws)| (c, fs, ws))
                 .collect();
             let task = task_pool.spawn(async move {
-                build_chunk_render_data(snapshot, floor_for_render)
+                build_chunk_render_data(snapshot, floor_for_render, lamp_cells)
             });
             runtime.pending_renders.insert(coord, task);
         }
@@ -922,6 +969,7 @@ pub(crate) fn ensure_chunk_generated(
     subtile_cache: &Hypermap<SubtilePassability>,
     style_floor_map: &Hypermap<TileStyle>,
     style_wall_map: &Hypermap<TileStyle>,
+    decoration_lamp_map: &Hypermap<LampDecoration>,
     coord: ChunkCoord,
     level_name: &str,
     chunk_metadata: &mut ChunkGeneratorMetadata,
@@ -941,7 +989,7 @@ pub(crate) fn ensure_chunk_generated(
             Ok(false) => {}
             Err(e) => warn!("level geometry `{}`: {e}", path.display()),
         }
-        fill_chunk_random(chunk, style_floor_map, coord, chunk_metadata);
+        fill_chunk_random(chunk, style_floor_map, decoration_lamp_map, coord, chunk_metadata);
         if coord == CENTER_CHUNK {
             if let Err(err) = apply_world_map_file_to_floor(chunk, 0, WORLD_MAP_FILE_PATH) {
                 warn!("failed to apply `{WORLD_MAP_FILE_PATH}` to center chunk floor 0: {err}");
@@ -973,6 +1021,12 @@ pub(crate) fn ensure_chunk_generated(
     if let Err(e) = try_load_chunk_style_file_into_map(&wall_style_path, style_wall_map, coord) {
         if e.kind() != std::io::ErrorKind::NotFound {
             warn!("chunk wall style `{}`: {e}", wall_style_path.display());
+        }
+    }
+    let lamp_path = chunk_decoration_lamp_path(level_name, coord);
+    if let Err(e) = try_load_chunk_decoration_lamp_into_map(&lamp_path, decoration_lamp_map, coord) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!("chunk decoration lamp `{}`: {e}", lamp_path.display());
         }
     }
 }
@@ -1084,10 +1138,11 @@ pub(crate) fn write_world_wall_style(
 fn fill_chunk_random(
     chunk: &mut HypermapChunk<CellType>,
     style_floor_map: &Hypermap<TileStyle>,
+    decoration_lamp_map: &Hypermap<LampDecoration>,
     coord: ChunkCoord,
     chunk_metadata: &mut ChunkGeneratorMetadata,
 ) {
-    fill_procedural_chunk(chunk, style_floor_map, coord, chunk_metadata);
+    fill_procedural_chunk(chunk, style_floor_map, decoration_lamp_map, coord, chunk_metadata);
     clear_upper_floors_to_void(chunk);
 }
 
@@ -1109,6 +1164,16 @@ fn reset_style_chunk(style_map: &Hypermap<TileStyle>, coord: ChunkCoord) {
     });
 }
 
+fn reset_decoration_lamp_chunk(decoration_map: &Hypermap<LampDecoration>, coord: ChunkCoord) {
+    decoration_map.with_chunk_write(coord, |chunk| {
+        for y in 0..HYPERMAP_CHUNK_SIZE {
+            for x in 0..HYPERMAP_CHUNK_SIZE {
+                chunk.set_local(LocalCoord::new(x, y), LampDecoration::None);
+            }
+        }
+    });
+}
+
 /// Replaces one chunk with fresh procedural geometry (no disk load, no `world_map` overlay).
 /// Callers should despawn actors on the chunk and queue a remesh afterward.
 pub(crate) fn regenerate_procedural_chunk(
@@ -1120,10 +1185,12 @@ pub(crate) fn regenerate_procedural_chunk(
 ) {
     reset_style_chunk(&runtime.style_floor_map, coord);
     reset_style_chunk(&runtime.style_wall_map, coord);
+    reset_decoration_lamp_chunk(&runtime.decoration_lamp_map, coord);
     runtime.map.with_chunk_write(coord, |chunk| {
         fill_chunk_random(
             chunk,
             &runtime.style_floor_map,
+            &runtime.decoration_lamp_map,
             coord,
             &mut runtime.procedural_metadata,
         );
@@ -1337,6 +1404,30 @@ fn spawn_chunk_meshes(
         ox,
         oy,
     );
+
+    // ── Floor 0: lamp decorations (cube mesh + point lights) ─────────────────
+    {
+        let (mesh3d, vis) =
+            if let Some(m) = build_floor0_lamp_mesh(&prepared.floor0_lamp_cells, ox, oy) {
+                (Mesh3d(meshes.add(m)), Visibility::Inherited)
+            } else {
+                (Mesh3d(assets.empty_mesh.clone()), Visibility::Hidden)
+            };
+        let id = commands
+            .spawn((
+                Name::new(format!("Chunk floor0 lamps {ox},{oy}")),
+                RenderedChunkFloor0LampCubes,
+                mesh3d,
+                MeshMaterial3d(assets.lamp_material.clone()),
+                Transform::default(),
+                vis,
+                NotShadowCaster,
+                Pickable::IGNORE,
+            ))
+            .id();
+        commands.entity(chunk_root).add_child(id);
+    }
+    spawn_floor0_lamp_lights(commands, chunk_root, &prepared.floor0_lamp_cells, ox, oy);
 
     // ── Upper floors ─────────────────────────────────────────────────────────
     let upper_road = spawn_upper_road_entity(
@@ -2063,6 +2154,79 @@ fn append_charger_connector(
     );
 }
 
+/// Builds a batch mesh of all lamp cubes for a chunk (floor 0).
+///
+/// Each lamp cube is a wall sconce: LAMP_SIZE³ mounted on the inner face of
+/// the wall slab at LAMP_WALL_HEIGHT, offset by LAMP_WALL_OFFSET from the
+/// cell center along the slab direction (flush against the inner face,
+/// protruding into the room by half the cube depth).
+fn build_floor0_lamp_mesh(
+    cells: &[(i32, i32, LampDecoration)],
+    origin_x: i32,
+    origin_y: i32,
+) -> Option<Mesh> {
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut uvs = Vec::new();
+    let mut indices = Vec::new();
+    for &(x, y, decoration) in cells {
+        let LampDecoration::Lamp(facing) = decoration else {
+            continue;
+        };
+        let cx = origin_x as f32 + x as f32 + 0.5;
+        let cz = origin_y as f32 + y as f32 + 0.5;
+        let (dx, dz) = facing.slab_dir();
+        append_box(
+            &mut positions,
+            &mut normals,
+            &mut uvs,
+            &mut indices,
+            cx + dx * LAMP_WALL_OFFSET,
+            LAMP_WALL_HEIGHT,
+            cz + dz * LAMP_WALL_OFFSET,
+            LAMP_SIZE,
+            LAMP_SIZE,
+            LAMP_SIZE,
+        );
+    }
+    finalize_mesh_from_buffers(positions, normals, uvs, indices)
+}
+
+/// Spawns one point-light entity per lamp in the chunk (no shadows, warm white).
+fn spawn_floor0_lamp_lights(
+    commands: &mut Commands,
+    chunk_root: Entity,
+    cells: &[(i32, i32, LampDecoration)],
+    origin_x: i32,
+    origin_y: i32,
+) {
+    for &(x, y, decoration) in cells {
+        let LampDecoration::Lamp(facing) = decoration else {
+            continue;
+        };
+        let (dx, dz) = facing.slab_dir();
+        // Light sits at the lamp cube center, matching the sconce position.
+        let lx = origin_x as f32 + x as f32 + 0.5 + dx * LAMP_WALL_OFFSET;
+        let lz = origin_y as f32 + y as f32 + 0.5 + dz * LAMP_WALL_OFFSET;
+        let light_y = LAMP_WALL_HEIGHT;
+        let light = commands
+            .spawn((
+                Name::new(format!("Lamp light {x},{y}")),
+                PointLight {
+                    color: LAMP_LIGHT_COLOR,
+                    intensity: LAMP_LIGHT_INTENSITY,
+                    range: LAMP_LIGHT_RANGE,
+                    shadows_enabled: false,
+                    ..default()
+                },
+                Transform::from_xyz(lx, light_y, lz),
+                NotShadowCaster,
+            ))
+            .id();
+        commands.entity(chunk_root).add_child(light);
+    }
+}
+
 pub(crate) fn build_floor0_charger_metal_mesh(cells: &[(i32, i32, CellType)], origin_x: i32, origin_y: i32) -> Option<Mesh> {
     let mut positions = Vec::new();
     let mut normals = Vec::new();
@@ -2292,6 +2456,19 @@ fn clone_styles_for_render_start(chunk: &HypermapChunk<TileStyle>) -> Vec<TileSt
     styles
 }
 
+fn clone_floor0_lamp_data(chunk: &HypermapChunk<LampDecoration>) -> Vec<(i32, i32, LampDecoration)> {
+    let mut result = Vec::new();
+    for y in 0..HYPERMAP_CHUNK_SIZE {
+        for x in 0..HYPERMAP_CHUNK_SIZE {
+            let d = *chunk.get_local(LocalCoord::new(x, y));
+            if d != LampDecoration::None {
+                result.push((x, y, d));
+            }
+        }
+    }
+    result
+}
+
 fn wall_is_glass(style: TileStyle) -> bool {
     style.0 == [b'w', b'g']
 }
@@ -2430,11 +2607,18 @@ fn partition_chunk_cells_from_vec(
         upper_road_pavement_cells,
         upper_road_marble_cells,
         upper_charger_cells,
+        floor0_lamp_cells: Vec::new(),
     }
 }
 
-fn build_chunk_render_data(snapshot: Vec<(CellType, TileStyle, TileStyle)>, active_floor: i32) -> PreparedChunkRender {
-    partition_chunk_cells_from_vec(snapshot, active_floor)
+fn build_chunk_render_data(
+    snapshot: Vec<(CellType, TileStyle, TileStyle)>,
+    active_floor: i32,
+    floor0_lamp_cells: Vec<(i32, i32, LampDecoration)>,
+) -> PreparedChunkRender {
+    let mut prepared = partition_chunk_cells_from_vec(snapshot, active_floor);
+    prepared.floor0_lamp_cells = floor0_lamp_cells;
+    prepared
 }
 
 /// Chunk coordinates the renderer would target around world tile `(world_x, world_y)`:

@@ -23,7 +23,7 @@ use crate::actor::{
 };
 use crate::map::hypermap_pathfind::world_tile_walkable;
 use crate::map::passability::SUBTILE_COUNT;
-use crate::map::pathfind_service::{PathKind, PathOutcome, RequestId};
+use crate::map::pathfind_service::{PathKind, PathOutcome, PathfindReason, RequestId};
 
 use super::BrainContext;
 
@@ -452,7 +452,7 @@ impl FollowPath {
             max_expanded: DETOUR_MAX_EXPANDED,
             radius,
             blocked_flags: views.blocked_flags,
-        }, ctx.entity))
+        }, ctx.entity, PathfindReason::SubtileDetour))
     }
 
     /// Installs an arrived subtile detour (raw subtile path including the start):

@@ -141,6 +141,60 @@ impl ChargerFacing {
     }
 }
 
+/// Which wall slab a lamp cube sits on top of. Token prefix `l`, suffix matches
+/// wall-direction letters (`n/s/e/w`). Directions match the wall bitmask:
+/// north → −Z, south → +Z, east → +X, west → −X.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LampFacing {
+    North,
+    South,
+    East,
+    West,
+}
+
+impl LampFacing {
+    /// Unit XZ direction from cell center toward the slab the lamp sits on.
+    pub fn slab_dir(self) -> (f32, f32) {
+        match self {
+            LampFacing::North => (0.0, -1.0),
+            LampFacing::South => (0.0, 1.0),
+            LampFacing::East => (1.0, 0.0),
+            LampFacing::West => (-1.0, 0.0),
+        }
+    }
+}
+
+/// Per-cell decoration stored in the decoration map. Default is `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LampDecoration {
+    #[default]
+    None,
+    Lamp(LampFacing),
+}
+
+/// Parses a 2-character decoration token (`ln`/`ls`/`le`/`lw` or `..`).
+pub(crate) fn parse_lamp_token(token: &str) -> Option<LampDecoration> {
+    match token {
+        ".." => Some(LampDecoration::None),
+        "ln" => Some(LampDecoration::Lamp(LampFacing::North)),
+        "ls" => Some(LampDecoration::Lamp(LampFacing::South)),
+        "le" => Some(LampDecoration::Lamp(LampFacing::East)),
+        "lw" => Some(LampDecoration::Lamp(LampFacing::West)),
+        _ => None,
+    }
+}
+
+/// Emits the canonical 2-character token for a [`LampDecoration`].
+pub(crate) fn lamp_to_token(d: LampDecoration) -> &'static str {
+    match d {
+        LampDecoration::None => "..",
+        LampDecoration::Lamp(LampFacing::North) => "ln",
+        LampDecoration::Lamp(LampFacing::South) => "ls",
+        LampDecoration::Lamp(LampFacing::East) => "le",
+        LampDecoration::Lamp(LampFacing::West) => "lw",
+    }
+}
+
 /// High-level map cell type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CellType {

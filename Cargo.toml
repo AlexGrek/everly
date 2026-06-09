@@ -16,6 +16,8 @@ rand = "0.8"
 bytemuck = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+arc-swap = "1"
+papaya = "0.2"
 
 # Opt-in feature for blazing-fast iterative dev builds via Bevy's dynamic linking.
 # Enable with: `cargo run --features dev`

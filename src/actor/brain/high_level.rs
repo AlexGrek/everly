@@ -6,12 +6,13 @@
 //! effects ([`BrainEffects`]). When an action reports
 //! [`HighLevelStatus::Done`] the brain drops it and re-plans next tick.
 
+use bevy::ecs::entity::Entity;
 use crate::rng::{self, StdRng};
 
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap, HYPERMAP_CHUNK_SIZE};
 use crate::map::hypermap_pathfind::{manhattan, world_tile_walkable};
 use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
-use crate::map::pathfind_service::{PathKind, PathOutcome, RequestId};
+use crate::map::pathfind_service::{PathKind, PathOutcome, PathfindReason, RequestId};
 
 use super::low_level::{FollowPath, LowLevelAction, PendingPath, Wait};
 use super::priority::PriorityKind;
@@ -192,6 +193,7 @@ impl GoToRandomPoints {
         ctx: &BrainContext,
         low: &mut Box<dyn LowLevelAction>,
         rng: &mut StdRng,
+        reason: PathfindReason,
     ) {
         let here = (ctx.main_tile.x, ctx.main_tile.y);
         match sample_wander_goal(rng, here, ctx.passability) {
@@ -201,7 +203,7 @@ impl GoToRandomPoints {
                     goal,
                     max_expanded: WANDER_SEARCH_LIMIT,
                     simplify_buffer: PATH_CORNER_BUFFER,
-                }, ctx.entity);
+                }, ctx.entity, reason);
                 self.awaiting = Some(id);
                 self.await_elapsed = 0.0;
                 self.leg = Some(LegDeadline::new(here, goal));
@@ -244,10 +246,10 @@ impl HighLevelAction for GoToRandomPoints {
                         }
                         *low = Box::new(FollowPath::new(path));
                     }
-                    _ => self.request_target(pf, ctx, low, rng),
+                    _ => self.request_target(pf, ctx, low, rng, PathfindReason::WanderPathFailed),
                 }
             } else if self.await_elapsed >= PATH_WAIT_RETRY_S {
-                self.request_target(pf, ctx, low, rng);
+                self.request_target(pf, ctx, low, rng, PathfindReason::WanderRetry);
             }
             self.prev_low_stuck = low.is_stuck();
             self.prev_low_finished = low.is_finished();
@@ -259,7 +261,7 @@ impl HighLevelAction for GoToRandomPoints {
                 let goal = leg.goal;
                 self.leg = None;
                 low.halt();
-                self.request_target(pf, ctx, low, rng);
+                self.request_target(pf, ctx, low, rng, PathfindReason::WanderLegTimedOut);
                 self.prev_low_stuck = low.is_stuck();
                 self.prev_low_finished = low.is_finished();
                 return HighLevelOutcome::running_with(BrainEffects {
@@ -271,7 +273,7 @@ impl HighLevelAction for GoToRandomPoints {
 
         if low_level_needs_replan(low.as_ref(), self.prev_low_stuck, self.prev_low_finished) {
             self.leg = None;
-            self.request_target(pf, ctx, low, rng);
+            self.request_target(pf, ctx, low, rng, PathfindReason::WanderNewGoal);
         }
         self.prev_low_stuck = low.is_stuck();
         self.prev_low_finished = low.is_finished();
@@ -338,6 +340,8 @@ impl GoToPatrol {
         here: (i32, i32),
         cursor: &mut usize,
         low: &mut Box<dyn LowLevelAction>,
+        entity: Entity,
+        reason: PathfindReason,
     ) {
         let len = loop_tiles.len();
         for _ in 0..len {
@@ -348,7 +352,7 @@ impl GoToPatrol {
                     goal: target,
                     max_expanded: WANDER_SEARCH_LIMIT,
                     simplify_buffer: PATH_CORNER_BUFFER,
-                }, ctx.entity);
+                }, entity, reason);
                 self.awaiting = Some(id);
                 self.await_elapsed = 0.0;
                 self.leg = Some(LegDeadline::new(here, target));
@@ -432,12 +436,12 @@ impl HighLevelAction for GoToPatrol {
                             *low = Box::new(Wait::retry(RETRY_S));
                         } else {
                             cursor = (cursor + 1) % len;
-                            self.request_leg(pf, loop_tiles, here, &mut cursor, low);
+                            self.request_leg(pf, loop_tiles, here, &mut cursor, low, ctx.entity, PathfindReason::PatrolLegUnreachable);
                         }
                     }
                 }
             } else if self.await_elapsed >= PATH_WAIT_RETRY_S {
-                self.request_leg(pf, loop_tiles, here, &mut cursor, low);
+                self.request_leg(pf, loop_tiles, here, &mut cursor, low, ctx.entity, PathfindReason::PatrolLegRetry);
             }
             self.prev_low_stuck = low.is_stuck();
             self.prev_low_finished = low.is_finished();
@@ -453,7 +457,7 @@ impl HighLevelAction for GoToPatrol {
                 cursor = (cursor + 1) % len;
                 self.engaged = true;
                 self.legs_tried = 0;
-                self.request_leg(pf, loop_tiles, here, &mut cursor, low);
+                self.request_leg(pf, loop_tiles, here, &mut cursor, low, ctx.entity, PathfindReason::PatrolLegTimedOut);
                 self.prev_low_stuck = low.is_stuck();
                 self.prev_low_finished = low.is_finished();
                 self.cursor = Some(cursor);
@@ -472,7 +476,7 @@ impl HighLevelAction for GoToPatrol {
                 cursor = (cursor + 1) % len;
             }
             self.legs_tried = 0;
-            self.request_leg(pf, loop_tiles, here, &mut cursor, low);
+            self.request_leg(pf, loop_tiles, here, &mut cursor, low, ctx.entity, PathfindReason::PatrolLeg);
         }
 
         self.prev_low_stuck = low.is_stuck();
@@ -536,7 +540,7 @@ pub fn enqueue_patrol_candidates(
                 goal: tile,
                 max_expanded: WANDER_SEARCH_LIMIT,
                 simplify_buffer: PATH_CORNER_BUFFER,
-            }, entity);
+            }, entity, PathfindReason::PatrolLoopGen);
             (id, tile)
         })
         .collect()
@@ -634,7 +638,7 @@ impl GoToChargeStation {
                 goal: (coords.x, coords.y),
                 max_expanded: SEARCH_LIMIT,
                 simplify_buffer: PATH_CORNER_BUFFER,
-            }, ctx.entity);
+            }, ctx.entity, PathfindReason::ChargerSeek);
             pending.push((coords, id));
         }
         self.seek = Some(ChargerSeek {
@@ -883,7 +887,7 @@ impl HighLevelAction for GoToChargeStation {
                             goal: (charger.x, charger.y),
                             max_expanded: SEARCH_LIMIT,
                             simplify_buffer: PATH_CORNER_BUFFER,
-                        }, ctx.entity);
+                        }, ctx.entity, PathfindReason::ChargerDockApproach);
                         self.dock_route = Some(id);
                         self.dock_elapsed = 0.0;
                         *low = Box::new(PendingPath::with_velocity(low.velocity()));
@@ -1604,7 +1608,7 @@ mod tests {
     fn enqueue_patrol_candidates_issues_reachability_requests() {
         let passability: Hypermap<f32> = Hypermap::new(1.0);
         let queue = PathfindQueue::default();
-        let checks = enqueue_patrol_candidates(&mut rng::seeded(7), (0, 0), &passability, &queue);
+        let checks = enqueue_patrol_candidates(&mut rng::seeded(7), (0, 0), &passability, &queue, Entity::PLACEHOLDER);
         assert!(!checks.is_empty(), "open map should sample patrol candidates");
         let routes = queue.drain_pending();
         assert_eq!(routes.len(), checks.len());

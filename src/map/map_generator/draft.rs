@@ -3,7 +3,7 @@
 use crate::rng::{self, StdRng};
 
 use crate::map::hypermap::{HypermapChunk, LocalCoord};
-use crate::map::world_map::{CellType, ChargerFacing, TileStyle, WallCorner, WallMask};
+use crate::map::world_map::{CellType, ChargerFacing, LampDecoration, TileStyle, WallCorner, WallMask};
 
 use super::house::House;
 use super::types::{GeneratedChunkMetadata, MapGeneratorConfig};
@@ -73,6 +73,8 @@ pub struct MapDraft {
     pub(crate) rng: StdRng,
     pub(crate) cells: Vec<Vec<DraftTile>>,
     pub(crate) floor_styles: Vec<Vec<TileStyle>>,
+    /// Per-cell lamp decorations (floor 0 only, same grid as `cells`).
+    pub(crate) lamp_cells: Vec<Vec<LampDecoration>>,
     pub(crate) primary_seeds: Vec<(i32, i32)>,
     pub(crate) growth_centers: Vec<(i32, i32)>,
     /// Centers added beside primaries; rooms grow here only.
@@ -95,6 +97,7 @@ impl MapDraft {
             rng: rng::seeded(config.seed),
             cells: vec![vec![DraftTile::Void; sz]; sz],
             floor_styles: vec![vec![TileStyle::DEFAULT; sz]; sz],
+            lamp_cells: vec![vec![LampDecoration::None; sz]; sz],
             primary_seeds: Vec::new(),
             growth_centers: Vec::new(),
             subseed_centers: Vec::new(),
@@ -146,17 +149,28 @@ impl MapDraft {
         mut self,
         chunk: &mut HypermapChunk<CellType>,
         style_chunk: &mut HypermapChunk<TileStyle>,
+        lamp_chunk: &mut HypermapChunk<LampDecoration>,
     ) {
         let size = self.size as usize;
         let styles = std::mem::take(&mut self.floor_styles);
+        let lamps = std::mem::take(&mut self.lamp_cells);
         let cells = self.finish();
         for z in 0..size {
             for x in 0..size {
                 let local = LocalCoord::new(x as i32, z as i32);
                 chunk.set_local(local, cells[z][x]);
                 style_chunk.set_local(local, styles[z][x]);
+                lamp_chunk.set_local(local, lamps[z][x]);
             }
         }
+    }
+
+    pub(crate) fn set_lamp(&mut self, x: i32, z: i32, lamp: LampDecoration) {
+        self.lamp_cells[z as usize][x as usize] = lamp;
+    }
+
+    pub(crate) fn get_lamp(&self, x: i32, z: i32) -> LampDecoration {
+        self.lamp_cells[z as usize][x as usize]
     }
 
     pub(crate) fn set_floor_style(&mut self, x: i32, z: i32, style: TileStyle) {

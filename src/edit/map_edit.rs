@@ -423,18 +423,20 @@ fn map_edit_save_button(
             &runtime.style_wall_map,
             dirt.read_map(),
             temperature.read_map(),
+            &runtime.decoration_lamp_map,
             &runtime.procedural_metadata,
         ) {
             Ok(report) => info!(
                 "saved level `{level_name}`: {} geometry chunk(s), {} floor style, {} wall style, \
                  {} dirt chunk(s) in dirt.bin, {} temperature chunk(s) in temperature.bin, \
-                 {} metadata chunk(s)",
+                 {} metadata chunk(s), {} lamp chunk(s)",
                 report.geometry_chunks,
                 report.floor_style_chunks,
                 report.wall_style_chunks,
                 report.dirt_chunks,
                 report.temperature_chunks,
                 report.metadata_chunks,
+                report.lamp_chunks,
             ),
             Err(e) => warn!("save full level failed: {e}"),
         }

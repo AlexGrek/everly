@@ -69,6 +69,24 @@ pub enum PathKind {
     },
 }
 
+/// Why a particular route was requested. Attached to every queued entry so
+/// duplicate-entity diagnostics can show what each request was for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathfindReason {
+    WanderNewGoal,
+    WanderPathFailed,
+    WanderRetry,
+    WanderLegTimedOut,
+    PatrolLeg,
+    PatrolLegUnreachable,
+    PatrolLegRetry,
+    PatrolLegTimedOut,
+    PatrolLoopGen,
+    ChargerSeek,
+    ChargerDockApproach,
+    SubtileDetour,
+}
+
 /// Result of a finished [`PathKind`] search.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PathOutcome {
@@ -88,17 +106,17 @@ pub enum PathOutcome {
 #[derive(Resource, Default)]
 pub struct PathfindQueue {
     next_id: AtomicU64,
-    pending: Mutex<VecDeque<(RequestId, PathKind, Entity)>>,
+    pending: Mutex<VecDeque<(RequestId, PathKind, Entity, PathfindReason)>>,
 }
 
 impl PathfindQueue {
     /// Mints a fresh id and appends the request. Returns the id to poll later.
-    pub fn enqueue(&self, kind: PathKind, entity: Entity) -> RequestId {
+    pub fn enqueue(&self, kind: PathKind, entity: Entity, reason: PathfindReason) -> RequestId {
         let id = RequestId(self.next_id.fetch_add(1, AtomicOrdering::Relaxed));
         self.pending
             .lock()
             .expect("pathfind queue poisoned")
-            .push_back((id, kind, entity));
+            .push_back((id, kind, entity, reason));
         id
     }
 
@@ -116,21 +134,20 @@ impl PathfindQueue {
             .lock()
             .expect("pathfind queue poisoned")
             .pop_front()
-            .map(|(id, kind, _entity)| (id, kind))
+            .map(|(id, kind, _entity, _reason)| (id, kind))
     }
 
-    /// Returns entities that have more than one request pending in the queue.
-    /// Used by the backlog warning to detect runaway re-enqueue loops.
-    fn find_duplicate_entities(&self) -> Vec<Entity> {
+    /// Returns entities that have more than one request pending, with all their
+    /// request ids and reasons. Used by the backlog warning to diagnose duplicate enqueues.
+    fn find_duplicate_entities(&self) -> Vec<(Entity, Vec<(RequestId, PathfindReason)>)> {
         let pending = self.pending.lock().expect("pathfind queue poisoned");
-        let mut counts: HashMap<Entity, u32> = HashMap::new();
-        for (_id, _kind, entity) in pending.iter() {
-            *counts.entry(*entity).or_insert(0) += 1;
+        let mut by_entity: HashMap<Entity, Vec<(RequestId, PathfindReason)>> = HashMap::new();
+        for (id, _kind, entity, reason) in pending.iter() {
+            by_entity.entry(*entity).or_default().push((*id, *reason));
         }
-        counts
+        by_entity
             .into_iter()
-            .filter(|(_e, n)| *n > 1)
-            .map(|(e, _)| e)
+            .filter(|(_, reqs)| reqs.len() > 1)
             .collect()
     }
 
@@ -302,10 +319,16 @@ fn pathfind_dispatch(
             },
             false,
         );
-        for entity in queue.find_duplicate_entities() {
+        for (entity, reqs) in queue.find_duplicate_entities() {
+            let details: Vec<String> = reqs
+                .iter()
+                .map(|(id, r)| format!("{id:?}={r:?}"))
+                .collect();
             error!(
-                "pathfind backlog: entity {:?} has more than one pending request",
-                entity
+                "pathfind backlog: entity {:?} has {} pending requests: {}",
+                entity,
+                reqs.len(),
+                details.join(", ")
             );
         }
     }
@@ -390,13 +413,13 @@ mod tests {
             goal: (1, 1),
             max_expanded: 10,
             simplify_buffer: 1,
-        });
+        }, Entity::PLACEHOLDER, PathfindReason::WanderNewGoal);
         let b = q.enqueue(PathKind::WorldRoute {
             start: (0, 0),
             goal: (2, 2),
             max_expanded: 10,
             simplify_buffer: 1,
-        });
+        }, Entity::PLACEHOLDER, PathfindReason::WanderNewGoal);
         assert_eq!(a.0 + 1, b.0, "ids must be monotonic");
         assert_eq!(q.len(), 2);
     }
@@ -500,13 +523,13 @@ mod tests {
             goal: (1, 0),
             max_expanded: 10,
             simplify_buffer: 1,
-        });
+        }, Entity::PLACEHOLDER, PathfindReason::WanderNewGoal);
         let b = q.enqueue(PathKind::WorldRoute {
             start: (0, 0),
             goal: (2, 0),
             max_expanded: 10,
             simplify_buffer: 1,
-        });
+        }, Entity::PLACEHOLDER, PathfindReason::WanderNewGoal);
         let drained = q.drain_pending();
         assert_eq!(drained.len(), 2);
         assert_eq!(drained[0].0, a);

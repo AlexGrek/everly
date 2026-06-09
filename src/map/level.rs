@@ -18,7 +18,10 @@ use crate::map::hypermap::{
     ChunkCoord, Hypermap, HypermapChunk, LocalCoord, HYPERMAP_CHUNK_SIZE, HYPERMAP_FLOOR_COUNT,
 };
 use crate::map::tile_field_level::{save_dirt_bin, save_temperature_bin};
-use crate::map::world_map::{cell_to_token, parse_cell_token, parse_style_token, CellType, TileStyle};
+use crate::map::world_map::{
+    cell_to_token, lamp_to_token, parse_cell_token, parse_lamp_token, parse_style_token,
+    CellType, LampDecoration, TileStyle,
+};
 
 /// Active level folder name under `levels/level_{name}/`. Currently fixed to `"default"`.
 #[derive(Resource, Debug, Clone)]
@@ -233,6 +236,7 @@ pub struct LevelSaveReport {
     pub dirt_chunks: usize,
     pub temperature_chunks: usize,
     pub metadata_chunks: usize,
+    pub lamp_chunks: usize,
 }
 
 /// Union of every chunk coordinate currently allocated in the level hypermaps.
@@ -242,6 +246,7 @@ pub fn loaded_chunk_coord_union(
     temperature_map: &Hypermap<f32>,
     style_floor_map: &Hypermap<TileStyle>,
     style_wall_map: &Hypermap<TileStyle>,
+    decoration_lamp_map: &Hypermap<LampDecoration>,
 ) -> Vec<ChunkCoord> {
     let mut set = HashSet::new();
     for coord in cell_map.loaded_chunks() {
@@ -259,10 +264,13 @@ pub fn loaded_chunk_coord_union(
     for coord in style_wall_map.loaded_chunks() {
         set.insert(coord);
     }
+    for coord in decoration_lamp_map.loaded_chunks() {
+        set.insert(coord);
+    }
     set.into_iter().collect()
 }
 
-/// Persists all in-memory generated chunks: geometry, styles, dirt, temperature, and metadata.
+/// Persists all in-memory generated chunks: geometry, styles, dirt, temperature, lamps, and metadata.
 pub fn save_full_generated_level(
     level_name: &str,
     cell_map: &Hypermap<CellType>,
@@ -270,6 +278,7 @@ pub fn save_full_generated_level(
     style_wall_map: &Hypermap<TileStyle>,
     dirt_map: &Hypermap<f32>,
     temperature_map: &Hypermap<f32>,
+    decoration_lamp_map: &Hypermap<LampDecoration>,
     chunk_metadata: &crate::map::chunk_metadata::ChunkGeneratorMetadata,
 ) -> io::Result<LevelSaveReport> {
     let coords = loaded_chunk_coord_union(
@@ -278,6 +287,7 @@ pub fn save_full_generated_level(
         temperature_map,
         style_floor_map,
         style_wall_map,
+        decoration_lamp_map,
     );
     Ok(LevelSaveReport {
         geometry_chunks: save_level_geometry_for_chunks(
@@ -301,6 +311,11 @@ pub fn save_full_generated_level(
             level_name,
             chunk_metadata,
             cell_map,
+        )?,
+        lamp_chunks: save_level_decoration_lamp_for_chunks(
+            level_name,
+            decoration_lamp_map,
+            coords.iter().copied(),
         )?,
     })
 }
@@ -361,6 +376,130 @@ pub fn try_load_chunk_geometry_file(path: &Path, chunk: &mut HypermapChunk<CellT
 }
 
 // ─── Style layer ────────────────────────────────────────────────────────────
+
+pub fn decoration_lamp_dir(level_name: &str) -> PathBuf {
+    PathBuf::from("levels").join(format!("level_{level_name}")).join("decoration_lamp")
+}
+
+pub fn chunk_decoration_lamp_path(level_name: &str, coord: ChunkCoord) -> PathBuf {
+    decoration_lamp_dir(level_name).join(format!("{}_{}.txt", coord.x, coord.y))
+}
+
+fn floor0_lamp_all_none(chunk: &HypermapChunk<LampDecoration>) -> bool {
+    for y in 0..HYPERMAP_CHUNK_SIZE {
+        for x in 0..HYPERMAP_CHUNK_SIZE {
+            if *chunk.get_local(LocalCoord::new(x, y)) != LampDecoration::None {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Serializes floor 0 lamp decorations to text. Returns empty string when no lamps are placed.
+pub fn encode_chunk_decoration_lamp(chunk: &HypermapChunk<LampDecoration>) -> String {
+    if floor0_lamp_all_none(chunk) {
+        return String::new();
+    }
+    let sz = HYPERMAP_CHUNK_SIZE as usize;
+    let mut out = String::from("# floor 0\n");
+    for y in 0..sz {
+        let mut first = true;
+        for x in 0..sz {
+            let d = *chunk.get_local(LocalCoord::new(x as i32, y as i32));
+            if !first {
+                out.push(' ');
+            }
+            first = false;
+            out.push_str(lamp_to_token(d));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Loads a decoration lamp file into the given map chunk, creating the chunk lazily.
+/// Returns `Ok(true)` if loaded, `Ok(false)` if the file does not exist.
+pub fn try_load_chunk_decoration_lamp_into_map(
+    path: &Path,
+    map: &Hypermap<LampDecoration>,
+    coord: ChunkCoord,
+) -> io::Result<bool> {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let sz = HYPERMAP_CHUNK_SIZE as usize;
+    let mut in_floor0 = false;
+    let mut rows_read = 0usize;
+    map.with_chunk_write(coord, |chunk| {
+        for (line_no, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line == "# floor 0" {
+                in_floor0 = true;
+                continue;
+            }
+            if line.starts_with("# floor") {
+                in_floor0 = false;
+                continue;
+            }
+            if !in_floor0 {
+                continue;
+            }
+            if rows_read >= sz {
+                warn!("decoration lamp file has extra rows at line {}", line_no + 1);
+                break;
+            }
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if tokens.len() != sz {
+                warn!(
+                    "decoration lamp row {} has {} tokens (expected {sz})",
+                    rows_read, tokens.len()
+                );
+                rows_read += 1;
+                continue;
+            }
+            for (x, tok) in tokens.iter().enumerate() {
+                if let Some(d) = parse_lamp_token(tok) {
+                    chunk.set_local(LocalCoord::new(x as i32, rows_read as i32), d);
+                }
+            }
+            rows_read += 1;
+        }
+    });
+    Ok(true)
+}
+
+/// Writes decoration lamp files for the given chunk coordinates.
+pub fn save_level_decoration_lamp_for_chunks(
+    level_name: &str,
+    map: &Hypermap<LampDecoration>,
+    coords: impl IntoIterator<Item = ChunkCoord>,
+) -> io::Result<usize> {
+    let dir = decoration_lamp_dir(level_name);
+    let mut count = 0usize;
+    for coord in coords {
+        if !map.has_chunk(coord) {
+            continue;
+        }
+        let text = map
+            .with_chunk_read(coord, |c| encode_chunk_decoration_lamp(c))
+            .unwrap_or_default();
+        if text.is_empty() {
+            continue;
+        }
+        fs::create_dir_all(&dir)?;
+        let path = chunk_decoration_lamp_path(level_name, coord);
+        let mut f = fs::File::create(&path)?;
+        f.write_all(text.as_bytes())?;
+        count += 1;
+    }
+    Ok(count)
+}
 
 pub fn style_floor_dir(level_name: &str) -> PathBuf {
     PathBuf::from("levels").join(format!("level_{level_name}")).join("style_floor")
