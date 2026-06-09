@@ -216,11 +216,7 @@ impl Plugin for DirtMapPlugin {
     }
 }
 
-pub(crate) fn flush_dirt_map(
-    dirt: Res<DirtMap>,
-    timings: Res<crate::hud::perf_timings::SystemTimings>,
-) {
-    let _t = timings.scope(crate::hud::perf_timings::TimedSystem::FlushDirt);
+pub(crate) fn flush_dirt_map(dirt: Res<DirtMap>) {
     dirt.field.flush_if_pending();
 }
 

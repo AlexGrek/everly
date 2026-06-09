@@ -88,17 +88,17 @@ pub enum PathOutcome {
 #[derive(Resource, Default)]
 pub struct PathfindQueue {
     next_id: AtomicU64,
-    pending: Mutex<VecDeque<(RequestId, PathKind)>>,
+    pending: Mutex<VecDeque<(RequestId, PathKind, Entity)>>,
 }
 
 impl PathfindQueue {
     /// Mints a fresh id and appends the request. Returns the id to poll later.
-    pub fn enqueue(&self, kind: PathKind) -> RequestId {
+    pub fn enqueue(&self, kind: PathKind, entity: Entity) -> RequestId {
         let id = RequestId(self.next_id.fetch_add(1, AtomicOrdering::Relaxed));
         self.pending
             .lock()
             .expect("pathfind queue poisoned")
-            .push_back((id, kind));
+            .push_back((id, kind, entity));
         id
     }
 
@@ -116,6 +116,22 @@ impl PathfindQueue {
             .lock()
             .expect("pathfind queue poisoned")
             .pop_front()
+            .map(|(id, kind, _entity)| (id, kind))
+    }
+
+    /// Returns entities that have more than one request pending in the queue.
+    /// Used by the backlog warning to detect runaway re-enqueue loops.
+    fn find_duplicate_entities(&self) -> Vec<Entity> {
+        let pending = self.pending.lock().expect("pathfind queue poisoned");
+        let mut counts: HashMap<Entity, u32> = HashMap::new();
+        for (_id, _kind, entity) in pending.iter() {
+            *counts.entry(*entity).or_insert(0) += 1;
+        }
+        counts
+            .into_iter()
+            .filter(|(_e, n)| *n > 1)
+            .map(|(e, _)| e)
+            .collect()
     }
 
     /// Test helper: drains every pending request without running dispatch.
@@ -224,9 +240,7 @@ fn pathfind_collect(
     time: Res<Time>,
     mut in_flight: ResMut<PathfindInFlight>,
     results: Res<PathfindResults>,
-    timings: Res<crate::hud::perf_timings::SystemTimings>,
 ) {
-    let _t = timings.scope(crate::hud::perf_timings::TimedSystem::PathfindCollect);
     let mut still: Vec<(RequestId, Task<PathOutcome>)> = Vec::with_capacity(in_flight.tasks.len());
     for (id, mut task) in in_flight.tasks.drain(..) {
         match future::block_on(future::poll_once(&mut task)) {
@@ -248,9 +262,7 @@ fn pathfind_dispatch(
     mut in_flight: ResMut<PathfindInFlight>,
     game_log: Res<GameLog>,
     camera: Query<&StrategyCamera>,
-    timings: Res<crate::hud::perf_timings::SystemTimings>,
 ) {
-    let _t = timings.scope(crate::hud::perf_timings::TimedSystem::PathfindDispatch);
     let pool = AsyncComputeTaskPool::get();
     while in_flight.tasks.len() < MAX_IN_FLIGHT {
         let Some((id, kind)) = queue.pop() else {
@@ -290,6 +302,12 @@ fn pathfind_dispatch(
             },
             false,
         );
+        for entity in queue.find_duplicate_entities() {
+            error!(
+                "pathfind backlog: entity {:?} has more than one pending request",
+                entity
+            );
+        }
     }
 }
 

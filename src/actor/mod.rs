@@ -471,11 +471,7 @@ fn toggle_pause(keys: Res<ButtonInput<KeyCode>>, mut paused: ResMut<Paused>) {
 }
 
 /// Flush write→read; clear write buffer. Must be first in the actor pipeline.
-pub(crate) fn flush_actor_occupancy(
-    passability: Res<DynamicPassabilityMap>,
-    timings: Res<SystemTimings>,
-) {
-    let _t = timings.scope(TimedSystem::FlushOccupancy);
+pub(crate) fn flush_actor_occupancy(passability: Res<DynamicPassabilityMap>) {
     passability.flush();
 }
 
@@ -583,7 +579,6 @@ pub(crate) fn process_actors(
     par_commands: ParallelCommands,
     timings: Res<SystemTimings>,
 ) {
-    let _t = timings.scope(TimedSystem::ProcessActors);
     // Parallel-safe by construction: collision reads hit the **read** buffer,
     // which is immutable for the whole frame (flushed once up front), and writes
     // accumulate into the **write** buffer as commutative per-chunk `|=` ORs. The
@@ -604,6 +599,8 @@ pub(crate) fn process_actors(
     // actor re-enters this frame.
     let reentering: Mutex<Vec<Entity>> = Mutex::new(Vec::new());
 
+    {
+    let _t = timings.scope(TimedSystem::ParallelPass);
     actors
         .par_iter_mut()
         .for_each(|(entity, mut actor_obj, off_screen)| {
@@ -638,7 +635,10 @@ pub(crate) fn process_actors(
                 actor.advance_unchecked();
             }
         });
+    } // end ParallelPass
 
+    {
+    let _t = timings.scope(TimedSystem::ReentryPass);
     // Sequential re-entry placement. The parallel borrow above has ended, so we
     // can re-borrow `actors` one entity at a time. By now the write buffer holds
     // every on-screen actor's new footprint (committed during the parallel pass),
@@ -652,6 +652,7 @@ pub(crate) fn process_actors(
             resolve_offscreen_collision(actor_obj.inner.as_mut(), dynamic_passability, static_cache);
         }
     }
+    } // end ReentryPass
 }
 
 // ---------------------------------------------------------------------------

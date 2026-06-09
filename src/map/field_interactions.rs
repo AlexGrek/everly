@@ -141,9 +141,7 @@ pub(crate) fn dirt_actor_interaction(
     mut actors: Query<&mut ActorObject>,
     dirt: Res<DirtMap>,
     hypermap: Res<HypermapRuntime>,
-    timings: Res<crate::hud::perf_timings::SystemTimings>,
 ) {
-    let _t = timings.scope(crate::hud::perf_timings::TimedSystem::DirtInteraction);
     let world = hypermap.map.as_ref();
     for mut actor_obj in actors.iter_mut() {
         let state = actor_obj.inner.state_mut();
@@ -184,9 +182,7 @@ fn bot_occupancy_heat(
     actors: Query<&ActorObject>,
     temperature: Res<TemperatureMap>,
     hypermap: Res<HypermapRuntime>,
-    timings: Res<crate::hud::perf_timings::SystemTimings>,
 ) {
-    let _t = timings.scope(crate::hud::perf_timings::TimedSystem::BotOccupancyHeat);
     timer.0.tick(time.delta());
     if !timer.0.just_finished() {
         return;

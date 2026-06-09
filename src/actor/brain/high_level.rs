@@ -201,7 +201,7 @@ impl GoToRandomPoints {
                     goal,
                     max_expanded: WANDER_SEARCH_LIMIT,
                     simplify_buffer: PATH_CORNER_BUFFER,
-                });
+                }, ctx.entity);
                 self.awaiting = Some(id);
                 self.await_elapsed = 0.0;
                 self.leg = Some(LegDeadline::new(here, goal));
@@ -348,7 +348,7 @@ impl GoToPatrol {
                     goal: target,
                     max_expanded: WANDER_SEARCH_LIMIT,
                     simplify_buffer: PATH_CORNER_BUFFER,
-                });
+                }, ctx.entity);
                 self.awaiting = Some(id);
                 self.await_elapsed = 0.0;
                 self.leg = Some(LegDeadline::new(here, target));
@@ -508,6 +508,7 @@ pub fn enqueue_patrol_candidates(
     anchor: (i32, i32),
     passability: &Hypermap<f32>,
     queue: &crate::map::pathfind_service::PathfindQueue,
+    entity: Entity,
 ) -> Vec<(RequestId, (i32, i32))> {
     let mut tiles: Vec<(i32, i32)> = Vec::new();
     for _ in 0..PATROL_GEN_ATTEMPTS {
@@ -535,7 +536,7 @@ pub fn enqueue_patrol_candidates(
                 goal: tile,
                 max_expanded: WANDER_SEARCH_LIMIT,
                 simplify_buffer: PATH_CORNER_BUFFER,
-            });
+            }, entity);
             (id, tile)
         })
         .collect()
@@ -633,7 +634,7 @@ impl GoToChargeStation {
                 goal: (coords.x, coords.y),
                 max_expanded: SEARCH_LIMIT,
                 simplify_buffer: PATH_CORNER_BUFFER,
-            });
+            }, ctx.entity);
             pending.push((coords, id));
         }
         self.seek = Some(ChargerSeek {
@@ -882,7 +883,7 @@ impl HighLevelAction for GoToChargeStation {
                             goal: (charger.x, charger.y),
                             max_expanded: SEARCH_LIMIT,
                             simplify_buffer: PATH_CORNER_BUFFER,
-                        });
+                        }, ctx.entity);
                         self.dock_route = Some(id);
                         self.dock_elapsed = 0.0;
                         *low = Box::new(PendingPath::with_velocity(low.velocity()));

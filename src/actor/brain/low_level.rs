@@ -452,7 +452,7 @@ impl FollowPath {
             max_expanded: DETOUR_MAX_EXPANDED,
             radius,
             blocked_flags: views.blocked_flags,
-        }))
+        }, ctx.entity))
     }
 
     /// Installs an arrived subtile detour (raw subtile path including the start):

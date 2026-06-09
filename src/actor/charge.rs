@@ -65,12 +65,7 @@ impl Plugin for ChargePlugin {
     }
 }
 
-fn discharge_actors(
-    time: Res<Time>,
-    mut charges: Query<&mut Charge>,
-    timings: Res<crate::hud::perf_timings::SystemTimings>,
-) {
-    let _t = timings.scope(crate::hud::perf_timings::TimedSystem::Charge);
+fn discharge_actors(time: Res<Time>, mut charges: Query<&mut Charge>) {
     let drop = DISCHARGE_PER_S * time.delta_secs();
     if drop <= 0.0 {
         return;
