@@ -304,9 +304,9 @@ pub fn line_of_sight(map: &Hypermap<f32>, a: (i32, i32), b: (i32, i32)) -> bool 
 /// bends that still require a detour.
 ///
 /// A final pass re-inserts the tile on each side of every **doorway** the path
-/// threads (a one-tile gap in a wall, see [`is_doorway_tile`]). A door is not a
-/// bend, so string-pulling would otherwise collapse the straight approach and
-/// let the follower cross the gap on a diagonal — clipping the doorframe. The
+/// threads (a 1- or 2-tile-wide gap in a wall, see [`is_doorway_tile`]). A door
+/// is not a bend, so string-pulling would otherwise collapse the straight approach
+/// and let the follower cross the gap on a diagonal — clipping the doorframe. The
 /// extra approach/exit tiles funnel a wide actor through the opening head-on.
 pub fn simplify_path_line_of_sight(
     map: &Hypermap<f32>,
@@ -322,31 +322,78 @@ pub fn simplify_path_line_of_sight(
     reinsert_doorway_approaches(map, path, simplified)
 }
 
-/// True when `(x, y)` is a walkable one-tile gap in an otherwise solid wall: it
-/// is pinched by walls on one axis and open on the other, *and* both open-axis
-/// neighbours widen out (are not pinched the same way). The widen test keeps
-/// genuine doorways — which open into roomier space and let a follower drift in
-/// diagonally — distinct from straight one-wide corridors, where every tile is
-/// pinched and a follower is already funnelled to the centre.
+/// True when `(x, y)` is part of a doorway: a 1- or 2-tile-wide walkable gap in an
+/// otherwise solid wall, flanked by walls on both ends of the band and open space on
+/// the crossing axis.
+///
+/// For a 1-wide gap both immediate wall-axis neighbours are blocked; the crossing-axis
+/// neighbours are open and widen out (not pinched the same way), so genuine doorways
+/// stay distinct from straight single-tile corridors.
+///
+/// For a 2-wide gap the tile itself has one walkable wall-axis neighbour (its partner)
+/// and one blocked one; both crossing-axis neighbours are open; and the space beyond
+/// both ends of the 2-tile band is blocked — preventing a wide corridor from matching.
 fn is_doorway_tile(map: &Hypermap<f32>, x: i32, y: i32) -> bool {
     if !world_tile_walkable(map, x, y) {
         return false;
     }
     let walk = |dx: i32, dy: i32| world_tile_walkable(map, x + dx, y + dy);
-    // Walls run north-south here, so the gap is crossed east-west.
-    let ns_walls = !walk(0, 1) && !walk(0, -1);
+
+    // --- 1-wide gap: walls run N-S, gap crossed E-W ---
+    let ns_walls_1 = !walk(0, 1) && !walk(0, -1);
     let ew_open = walk(1, 0) && walk(-1, 0);
-    if ns_walls && ew_open {
+    if ns_walls_1 && ew_open {
         let widens = |nx: i32| world_tile_walkable(map, nx, y + 1) || world_tile_walkable(map, nx, y - 1);
         return widens(x + 1) && widens(x - 1);
     }
-    // Walls run east-west, gap crossed north-south.
-    let ew_walls = !walk(1, 0) && !walk(-1, 0);
+
+    // --- 1-wide gap: walls run E-W, gap crossed N-S ---
+    let ew_walls_1 = !walk(1, 0) && !walk(-1, 0);
     let ns_open = walk(0, 1) && walk(0, -1);
-    if ew_walls && ns_open {
+    if ew_walls_1 && ns_open {
         let widens = |ny: i32| world_tile_walkable(map, x + 1, ny) || world_tile_walkable(map, x - 1, ny);
         return widens(y + 1) && widens(y - 1);
     }
+
+    // --- 2-wide gap: walls run N-S (along Y), gap crossed E-W (along X) ---
+    // The 2-tile band occupies this tile (y) and its partner (y ± 1).
+    // Both ends of the band are bounded by wall cells; the EW crossing is open.
+    for partner_dz in [1i32, -1i32] {
+        if world_tile_walkable(map, x, y + partner_dz)          // partner walkable
+            && !world_tile_walkable(map, x, y - partner_dz)     // near end blocked
+            && !world_tile_walkable(map, x, y + partner_dz * 2) // far end blocked
+            && walk(1, 0) && walk(-1, 0)                        // crossing axis open
+        {
+            // Widening guard: at each EW crossing neighbor, space beyond the band ends
+            // must exist — distinguishes a doorway (opening into a room) from a 2-wide
+            // edge slab (corridor wall with no room on either end of the band).
+            let widens = |nx: i32| {
+                world_tile_walkable(map, nx, y - partner_dz)        // beyond near end
+                    || world_tile_walkable(map, nx, y + partner_dz * 2) // beyond far end
+            };
+            if widens(x + 1) && widens(x - 1) {
+                return true;
+            }
+        }
+    }
+
+    // --- 2-wide gap: walls run E-W (along X), gap crossed N-S (along Y) ---
+    for partner_dx in [1i32, -1i32] {
+        if world_tile_walkable(map, x + partner_dx, y)          // partner walkable
+            && !world_tile_walkable(map, x - partner_dx, y)     // near end blocked
+            && !world_tile_walkable(map, x + partner_dx * 2, y) // far end blocked
+            && walk(0, 1) && walk(0, -1)                        // crossing axis open
+        {
+            let widens = |ny: i32| {
+                world_tile_walkable(map, x - partner_dx, ny)
+                    || world_tile_walkable(map, x + partner_dx * 2, ny)
+            };
+            if widens(y + 1) && widens(y - 1) {
+                return true;
+            }
+        }
+    }
+
     false
 }
 
@@ -835,6 +882,87 @@ mod tests {
             other => panic!("expected Found, got {other:?}"),
         };
         assert_eq!(simplify_path_line_of_sight(&map, &raw, 1), vec![(0, 0), (9, 0)]);
+    }
+
+    #[test]
+    fn is_doorway_detects_two_wide_gap() {
+        // Two open rooms separated by a vertical wall at x = 3, with a 2-tile doorway
+        // at (3, 2) and (3, 3).  Both gap tiles must be identified as doorway tiles.
+        //
+        //   . . . . . . .
+        //   . O O # O O .
+        //   . O O . O O .   <- doorway row z=2 (tile 3 open)
+        //   . O O . O O .   <- doorway row z=3 (tile 3 open)
+        //   . O O # O O .
+        //   . . . . . . .
+        //
+        // All non-wall tiles marked O are open; # = wall (blocked).
+        let map: Hypermap<f32> = Hypermap::new(0.0);
+        for x in 0..7i32 {
+            for y in 0..6i32 {
+                if x != 3 {
+                    map.set(x, y, 1.0);
+                }
+            }
+        }
+        // Cut the 2-wide doorway at z=2 and z=3.
+        map.set(3, 2, 1.0);
+        map.set(3, 3, 1.0);
+
+        assert!(is_doorway_tile(&map, 3, 2), "first gap tile must be a doorway");
+        assert!(is_doorway_tile(&map, 3, 3), "second gap tile must be a doorway");
+        assert!(!is_doorway_tile(&map, 1, 2), "open-room tile must not be a doorway");
+        assert!(!is_doorway_tile(&map, 3, 0), "wall tile must not be a doorway");
+    }
+
+    #[test]
+    fn does_not_treat_two_wide_corridor_as_doorway() {
+        // A straight 2-wide corridor running along x: none of the interior tiles
+        // should match as a doorway.
+        let map: Hypermap<f32> = Hypermap::new(0.0);
+        for x in 0..10i32 {
+            map.set(x, 0, 1.0);
+            map.set(x, 1, 1.0);
+        }
+        for x in 1..9 {
+            assert!(
+                !is_doorway_tile(&map, x, 0),
+                "corridor tile ({x},0) must not be a doorway"
+            );
+            assert!(
+                !is_doorway_tile(&map, x, 1),
+                "corridor tile ({x},1) must not be a doorway"
+            );
+        }
+    }
+
+    #[test]
+    fn simplify_keeps_approach_through_two_wide_doorway() {
+        // Same setup as the 1-wide doorway test but with 2 open tiles at x=3.
+        let map: Hypermap<f32> = Hypermap::new(0.0);
+        for x in 0..7i32 {
+            for y in 0..6i32 {
+                if x != 3 {
+                    map.set(x, y, 1.0);
+                }
+            }
+        }
+        map.set(3, 2, 1.0);
+        map.set(3, 3, 1.0);
+
+        let raw = match astar_shortest_world_path(
+            &map,
+            (0, 0),
+            (6, 5),
+            HypermapSearchLimits::default(),
+        ) {
+            HypermapPathResult::Found { path, .. } => path,
+            other => panic!("expected Found, got {other:?}"),
+        };
+        let simplified = simplify_path_line_of_sight(&map, &raw, 1);
+        // At least one doorway tile must remain in the simplified path.
+        let has_doorway = simplified.iter().any(|&(x, y)| is_doorway_tile(&map, x, y));
+        assert!(has_doorway, "at least one doorway tile must survive simplification: {simplified:?}");
     }
 
     #[test]

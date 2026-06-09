@@ -25,7 +25,8 @@
       "Bash(tee /tmp/everly_check.log)",
       "Bash(git fetch *)",
       "Bash(git merge *)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Edit(/.claude/skills/map-generator/**)"
     ],
     "additionalDirectories": [
       "/tmp"

@@ -226,3 +226,47 @@ BlackBot per frame** (the path follower's hot path).
 
 Verified green: `cargo test -p everly` (201 passed, 0 failed, 2 ignored) and
 `cargo check -p everly` warning-clean.
+
+### FPS counter — allocation-free steady state (2026-06)
+
+New FPS counter HUD overlay in [`src/hud/game_hud.rs`](src/hud/game_hud.rs)
+(`update_fps_counter`) originally called `format!("{fps} fps")` and assigned
+the resulting `String` **every frame** — a per-frame heap allocation violating
+rule 4 even when the displayed integer was unchanged.
+
+- **Fix:** added a `Local<u32>` tracking the last displayed fps. The `format!`
+  and text write are now gated on `fps != *last_fps`, so the system is a no-op
+  on steady-framerate frames (one integer compare, zero allocations). The
+  `String` is still allocated only when the fps integer changes (~1 Hz at 60 fps).
+- **Rule 4.** No semantic change: the counter still shows instantaneous fps.
+
+Verified green: `cargo test -p everly` (211 passed, 0 failed, 2 ignored) and
+`cargo check -p everly` warning-clean.
+
+### Patrol loop generation — back off on empty result (2026-06)
+
+The lazy patrol-loop generation in
+[`black_bot_brain`](src/actor/black_bot.rs) (the per-frame, per-bot brain loop)
+re-ran [`generate_patrol_loop`](src/actor/brain/high_level.rs) whenever
+`Patrol::loop_tiles` was empty.
+
+- **Issue (rules 4/7 — repeated expensive probe on a per-frame path):**
+  `generate_patrol_loop` runs A\* up to `PATROL_GEN_ATTEMPTS` (64) times
+  (`max_expanded` 2000 each). A normal bot fills its loop on the first
+  operational frame and never retries — but a bot whose anchor has **no**
+  reachable waypoint within `PATROL_RADIUS` (boxed-in, or a chunk still
+  streaming in) returned empty, leaving `is_empty()` true, so the full 64-search
+  sweep re-ran **every frame, forever** — a per-frame A\* storm scaling with the
+  number of trapped patrol bots.
+- **Fix:** added `Patrol::retry_cooldown` (`f32`, `Default` `0.0`). An empty
+  result sets it to [`PATROL_RETRY_COOLDOWN_SECS`] (1.0 s); while positive it just
+  decrements by `dt` and skips generation. So a stuck bot retries ~once/second
+  instead of ~60×/second (≈60× fewer A\* sweeps on that degenerate path).
+- **Semantics (rule 8):** the normal case is **identical** — `retry_cooldown`
+  starts at `0.0`, so the first frame attempts immediately and a reachable anchor
+  fills the loop with no retry ever. Only the unreachable-anchor path changes,
+  and only in *timing* (loop appears up to 1 s later once the area becomes
+  reachable). `Patrol` is not serialized, so the new field needs no migration.
+
+Verified green: `cargo test -p everly` (212 passed, 0 failed, 2 ignored) and
+`cargo check -p everly --all-targets` warning-clean.

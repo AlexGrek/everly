@@ -269,7 +269,19 @@ impl BotSpecialization {
 #[derive(Component, Default)]
 pub struct Patrol {
     pub loop_tiles: Vec<(i32, i32)>,
+    /// Seconds until the next generation attempt while `loop_tiles` is still
+    /// empty. [`generate_patrol_loop`](crate::actor::brain::generate_patrol_loop)
+    /// runs A\* up to `PATROL_GEN_ATTEMPTS` times, so when the bot's anchor area
+    /// is unreachable (transiently while a chunk streams in, or permanently for a
+    /// boxed-in bot) we back off for [`PATROL_RETRY_COOLDOWN_SECS`] instead of
+    /// re-running that whole search every frame. `0.0` (the `Default`) attempts
+    /// immediately, so a normal bot fills its loop on the first operational frame.
+    retry_cooldown: f32,
 }
+
+/// Backoff between empty [`Patrol::loop_tiles`] generation attempts — see
+/// [`Patrol::retry_cooldown`].
+const PATROL_RETRY_COOLDOWN_SECS: f32 = 1.0;
 
 pub struct BlackBot {
     state: ActorState,
@@ -530,11 +542,23 @@ fn black_bot_brain(
         vis.offline_released = false;
 
         // Generate the patrol loop once, lazily, from the bot's current (spawn)
-        // tile. It then never changes — the bot sticks to it forever.
+        // tile. It then never changes — the bot sticks to it forever. If a bot's
+        // surroundings yield no reachable waypoint the result is empty; back off
+        // before retrying so we don't re-run the full A* sweep every frame.
         if let Some(p) = patrol.as_mut() {
             if p.loop_tiles.is_empty() {
-                p.loop_tiles =
-                    generate_patrol_loop(brain.rng_mut(), (current_tile.x, current_tile.y), passability);
+                if p.retry_cooldown > 0.0 {
+                    p.retry_cooldown -= dt;
+                } else {
+                    p.loop_tiles = generate_patrol_loop(
+                        brain.rng_mut(),
+                        (current_tile.x, current_tile.y),
+                        passability,
+                    );
+                    if p.loop_tiles.is_empty() {
+                        p.retry_cooldown = PATROL_RETRY_COOLDOWN_SECS;
+                    }
+                }
             }
         }
         let patrol_loop = patrol.as_deref().map(|p| p.loop_tiles.as_slice());

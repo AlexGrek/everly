@@ -148,6 +148,16 @@ struct ChunkUpperMeshEntities {
 #[derive(Resource, Default, Debug)]
 pub struct HypermapChunkRemeshQueue(pub HashSet<ChunkCoord>);
 
+/// Controls whether water planes are rendered. Toggle via the HUD "Water" button.
+#[derive(Resource, Debug)]
+pub struct WaterRenderingEnabled(pub bool);
+
+impl Default for WaterRenderingEnabled {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
 /// Queues a chunk for mesh rebuild after editing tile `(world_x, world_z)` (ground plane indices).
 pub fn queue_hypermap_chunk_remesh(queue: &mut HypermapChunkRemeshQueue, world_x: i32, world_z: i32) {
     let (coord, _) = world_to_chunk_local(world_x, world_z);
@@ -249,8 +259,7 @@ struct ChunkRenderCadence {
 
 #[derive(Resource)]
 struct HypermapRenderAssets {
-    /// Horizontal water plane sized to the chunk **interior** (excluding
-    /// [`WATER_MESH_EDGE_STRIP`] cells on each side) so water never covers the border band.
+    /// Horizontal water plane spanning the full chunk (128×128 cells).
     water_mesh: Handle<Mesh>,
     /// Invisible placeholder mesh for upper layers when empty.
     empty_mesh: Handle<Mesh>,
@@ -277,20 +286,27 @@ impl Plugin for HypermapWorldPlugin {
         // the time we enter `GameState::InGame` its resources are ready and
         // the cross-schedule `.after(setup_water)` from before is no longer
         // needed.
-        app.add_systems(
-            OnEnter(GameState::InGame),
-            (setup_hypermap_runtime, setup_hypermap_assets).chain(),
-        )
-        .add_systems(
-            Update,
-            (
-                refresh_chunk_upper_layers_on_floor_change,
-                update_visible_hypermap_chunks,
-                render_chunks_30fps,
+        app.init_resource::<WaterRenderingEnabled>()
+            .add_systems(
+                OnEnter(GameState::InGame),
+                (setup_hypermap_runtime, setup_hypermap_assets).chain(),
             )
-                .chain()
-                .run_if(in_state(GameState::InGame)),
-        );
+            .add_systems(
+                Update,
+                (
+                    refresh_chunk_upper_layers_on_floor_change,
+                    update_visible_hypermap_chunks,
+                    render_chunks_30fps,
+                )
+                    .chain()
+                    .run_if(in_state(GameState::InGame)),
+            )
+            .add_systems(
+                Update,
+                sync_water_visibility
+                    .run_if(in_state(GameState::InGame))
+                    .run_if(resource_changed::<WaterRenderingEnabled>),
+            );
     }
 }
 
@@ -328,8 +344,8 @@ fn setup_hypermap_assets(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut water_materials: ResMut<Assets<StandardWaterMaterial>>,
 ) {
-    let interior = (HYPERMAP_CHUNK_SIZE - 2 * WATER_MESH_EDGE_STRIP).max(1) as f32;
-    let water_mesh = meshes.add(PlaneMeshBuilder::from_size(Vec2::new(interior, interior)));
+    let chunk_size = HYPERMAP_CHUNK_SIZE as f32;
+    let water_mesh = meshes.add(PlaneMeshBuilder::from_size(Vec2::splat(chunk_size)));
     let empty_mesh = meshes.add(PlaneMeshBuilder::from_size(Vec2::splat(0.02)));
 
     let road_material = materials.add(StandardMaterial {
@@ -403,8 +419,8 @@ fn setup_hypermap_assets(
         ..default()
     });
     let normalized_dir = settings.wave_direction.normalize_or_zero();
-    let coord_scale = Vec2::splat(interior);
-    let coord_offset = Vec2::splat(-interior * 0.5);
+    let coord_scale = Vec2::splat(chunk_size);
+    let coord_offset = Vec2::splat(-chunk_size * 0.5);
     let water_material = water_materials.add(StandardWaterMaterial {
         base: StandardMaterial {
             base_color: settings.base_color,
@@ -2173,6 +2189,16 @@ fn build_chunk_render_data(snapshot: Vec<(CellType, TileStyle, TileStyle)>, acti
 pub fn rendered_chunks_around(world_x: i32, world_y: i32) -> HashSet<ChunkCoord> {
     let (center, local) = world_to_chunk_local(world_x, world_y);
     target_chunks_for(center, local)
+}
+
+fn sync_water_visibility(
+    enabled: Res<WaterRenderingEnabled>,
+    mut waters: Query<&mut Visibility, With<RenderedChunkWater>>,
+) {
+    let vis = if enabled.0 { Visibility::Inherited } else { Visibility::Hidden };
+    for mut v in &mut waters {
+        *v = vis;
+    }
 }
 
 /// Exactly three chunks: camera chunk plus one neighbor on each axis toward the

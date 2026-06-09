@@ -193,6 +193,29 @@ changes deferred through `ParallelCommands`. Two actors stepping into the same
 free cell still both succeed for one frame (they read last frame's snapshot) and
 resolve after the next flush — exactly as in the previous sequential loop.
 
+### Off-screen culling and re-entry
+
+An actor whose containing chunk has no spawned mesh entity
+(`HypermapRuntime::is_world_pos_rendered` is `false` — i.e. it is far from the
+camera) is **not** collision-checked. It carries the `OffScreenActor` marker and
+moves via `Actor::advance_unchecked`: position advances with no footprint stamp,
+so off-screen actors neither collide nor occupy the dynamic map. This keeps the
+collision cost proportional to the *visible* actor set, not the whole world.
+
+On the single frame an actor crosses **off-screen → on-screen**, it is placed
+back into a free cell by `resolve_offscreen_collision` (current cell →
+`next_waypoint_hint` → expanding tile ring r=1..5). This "physics kick-in" runs
+in a **sequential pass after** the parallel movement loop, over only the actors
+that re-entered this frame (collected during the parallel pass, sorted by entity
+for scheduling-independent order). Each placement uses
+`DynamicPassabilityMap::try_claim_reentry_footprint`, which — unlike
+`try_update_footprint` — also probes the **write** buffer and commits its claim
+there. So a re-entrant avoids both the on-screen actors' new footprints (stamped
+during the parallel pass) and earlier re-entrants' just-claimed cells, even
+though none of those are visible in the read buffer yet. This is why several
+actors re-entering on the same frame can never be packed onto the same cell —
+the placement is still fully deterministic.
+
 ### Per-actor static passability
 
 The closure passed into `try_update_footprint_with_static` is **built per actor** from a trait method:

@@ -16,6 +16,7 @@ const NEIGHBORS: [(i32, i32, u8); 4] = [
 
 impl MapDraft {
     /// Exactly one door per house; only accepts sites that open onto road, not other houses.
+    /// Doors are widened to 2 tiles when a valid neighbor along the wall run exists.
     pub fn step_place_house_doors(&mut self) {
         let house_count = self.houses.len();
         for index in 0..house_count {
@@ -26,8 +27,22 @@ impl MapDraft {
             if valid.is_empty() {
                 continue;
             }
-            let pick = valid[self.rng.gen_range(0..valid.len())];
+            // Prefer a site that can be widened to 2 tiles.
+            let widenable: Vec<_> = valid
+                .iter()
+                .copied()
+                .filter(|&(x, z, edge)| find_wide_companion(self, index, x, z, edge).is_some())
+                .collect();
+            let pick = if !widenable.is_empty() {
+                widenable[self.rng.gen_range(0..widenable.len())]
+            } else {
+                valid[self.rng.gen_range(0..valid.len())]
+            };
             open_doorway(self, pick.0, pick.1, pick.2);
+            let companion = find_wide_companion(self, index, pick.0, pick.1, pick.2);
+            if let Some((cx, cz)) = companion {
+                open_doorway(self, cx, cz, pick.2);
+            }
             let (walk_x, walk_z) = entrypoint_walk_tile(pick.0, pick.1, pick.2);
             self.houses[index].entry = Some(HouseEntrypoint {
                 walk_x,
@@ -35,6 +50,7 @@ impl MapDraft {
                 wall_x: pick.0,
                 wall_z: pick.1,
                 outward_edge: pick.2,
+                wall2: companion,
             });
         }
     }
@@ -247,4 +263,29 @@ fn open_doorway(draft: &mut MapDraft, x: i32, z: i32, bit: u8) {
         DraftTile::Corner(_) => draft.set(x, z, DraftTile::Open),
         _ => {}
     }
+}
+
+/// Returns the adjacent cell along the wall run (perpendicular to `outward_edge`) that
+/// can serve as a second valid door site, making the opening 2 tiles wide.  Returns
+/// `None` when no such neighbor exists (degenerate geometry → 1-wide fallback).
+fn find_wide_companion(
+    draft: &MapDraft,
+    house_index: usize,
+    wall_x: i32,
+    wall_z: i32,
+    outward_edge: u8,
+) -> Option<(i32, i32)> {
+    // Candidates run along the wall axis (the axis *not* crossed by the door opening).
+    let along: &[(i32, i32)] = match outward_edge {
+        MASK_NORTH | MASK_SOUTH => &[(1, 0), (-1, 0)], // N/S wall → run east-west
+        MASK_EAST | MASK_WEST => &[(0, 1), (0, -1)],   // E/W wall → run north-south
+        _ => return None,
+    };
+    for &(dx, dz) in along {
+        let (nx, nz) = (wall_x + dx, wall_z + dz);
+        if is_valid_door_site(draft, house_index, nx, nz, outward_edge) {
+            return Some((nx, nz));
+        }
+    }
+    None
 }

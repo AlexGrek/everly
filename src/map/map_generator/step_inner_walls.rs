@@ -113,16 +113,17 @@ impl MapDraft {
             let h = &self.houses[house_idx];
             (h.x0, h.x1)
         };
-        let door_cell = self.houses[house_idx]
+        let (door_cell, door_cell2) = self.houses[house_idx]
             .entry
             .as_ref()
-            .map(|e| (e.wall_x, e.wall_z));
+            .map(|e| (Some((e.wall_x, e.wall_z)), e.wall2))
+            .unwrap_or((None, None));
         for x in x0..=x1 {
             if !self.houses[house_idx].contains(x, zw) {
                 continue;
             }
-            // Don't re-seal the outer door cell with an inner wall slab.
-            if door_cell == Some((x, zw)) {
+            // Don't re-seal either outer door cell with an inner wall slab.
+            if door_cell == Some((x, zw)) || door_cell2 == Some((x, zw)) {
                 continue;
             }
             add_wall_bit(self, x, zw, MASK_NORTH);
@@ -134,15 +135,16 @@ impl MapDraft {
             let h = &self.houses[house_idx];
             (h.z0, h.z1)
         };
-        let door_cell = self.houses[house_idx]
+        let (door_cell, door_cell2) = self.houses[house_idx]
             .entry
             .as_ref()
-            .map(|e| (e.wall_x, e.wall_z));
+            .map(|e| (Some((e.wall_x, e.wall_z)), e.wall2))
+            .unwrap_or((None, None));
         for z in z0..=z1 {
             if !self.houses[house_idx].contains(xw, z) {
                 continue;
             }
-            if door_cell == Some((xw, z)) {
+            if door_cell == Some((xw, z)) || door_cell2 == Some((xw, z)) {
                 continue;
             }
             add_wall_bit(self, xw, z, MASK_WEST);

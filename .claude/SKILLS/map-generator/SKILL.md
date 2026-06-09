@@ -135,7 +135,11 @@ Union shell uses `union_perimeter_wall_mask` in `union.rs` (not per-room `perime
 ## Doors
 
 - `is_valid_door_site` — walk tile is exterior road (not inside any house), inward is open floor, single-bit wall only (no L-corner slabs), must not face another house’s wall.
-- `step_place_house_doors` — random pick among **valid** sites only (no bad doors left in place).
+- `step_place_house_doors` — prefers a widenable site (a valid neighbor along the wall run), opens **both** cells to make a **2-tile-wide doorway**. Falls back to 1-wide when no widenable site exists. The second cell is stored in `HouseEntrypoint.wall2` (chunk metadata v4).
+- Inner walls (`step_inner_walls.rs`) skip **both** door cells (`wall_x/wall_z` and `wall2`).
+- Charger placement (`step_charging_stations.rs`) excludes **both** door cells and both inward tiles.
+- `step_place_inner_doors` also widens each inner door to 2 tiles: after clearing an edge, it clears the parallel adjacent edge one step along the wall run if both neighbour cells are in-house and blocked.
+- `is_doorway_tile` in `hypermap_pathfind.rs` recognizes both 1- and **2-wide** gaps (band-based check with a widening guard to reject corridors).
 - Crawlers never modify walls.
 
 ## House count

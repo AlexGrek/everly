@@ -17,7 +17,7 @@ pub const SUBSEEDS_PER_PRIMARY_MAX: i32 = 4;
 /// Minimum house footprint (1 m² cells) for the center glass floor wave.
 pub const MIN_HOUSE_AREA_FOR_CENTER_WAVE: i32 = 30;
 
-pub const GENERATED_CHUNK_METADATA_VERSION: u32 = 3;
+pub const GENERATED_CHUNK_METADATA_VERSION: u32 = 4;
 
 /// Main doorway for one house (chunk-local tiles).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -30,6 +30,10 @@ pub struct HouseEntrypoint {
     pub wall_z: i32,
     /// [`MASK_NORTH`] … [`MASK_WEST`] bit opened toward `walk_*`.
     pub outward_edge: u8,
+    /// Second wall cell of a 2-wide doorway (adjacent along the wall run).
+    /// `None` when only a 1-wide opening could be cut (degenerate geometry).
+    #[serde(default)]
+    pub wall2: Option<(i32, i32)>,
 }
 
 /// One merged building footprint plus its single entry (chunk-local tiles).

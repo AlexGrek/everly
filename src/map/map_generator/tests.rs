@@ -930,3 +930,132 @@ fn charging_stations_back_onto_a_wall_and_skip_corners() {
     }
     assert!(found_any, "at least some seeds should place a charging station");
 }
+
+#[test]
+fn outer_doors_are_two_tiles_wide_when_possible() {
+    // Across many seeds the vast majority of outer house doors should be 2-wide.
+    // We allow a small fraction of 1-wide fallbacks for degenerate geometry.
+    let mut two_wide = 0u32;
+    let mut one_wide = 0u32;
+    for seed in 0..64u64 {
+        let mut draft = MapDraft::new(MapGeneratorConfig {
+            seed,
+            ..Default::default()
+        });
+        draft.run_pipeline();
+        for house in &draft.houses {
+            let Some(ref ep) = house.entry else { continue };
+            if ep.wall2.is_some() {
+                two_wide += 1;
+            } else {
+                one_wide += 1;
+            }
+        }
+    }
+    let total = two_wide + one_wide;
+    assert!(total > 0, "expected at least one house entry across 64 seeds");
+    // At least 80% of entries should be 2-wide.
+    assert!(
+        two_wide * 10 >= total * 8,
+        "expected ≥80% 2-wide doors, got {two_wide}/{total}"
+    );
+}
+
+#[test]
+fn outer_door_wall2_is_adjacent_along_wall_run() {
+    // When wall2 is set, it must be exactly one step from wall_x/wall_z along the wall
+    // run (perpendicular to outward_edge), not diagonally or further away.
+    use crate::map::world_map::{MASK_EAST, MASK_NORTH, MASK_SOUTH, MASK_WEST};
+    for seed in 0..64u64 {
+        let mut draft = MapDraft::new(MapGeneratorConfig { seed, ..Default::default() });
+        draft.run_pipeline();
+        for (i, house) in draft.houses.iter().enumerate() {
+            let Some(ref ep) = house.entry else { continue };
+            let Some((wx2, wz2)) = ep.wall2 else { continue };
+            let dist = (wx2 - ep.wall_x).abs() + (wz2 - ep.wall_z).abs();
+            assert_eq!(
+                dist, 1,
+                "seed {seed} house {i}: wall2 must be exactly 1 step from wall_x/wall_z"
+            );
+            // The step must be along the wall run (perpendicular to outward_edge).
+            let along_run = match ep.outward_edge {
+                MASK_NORTH | MASK_SOUTH => (wx2 - ep.wall_x).abs() == 1 && wz2 == ep.wall_z,
+                MASK_EAST | MASK_WEST   => (wz2 - ep.wall_z).abs() == 1 && wx2 == ep.wall_x,
+                _ => false,
+            };
+            assert!(
+                along_run,
+                "seed {seed} house {i}: wall2 must step along the wall run, not the door direction"
+            );
+        }
+    }
+}
+
+#[test]
+fn inner_doors_make_all_rooms_accessible_with_wide_doors() {
+    // The widened inner doors must not break the "all rooms accessible" invariant.
+    // This reuses the same connectivity check as `inner_doors_make_all_rooms_accessible`.
+    use std::collections::{HashSet, VecDeque};
+    use crate::map::world_map::{MASK_EAST, MASK_NORTH, MASK_SOUTH, MASK_WEST};
+
+    let cell_bits = |draft: &MapDraft, x: i32, z: i32| -> Option<u8> {
+        match draft.get(x, z) {
+            DraftTile::Open | DraftTile::Corner(_) | DraftTile::Charger(_) => Some(0),
+            DraftTile::Wall(bits) => Some(bits),
+            DraftTile::Void => None,
+        }
+    };
+    const EDGES: [(i32, i32, u8, u8); 4] = [
+        (0, -1, MASK_NORTH, MASK_SOUTH),
+        (0, 1, MASK_SOUTH, MASK_NORTH),
+        (1, 0, MASK_EAST, MASK_WEST),
+        (-1, 0, MASK_WEST, MASK_EAST),
+    ];
+
+    for seed in 0..64u64 {
+        let mut draft = MapDraft::new(MapGeneratorConfig { seed, ..Default::default() });
+        draft.step_init_carpet();
+        draft.step_place_primary_seeds();
+        draft.step_separate_primary_seeds();
+        draft.step_spawn_subseeds();
+        draft.step_grow_rooms();
+        draft.step_cluster_houses();
+        draft.step_paint_union_interior();
+        draft.step_build_union_outer_walls();
+        draft.step_stamp_union_inner_corner_pillars();
+        draft.step_place_house_doors();
+        draft.step_split_houses_into_rooms();
+        draft.step_place_inner_doors();
+
+        for (hi, house) in draft.houses.iter().enumerate() {
+            let Some(ref ep) = house.entry else { continue };
+            let Some(start) = super::step_home_crawler::house_entry_interior_tile(&draft, ep) else { continue };
+
+            let mut visited: HashSet<(i32, i32)> = HashSet::from([start]);
+            let mut queue: VecDeque<(i32, i32)> = VecDeque::from([start]);
+            while let Some((x, z)) = queue.pop_front() {
+                let Some(b) = cell_bits(&draft, x, z) else { continue };
+                for (dx, dz, this_bit, nbr_bit) in EDGES {
+                    let n = (x + dx, z + dz);
+                    if visited.contains(&n) || !house.contains(n.0, n.1) { continue; }
+                    let Some(nb) = cell_bits(&draft, n.0, n.1) else { continue };
+                    if b & this_bit == 0 && nb & nbr_bit == 0 {
+                        visited.insert(n);
+                        queue.push_back(n);
+                    }
+                }
+            }
+
+            for z in house.z0..=house.z1 {
+                for x in house.x0..=house.x1 {
+                    if house.contains(x, z)
+                        && cell_bits(&draft, x, z).is_some()
+                        && !visited.contains(&(x, z))
+                    {
+                        panic!("seed {seed} house {hi}: ({x},{z}) unreachable from entry");
+                    }
+                }
+            }
+        }
+    }
+}

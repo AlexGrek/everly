@@ -13,7 +13,7 @@ use crate::edit::actor_spawn::{ActorSpawnToggleButton, ActorSpawnToggleLabel};
 use crate::edit::map_edit::{MapEditToggleButton, MapEditToggleLabel};
 use crate::map::chunk_overlay::OccupancyOverlayEnabled;
 use crate::map::dirt::DirtMap;
-use crate::map::hypermap_world::{HypermapChunkRemeshQueue, HypermapRuntime};
+use crate::map::hypermap_world::{HypermapChunkRemeshQueue, HypermapRuntime, WaterRenderingEnabled};
 use crate::map::temperature::TemperatureMap;
 use crate::map::temperature_overlay::TemperatureOverlayEnabled;
 use crate::map::floor_level::{ActiveFloorLevel, HYPERMAP_FLOOR_MAX};
@@ -59,6 +59,12 @@ struct HeatmapToggleButton;
 struct HeatmapToggleLabel;
 
 #[derive(Component)]
+struct WaterToggleButton;
+
+#[derive(Component)]
+struct WaterToggleLabel;
+
+#[derive(Component)]
 struct RedrawAllButton;
 
 #[derive(Component)]
@@ -100,6 +106,8 @@ impl Plugin for GameHudPlugin {
                 sync_occupancy_toggle_label,
                 heatmap_toggle_button,
                 sync_heatmap_toggle_label,
+                water_toggle_button,
+                sync_water_toggle_label,
                 redraw_all_button,
                 floor_level_buttons,
                 update_floor_level_readout,
@@ -296,6 +304,33 @@ pub(crate) fn spawn_bottom_hud(mut commands: Commands, camera: Query<Entity, Wit
                     p.spawn((
                         HeatmapToggleLabel,
                         Text::new("Heat: Off"),
+                        TextFont::from_font_size(17.0),
+                        TextColor(TEXT_MAIN),
+                    ));
+                });
+
+            parent
+                .spawn((
+                    Name::new("HUD water toggle"),
+                    WaterToggleButton,
+                    Button,
+                    Node {
+                        min_width: Val::Px(106.0),
+                        height: Val::Px(36.0),
+                        padding: UiRect::horizontal(Val::Px(12.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(1.0)),
+                        border_radius: BorderRadius::all(Val::Px(6.0)),
+                        ..default()
+                    },
+                    BorderColor::all(BTN_BORDER),
+                    BackgroundColor(BTN_BG),
+                ))
+                .with_children(|p| {
+                    p.spawn((
+                        WaterToggleLabel,
+                        Text::new("Water: On"),
                         TextFont::from_font_size(17.0),
                         TextColor(TEXT_MAIN),
                     ));
@@ -716,12 +751,46 @@ fn spawn_fps_counter(mut commands: Commands, camera: Query<Entity, With<Strategy
     ));
 }
 
-fn update_fps_counter(time: Res<Time>, mut query: Query<&mut Text, With<FpsCounterText>>) {
+fn water_toggle_button(
+    interactions: Query<&Interaction, (With<WaterToggleButton>, Changed<Interaction>)>,
+    mut enabled: ResMut<WaterRenderingEnabled>,
+) {
+    for interaction in &interactions {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        enabled.0 = !enabled.0;
+    }
+}
+
+fn sync_water_toggle_label(
+    enabled: Res<WaterRenderingEnabled>,
+    mut texts: Query<&mut Text, With<WaterToggleLabel>>,
+) {
+    if !enabled.is_changed() {
+        return;
+    }
+    let label = if enabled.0 { "Water: On" } else { "Water: Off" };
+    for mut text in &mut texts {
+        **text = label.to_string();
+    }
+}
+
+fn update_fps_counter(
+    time: Res<Time>,
+    mut last_fps: Local<u32>,
+    mut query: Query<&mut Text, With<FpsCounterText>>,
+) {
     let dt = time.delta_secs();
     if dt <= 0.0 {
         return;
     }
     let fps = (1.0 / dt).round() as u32;
+    // Only allocate and write when the displayed integer actually changes.
+    if fps == *last_fps {
+        return;
+    }
+    *last_fps = fps;
     for mut text in &mut query {
         **text = format!("{fps} fps");
     }

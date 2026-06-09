@@ -31,6 +31,8 @@ pub mod glitch_bot;
 pub mod inspect;
 pub mod snapshot;
 
+use std::sync::Mutex;
+
 use bevy::prelude::*;
 
 use crate::map::hypermap::Hypermap;
@@ -479,6 +481,13 @@ pub(crate) fn flush_actor_occupancy(passability: Res<DynamicPassabilityMap>) {
 /// 2. [`ActorState::next_waypoint_hint`] (set by the actor's think system).
 /// 3. Centers of tiles in an expanding ring of radius 1–5 around the actor.
 ///
+/// Each candidate is tested with
+/// [`DynamicPassabilityMap::try_claim_reentry_footprint`], which checks the
+/// **write** buffer in addition to static geometry and the read buffer and
+/// stamps the claim into the write buffer on success. Called sequentially (see
+/// [`process_actors`]), this keeps several actors re-entering on the same frame
+/// from being placed on the same cell.
+///
 /// If nothing is passable the actor is left in place without stamping a
 /// footprint; it will retry next frame.
 fn resolve_offscreen_collision(
@@ -493,9 +502,11 @@ fn resolve_offscreen_collision(
         .last_accepted_center_subtile
         .unwrap_or_else(|| actor.state().center_subtile_i32());
 
-    // 1. Try current position (previous=None — off-screen footprint was not stamped).
+    // 1. Try current position. Re-entry placement probes the write buffer too,
+    // so several actors re-entering on the same frame (resolved sequentially)
+    // never claim the same cell.
     if dynamic
-        .try_update_footprint(current_sub, radius, None, blocked, static_cache)
+        .try_claim_reentry_footprint(current_sub, radius, blocked, static_cache)
         .is_ok()
     {
         let s = actor.state_mut();
@@ -510,7 +521,7 @@ fn resolve_offscreen_collision(
         let sc = SUBTILE_COUNT as f32;
         let candidate = IVec2::new((wp.x * sc).floor() as i32, (wp.y * sc).floor() as i32);
         if dynamic
-            .try_update_footprint(candidate, radius, None, blocked, static_cache)
+            .try_claim_reentry_footprint(candidate, radius, blocked, static_cache)
             .is_ok()
         {
             let s = actor.state_mut();
@@ -536,7 +547,7 @@ fn resolve_offscreen_collision(
                 let tile = current_tile + IVec2::new(dx, dy);
                 let candidate = IVec2::new(tile.x * sc_i + sc_i / 2, tile.y * sc_i + sc_i / 2);
                 if dynamic
-                    .try_update_footprint(candidate, radius, None, blocked, static_cache)
+                    .try_claim_reentry_footprint(candidate, radius, blocked, static_cache)
                     .is_ok()
                 {
                     let tile_center = Vec2::new(tile.x as f32 + 0.5, tile.y as f32 + 0.5);
@@ -576,6 +587,15 @@ pub(crate) fn process_actors(
     let dynamic_passability = &*dynamic_passability;
     let hypermap = &*hypermap;
 
+    // Actors crossing off-screen → on-screen this frame. Their placement is
+    // deferred out of the parallel pass into the sequential one below: re-entry
+    // resolution both reads *and* writes the dynamic write buffer, so it must
+    // run one actor at a time or two simultaneous re-entrants could be packed
+    // onto the same cell. The lock guards only this rare transition path — never
+    // the steady-state movement path — and stays empty (no allocation) when no
+    // actor re-enters this frame.
+    let reentering: Mutex<Vec<Entity>> = Mutex::new(Vec::new());
+
     actors
         .par_iter_mut()
         .for_each(|(entity, mut actor_obj, off_screen)| {
@@ -591,12 +611,13 @@ pub(crate) fn process_actors(
 
             if is_rendered {
                 if was_off_screen {
-                    // Transition: off-screen → on-screen. Place actor at valid position, then
-                    // normal movement resumes next frame once the marker is removed.
+                    // Transition: off-screen → on-screen. Drop the marker now, but
+                    // defer placement to the sequential pass so re-entrants resolve
+                    // against each other's claims.
                     par_commands.command_scope(|mut commands| {
                         commands.entity(entity).remove::<OffScreenActor>();
                     });
-                    resolve_offscreen_collision(actor, dynamic_passability, static_cache);
+                    reentering.lock().expect("reentry lock poisoned").push(entity);
                 } else {
                     actor.try_move(dynamic_passability, static_cache);
                 }
@@ -609,6 +630,20 @@ pub(crate) fn process_actors(
                 actor.advance_unchecked();
             }
         });
+
+    // Sequential re-entry placement. The parallel borrow above has ended, so we
+    // can re-borrow `actors` one entity at a time. By now the write buffer holds
+    // every on-screen actor's new footprint (committed during the parallel pass),
+    // so each re-entrant avoids those too. Sorting by entity makes the placement
+    // order — and therefore the result — independent of the thread scheduling
+    // that filled `reentering`.
+    let mut reentering = reentering.into_inner().expect("reentry lock poisoned");
+    reentering.sort_unstable();
+    for entity in reentering {
+        if let Ok((_, mut actor_obj, _)) = actors.get_mut(entity) {
+            resolve_offscreen_collision(actor_obj.inner.as_mut(), dynamic_passability, static_cache);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -936,6 +971,36 @@ mod tests {
         let final_sub = actor.state.last_accepted_center_subtile.unwrap();
         assert_ne!(final_sub, IVec2::new(2, 2),
             "must escape blocked tile via ring search");
+    }
+
+    #[test]
+    fn resolve_offscreen_same_frame_reentrants_dont_overlap() {
+        // Two actors re-entering on the **same** frame from the same subtile must
+        // be placed on different cells. They are resolved sequentially with NO
+        // flush in between (mirroring `process_actors`' re-entry pass): the second
+        // sees the first's claim only because re-entry placement probes the write
+        // buffer. Under the old read-buffer-only path both would keep (27, 27).
+        let map = DynamicPassabilityMap::new();
+        let sc = empty_static_cache();
+
+        let mut a = DummyActor::new(Vec2::new(5.5, 5.5), 0);
+        a.state.last_accepted_center_subtile = Some(IVec2::new(27, 27));
+        let mut b = DummyActor::new(Vec2::new(5.5, 5.5), 0);
+        b.state.last_accepted_center_subtile = Some(IVec2::new(27, 27));
+
+        super::resolve_offscreen_collision(&mut a, &map, &sc);
+        super::resolve_offscreen_collision(&mut b, &map, &sc);
+
+        let a_sub = a.state.last_accepted_center_subtile.unwrap();
+        let b_sub = b.state.last_accepted_center_subtile.unwrap();
+        assert_eq!(a_sub, IVec2::new(27, 27), "first re-entrant keeps the clear cell");
+        assert_ne!(a_sub, b_sub, "same-frame re-entrants must not share a cell");
+
+        // Both claims are stamped in the write buffer (visible after flush).
+        map.flush();
+        let view = SubtilePassabilityMap::new(&map);
+        assert_ne!(view.flags_xy(0, 0, a_sub.x, a_sub.y) & FLAG_BLOCKED, 0);
+        assert_ne!(view.flags_xy(0, 0, b_sub.x, b_sub.y) & FLAG_BLOCKED, 0);
     }
 
     #[test]

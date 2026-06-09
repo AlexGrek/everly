@@ -230,6 +230,34 @@ impl DynamicPassabilityMap {
         actor_blocked: u64,
         static_cache: &Hypermap<SubtilePassability>,
     ) -> Result<(), TryUpdateFootprintError> {
+        self.probe_footprint_inner(
+            next_center_subtile,
+            radius_subtiles,
+            previous,
+            actor_blocked,
+            static_cache,
+            None,
+        )
+    }
+
+    /// Shared body of [`probe_footprint`] and [`try_claim_reentry_footprint`].
+    ///
+    /// `pending_dynamic`, when `Some`, is a second dynamic map (the **write**
+    /// buffer) whose creature occupancy also blocks the candidate. The read
+    /// buffer is the immutable per-frame snapshot; the write buffer additionally
+    /// holds *this* frame's not-yet-flushed footprints. Checking it lets
+    /// off-screen re-entrants placed sequentially after the parallel movement
+    /// pass avoid both on-screen actors' new footprints and earlier re-entrants'
+    /// just-claimed cells — neither of which the read buffer shows yet.
+    fn probe_footprint_inner(
+        &self,
+        next_center_subtile: IVec2,
+        radius_subtiles: i32,
+        previous: Option<(IVec2, i32)>,
+        actor_blocked: u64,
+        static_cache: &Hypermap<SubtilePassability>,
+        pending_dynamic: Option<&Hypermap<SubtilePassability>>,
+    ) -> Result<(), TryUpdateFootprintError> {
         if radius_subtiles < 0 {
             return Err(TryUpdateFootprintError::InvalidRadius(radius_subtiles));
         }
@@ -249,6 +277,7 @@ impl DynamicPassabilityMap {
         // table lock, `Arc` clone, or 200-byte tile copy.
         let mut static_cursor = SubtileReadCursor::new(static_cache);
         let mut dynamic_cursor = SubtileReadCursor::new(self.inner.read_map());
+        let mut pending_cursor = pending_dynamic.map(SubtileReadCursor::new);
 
         for offset in new_shadow.offsets {
             let target = next_center_subtile + *offset;
@@ -276,6 +305,14 @@ impl DynamicPassabilityMap {
                     world_subtile: target,
                 });
             }
+
+            if let Some(pending) = pending_cursor.as_mut() {
+                if pending.flags(target) & actor_blocked != 0 {
+                    return Err(TryUpdateFootprintError::BlockedByOccupancy {
+                        world_subtile: target,
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -293,6 +330,36 @@ impl DynamicPassabilityMap {
         }
         let shadow = baked_circle_shadow(radius_subtiles);
         write_circle(self.inner.write_map(), center_subtile, shadow);
+    }
+
+    /// Places a re-entering off-screen actor: probes the candidate footprint
+    /// against static geometry, the dynamic **read** buffer, **and** the dynamic
+    /// **write** buffer (this frame's pending occupancy), then stamps it into the
+    /// write buffer on success.
+    ///
+    /// Unlike [`try_update_footprint`], the write-buffer check makes placement
+    /// safe for several actors re-entering on the **same** frame: called after
+    /// the parallel movement pass and **sequentially** (in a deterministic
+    /// order), each successful claim is visible — via the write buffer — to the
+    /// next, so two re-entrants can never be packed onto the same cell. There is
+    /// no `previous`: an off-screen actor holds no stamped footprint to exempt.
+    pub fn try_claim_reentry_footprint(
+        &self,
+        center_subtile: IVec2,
+        radius_subtiles: i32,
+        actor_blocked: u64,
+        static_cache: &Hypermap<SubtilePassability>,
+    ) -> Result<(), TryUpdateFootprintError> {
+        self.probe_footprint_inner(
+            center_subtile,
+            radius_subtiles,
+            None,
+            actor_blocked,
+            static_cache,
+            Some(self.inner.write_map()),
+        )?;
+        self.commit_footprint(center_subtile, radius_subtiles);
+        Ok(())
     }
 
     /// Stamps an arbitrary list of world-subtiles as creature-blocked in the

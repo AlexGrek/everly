@@ -62,6 +62,9 @@ Corners and T-junctions combine bits (e.g. N+W = `1 + 8 = 9`). Mesher draws **on
 **Doors** are not a separate token: omit the bit for the side that should stay open. Example:
 omit `MASK_SOUTH` to leave the cell’s **+Z** side open toward the neighboring tile (often `__`
 if that was the only bit). Facing `__` reads as a doorway onto road or another room.
+Procedurally generated doors are **2 tiles wide** (two adjacent cells with the shared slab removed),
+with a 1-wide fallback for degenerate geometry. Both door cells are stored in `HouseEntrypoint`
+(`wall_x`/`wall_z` and `wall2`) in the chunk metadata.
 
 ### Text tokens
 

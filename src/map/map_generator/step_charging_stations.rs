@@ -41,10 +41,15 @@ impl MapDraft {
             .entry
             .as_ref()
             .map(|e| {
-                vec![
+                let mut cells = vec![
                     (e.wall_x, e.wall_z),
                     entrypoint_inward_tile(e.wall_x, e.wall_z, e.outward_edge),
-                ]
+                ];
+                if let Some((wx2, wz2)) = e.wall2 {
+                    cells.push((wx2, wz2));
+                    cells.push(entrypoint_inward_tile(wx2, wz2, e.outward_edge));
+                }
+                cells
             })
             .unwrap_or_default();
 

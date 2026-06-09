@@ -57,6 +57,8 @@ impl MapDraft {
                 candidates[self.rng.gen_range(0..candidates.len())];
             clear_edge_bit(self, x, z, this_bit);
             clear_edge_bit(self, nx, nz, nbr_bit);
+            // Widen to 2 tiles: clear the parallel adjacent edge one step along the wall run.
+            widen_inner_door(self, &house, x, z, nx, nz, this_bit, nbr_bit);
         }
     }
 }
@@ -162,4 +164,52 @@ fn first_walkable_in_house(draft: &MapDraft, house: &House) -> Option<(i32, i32)
         }
     }
     None
+}
+
+/// Attempt to widen a just-opened inner door by one more tile along the wall run.
+///
+/// The door edge connects `(x, z)` → `(nx, nz)` (crossing axis).  The wall runs
+/// perpendicular to that crossing.  We try one adjacent tile along the run on the
+/// *this-side* cell and the *nbr-side* cell; pick whichever pair is in-house and
+/// currently blocked, then clear that edge too.
+fn widen_inner_door(
+    draft: &mut MapDraft,
+    house: &House,
+    x: i32,
+    z: i32,
+    nx: i32,
+    nz: i32,
+    this_bit: u8,
+    nbr_bit: u8,
+) {
+    // The crossing delta (door direction).
+    let (cdx, _cdz) = (nx - x, nz - z);
+    // Wall-run axes are perpendicular to the crossing.
+    let run_deltas: &[(i32, i32)] = if cdx == 0 {
+        &[(1, 0), (-1, 0)]
+    } else {
+        &[(0, 1), (0, -1)]
+    };
+    for &(rdx, rdz) in run_deltas {
+        let sx = x + rdx;
+        let sz = z + rdz;
+        let snx = nx + rdx;
+        let snz = nz + rdz;
+        if house.contains(sx, sz) && house.contains(snx, snz)
+            && walkable(draft, sx, sz) && walkable(draft, snx, snz)
+        {
+            // Only open if this parallel edge is actually blocked.
+            let blocked = cell_bits(draft, sx, sz)
+                .map(|b| b & this_bit != 0)
+                .unwrap_or(false)
+                || cell_bits(draft, snx, snz)
+                    .map(|b| b & nbr_bit != 0)
+                    .unwrap_or(false);
+            if blocked {
+                clear_edge_bit(draft, sx, sz, this_bit);
+                clear_edge_bit(draft, snx, snz, nbr_bit);
+            }
+            return; // only one adjacent pair — stop after first in-house neighbor
+        }
+    }
 }
