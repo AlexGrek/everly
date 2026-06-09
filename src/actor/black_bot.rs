@@ -546,6 +546,7 @@ fn black_bot_brain(
     pathfind_results: Res<PathfindResults>,
     mut interactive: ResMut<InteractiveEntityMap>,
     game_log: Res<GameLog>,
+    timings: Res<crate::hud::perf_timings::SystemTimings>,
     mut indexed: Local<IndexedChargerChunks>,
     mut query: Query<(
         Entity,
@@ -559,6 +560,7 @@ fn black_bot_brain(
         Option<&mut Patrol>,
     )>,
 ) {
+    let _t = timings.scope(crate::hud::perf_timings::TimedSystem::BlackBotBrain);
     let dt = time.delta_secs();
     let passability = &*hypermap.static_passability_map;
     let static_subtiles = &*hypermap.static_subtile_cache;

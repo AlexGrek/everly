@@ -771,7 +771,9 @@ fn render_chunks_30fps(
     level: Res<LevelName>,
     roots: Query<Entity, With<RenderedChunkRoot>>,
     waters: Query<Entity, With<RenderedChunkWater>>,
+    timings: Res<crate::hud::perf_timings::SystemTimings>,
 ) {
+    let _t = timings.scope(crate::hud::perf_timings::TimedSystem::RenderChunks);
     let remesh_coords: Vec<ChunkCoord> = remesh.0.drain().collect();
     for coord in remesh_coords {
         if !runtime.desired_chunks.contains(&coord) {

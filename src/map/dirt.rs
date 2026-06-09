@@ -2,16 +2,14 @@
 //!
 //! See `docs/field-interactions.md` for actor deposits and `docs/chunk-overlay.md` for rendering.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
 use bevy::prelude::*;
 use crate::rng;
 
 use crate::map::hypermap::{random_rng_seed, ChunkCoord, Hypermap, LocalCoord, HYPERMAP_CHUNK_SIZE};
-use crate::map::hypermap_pathfind::{
-    astar_shortest_world_path, passability_walkable, HypermapPathResult, HypermapSearchLimits,
-};
+use crate::map::hypermap_pathfind::passability_walkable;
 use crate::map::level::LevelName;
 use crate::map::tile_field_level::{dirt_bin_path, load_tile_field_bin};
 use crate::map::hypermap_world::HypermapRuntime;
@@ -127,34 +125,41 @@ impl DirtMap {
             }
 
             if passable_tiles.len() >= 2 {
-                const SAMPLE_COUNT: usize = 50;
-                const PATH_COUNT: usize = 100;
-                // Each traversal of a tile by a path adds this much dirt.
-                // A tile on 20+ paths reaches max dirt (1.0).
-                const DIRT_PER_TRAVERSAL: f32 = 0.05;
+                // Each hotspot BFS-floods outward with a damped cosine wave:
+                // strong peak at center, a dead ring at ~WAVE_HALF_PERIOD tiles,
+                // a faint secondary ring beyond that, then gone. Walls block spread.
+                const HOTSPOT_COUNT: usize = 200;
+                const HOTSPOT_INTENSITY: f32 = 0.35;
+                const WAVE_DECAY: f32 = 0.2;       // exponential amplitude decay per tile
+                const WAVE_HALF_PERIOD: f32 = 4.0; // cosine gap at this BFS distance
+                const MAX_RADIUS: u32 = 20;
 
-                let samples: Vec<(i32, i32)> = if passable_tiles.len() <= SAMPLE_COUNT {
-                    passable_tiles.clone()
-                } else {
-                    (0..SAMPLE_COUNT)
-                        .map(|_| *rng::pick(&mut rng, &passable_tiles))
-                        .collect()
-                };
-
-                let limits = HypermapSearchLimits { max_expanded: 20_000 };
+                let count = HOTSPOT_COUNT.min(passable_tiles.len());
                 let mut hit_counts: HashMap<(i32, i32), f32> = HashMap::new();
 
-                for _ in 0..PATH_COUNT {
-                    let start = *rng::pick(&mut rng, &samples);
-                    let goal = *rng::pick(&mut rng, &samples);
-                    if start == goal {
-                        continue;
-                    }
-                    if let HypermapPathResult::Found { path, .. } =
-                        astar_shortest_world_path(passability, start, goal, limits)
-                    {
-                        for tile in path {
-                            *hit_counts.entry(tile).or_insert(0.0) += DIRT_PER_TRAVERSAL;
+                for _ in 0..count {
+                    let center = *rng::pick(&mut rng, &passable_tiles);
+                    let mut queue: VecDeque<((i32, i32), u32)> = VecDeque::new();
+                    let mut visited: HashSet<(i32, i32)> = HashSet::new();
+                    queue.push_back((center, 0));
+                    visited.insert(center);
+
+                    while let Some((tile, dist)) = queue.pop_front() {
+                        let d = dist as f32;
+                        let wave = (0.5 + 0.5 * (d * std::f32::consts::PI / WAVE_HALF_PERIOD).cos())
+                            * (-d * WAVE_DECAY).exp();
+                        *hit_counts.entry(tile).or_insert(0.0) += HOTSPOT_INTENSITY * wave;
+
+                        if dist < MAX_RADIUS {
+                            for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+                                let neighbor = (tile.0 + dx, tile.1 + dy);
+                                if !visited.contains(&neighbor)
+                                    && passability_walkable(passability.get(neighbor.0, neighbor.1))
+                                {
+                                    visited.insert(neighbor);
+                                    queue.push_back((neighbor, dist + 1));
+                                }
+                            }
                         }
                     }
                 }
@@ -211,7 +216,11 @@ impl Plugin for DirtMapPlugin {
     }
 }
 
-pub(crate) fn flush_dirt_map(dirt: Res<DirtMap>) {
+pub(crate) fn flush_dirt_map(
+    dirt: Res<DirtMap>,
+    timings: Res<crate::hud::perf_timings::SystemTimings>,
+) {
+    let _t = timings.scope(crate::hud::perf_timings::TimedSystem::FlushDirt);
     dirt.field.flush_if_pending();
 }
 

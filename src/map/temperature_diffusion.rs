@@ -247,7 +247,9 @@ fn diffusion_tick(
     mut window: ResMut<DiffusionWindow>,
     mut scratch: ResMut<DiffusionScratch>,
     mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    timings: Res<crate::hud::perf_timings::SystemTimings>,
 ) {
+    let _t = timings.scope(crate::hud::perf_timings::TimedSystem::Diffusion);
     let coords = runtime.desired_chunk_coords();
     let Some((origin_chunk, chunks_w, chunks_h)) = window_chunk_bounds(&coords) else {
         gpu.active = false;

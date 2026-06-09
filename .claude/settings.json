@@ -26,7 +26,8 @@
       "Bash(git fetch *)",
       "Bash(git merge *)",
       "Bash(git add *)",
-      "Edit(/.claude/skills/map-generator/**)"
+      "Edit(/.claude/skills/map-generator/**)",
+      "Bash(\" | head -30)"
     ],
     "additionalDirectories": [
       "/tmp"

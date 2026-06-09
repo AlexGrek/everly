@@ -224,7 +224,9 @@ fn pathfind_collect(
     time: Res<Time>,
     mut in_flight: ResMut<PathfindInFlight>,
     results: Res<PathfindResults>,
+    timings: Res<crate::hud::perf_timings::SystemTimings>,
 ) {
+    let _t = timings.scope(crate::hud::perf_timings::TimedSystem::PathfindCollect);
     let mut still: Vec<(RequestId, Task<PathOutcome>)> = Vec::with_capacity(in_flight.tasks.len());
     for (id, mut task) in in_flight.tasks.drain(..) {
         match future::block_on(future::poll_once(&mut task)) {
@@ -246,7 +248,9 @@ fn pathfind_dispatch(
     mut in_flight: ResMut<PathfindInFlight>,
     game_log: Res<GameLog>,
     camera: Query<&StrategyCamera>,
+    timings: Res<crate::hud::perf_timings::SystemTimings>,
 ) {
+    let _t = timings.scope(crate::hud::perf_timings::TimedSystem::PathfindDispatch);
     let pool = AsyncComputeTaskPool::get();
     while in_flight.tasks.len() < MAX_IN_FLIGHT {
         let Some((id, kind)) = queue.pop() else {

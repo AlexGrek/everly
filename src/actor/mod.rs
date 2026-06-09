@@ -44,6 +44,7 @@ use crate::map::passability::{
 };
 #[cfg(test)]
 use crate::map::passability::FLAG_CREATURE;
+use crate::hud::perf_timings::{SystemTimings, TimedSystem};
 use crate::menu::main_menu::GameState;
 
 // ---------------------------------------------------------------------------
@@ -470,7 +471,11 @@ fn toggle_pause(keys: Res<ButtonInput<KeyCode>>, mut paused: ResMut<Paused>) {
 }
 
 /// Flush write→read; clear write buffer. Must be first in the actor pipeline.
-pub(crate) fn flush_actor_occupancy(passability: Res<DynamicPassabilityMap>) {
+pub(crate) fn flush_actor_occupancy(
+    passability: Res<DynamicPassabilityMap>,
+    timings: Res<SystemTimings>,
+) {
+    let _t = timings.scope(TimedSystem::FlushOccupancy);
     passability.flush();
 }
 
@@ -576,7 +581,9 @@ pub(crate) fn process_actors(
     dynamic_passability: Res<DynamicPassabilityMap>,
     hypermap: Res<HypermapRuntime>,
     par_commands: ParallelCommands,
+    timings: Res<SystemTimings>,
 ) {
+    let _t = timings.scope(TimedSystem::ProcessActors);
     // Parallel-safe by construction: collision reads hit the **read** buffer,
     // which is immutable for the whole frame (flushed once up front), and writes
     // accumulate into the **write** buffer as commutative per-chunk `|=` ORs. The

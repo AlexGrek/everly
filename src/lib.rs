@@ -73,6 +73,7 @@ impl Plugin for GamePlugin {
                 edit::map_selection::MapSelectionPlugin,
             ))
             .add_plugins(hud::overlays::OverlaysPlugin)
+            .add_plugins(hud::perf_timings::PerfTimingsPlugin)
             .add_plugins(map::pathfind_service::PathfindServicePlugin)
             .add_systems(
                 OnEnter(menu::main_menu::GameState::InGame),
