@@ -51,10 +51,17 @@ const CHARGER_CUBE_DEPTH: f32 = 0.22;
 /// Vertical center of the glowing cube above the storey floor (mounted high on the wall).
 const CHARGER_CUBE_CENTER_Y: f32 = 1.3;
 /// Point light at each glow cube — supplements emissive bloom with scene illumination.
-const CHARGER_LIGHT_COLOR_IDLE: Color = Color::srgb(0.35, 0.75, 1.0);
-const CHARGER_LIGHT_COLOR_ACTIVE: Color = Color::srgb(0.35, 0.95, 0.45);
-const CHARGER_LIGHT_INTENSITY: f32 = 2500.0;
+const CHARGER_GLOW_BASE_IDLE: Color = Color::srgb(0.04, 0.10, 0.30);
+const CHARGER_GLOW_EMISSIVE_IDLE: LinearRgba = LinearRgba::rgb(0.15, 0.85, 3.2);
+const CHARGER_GLOW_BASE_ACTIVE: Color = Color::srgb(0.04, 0.28, 0.10);
+const CHARGER_GLOW_EMISSIVE_ACTIVE: LinearRgba = LinearRgba::rgb(0.20, 3.2, 0.45);
+/// Point-light tints matched to the glow-cube emissive read (idle blue, active green).
+const CHARGER_LIGHT_COLOR_IDLE: Color = Color::srgb(0.35, 0.82, 1.0);
+const CHARGER_LIGHT_COLOR_ACTIVE: Color = Color::srgb(0.40, 1.0, 0.50);
+const CHARGER_LIGHT_INTENSITY: f32 = 12_000.0;
 const CHARGER_LIGHT_RANGE: f32 = 6.0;
+/// Nudge the point light slightly past the room-facing cube face so it reads as surface emission.
+const CHARGER_LIGHT_FACE_NUDGE: f32 = 0.04;
 /// Connector: a chunky black "transformer" box, **larger** than the glowing cube,
 /// that bridges the gap to the backing wall. The wall slab sits on the *outer* edge
 /// of the neighboring cell, so its inner face is one cell minus one slab thickness
@@ -112,9 +119,9 @@ struct RenderedChunkFloor0ChargerConnector;
 #[derive(Component)]
 struct RenderedChunkChargerLight;
 
-/// Maps a chunk light entity back to its [`InteractiveEntityMap`] tile for occupancy tinting.
+/// Per-charger runtime visual (glow mesh + point light); keyed to [`InteractiveEntityMap`].
 #[derive(Component)]
-struct ChargerLightMarker {
+struct ChargerVisualMarker {
     coords: EntityCoordinates,
 }
 
@@ -292,7 +299,8 @@ struct HypermapRenderAssets {
     glass_wall_material: Handle<StandardMaterial>,
     // ── Charging-station materials ─────────────────────────────────────────────
     charger_metal_material: Handle<StandardMaterial>,
-    charger_glow_material: Handle<StandardMaterial>,
+    charger_glow_idle_material: Handle<StandardMaterial>,
+    charger_glow_active_material: Handle<StandardMaterial>,
     charger_connector_material: Handle<StandardMaterial>,
     water_material: Handle<StandardWaterMaterial>,
 }
@@ -328,7 +336,7 @@ impl Plugin for HypermapWorldPlugin {
             )
             .add_systems(
                 Update,
-                sync_charger_light_colors.run_if(in_state(GameState::InGame)),
+                sync_charger_visuals.run_if(in_state(GameState::InGame)),
             );
     }
 }
@@ -425,9 +433,17 @@ fn setup_hypermap_assets(
         ..default()
     });
     // Emissive HDR blue — the camera's Bloom + Hdr stack make this read as a glow.
-    let charger_glow_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.04, 0.10, 0.30),
-        emissive: LinearRgba::rgb(0.15, 0.85, 3.2),
+    let charger_glow_idle_material = materials.add(StandardMaterial {
+        base_color: CHARGER_GLOW_BASE_IDLE,
+        emissive: CHARGER_GLOW_EMISSIVE_IDLE,
+        perceptual_roughness: 0.30,
+        metallic: 0.0,
+        cull_mode: None,
+        ..default()
+    });
+    let charger_glow_active_material = materials.add(StandardMaterial {
+        base_color: CHARGER_GLOW_BASE_ACTIVE,
+        emissive: CHARGER_GLOW_EMISSIVE_ACTIVE,
         perceptual_roughness: 0.30,
         metallic: 0.0,
         cull_mode: None,
@@ -477,7 +493,8 @@ fn setup_hypermap_assets(
         wall_material,
         glass_wall_material,
         charger_metal_material,
-        charger_glow_material,
+        charger_glow_idle_material,
+        charger_glow_active_material,
         charger_connector_material,
         water_material,
     });
@@ -588,8 +605,8 @@ fn refresh_chunk_upper_layers_on_floor_change(
         );
         update_upper_charger_entity(
             &mut commands, &mut meshes, mesh_ids.charger_glow,
-            build_upper_charger_glow_mesh(&prepared.upper_charger_cells, ox, oy),
-            assets.charger_glow_material.clone(), assets.empty_mesh.clone(),
+            None,
+            assets.charger_glow_idle_material.clone(), assets.empty_mesh.clone(),
         );
         update_upper_charger_entity(
             &mut commands, &mut meshes, mesh_ids.charger_connector,
@@ -600,6 +617,8 @@ fn refresh_chunk_upper_layers_on_floor_change(
         commands.entity(mesh_ids.charger_lights).despawn();
         let charger_lights = spawn_upper_charger_lights(
             &mut commands,
+            &mut meshes,
+            &assets,
             runtime.chunk_roots[&coord],
             &prepared.upper_charger_cells,
             ox,
@@ -1262,22 +1281,16 @@ fn spawn_chunk_meshes(
             .id();
         commands.entity(chunk_root).add_child(id);
     }
-    // ── Floor 0: charging stations (glowing cube) ─────────────────────────────
+    // ── Floor 0: charging stations (glowing cube) — per-charger entities; batch slot unused.
     {
-        let (mesh3d, vis) =
-            if let Some(m) = build_floor0_charger_glow_mesh(&prepared.floor0_charger_cells, ox, oy) {
-                (Mesh3d(meshes.add(m)), Visibility::Inherited)
-            } else {
-                (Mesh3d(assets.empty_mesh.clone()), Visibility::Hidden)
-            };
         let id = commands
             .spawn((
                 Name::new(format!("Chunk floor0 charger glow {},{}", ox, oy)),
                 RenderedChunkFloor0ChargerGlow,
-                mesh3d,
-                MeshMaterial3d(assets.charger_glow_material.clone()),
+                Mesh3d(assets.empty_mesh.clone()),
+                MeshMaterial3d(assets.charger_glow_idle_material.clone()),
                 Transform::default(),
-                vis,
+                Visibility::Hidden,
                 Pickable::IGNORE,
             ))
             .id();
@@ -1306,6 +1319,8 @@ fn spawn_chunk_meshes(
     }
     spawn_floor0_charger_lights(
         commands,
+        meshes,
+        assets,
         chunk_root,
         &prepared.floor0_charger_cells,
         ox,
@@ -1401,20 +1416,14 @@ fn spawn_chunk_meshes(
     };
 
     let upper_charger_glow = {
-        let (mesh3d, vis) =
-            if let Some(m) = build_upper_charger_glow_mesh(&prepared.upper_charger_cells, ox, oy) {
-                (Mesh3d(meshes.add(m)), Visibility::Inherited)
-            } else {
-                (Mesh3d(assets.empty_mesh.clone()), Visibility::Hidden)
-            };
         let id = commands
             .spawn((
                 Name::new(format!("Chunk upper charger glow {},{}", ox, oy)),
                 RenderedChunkUpperChargerGlow,
-                mesh3d,
-                MeshMaterial3d(assets.charger_glow_material.clone()),
+                Mesh3d(assets.empty_mesh.clone()),
+                MeshMaterial3d(assets.charger_glow_idle_material.clone()),
                 Transform::default(),
-                vis,
+                Visibility::Hidden,
                 Pickable::IGNORE,
             ))
             .id();
@@ -1446,6 +1455,8 @@ fn spawn_chunk_meshes(
 
     let upper_charger_lights = spawn_upper_charger_lights(
         commands,
+        meshes,
+        assets,
         chunk_root,
         &prepared.upper_charger_cells,
         ox,
@@ -1761,41 +1772,76 @@ fn append_charger_metal(
     );
 }
 
-/// World position of the glow-cube center (matches [`append_charger_cube`]).
-fn charger_glow_world_position(cx: f32, cz: f32, y_base: f32, facing: ChargerFacing) -> Vec3 {
+/// Room-facing glow-cube face — where the point light sits so it reads as surface emission.
+fn charger_glow_light_position(cx: f32, cz: f32, y_base: f32, facing: ChargerFacing) -> Vec3 {
     let (dx, dz) = facing.wall_dir();
-    let edge = 0.5 - CHARGER_CUBE_DEPTH * 0.5;
+    let along = 0.5 - CHARGER_CUBE_DEPTH - CHARGER_LIGHT_FACE_NUDGE;
     Vec3::new(
-        cx + dx * edge,
+        cx + dx * along,
         y_base + CHARGER_CUBE_CENTER_Y,
-        cz + dz * edge,
+        cz + dz * along,
     )
 }
 
-fn spawn_charger_point_light(
+fn build_single_charger_glow_mesh(
+    cx: f32,
+    cz: f32,
+    y_base: f32,
+    facing: ChargerFacing,
+) -> Mesh {
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut uvs = Vec::new();
+    let mut indices = Vec::new();
+    append_charger_cube(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, y_base, facing);
+    finalize_mesh_from_buffers(positions, normals, uvs, indices)
+        .expect("single charger glow cube")
+}
+
+fn spawn_charger_visual(
     commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    assets: &HypermapRenderAssets,
     parent: Entity,
-    pos: Vec3,
+    cx: f32,
+    cz: f32,
+    y_base: f32,
+    facing: ChargerFacing,
     coords: EntityCoordinates,
     label: &str,
 ) -> Entity {
-    let light = commands
+    let light_pos = charger_glow_light_position(cx, cz, y_base, facing);
+    let glow_mesh = meshes.add(build_single_charger_glow_mesh(cx, cz, y_base, facing));
+
+    // Mesh vertices carry absolute world XZ (same as batched chunk meshes); keep identity transform.
+    let root = commands
         .spawn((
-            Name::new(format!("Charger light {label}")),
+            Name::new(format!("Charger visual {label}")),
             RenderedChunkChargerLight,
-            ChargerLightMarker { coords },
-            PointLight {
-                color: CHARGER_LIGHT_COLOR_IDLE,
-                intensity: CHARGER_LIGHT_INTENSITY,
-                range: CHARGER_LIGHT_RANGE,
-                shadows_enabled: false,
-                ..default()
-            },
-            Transform::from_translation(pos),
+            ChargerVisualMarker { coords },
+            Mesh3d(glow_mesh),
+            MeshMaterial3d(assets.charger_glow_idle_material.clone()),
+            Transform::default(),
+            Visibility::Inherited,
+            Pickable::IGNORE,
         ))
+        .with_children(|child| {
+            child.spawn((
+                Name::new(format!("Charger light {label}")),
+                ChargerVisualMarker { coords },
+                PointLight {
+                    color: CHARGER_LIGHT_COLOR_IDLE,
+                    intensity: CHARGER_LIGHT_INTENSITY,
+                    range: CHARGER_LIGHT_RANGE,
+                    shadows_enabled: false,
+                    ..default()
+                },
+                Transform::from_translation(light_pos),
+            ));
+        })
         .id();
-    commands.entity(parent).add_child(light);
-    light
+    commands.entity(parent).add_child(root);
+    root
 }
 
 fn charger_in_use(map: &InteractiveEntityMap, coords: EntityCoordinates) -> bool {
@@ -1805,24 +1851,43 @@ fn charger_in_use(map: &InteractiveEntityMap, coords: EntityCoordinates) -> bool
         .any(|c| c.occupant().is_some())
 }
 
-fn sync_charger_light_colors(
+fn sync_charger_visuals(
     interactive: Res<InteractiveEntityMap>,
-    mut lights: Query<(&ChargerLightMarker, &mut PointLight)>,
+    assets: Res<HypermapRenderAssets>,
+    mut lights: Query<(&ChargerVisualMarker, &mut PointLight), Without<Mesh3d>>,
+    mut glow_mats: Query<
+        (&ChargerVisualMarker, &mut MeshMaterial3d<StandardMaterial>),
+        (With<RenderedChunkChargerLight>, With<Mesh3d>),
+    >,
 ) {
     for (marker, mut light) in &mut lights {
-        let target = if charger_in_use(&interactive, marker.coords) {
+        let active = charger_in_use(&interactive, marker.coords);
+        let target_color = if active {
             CHARGER_LIGHT_COLOR_ACTIVE
         } else {
             CHARGER_LIGHT_COLOR_IDLE
         };
-        if light.color != target {
-            light.color = target;
+        if light.color != target_color {
+            light.color = target_color;
+        }
+    }
+    for (marker, mut mat) in &mut glow_mats {
+        let active = charger_in_use(&interactive, marker.coords);
+        let target = if active {
+            assets.charger_glow_active_material.clone()
+        } else {
+            assets.charger_glow_idle_material.clone()
+        };
+        if mat.0 != target {
+            mat.0 = target;
         }
     }
 }
 
 fn spawn_floor0_charger_lights(
     commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    assets: &HypermapRenderAssets,
     chunk_root: Entity,
     cells: &[(i32, i32, CellType)],
     origin_x: i32,
@@ -1836,14 +1901,26 @@ fn spawn_floor0_charger_lights(
         let wy = origin_y + y;
         let cx = wx as f32 + 0.5;
         let cz = wy as f32 + 0.5;
-        let pos = charger_glow_world_position(cx, cz, 0.0, facing);
         let coords = EntityCoordinates::new(wx, wy, 0);
-        spawn_charger_point_light(commands, chunk_root, pos, coords, &format!("{x},{y},f0"));
+        spawn_charger_visual(
+            commands,
+            meshes,
+            assets,
+            chunk_root,
+            cx,
+            cz,
+            0.0,
+            facing,
+            coords,
+            &format!("{x},{y},f0"),
+        );
     }
 }
 
 fn spawn_upper_charger_lights(
     commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    assets: &HypermapRenderAssets,
     chunk_root: Entity,
     cells: &[(i32, i32, i32, CellType)],
     origin_x: i32,
@@ -1867,9 +1944,19 @@ fn spawn_upper_charger_lights(
         let cx = wx as f32 + 0.5;
         let cz = wy as f32 + 0.5;
         let y_base = floor as f32 * HYPERMAP_FLOOR_HEIGHT;
-        let pos = charger_glow_world_position(cx, cz, y_base, facing);
         let coords = EntityCoordinates::new(wx, wy, floor);
-        spawn_charger_point_light(commands, parent, pos, coords, &format!("{x},{y},f{floor}"));
+        spawn_charger_visual(
+            commands,
+            meshes,
+            assets,
+            parent,
+            cx,
+            cz,
+            y_base,
+            facing,
+            coords,
+            &format!("{x},{y},f{floor}"),
+        );
     }
     parent
 }
@@ -1953,20 +2040,6 @@ pub(crate) fn build_floor0_charger_metal_mesh(cells: &[(i32, i32, CellType)], or
     finalize_mesh_from_buffers(positions, normals, uvs, indices)
 }
 
-pub(crate) fn build_floor0_charger_glow_mesh(cells: &[(i32, i32, CellType)], origin_x: i32, origin_y: i32) -> Option<Mesh> {
-    let mut positions = Vec::new();
-    let mut normals = Vec::new();
-    let mut uvs = Vec::new();
-    let mut indices = Vec::new();
-    for &(x, y, cell_type) in cells {
-        let CellType::Charger(facing) = cell_type else { continue };
-        let cx = origin_x as f32 + x as f32 + 0.5;
-        let cz = origin_y as f32 + y as f32 + 0.5;
-        append_charger_cube(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, 0.0, facing);
-    }
-    finalize_mesh_from_buffers(positions, normals, uvs, indices)
-}
-
 pub(crate) fn build_floor0_charger_connector_mesh(cells: &[(i32, i32, CellType)], origin_x: i32, origin_y: i32) -> Option<Mesh> {
     let mut positions = Vec::new();
     let mut normals = Vec::new();
@@ -1991,21 +2064,6 @@ pub(crate) fn build_upper_charger_metal_mesh(cells: &[(i32, i32, i32, CellType)]
         let cz = origin_y as f32 + y as f32 + 0.5;
         let y_base = floor as f32 * HYPERMAP_FLOOR_HEIGHT;
         append_charger_metal(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, y_base);
-    }
-    finalize_mesh_from_buffers(positions, normals, uvs, indices)
-}
-
-pub(crate) fn build_upper_charger_glow_mesh(cells: &[(i32, i32, i32, CellType)], origin_x: i32, origin_y: i32) -> Option<Mesh> {
-    let mut positions = Vec::new();
-    let mut normals = Vec::new();
-    let mut uvs = Vec::new();
-    let mut indices = Vec::new();
-    for &(x, y, floor, cell_type) in cells {
-        let CellType::Charger(facing) = cell_type else { continue };
-        let cx = origin_x as f32 + x as f32 + 0.5;
-        let cz = origin_y as f32 + y as f32 + 0.5;
-        let y_base = floor as f32 * HYPERMAP_FLOOR_HEIGHT;
-        append_charger_cube(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, y_base, facing);
     }
     finalize_mesh_from_buffers(positions, normals, uvs, indices)
 }

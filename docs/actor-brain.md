@@ -51,7 +51,27 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
   step-aside-and-pause; rear bumps ignored — tuned by [`FollowTuning`]).
   When `FollowPath` abandons an unfinished route due to no progress, the brain
   exposes a `stuck` status (`Brain::is_stuck`) and the bot mesh flashes yellow,
-  then eases back to black over a few seconds.
+  then eases back to black over a few seconds. The stall trigger fires when the
+  bot has not moved more than [`FollowTuning::stuck_progress_eps`] from a
+  reference position for [`FollowTuning::stuck_repath_secs`], regardless of
+  distance to the active waypoint (near goals are no longer exempt).
+  Charger-queue membership pauses the timer. [`Wait::retry`] uses the same stall
+  rule so patrol/wander bots that cannot plan a route still recover instead of
+  idling until depletion.
+
+  **Relocate before rescheduling.** A stalled bot does *not* immediately
+  abandon (which would replan expensive A\* every cycle while it keeps wedging a
+  chokepoint and dragging every queued bot's velocity toward zero). Instead it
+  enters an *escape*: `find_escape_cell` scans the `ESCAPE_SEARCH_TILES`-radius
+  square for the **nearest cell whose whole footprint is clear of other
+  creatures and static geometry** (its own current footprint is bypassed, via
+  `DynamicPassabilityMap::probe_footprint`), then drives to that cell's center
+  with the normal braking profile. Only on arrival does it mark the route
+  abandoned, so `Brain::is_stuck` (yellow flash + `BotStuck` log) and the
+  high-level reschedule happen **from a free, tile-centered position** the bot
+  has just vacated into — not from inside the jam. A secondary stall timer
+  during the escape, plus the no-avoidance-data fallback (headless tests),
+  abandons in place so the maneuver can never loop forever.
 
 ### BlackBot status colors
 

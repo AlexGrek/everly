@@ -71,6 +71,7 @@ impl Plugin for GamePlugin {
                 edit::actor_spawn::ActorSpawnPlugin,
                 edit::map_selection::MapSelectionPlugin,
             ))
+            .add_plugins(hud::overlays::OverlaysPlugin)
             .add_systems(
                 OnEnter(menu::main_menu::GameState::InGame),
                 (

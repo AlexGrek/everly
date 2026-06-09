@@ -50,7 +50,7 @@ Shared layout via [`tile_field`](../src/map/tile_field.rs) — **one texel per w
 
 ### Temperature (heatmap)
 
-`TemperatureOverlayPlugin` + `TemperatureMapPlugin` — values in **°C** on [−30, +30]. Colormap: **blue** (cold) → **white** (0) → **yellow** → **red** (hot). Off by default; HUD **Heat** button or **F5**. Seeding: ~4% cold patches (−26..−6 °C), ~4% warm (6..26 °C), rest 0 °C.
+`TemperatureOverlayPlugin` + `TemperatureMapPlugin` — values in **°C** on [−30, +30]. Colormap: **blue** (cold) → **white** (0) → **yellow** → **red** (hot). Off by default; open **Overlays** panel from HUD (or press **F5**). Seeding: ~4% cold patches (−26..−6 °C), ~4% warm (6..26 °C), rest 0 °C.
 
 ---
 
@@ -140,7 +140,7 @@ snapshot of static geometry + actor footprints) and colours each of the
 
 ### Toggle
 
-Click **"Occ"** in the HUD bar, or press **F4**.  Off by default.
+Click **"Overlays"** in the HUD bar (opens the Overlays panel, similar to the actor inspector modal) then the **Occ** entry inside, or press **F4** directly. Off by default.
 
 ### Update cadence and locking
 
@@ -160,7 +160,7 @@ Only the `paint_black_bot_targets` system writes to it; on every frame it clears
 
 ### Toggle
 
-Click **"Path"** in the HUD bar, or press **F6**. Off by default (planes are not spawned, no painting occurs).
+Click **"Overlays"** in the HUD bar to open the panel, then the **Path** entry (or press **F6** directly). Off by default (planes are not spawned, no painting occurs). The panel also hosts the other visibility toggles (see below).
 
 When enabled the generic planes appear and the painter runs (gated like occupancy and temperature overlays).
 

@@ -127,7 +127,7 @@ impl HighLevelAction for GoToRandomPoints {
             let here = (ctx.main_tile.x, ctx.main_tile.y);
             match pick_random_target(rng, here, ctx.passability) {
                 Some(path) => *low = Box::new(FollowPath::new(path)),
-                None => *low = Box::new(Wait::new(RETRY_S)),
+                None => *low = Box::new(Wait::retry(RETRY_S)),
             }
         }
         HighLevelOutcome::running()
@@ -188,7 +188,7 @@ impl HighLevelAction for GoToPatrol {
         // No usable route yet (loop still generating, or not a patrol bot): hold.
         let Some(loop_tiles) = ctx.patrol_loop.filter(|l| !l.is_empty()) else {
             if low.is_finished() {
-                *low = Box::new(Wait::new(RETRY_S));
+                *low = Box::new(Wait::retry(RETRY_S));
             }
             return HighLevelOutcome::running();
         };
@@ -227,7 +227,7 @@ impl HighLevelAction for GoToPatrol {
             if !installed {
                 // Nothing reachable this tick (or already standing on the only
                 // distinct waypoint) — wait briefly and retry.
-                *low = Box::new(Wait::new(RETRY_S));
+                *low = Box::new(Wait::retry(RETRY_S));
                 self.engaged = false;
             }
         }

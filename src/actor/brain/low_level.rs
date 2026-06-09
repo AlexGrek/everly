@@ -44,6 +44,10 @@ const STEP_BACK_WAIT_MIN_SECS: f32 = 1.0;
 const STEP_BACK_WAIT_MAX_SECS: f32 = 3.0;
 /// Speed (tiles/s) below which a post-step-aside hold counts as "stopped".
 const CONTACT_WAIT_STOP_SPEED: f32 = 0.08;
+/// Half-width (tiles) of the square scanned for a free cell when a stalled bot
+/// tries to relocate before it reschedules. Kept small so the search is cheap
+/// and the bot only backs out to a *nearby* clear cell.
+const ESCAPE_SEARCH_TILES: i32 = 4;
 
 /// Tuning for [`FollowPath`]. Defaults reproduce BlackBot's historical movement
 /// feel so the planning refactor changes nothing about how a bot moves.
@@ -162,24 +166,73 @@ impl LowLevelAction for Idle {
 /// short retry delay when planning fails.
 pub struct Wait {
     pub remaining_s: f32,
+    /// When set, no displacement for `stuck_repath_secs` reports `is_stuck` so
+    /// the high-level action can pick a different target (patrol / wander retry).
+    detect_stall: bool,
+    stall_timer: f32,
+    stall_reference_pos: Option<Vec2>,
+    stalled: bool,
 }
 
 impl Wait {
     pub fn new(seconds: f32) -> Self {
-        Self { remaining_s: seconds }
+        Self {
+            remaining_s: seconds,
+            detect_stall: false,
+            stall_timer: 0.0,
+            stall_reference_pos: None,
+            stalled: false,
+        }
+    }
+
+    /// Retry delay that abandons when the bot has not moved for
+    /// [`FollowTuning::stuck_repath_secs`].
+    pub fn retry(seconds: f32) -> Self {
+        Self {
+            remaining_s: seconds,
+            detect_stall: true,
+            stall_timer: 0.0,
+            stall_reference_pos: None,
+            stalled: false,
+        }
     }
 }
 
 impl LowLevelAction for Wait {
-    fn execute(&mut self, state: &mut ActorState, ctx: &BrainContext, _rng: &mut StdRng, _t: &FollowTuning) {
+    fn execute(&mut self, state: &mut ActorState, ctx: &BrainContext, _rng: &mut StdRng, t: &FollowTuning) {
         self.remaining_s -= ctx.dt;
         state.move_buffer = ActorMoveBuffer::default();
         state.next_waypoint_hint = None;
+
+        if self.detect_stall && !self.stalled {
+            let center = state.center;
+            let in_queue = ctx.interactive.is_in_any_queue(ctx.entity);
+            tick_stall_timer(
+                &mut self.stall_timer,
+                &mut self.stall_reference_pos,
+                center,
+                ctx.dt,
+                t.stuck_progress_eps,
+                in_queue,
+            );
+            if self.stall_timer >= t.stuck_repath_secs {
+                self.stalled = true;
+            }
+        }
     }
     fn is_finished(&self) -> bool {
-        self.remaining_s <= 0.0
+        self.remaining_s <= 0.0 || self.stalled
+    }
+    fn is_stuck(&self) -> bool {
+        self.stalled
+    }
+    fn stuck_timer(&self) -> f32 {
+        self.stall_timer
     }
     fn label(&self) -> String {
+        if self.stalled {
+            return "Wait (stalled)".to_string();
+        }
         if self.remaining_s.is_finite() {
             format!("Wait ({:.1}s)", self.remaining_s.max(0.0))
         } else {
@@ -230,6 +283,10 @@ pub struct FollowPath {
     /// Index in [`path`](Self::path) of a step-aside tile inserted by the bump
     /// handler. Cleared once the bot reaches that cell or chooses a detour instead.
     step_aside_at: Option<usize>,
+    /// When the stall timer fires, the bot first relocates to the center of the
+    /// nearest free cell (`Some(tile)`) and only marks itself abandoned once it
+    /// arrives — so it vacates a chokepoint before the high level reschedules.
+    escape_target: Option<(i32, i32)>,
     /// Set when the stuck timer fires; makes `is_finished` report `true`.
     abandoned: bool,
 }
@@ -253,6 +310,7 @@ impl FollowPath {
             detour_timer: 0.0,
             last_head_on_bump: None,
             step_aside_at: None,
+            escape_target: None,
             abandoned: false,
         }
     }
@@ -367,6 +425,103 @@ impl FollowPath {
         self.path.get(self.index).copied().map(waypoint_center)
     }
 
+    /// The nearest cell whose center the bot's whole footprint can occupy clear
+    /// of other creatures and static geometry (its own current footprint is
+    /// bypassed, so the cell it already stands in is eligible). Returns the tile,
+    /// or `None` when avoidance data is unavailable or nothing is free in range.
+    fn find_escape_cell(&self, state: &ActorState, ctx: &BrainContext) -> Option<(i32, i32)> {
+        let views = ctx.avoidance.as_ref()?;
+        let sc = SUBTILE_COUNT as i32;
+        let radius = state.radius_subtiles;
+        let start = state
+            .last_accepted_center_subtile
+            .unwrap_or_else(|| float_subtile(state.center));
+        let previous = Some((start, radius));
+        let dynamic = views.dynamic;
+        let static_subtiles = views.static_subtiles;
+        let blocked = views.blocked_flags;
+        let here = ctx.main_tile;
+        let center = state.center;
+
+        let mut best: Option<((i32, i32), f32)> = None;
+        for dy in -ESCAPE_SEARCH_TILES..=ESCAPE_SEARCH_TILES {
+            for dx in -ESCAPE_SEARCH_TILES..=ESCAPE_SEARCH_TILES {
+                let tile = (here.x + dx, here.y + dy);
+                let goal_center = IVec2::new(tile.0 * sc + sc / 2, tile.1 * sc + sc / 2);
+                if dynamic
+                    .probe_footprint(goal_center, radius, previous, blocked, static_subtiles)
+                    .is_ok()
+                {
+                    let d2 = (waypoint_center(tile) - center).length_squared();
+                    if best.map_or(true, |(_, bd)| d2 < bd) {
+                        best = Some((tile, d2));
+                    }
+                }
+            }
+        }
+        best.map(|(t, _)| t)
+    }
+
+    /// Drives toward the active [`escape_target`](Self::escape_target). On arrival
+    /// the bot is abandoned (so the high level reschedules from a clean, centered
+    /// cell); if it cannot make progress toward the free cell either it abandons
+    /// anyway as a safety valve.
+    fn run_escape(&mut self, state: &mut ActorState, ctx: &BrainContext, t: &FollowTuning, dt: f32) {
+        let center = state.center;
+        let Some(target) = self.escape_target else {
+            return;
+        };
+
+        if reached_waypoint(center, target, t.waypoint_eps) {
+            self.finish_escape(state);
+            return;
+        }
+
+        let in_queue = ctx.interactive.is_in_any_queue(ctx.entity);
+        tick_stall_timer(
+            &mut self.stuck_timer,
+            &mut self.stuck_reference_pos,
+            center,
+            dt,
+            t.stuck_progress_eps,
+            in_queue,
+        );
+        if self.stuck_timer >= t.stuck_repath_secs {
+            self.finish_escape(state);
+            return;
+        }
+
+        let target_pos = waypoint_center(target);
+        let to_wp = target_pos - center;
+        if to_wp.length_squared() > 1e-12 {
+            self.direction = to_wp.normalize();
+        }
+        let dist = to_wp.length();
+        let brake_limited_speed = (2.0 * t.decel * dist).sqrt();
+        let desired_speed = t.max_speed.min(brake_limited_speed);
+        let desired = self.direction * desired_speed;
+        let steer_rate = if self.velocity.length() > desired_speed {
+            t.decel
+        } else {
+            t.accel
+        };
+        self.drive(state, center, desired, steer_rate, dt);
+        state.next_waypoint_hint = Some(target_pos);
+    }
+
+    /// Ends an escape maneuver and marks the route abandoned so the owning
+    /// high-level action replans on the next tick.
+    fn finish_escape(&mut self, state: &mut ActorState) {
+        self.escape_target = None;
+        self.abandoned = true;
+        self.clear_detour();
+        self.last_head_on_bump = None;
+        self.velocity = Vec2::ZERO;
+        self.prev_center = None;
+        state.move_buffer = ActorMoveBuffer::default();
+        state.next_waypoint_hint = None;
+    }
+
     /// Plans and installs a subtile detour around the blocker; returns whether
     /// one was found.
     fn try_begin_detour(&mut self, state: &ActorState, ctx: &BrainContext) -> bool {
@@ -435,6 +590,13 @@ impl LowLevelAction for FollowPath {
             Some(ActorMovementError::BlockedByOccupancy { .. })
         ) {
             self.last_head_on_bump = None;
+        }
+
+        // Relocating to a free cell after a stall takes over the whole tick: the
+        // bot vacates whatever chokepoint it was wedged in before it reschedules.
+        if self.escape_target.is_some() {
+            self.run_escape(state, ctx, t, dt);
+            return;
         }
 
         // Holding position after a step-aside: brake to a stop, then count down the
@@ -574,38 +736,43 @@ impl LowLevelAction for FollowPath {
         if to_wp.length_squared() > 1e-12 {
             self.direction = to_wp.normalize();
         }
-
-        // Stuck detection: abandon the path if the bot is not in a queue, has a far waypoint,
-        // and cannot move away from its reference position for a long time.
-        let in_queue = ctx.interactive.is_in_any_queue(ctx.entity);
         let dist_to_wp = to_wp.length();
-        let far_waypoint = dist_to_wp > 1.0;
 
-        if in_queue || !far_waypoint {
-            self.stuck_timer = 0.0;
-            self.stuck_reference_pos = Some(center);
-        } else {
-            if let Some(ref_pos) = self.stuck_reference_pos {
-                if (center - ref_pos).length() > 0.5 {
-                    self.stuck_reference_pos = Some(center);
-                    self.stuck_timer = 0.0;
-                } else {
-                    self.stuck_timer += dt;
-                }
-            } else {
-                self.stuck_reference_pos = Some(center);
-                self.stuck_timer = 0.0;
-            }
-        }
+        // Stuck detection: abandon the path when the bot is not in a charger queue
+        // and has not moved more than `stuck_progress_eps` from its reference
+        // position for `stuck_repath_secs` (near waypoints included).
+        let in_queue = ctx.interactive.is_in_any_queue(ctx.entity);
+        tick_stall_timer(
+            &mut self.stuck_timer,
+            &mut self.stuck_reference_pos,
+            center,
+            dt,
+            t.stuck_progress_eps,
+            in_queue,
+        );
 
         if self.stuck_timer >= t.stuck_repath_secs {
-            self.abandoned = true;
-            self.clear_detour();
-            self.last_head_on_bump = None;
-            self.velocity = Vec2::ZERO;
-            self.prev_center = None;
-            state.move_buffer = ActorMoveBuffer::default();
-            state.next_waypoint_hint = None;
+            // Before rescheduling, relocate to the center of the nearest free cell
+            // so the bot stops wedging a chokepoint and replans from a clean spot.
+            // Falls back to abandoning in place when no avoidance data / free cell
+            // is available (e.g. headless tests).
+            if let Some(target) = self.find_escape_cell(state, ctx) {
+                self.escape_target = Some(target);
+                self.clear_detour();
+                self.last_head_on_bump = None;
+                self.pending_wait = None;
+                self.stuck_timer = 0.0;
+                self.stuck_reference_pos = Some(center);
+                self.run_escape(state, ctx, t, dt);
+            } else {
+                self.abandoned = true;
+                self.clear_detour();
+                self.last_head_on_bump = None;
+                self.velocity = Vec2::ZERO;
+                self.prev_center = None;
+                state.move_buffer = ActorMoveBuffer::default();
+                state.next_waypoint_hint = None;
+            }
             return;
         }
 
@@ -633,12 +800,15 @@ impl LowLevelAction for FollowPath {
         self.prev_center = None;
         self.contact_wait_s = 0.0;
         self.pending_wait = None;
+        self.escape_target = None;
         self.clear_detour();
         self.last_head_on_bump = None;
     }
 
     fn label(&self) -> String {
-        if self.detour.is_empty() {
+        if self.escape_target.is_some() {
+            "FollowPath (escaping)".to_string()
+        } else if self.detour.is_empty() {
             "FollowPath".to_string()
         } else {
             "FollowPath (detour)".to_string()
@@ -681,6 +851,34 @@ pub fn waypoint_center(tile: (i32, i32)) -> Vec2 {
 #[inline]
 pub fn reached_waypoint(center: Vec2, tile: (i32, i32), eps: f32) -> bool {
     (waypoint_center(tile) - center).length_squared() <= eps * eps
+}
+
+/// Advance a no-progress timer; reset when `center` moves past `progress_eps` or
+/// when `disabled` (e.g. bot is legitimately waiting in a charger queue).
+fn tick_stall_timer(
+    timer: &mut f32,
+    reference_pos: &mut Option<Vec2>,
+    center: Vec2,
+    dt: f32,
+    progress_eps: f32,
+    disabled: bool,
+) {
+    if disabled {
+        *timer = 0.0;
+        *reference_pos = Some(center);
+        return;
+    }
+    if let Some(ref_pos) = *reference_pos {
+        if (center - ref_pos).length() > progress_eps {
+            *reference_pos = Some(center);
+            *timer = 0.0;
+        } else {
+            *timer += dt;
+        }
+    } else {
+        *reference_pos = Some(center);
+        *timer = 0.0;
+    }
 }
 
 /// Subtile coordinate that contains `pos` (floor of `pos * SUBTILE_COUNT`).
@@ -1401,6 +1599,182 @@ mod tests {
 
         assert!(fp.is_stuck(), "no-progress route should mark low-level action as stuck");
         assert!(fp.is_finished(), "stuck route must request replanning");
+    }
+
+    #[test]
+    fn follow_path_stuck_when_near_waypoint_has_no_progress() {
+        let mut fp = FollowPath::new(vec![(1, 0)]);
+        let mut state = ActorState {
+            center: Vec2::new(0.55, 0.5),
+            radius_subtiles: 2,
+            rotation: 0.0,
+            move_buffer: ActorMoveBuffer::default(),
+            last_movement_error: None,
+            last_accepted_center_subtile: Some(IVec2::new(2, 2)),
+            last_accepted_radius_subtiles: 2,
+            next_waypoint_hint: None,
+            field_main_tile: None,
+            dirtiness: 0.0,
+        };
+        let passability = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let mut rng = StdRng::seed_from_u64(19);
+        let tuning = FollowTuning {
+            stuck_repath_secs: 0.3,
+            ..FollowTuning::default()
+        };
+
+        for _ in 0..4 {
+            let ctx = BrainContext {
+                entity: Entity::PLACEHOLDER,
+                dt: 0.1,
+                center: state.center,
+                main_tile: IVec2::new(0, 0),
+                main_tile_changed: false,
+                floor: 0,
+                charge: 1.0,
+                missing_charge_pct: 0.0,
+                depleted: false,
+                broken: false,
+                passability: &passability,
+                interactive: &interactive,
+                avoidance: None,
+                patrol_loop: None,
+            };
+            fp.execute(&mut state, &ctx, &mut rng, &tuning);
+            state.move_buffer = ActorMoveBuffer::default();
+        }
+
+        assert!(
+            fp.is_stuck(),
+            "waypoint within 1 tile must still trigger stuck when pinned"
+        );
+    }
+
+    #[test]
+    fn follow_path_relocates_to_free_cell_before_abandoning() {
+        use crate::actor::brain::AvoidanceViews;
+        use crate::map::passability::{
+            DynamicPassabilityMap, SubtilePassability, FLAG_BLOCKED, FLAG_VOID,
+        };
+
+        // Everything is free, so the nearest free cell is the bot's own tile (0,0).
+        let dynamic = DynamicPassabilityMap::new();
+        let static_subtiles: Hypermap<SubtilePassability> = Hypermap::new(SubtilePassability::EMPTY);
+        let passability = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let tuning = FollowTuning {
+            stuck_repath_secs: 0.3,
+            ..FollowTuning::default()
+        };
+
+        // Start wedged off-center, heading for a far waypoint, and pinned so the
+        // stall timer fires.
+        let mut fp = FollowPath::new(vec![(10, 0)]);
+        let mut state = ActorState {
+            center: Vec2::new(0.2, 0.2),
+            radius_subtiles: 2,
+            rotation: 0.0,
+            move_buffer: ActorMoveBuffer::default(),
+            last_movement_error: None,
+            last_accepted_center_subtile: Some(IVec2::new(1, 1)),
+            last_accepted_radius_subtiles: 2,
+            next_waypoint_hint: None,
+            field_main_tile: None,
+            dirtiness: 0.0,
+        };
+        let mut rng = StdRng::seed_from_u64(23);
+
+        let make_ctx = |center: Vec2| BrainContext {
+            entity: Entity::PLACEHOLDER,
+            dt: 0.1,
+            center,
+            main_tile: IVec2::new(0, 0),
+            main_tile_changed: false,
+            floor: 0,
+            charge: 1.0,
+            missing_charge_pct: 0.0,
+            depleted: false,
+            broken: false,
+            passability: &passability,
+            interactive: &interactive,
+            avoidance: Some(AvoidanceViews {
+                dynamic: &dynamic,
+                static_subtiles: &static_subtiles,
+                blocked_flags: FLAG_BLOCKED | FLAG_VOID,
+            }),
+            patrol_loop: None,
+        };
+
+        for _ in 0..4 {
+            let ctx = make_ctx(state.center);
+            fp.execute(&mut state, &ctx, &mut rng, &tuning);
+            state.move_buffer = ActorMoveBuffer::default();
+        }
+
+        assert_eq!(
+            fp.escape_target,
+            Some((0, 0)),
+            "a stalled bot should target the nearest free cell instead of abandoning"
+        );
+        assert!(!fp.abandoned, "escape must not reschedule until the free cell is reached");
+        assert!(!fp.is_stuck());
+
+        // Arrive at the free cell center: now the route is abandoned for replanning.
+        state.center = Vec2::new(0.5, 0.5);
+        let ctx = make_ctx(state.center);
+        fp.execute(&mut state, &ctx, &mut rng, &tuning);
+
+        assert_eq!(fp.escape_target, None, "reaching the free cell ends the escape");
+        assert!(fp.abandoned, "after relocating, the route is abandoned to replan");
+        assert!(fp.is_stuck());
+    }
+
+    #[test]
+    fn wait_retry_reports_stuck_after_no_progress() {
+        let mut wait = Wait::retry(10.0);
+        let mut state = ActorState {
+            center: Vec2::new(3.2, 4.1),
+            radius_subtiles: 2,
+            rotation: 0.0,
+            move_buffer: ActorMoveBuffer::default(),
+            last_movement_error: None,
+            last_accepted_center_subtile: Some(IVec2::new(16, 20)),
+            last_accepted_radius_subtiles: 2,
+            next_waypoint_hint: None,
+            field_main_tile: None,
+            dirtiness: 0.0,
+        };
+        let passability = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let tuning = FollowTuning {
+            stuck_repath_secs: 0.25,
+            ..FollowTuning::default()
+        };
+
+        for _ in 0..4 {
+            let ctx = BrainContext {
+                entity: Entity::PLACEHOLDER,
+                dt: 0.1,
+                center: state.center,
+                main_tile: IVec2::new(3, 4),
+                main_tile_changed: false,
+                floor: 0,
+                charge: 1.0,
+                missing_charge_pct: 0.0,
+                depleted: false,
+                broken: false,
+                passability: &passability,
+                interactive: &interactive,
+                avoidance: None,
+                patrol_loop: None,
+            };
+            wait.execute(&mut state, &ctx, &mut StdRng::seed_from_u64(1), &tuning);
+        }
+
+        assert!(wait.is_stuck());
+        assert!(wait.is_finished());
+        assert!(wait.remaining_s > 0.0, "stall should pre-empt the retry timer");
     }
 
     fn detour_state(center_subtile: IVec2, blocker_subtile: IVec2) -> ActorState {

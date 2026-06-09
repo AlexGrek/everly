@@ -123,7 +123,7 @@ the **facing** — which wall edge the charger backs onto; the cube faces into t
 Uppercase (`CN` … `CW`) is also accepted. The `c` + **letter** form never collides
 with the `c` + **digit** corner pillars. Parsed as `CellType::Charger(ChargerFacing)`
 in `src/map/world_map.rs`; meshing lives in `src/map/hypermap_world.rs`
-(`build_*_charger_metal_mesh` / `build_*_charger_glow_mesh`), see `docs/rendering-pipeline.md`.
+(`build_*_charger_metal_mesh` / per-charger glow visuals), see `docs/rendering-pipeline.md`.
 Procedural placement (one per house, against an interior wall, not in a corner) is in
 `src/map/map_generator/step_charging_stations.rs` — see `docs/map-generator.md`.
 

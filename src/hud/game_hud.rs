@@ -6,19 +6,15 @@ use bevy::ui::widget::Button;
 
 use crate::actor::Paused;
 use crate::scene::camera::{
-    spawn_camera, AmbientFillEnabled, StrategyCamera, StrategyCameraRig,
+    spawn_camera, StrategyCamera, StrategyCameraRig,
     StrategyCameraViewMode, STRATEGY_CAMERA_DEFAULT_PITCH, STRATEGY_CAMERA_MAP_PITCH,
 };
 use crate::edit::actor_spawn::{ActorSpawnToggleButton, ActorSpawnToggleLabel};
 use crate::edit::map_edit::{MapEditToggleButton, MapEditToggleLabel};
-use crate::map::chunk_overlay::OccupancyOverlayEnabled;
-use crate::map::chunk_overlay::PathOverlayEnabled;
 use crate::map::dirt::DirtMap;
-use crate::map::hypermap_world::{HypermapChunkRemeshQueue, HypermapRuntime, WaterRenderingEnabled};
+use crate::map::hypermap_world::{HypermapChunkRemeshQueue, HypermapRuntime};
 use crate::map::temperature::TemperatureMap;
-use crate::map::temperature_overlay::TemperatureOverlayEnabled;
 use crate::map::floor_level::{ActiveFloorLevel, HYPERMAP_FLOOR_MAX};
-use crate::hud::game_log::GameLog;
 use crate::hud::panel_anim::PanelAnim;
 use crate::menu::main_menu::GameState;
 
@@ -43,40 +39,10 @@ struct FloorLevelUpButton;
 struct FloorHudLevelText;
 
 #[derive(Component)]
-struct AmbientToggleButton;
+struct OverlaysToggleButton;
 
 #[derive(Component)]
-struct AmbientToggleLabel;
-
-#[derive(Component)]
-struct OccupancyToggleButton;
-
-#[derive(Component)]
-struct OccupancyToggleLabel;
-
-#[derive(Component)]
-struct HeatmapToggleButton;
-
-#[derive(Component)]
-struct HeatmapToggleLabel;
-
-#[derive(Component)]
-struct PathToggleButton;
-
-#[derive(Component)]
-struct PathToggleLabel;
-
-#[derive(Component)]
-struct WaterToggleButton;
-
-#[derive(Component)]
-struct WaterToggleLabel;
-
-#[derive(Component)]
-struct LogToggleButton;
-
-#[derive(Component)]
-struct LogToggleLabel;
+struct OverlaysToggleLabel;
 
 #[derive(Component)]
 struct RedrawAllButton;
@@ -114,16 +80,8 @@ impl Plugin for GameHudPlugin {
             (
                 map_button_toggle_views,
                 map_key_toggle_views,
-                ambient_fill_toggle_button,
-                sync_ambient_toggle_label,
-                occupancy_toggle_button,
-                sync_occupancy_toggle_label,
-                heatmap_toggle_button,
-                sync_heatmap_toggle_label,
-                water_toggle_button,
-                sync_water_toggle_label,
-                log_toggle_button,
-                sync_log_toggle_label,
+                overlays_toggle_button,
+                sync_overlays_toggle_label,
                 redraw_all_button,
                 floor_level_buttons,
                 update_floor_level_readout,
@@ -131,14 +89,6 @@ impl Plugin for GameHudPlugin {
                 pause_button_click,
                 sync_pause_ui,
                 update_fps_counter,
-            )
-                .run_if(in_state(GameState::InGame)),
-        )
-        .add_systems(
-            Update,
-            (
-                path_toggle_button,
-                sync_path_toggle_label,
             )
                 .run_if(in_state(GameState::InGame)),
         );
@@ -254,89 +204,8 @@ pub(crate) fn spawn_bottom_hud(mut commands: Commands, camera: Query<Entity, Wit
 
             parent
                 .spawn((
-                    Name::new("HUD ambient fill toggle"),
-                    AmbientToggleButton,
-                    Button,
-                    Node {
-                        min_width: Val::Px(118.0),
-                        height: Val::Px(36.0),
-                        padding: UiRect::horizontal(Val::Px(12.0)),
-                        justify_content: JustifyContent::Center,
-                        align_items: AlignItems::Center,
-                        border: UiRect::all(Val::Px(1.0)),
-                        border_radius: BorderRadius::all(Val::Px(6.0)),
-                        ..default()
-                    },
-                    BorderColor::all(BTN_BORDER),
-                    BackgroundColor(BTN_BG),
-                ))
-                .with_children(|p| {
-                    p.spawn((
-                        AmbientToggleLabel,
-                        Text::new("Ambient: On"),
-                        TextFont::from_font_size(17.0),
-                        TextColor(TEXT_MAIN),
-                    ));
-                });
-
-            parent
-                .spawn((
-                    Name::new("HUD occupancy overlay toggle"),
-                    OccupancyToggleButton,
-                    Button,
-                    Node {
-                        min_width: Val::Px(88.0),
-                        height: Val::Px(36.0),
-                        padding: UiRect::horizontal(Val::Px(12.0)),
-                        justify_content: JustifyContent::Center,
-                        align_items: AlignItems::Center,
-                        border: UiRect::all(Val::Px(1.0)),
-                        border_radius: BorderRadius::all(Val::Px(6.0)),
-                        ..default()
-                    },
-                    BorderColor::all(BTN_BORDER),
-                    BackgroundColor(BTN_BG),
-                ))
-                .with_children(|p| {
-                    p.spawn((
-                        OccupancyToggleLabel,
-                        Text::new("Occ: Off"),
-                        TextFont::from_font_size(17.0),
-                        TextColor(TEXT_MAIN),
-                    ));
-                });
-
-            parent
-                .spawn((
-                    Name::new("HUD heatmap toggle"),
-                    HeatmapToggleButton,
-                    Button,
-                    Node {
-                        min_width: Val::Px(108.0),
-                        height: Val::Px(36.0),
-                        padding: UiRect::horizontal(Val::Px(12.0)),
-                        justify_content: JustifyContent::Center,
-                        align_items: AlignItems::Center,
-                        border: UiRect::all(Val::Px(1.0)),
-                        border_radius: BorderRadius::all(Val::Px(6.0)),
-                        ..default()
-                    },
-                    BorderColor::all(BTN_BORDER),
-                    BackgroundColor(BTN_BG),
-                ))
-                .with_children(|p| {
-                    p.spawn((
-                        HeatmapToggleLabel,
-                        Text::new("Heat: Off"),
-                        TextFont::from_font_size(17.0),
-                        TextColor(TEXT_MAIN),
-                    ));
-                });
-
-            parent
-                .spawn((
-                    Name::new("HUD path overlay toggle"),
-                    PathToggleButton,
+                    Name::new("HUD overlays panel toggle"),
+                    OverlaysToggleButton,
                     Button,
                     Node {
                         min_width: Val::Px(100.0),
@@ -353,62 +222,8 @@ pub(crate) fn spawn_bottom_hud(mut commands: Commands, camera: Query<Entity, Wit
                 ))
                 .with_children(|p| {
                     p.spawn((
-                        PathToggleLabel,
-                        Text::new("Path: Off"),
-                        TextFont::from_font_size(17.0),
-                        TextColor(TEXT_MAIN),
-                    ));
-                });
-
-            parent
-                .spawn((
-                    Name::new("HUD water toggle"),
-                    WaterToggleButton,
-                    Button,
-                    Node {
-                        min_width: Val::Px(106.0),
-                        height: Val::Px(36.0),
-                        padding: UiRect::horizontal(Val::Px(12.0)),
-                        justify_content: JustifyContent::Center,
-                        align_items: AlignItems::Center,
-                        border: UiRect::all(Val::Px(1.0)),
-                        border_radius: BorderRadius::all(Val::Px(6.0)),
-                        ..default()
-                    },
-                    BorderColor::all(BTN_BORDER),
-                    BackgroundColor(BTN_BG),
-                ))
-                .with_children(|p| {
-                    p.spawn((
-                        WaterToggleLabel,
-                        Text::new("Water: On"),
-                        TextFont::from_font_size(17.0),
-                        TextColor(TEXT_MAIN),
-                    ));
-                });
-
-            parent
-                .spawn((
-                    Name::new("HUD log toggle"),
-                    LogToggleButton,
-                    Button,
-                    Node {
-                        min_width: Val::Px(92.0),
-                        height: Val::Px(36.0),
-                        padding: UiRect::horizontal(Val::Px(12.0)),
-                        justify_content: JustifyContent::Center,
-                        align_items: AlignItems::Center,
-                        border: UiRect::all(Val::Px(1.0)),
-                        border_radius: BorderRadius::all(Val::Px(6.0)),
-                        ..default()
-                    },
-                    BorderColor::all(BTN_BORDER),
-                    BackgroundColor(BTN_BG),
-                ))
-                .with_children(|p| {
-                    p.spawn((
-                        LogToggleLabel,
-                        Text::new("Log: Off"),
+                        OverlaysToggleLabel,
+                        Text::new("Overlays"),
                         TextFont::from_font_size(17.0),
                         TextColor(TEXT_MAIN),
                     ));
@@ -543,31 +358,6 @@ pub(crate) fn spawn_bottom_hud(mut commands: Commands, camera: Query<Entity, Wit
         });
 }
 
-fn ambient_fill_toggle_button(
-    interactions: Query<&Interaction, (With<AmbientToggleButton>, Changed<Interaction>)>,
-    mut fill: ResMut<AmbientFillEnabled>,
-) {
-    for interaction in &interactions {
-        if *interaction != Interaction::Pressed {
-            continue;
-        }
-        fill.0 = !fill.0;
-    }
-}
-
-fn sync_ambient_toggle_label(
-    fill: Res<AmbientFillEnabled>,
-    mut texts: Query<&mut Text, With<AmbientToggleLabel>>,
-) {
-    if !fill.is_changed() {
-        return;
-    }
-    let label = if fill.0 { "Ambient: On" } else { "Ambient: Off" };
-    for mut text in &mut texts {
-        **text = label.to_string();
-    }
-}
-
 fn toggle_strategy_camera_view(cam: &mut StrategyCamera) {
     match cam.view_mode {
         StrategyCameraViewMode::Strategy => {
@@ -633,81 +423,6 @@ fn update_floor_level_readout(
     }
     for mut text in &mut texts {
         **text = format!("Floor {}", floor.0);
-    }
-}
-
-fn occupancy_toggle_button(
-    interactions: Query<&Interaction, (With<OccupancyToggleButton>, Changed<Interaction>)>,
-    mut enabled: ResMut<OccupancyOverlayEnabled>,
-) {
-    for interaction in &interactions {
-        if *interaction != Interaction::Pressed {
-            continue;
-        }
-        enabled.0 = !enabled.0;
-    }
-}
-
-fn sync_occupancy_toggle_label(
-    enabled: Res<OccupancyOverlayEnabled>,
-    mut texts: Query<&mut Text, With<OccupancyToggleLabel>>,
-) {
-    if !enabled.is_changed() {
-        return;
-    }
-    let label = if enabled.0 { "Occ: On" } else { "Occ: Off" };
-    for mut text in &mut texts {
-        **text = label.to_string();
-    }
-}
-
-fn heatmap_toggle_button(
-    interactions: Query<&Interaction, (With<HeatmapToggleButton>, Changed<Interaction>)>,
-    mut enabled: ResMut<TemperatureOverlayEnabled>,
-) {
-    for interaction in &interactions {
-        if *interaction != Interaction::Pressed {
-            continue;
-        }
-        enabled.0 = !enabled.0;
-    }
-}
-
-fn sync_heatmap_toggle_label(
-    enabled: Res<TemperatureOverlayEnabled>,
-    mut texts: Query<&mut Text, With<HeatmapToggleLabel>>,
-) {
-    if !enabled.is_changed() {
-        return;
-    }
-    let label = if enabled.0 { "Heat: On" } else { "Heat: Off" };
-    for mut text in &mut texts {
-        **text = label.to_string();
-    }
-}
-
-fn path_toggle_button(
-    interactions: Query<&Interaction, (With<PathToggleButton>, Changed<Interaction>)>,
-    mut enabled: ResMut<PathOverlayEnabled>,
-) {
-    for interaction in &interactions {
-        if *interaction != Interaction::Pressed {
-            continue;
-        }
-        enabled.0 = !enabled.0;
-    }
-}
-
-fn sync_path_toggle_label(
-    enabled: Res<PathOverlayEnabled>,
-    mut texts: Query<&mut Text, With<PathToggleLabel>>,
-) {
-    if !enabled.is_changed() {
-        return;
-    }
-    let label = if enabled.0 { "Path: On" } else { "Path: Off" };
-    for mut text in &mut texts {
-        **text = label.to_string();
     }
 }
 
@@ -854,56 +569,26 @@ fn spawn_fps_counter(mut commands: Commands, camera: Query<Entity, With<Strategy
     ));
 }
 
-fn water_toggle_button(
-    interactions: Query<&Interaction, (With<WaterToggleButton>, Changed<Interaction>)>,
-    mut enabled: ResMut<WaterRenderingEnabled>,
+fn overlays_toggle_button(
+    interactions: Query<&Interaction, (With<OverlaysToggleButton>, Changed<Interaction>)>,
+    mut panel: ResMut<crate::hud::overlays::OverlaysPanel>,
 ) {
     for interaction in &interactions {
         if *interaction != Interaction::Pressed {
             continue;
         }
-        enabled.0 = !enabled.0;
+        panel.open = !panel.open;
     }
 }
 
-fn sync_water_toggle_label(
-    enabled: Res<WaterRenderingEnabled>,
-    mut texts: Query<&mut Text, With<WaterToggleLabel>>,
+fn sync_overlays_toggle_label(
+    panel: Res<crate::hud::overlays::OverlaysPanel>,
+    mut texts: Query<&mut Text, With<OverlaysToggleLabel>>,
 ) {
-    if !enabled.is_changed() {
+    if !panel.is_changed() {
         return;
     }
-    let label = if enabled.0 { "Water: On" } else { "Water: Off" };
-    for mut text in &mut texts {
-        **text = label.to_string();
-    }
-}
-
-fn log_toggle_button(
-    interactions: Query<&Interaction, (With<LogToggleButton>, Changed<Interaction>)>,
-    log: Res<GameLog>,
-) {
-    for interaction in &interactions {
-        if *interaction != Interaction::Pressed {
-            continue;
-        }
-        log.toggle();
-    }
-}
-
-fn sync_log_toggle_label(
-    log: Res<GameLog>,
-    mut last: Local<Option<bool>>,
-    mut texts: Query<&mut Text, With<LogToggleLabel>>,
-) {
-    // `GameLog::enabled` is an interior atomic, so `Res::is_changed` never fires;
-    // track the last shown state and rewrite only on an actual change.
-    let enabled = log.is_enabled();
-    if *last == Some(enabled) {
-        return;
-    }
-    *last = Some(enabled);
-    let label = if enabled { "Log: On" } else { "Log: Off" };
+    let label = if panel.open { "Overlays ✓" } else { "Overlays" };
     for mut text in &mut texts {
         **text = label.to_string();
     }
