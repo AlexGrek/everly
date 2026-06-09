@@ -13,7 +13,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use crate::actor::actor_name::random_actor_name;
-use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
+use crate::actor::actor_pick::{ActorForceLogs, ActorInspectable, ActorPickMesh};
 use crate::actor::charge::Charge;
 use bevy::picking::prelude::Pickable;
 use crate::actor::snapshot::{GlitchBotVisualSnap, SerVec2};
@@ -21,6 +21,7 @@ use crate::actor::{
     is_paused, occupancy_collision_normal, process_actors, reflect_velocity, Actor, ActorMoveBuffer,
     ActorMovementError, ActorObject, ActorState, OffScreenActor,
 };
+use crate::hud::game_log::{GameLog, LogEntry};
 use crate::map::passability::{FLAG_BLOCKED, SUBTILE_COUNT};
 use crate::menu::main_menu::GameState;
 
@@ -48,6 +49,9 @@ pub struct GlitchBotVisual {
     dir_timer: f32,
     dir_interval: f32,
     collision_streak: u32,
+    /// `true` once charge depletion has been logged; cleared when charge rises
+    /// above zero again.
+    depleted_logged: bool,
     /// Seed for [`Self::rng`]; persisted in level actor snapshots only.
     rng_seed: u64,
     rng: StdRng,
@@ -78,6 +82,7 @@ impl GlitchBotVisual {
             dir_timer: snap.dir_timer,
             dir_interval: snap.dir_interval,
             collision_streak: snap.collision_streak,
+            depleted_logged: false,
             rng_seed: snap.rng_seed,
             rng: StdRng::seed_from_u64(snap.rng_seed),
         }
@@ -191,20 +196,38 @@ impl Plugin for GlitchBotPlugin {
 /// change so they can never diverge.
 fn glitch_bot_think(
     time: Res<Time>,
-    mut query: Query<(&mut ActorObject, &mut GlitchBotVisual, Option<&Charge>)>,
+    game_log: Res<GameLog>,
+    mut query: Query<(
+        &Name,
+        &mut ActorObject,
+        &mut GlitchBotVisual,
+        &ActorForceLogs,
+        Option<&Charge>,
+    )>,
 ) {
     let dt = time.delta_secs();
 
-    for (mut obj, mut vis, charge) in &mut query {
+    for (name, mut obj, mut vis, force_logs, charge) in &mut query {
         let state = obj.inner.state_mut();
 
         // Depleted bots are immobilized: clear any pending intent and freeze the
         // accumulator so the bot neither steps on the collision grid nor drifts
         // visually (sync renders from last_accepted_center_subtile + accumulator).
         if charge.is_some_and(Charge::is_depleted) {
+            if !vis.depleted_logged {
+                vis.depleted_logged = true;
+                let tile = crate::actor::actor_main_tile(state.center);
+                game_log.push_world(
+                    tile.x,
+                    tile.y,
+                    LogEntry::ChargeDepleted { name: name.to_string() },
+                    force_logs.0,
+                );
+            }
             state.move_buffer = ActorMoveBuffer::default();
             continue;
         }
+        vis.depleted_logged = false;
 
         let movement_error = state.last_movement_error.clone();
         if let Some(err) = movement_error {
@@ -353,6 +376,7 @@ pub fn spawn_glitch_bot_from_snapshot(
         .spawn((
             Name::new(name.to_string()),
             ActorInspectable,
+            ActorForceLogs::default(),
             vis,
             ActorObject::new(Box::new(bot)),
             Transform::default(),
@@ -424,6 +448,7 @@ pub fn spawn_glitch_bot(
         .spawn((
             Name::new(random_actor_name()),
             ActorInspectable,
+            ActorForceLogs::default(),
             Charge::random(rng),
             GlitchBotVisual {
                 direction: initial_dir,
@@ -431,6 +456,7 @@ pub fn spawn_glitch_bot(
                 dir_timer: 0.0,
                 dir_interval: vis_rng.gen_range(DIR_CHANGE_MIN_S..DIR_CHANGE_MAX_S),
                 collision_streak: 0,
+                depleted_logged: false,
                 rng_seed: vis_seed,
                 rng: vis_rng,
             },

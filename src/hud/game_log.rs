@@ -1,5 +1,5 @@
 //! In-game event log: a top-left overlay that surfaces gameplay events
-//! (bot reroutes, charging) as short-lived colored lines.
+//! (stuck bots, breakage, charge, charging) as short-lived colored lines.
 //!
 //! ## Hypertile-local queues (the architecture)
 //! Logs are **grouped by hypertile** (one [`ChunkCoord`] queue each), not held
@@ -22,7 +22,7 @@
 //! that string is cached on the [`StoredLog`] so it is never re-rendered. We
 //! only ever render the queue for **the hypertile the camera is currently on**;
 //! every other chunk's events stay as structs and age out unrendered. While the
-//! panel is disabled (the default), nothing is rendered at all.
+//! panel is disabled (the default), only FORCE-flagged lines are rendered.
 //!
 //! ## Lifetime
 //! Every line lives [`LOG_LIFETIME_SECS`] seconds and then disappears.
@@ -81,10 +81,35 @@ impl LogLevel {
 
 /// A single logged event, stored in non-rendered form. All referenced data is
 /// owned (copied at push time) so rendering later never borrows world state.
+/// A breakable BlackBot sub-component surfaced in the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakableSystem {
+    MovementEngine,
+    ControlPlane,
+    SensorySystem,
+}
+
+impl BreakableSystem {
+    fn label(self) -> &'static str {
+        match self {
+            BreakableSystem::MovementEngine => "movement engine",
+            BreakableSystem::ControlPlane => "control plane",
+            BreakableSystem::SensorySystem => "sensory system",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum LogEntry {
-    /// A bot rerouted after a head-on collision with another bot.
-    BotReroute { name: String },
+    /// A bot abandoned its route because progress stalled.
+    BotStuck { name: String },
+    /// A bot's battery reached zero.
+    ChargeDepleted { name: String },
+    /// A breakable sub-component failed.
+    SystemBroken {
+        name: String,
+        system: BreakableSystem,
+    },
     /// A bot docked at a charger and started charging.
     ChargingStarted { name: String },
     /// A bot finished charging (reached full) and undocked.
@@ -97,7 +122,9 @@ impl LogEntry {
     /// Severity of this entry.
     pub fn level(&self) -> LogLevel {
         match self {
-            LogEntry::BotReroute { .. } => LogLevel::Unexpected,
+            LogEntry::BotStuck { .. } => LogLevel::Warn,
+            LogEntry::ChargeDepleted { .. } => LogLevel::Err,
+            LogEntry::SystemBroken { .. } => LogLevel::Err,
             LogEntry::ChargingStarted { .. } => LogLevel::Info,
             LogEntry::ChargingDone { .. } => LogLevel::Success,
             LogEntry::Message { level, .. } => *level,
@@ -108,7 +135,11 @@ impl LogEntry {
     /// entry (the result is cached on the [`StoredLog`]).
     pub fn render(&self) -> String {
         match self {
-            LogEntry::BotReroute { name } => format!("{name} rerouting after collision"),
+            LogEntry::BotStuck { name } => format!("{name} stuck"),
+            LogEntry::ChargeDepleted { name } => format!("{name} charge depleted"),
+            LogEntry::SystemBroken { name, system } => {
+                format!("{name} {} broken", system.label())
+            }
             LogEntry::ChargingStarted { name } => format!("{name} started charging"),
             LogEntry::ChargingDone { name } => format!("{name} finished charging"),
             LogEntry::Message { text, .. } => text.clone(),
@@ -116,10 +147,21 @@ impl LogEntry {
     }
 }
 
+/// Which stored lines [`GameLog::render_lines`] includes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogDisplayFilter {
+    /// Every entry in the chunk queue.
+    All,
+    /// Only entries pushed with `force: true` (per-actor `ActorForceLogs`).
+    ForcedOnly,
+}
+
 /// One stored event plus its on-screen age and lazily-rendered string cache.
 #[derive(Debug)]
 struct StoredLog {
     entry: LogEntry,
+    /// When `true`, this line is shown even if the global log overlay is off.
+    force: bool,
     /// Seconds this line has been alive; advanced only while unpaused.
     age: f32,
     /// Cached render of `entry`, populated the first time it is displayed.
@@ -135,11 +177,16 @@ struct ChunkLog {
 }
 
 impl ChunkLog {
-    fn push(&mut self, entry: LogEntry) {
+    fn push(&mut self, entry: LogEntry, force: bool) {
         if self.entries.len() >= MAX_LOGS_PER_CHUNK {
             self.entries.pop_front();
         }
-        self.entries.push_back(StoredLog { entry, age: 0.0, rendered: None });
+        self.entries.push_back(StoredLog {
+            entry,
+            force,
+            age: 0.0,
+            rendered: None,
+        });
         self.dirty = true;
     }
 }
@@ -173,21 +220,22 @@ impl GameLog {
 
     /// Records `entry` in the queue for the hypertile containing world tile
     /// `(world_x, world_y)`. Stores the struct only — no string is rendered
-    /// here, even when the panel is enabled.
-    pub fn push_world(&self, world_x: i32, world_y: i32, entry: LogEntry) {
+    /// here, even when the panel is enabled. Set `force` when the producing
+    /// actor has [`ActorForceLogs`](crate::actor::actor_pick::ActorForceLogs) enabled.
+    pub fn push_world(&self, world_x: i32, world_y: i32, entry: LogEntry, force: bool) {
         let (coord, _) = world_to_chunk_local(world_x, world_y);
-        self.push(coord, entry);
+        self.push(coord, entry, force);
     }
 
     /// Records `entry` in the given hypertile's queue, holding each lock only
     /// for the push itself.
-    pub fn push(&self, coord: ChunkCoord, entry: LogEntry) {
+    pub fn push(&self, coord: ChunkCoord, entry: LogEntry, force: bool) {
         // Warm path: the chunk's queue already exists — a read lock is enough to
         // reach its `Mutex`, which we hold only for the push.
         {
             let map = self.chunks.read().expect("game log map poisoned");
             if let Some(chunk) = map.get(&coord) {
-                chunk.lock().expect("chunk log poisoned").push(entry);
+                chunk.lock().expect("chunk log poisoned").push(entry, force);
                 return;
             }
         }
@@ -199,7 +247,7 @@ impl GameLog {
             .or_insert_with(|| Mutex::new(ChunkLog::default()))
             .lock()
             .expect("chunk log poisoned")
-            .push(entry);
+            .push(entry, force);
     }
 
     /// Advances every queue's ages by `dt` and drops lines past
@@ -229,15 +277,20 @@ impl GameLog {
     /// can skip rebuilding the UI. `force` is set when the camera just moved
     /// onto this hypertile (or the panel was just enabled), where a rebuild is
     /// always needed even if the queue itself is unchanged.
-    fn render_lines(&self, coord: ChunkCoord, force: bool) -> Option<Vec<(Color, String)>> {
+    fn render_lines(
+        &self,
+        coord: ChunkCoord,
+        force_rebuild: bool,
+        filter: LogDisplayFilter,
+    ) -> Option<Vec<(Color, String)>> {
         let map = self.chunks.read().expect("game log map poisoned");
         let Some(chunk) = map.get(&coord) else {
             // No queue here: only the camera-moved-here case needs to clear
             // whatever the previous chunk left on screen.
-            return force.then(Vec::new);
+            return force_rebuild.then(Vec::new);
         };
         let mut log = chunk.lock().expect("chunk log poisoned");
-        if !force && !log.dirty {
+        if !force_rebuild && !log.dirty {
             return None;
         }
         log.dirty = false;
@@ -245,6 +298,7 @@ impl GameLog {
             .entries
             .iter_mut()
             .rev()
+            .filter(|stored| filter == LogDisplayFilter::All || stored.force)
             .map(|stored| {
                 let color = stored.entry.level().color();
                 let text = stored.rendered.get_or_insert_with(|| stored.entry.render()).clone();
@@ -309,27 +363,19 @@ fn age_logs(time: Res<Time>, log: Res<GameLog>) {
 }
 
 /// Rebuilds the overlay from the queue of the hypertile the camera is on, only
-/// when that queue changed or the camera moved to a new hypertile. Renders
-/// nothing while disabled (beyond clearing leftover lines once).
+/// when that queue changed or the camera moved to a new hypertile. When the
+/// global log toggle is off, only FORCE-flagged lines are shown.
 fn render_logs(
     log: Res<GameLog>,
     cameras: Query<&StrategyCamera>,
     root: Query<Entity, With<GameLogRoot>>,
-    children: Query<&Children, With<GameLogRoot>>,
     mut last_chunk: Local<Option<ChunkCoord>>,
+    mut last_enabled: Local<bool>,
     mut commands: Commands,
 ) {
     let Ok(root) = root.single() else {
         return;
     };
-
-    if !log.is_enabled() {
-        if children.get(root).is_ok_and(|c| !c.is_empty()) {
-            commands.entity(root).despawn_related::<Children>();
-        }
-        *last_chunk = None;
-        return;
-    }
 
     let Ok(camera) = cameras.single() else {
         return;
@@ -337,12 +383,23 @@ fn render_logs(
     let (coord, _) =
         world_to_chunk_local(camera.focus.x.floor() as i32, camera.focus.z.floor() as i32);
 
-    // Force a rebuild when the camera moved onto a different hypertile (or the
-    // panel was just enabled, when `last_chunk` is `None`).
-    let force = *last_chunk != Some(coord);
+    let enabled = log.is_enabled();
+    let toggled = *last_enabled != enabled;
+    *last_enabled = enabled;
+
+    // Force a rebuild when the camera moved onto a different hypertile, the
+    // global toggle flipped, or the panel was just enabled (`last_chunk` is
+    // `None`).
+    let force_rebuild = *last_chunk != Some(coord) || toggled;
     *last_chunk = Some(coord);
 
-    if let Some(lines) = log.render_lines(coord, force) {
+    let filter = if enabled {
+        LogDisplayFilter::All
+    } else {
+        LogDisplayFilter::ForcedOnly
+    };
+
+    if let Some(lines) = log.render_lines(coord, force_rebuild, filter) {
         commands.entity(root).despawn_related::<Children>();
         for (color, text) in lines {
             let line = commands
@@ -364,9 +421,20 @@ mod tests {
 
     #[test]
     fn render_matches_level_and_text() {
-        let e = LogEntry::BotReroute { name: "Zippy".to_string() };
-        assert_eq!(e.level(), LogLevel::Unexpected);
-        assert_eq!(e.render(), "Zippy rerouting after collision");
+        let e = LogEntry::BotStuck { name: "Zippy".to_string() };
+        assert_eq!(e.level(), LogLevel::Warn);
+        assert_eq!(e.render(), "Zippy stuck");
+
+        let e = LogEntry::ChargeDepleted { name: "Bolt".to_string() };
+        assert_eq!(e.level(), LogLevel::Err);
+        assert_eq!(e.render(), "Bolt charge depleted");
+
+        let e = LogEntry::SystemBroken {
+            name: "Bolt".to_string(),
+            system: BreakableSystem::ControlPlane,
+        };
+        assert_eq!(e.level(), LogLevel::Err);
+        assert_eq!(e.render(), "Bolt control plane broken");
 
         let e = LogEntry::ChargingStarted { name: "Bolt".to_string() };
         assert_eq!(e.level(), LogLevel::Info);
@@ -381,9 +449,9 @@ mod tests {
     fn push_groups_by_hypertile_and_stores_unrendered() {
         let log = GameLog::default();
         // Two events in the same chunk, one far away in another chunk.
-        log.push_world(5, 5, LogEntry::Message { level: LogLevel::Info, text: "a".into() });
-        log.push_world(6, 7, LogEntry::Message { level: LogLevel::Info, text: "b".into() });
-        log.push_world(1000, 1000, LogEntry::Message { level: LogLevel::Err, text: "c".into() });
+        log.push_world(5, 5, LogEntry::Message { level: LogLevel::Info, text: "a".into() }, false);
+        log.push_world(6, 7, LogEntry::Message { level: LogLevel::Info, text: "b".into() }, false);
+        log.push_world(1000, 1000, LogEntry::Message { level: LogLevel::Err, text: "c".into() }, false);
 
         let map = log.chunks.read().unwrap();
         assert_eq!(map.len(), 2, "events split across two hypertiles");
@@ -398,19 +466,22 @@ mod tests {
     fn render_lines_only_for_requested_chunk_newest_first() {
         let log = GameLog::default();
         let (here, _) = world_to_chunk_local(5, 5);
-        log.push(here, LogEntry::Message { level: LogLevel::Info, text: "first".into() });
-        log.push(here, LogEntry::Message { level: LogLevel::Info, text: "second".into() });
+        log.push(here, LogEntry::Message { level: LogLevel::Info, text: "first".into() }, false);
+        log.push(here, LogEntry::Message { level: LogLevel::Info, text: "second".into() }, true);
 
-        let lines = log.render_lines(here, true).unwrap();
+        let lines = log.render_lines(here, true, LogDisplayFilter::All).unwrap();
         assert_eq!(lines.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(), ["second", "first"]);
 
+        let forced = log.render_lines(here, true, LogDisplayFilter::ForcedOnly).unwrap();
+        assert_eq!(forced.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(), ["second"]);
+
         // Unchanged since last render and not forced → no rebuild requested.
-        assert!(log.render_lines(here, false).is_none());
+        assert!(log.render_lines(here, false, LogDisplayFilter::All).is_none());
 
         // A chunk with no queue only rebuilds (to clear) when forced.
         let (elsewhere, _) = world_to_chunk_local(1000, 1000);
-        assert_eq!(log.render_lines(elsewhere, true), Some(Vec::new()));
-        assert!(log.render_lines(elsewhere, false).is_none());
+        assert_eq!(log.render_lines(elsewhere, true, LogDisplayFilter::All), Some(Vec::new()));
+        assert!(log.render_lines(elsewhere, false, LogDisplayFilter::All).is_none());
     }
 
     #[test]
@@ -418,7 +489,7 @@ mod tests {
         let log = GameLog::default();
         let (here, _) = world_to_chunk_local(0, 0);
         for i in 0..(MAX_LOGS_PER_CHUNK + 5) {
-            log.push(here, LogEntry::Message { level: LogLevel::Info, text: format!("{i}") });
+            log.push(here, LogEntry::Message { level: LogLevel::Info, text: format!("{i}") }, false);
         }
         let map = log.chunks.read().unwrap();
         let chunk = map.get(&here).unwrap().lock().unwrap();
@@ -430,7 +501,7 @@ mod tests {
     fn age_expires_lines_past_lifetime() {
         let log = GameLog::default();
         let (here, _) = world_to_chunk_local(0, 0);
-        log.push(here, LogEntry::Message { level: LogLevel::Info, text: "x".into() });
+        log.push(here, LogEntry::Message { level: LogLevel::Info, text: "x".into() }, false);
         log.age_all(LOG_LIFETIME_SECS + 0.1);
         let map = log.chunks.read().unwrap();
         assert!(map.get(&here).unwrap().lock().unwrap().entries.is_empty());

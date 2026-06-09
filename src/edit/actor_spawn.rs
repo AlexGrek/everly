@@ -17,12 +17,21 @@ use crate::edit::map_edit::{
 };
 use crate::hud::panel_anim::PanelAnim;
 use crate::map::floor_level::{ActiveFloorLevel, HYPERMAP_FLOOR_HEIGHT};
+use crate::map::hypermap_world::HypermapRuntime;
+use crate::map::hypermap::Hypermap;
+use crate::map::passability::{
+    DynamicPassabilityMap, SubtilePassability, FLAG_BLOCKED, FLAG_VOID, SUBTILE_COUNT,
+};
 use crate::menu::main_menu::GameState;
 use crate::scene::camera::StrategyCameraRig;
 
 /// Pixels from the bottom of the window where spawn clicks are suppressed (covers the
 /// 52 px HUD bar + the 40 px palette row this panel shares with the map-edit palette).
 const ACTOR_DEAD_ZONE_PX: f32 = 120.0;
+
+/// Both spawnable bots use radius-2 subtiles (see `GLITCH_RADIUS_SUBTILES` /
+/// `BLACK_RADIUS_SUBTILES`).
+const ACTOR_SPAWN_RADIUS_SUBTILES: i32 = 2;
 
 const PALETTE_BG: Color = Color::srgba(0.05, 0.06, 0.09, 0.78);
 const BTN_BG: Color = Color::srgba(0.16, 0.18, 0.22, 0.75);
@@ -73,12 +82,16 @@ pub struct ActorSpawnState {
 #[derive(Resource, Default)]
 struct ActorSpawnHoverCell(Option<(i32, i32)>);
 
+#[derive(Resource)]
+struct ActorSpawnPreviewInvalidMaterial(Handle<StandardMaterial>);
+
 pub struct ActorSpawnPlugin;
 
 impl Plugin for ActorSpawnPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ActorSpawnState>()
             .init_resource::<ActorSpawnHoverCell>()
+            .add_systems(OnEnter(GameState::InGame), setup_actor_spawn_preview_material)
             .add_systems(
                 Update,
                 (
@@ -260,6 +273,8 @@ fn actor_spawn_pointer_click(
     cameras: Query<(&Camera, &GlobalTransform), With<StrategyCameraRig>>,
     state: Res<ActorSpawnState>,
     floor: Res<ActiveFloorLevel>,
+    dynamic_passability: Res<DynamicPassabilityMap>,
+    hypermap: Res<HypermapRuntime>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut bot_rng: ResMut<GlitchBotRng>,
@@ -280,6 +295,15 @@ fn actor_spawn_pointer_click(
     let Some((cx, cz)) = actor_spawn_plane_cell(window, cam, cam_gt, floor.0) else {
         return;
     };
+    if !actor_spawn_cell_passable(
+        kind,
+        cx,
+        cz,
+        &dynamic_passability,
+        hypermap.static_subtile_cache.as_ref(),
+    ) {
+        return;
+    }
 
     let center = Vec2::new(cx as f32 + 0.5, cz as f32 + 0.5);
     match kind {
@@ -318,16 +342,27 @@ fn actor_spawn_update_preview(
     state: Res<ActorSpawnState>,
     hover: Res<ActorSpawnHoverCell>,
     floor: Res<ActiveFloorLevel>,
+    dynamic_passability: Res<DynamicPassabilityMap>,
+    hypermap: Res<HypermapRuntime>,
     mut meshes: ResMut<Assets<Mesh>>,
     preview_mat: Option<Res<MapEditPreviewMaterial>>,
+    invalid_preview_mat: Option<Res<ActorSpawnPreviewInvalidMaterial>>,
     mut preview_entity: Local<Option<Entity>>,
 ) {
-    let Some(preview_mat) = preview_mat else {
+    let (Some(preview_mat), Some(invalid_preview_mat)) = (preview_mat, invalid_preview_mat) else {
         return;
     };
 
-    let spawning = matches!(state.tool, Some(ActorTool::Spawn(_)));
-    let Some((cx, cz)) = spawning.then_some(hover.0).flatten() else {
+    let kind = match state.tool {
+        Some(ActorTool::Spawn(k)) => k,
+        _ => {
+            if let Some(e) = *preview_entity {
+                commands.entity(e).insert(Visibility::Hidden);
+            }
+            return;
+        }
+    };
+    let Some((cx, cz)) = hover.0 else {
         if let Some(e) = *preview_entity {
             commands.entity(e).insert(Visibility::Hidden);
         }
@@ -343,11 +378,23 @@ fn actor_spawn_update_preview(
         floor.0 as f32 * HYPERMAP_FLOOR_HEIGHT + 0.02,
         cz as f32 + 0.5,
     );
+    let passable = actor_spawn_cell_passable(
+        kind,
+        cx,
+        cz,
+        &dynamic_passability,
+        hypermap.static_subtile_cache.as_ref(),
+    );
+    let mat = if passable {
+        preview_mat.0.clone()
+    } else {
+        invalid_preview_mat.0.clone()
+    };
 
     if let Some(e) = *preview_entity {
         commands.entity(e).insert((
             Mesh3d(mesh_h),
-            MeshMaterial3d(preview_mat.0.clone()),
+            MeshMaterial3d(mat),
             transform,
             Visibility::Inherited,
             NotShadowCaster,
@@ -359,7 +406,7 @@ fn actor_spawn_update_preview(
                 Name::new("Actor spawn preview"),
                 ActorSpawnPreviewRoot,
                 Mesh3d(mesh_h),
-                MeshMaterial3d(preview_mat.0.clone()),
+                MeshMaterial3d(mat),
                 transform,
                 Visibility::Inherited,
                 NotShadowCaster,
@@ -391,4 +438,52 @@ fn actor_spawn_plane_cell(
     let plane_y = floor_idx as f32 * HYPERMAP_FLOOR_HEIGHT;
     let hit = ray_intersect_horizontal_plane(ray, plane_y)?;
     Some((hit.x.floor() as i32, hit.z.floor() as i32))
+}
+
+fn actor_spawn_blocked_flags(kind: ActorKind) -> u64 {
+    match kind {
+        ActorKind::GlitchBot => FLAG_BLOCKED,
+        ActorKind::BlackBot => FLAG_BLOCKED | FLAG_VOID,
+    }
+}
+
+fn actor_spawn_center_subtile(cx: i32, cz: i32) -> IVec2 {
+    let sc = SUBTILE_COUNT as f32;
+    IVec2::new(
+        ((cx as f32 + 0.5) * sc).floor() as i32,
+        ((cz as f32 + 0.5) * sc).floor() as i32,
+    )
+}
+
+fn actor_spawn_cell_passable(
+    kind: ActorKind,
+    cx: i32,
+    cz: i32,
+    dynamic: &DynamicPassabilityMap,
+    static_cache: &Hypermap<SubtilePassability>,
+) -> bool {
+    dynamic
+        .probe_footprint(
+            actor_spawn_center_subtile(cx, cz),
+            ACTOR_SPAWN_RADIUS_SUBTILES,
+            None,
+            actor_spawn_blocked_flags(kind),
+            static_cache,
+        )
+        .is_ok()
+}
+
+fn setup_actor_spawn_preview_material(
+    mut commands: Commands,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let h = materials.add(StandardMaterial {
+        base_color: Color::srgba(1.0, 0.28, 0.28, 0.42),
+        emissive: LinearRgba::BLACK,
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        depth_bias: 1.0,
+        ..Default::default()
+    });
+    commands.insert_resource(ActorSpawnPreviewInvalidMaterial(h));
 }

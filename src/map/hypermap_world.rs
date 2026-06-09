@@ -27,6 +27,7 @@ use crate::map::level::{
 };
 use crate::menu::main_menu::GameState;
 use crate::map::dirt::DirtMap;
+use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
 use crate::map::passability::{cell_subtile_flags, SubtilePassability, SUBTILE_COUNT};
 use crate::map::chunk_metadata::{try_load_chunk_metadata, ChunkGeneratorMetadata};
 use crate::map::map_generator::{fill_procedural_chunk, CHUNK_VOID_MARGIN};
@@ -49,6 +50,11 @@ const CHARGER_CUBE_HEIGHT: f32 = 0.9;
 const CHARGER_CUBE_DEPTH: f32 = 0.22;
 /// Vertical center of the glowing cube above the storey floor (mounted high on the wall).
 const CHARGER_CUBE_CENTER_Y: f32 = 1.3;
+/// Point light at each glow cube — supplements emissive bloom with scene illumination.
+const CHARGER_LIGHT_COLOR_IDLE: Color = Color::srgb(0.35, 0.75, 1.0);
+const CHARGER_LIGHT_COLOR_ACTIVE: Color = Color::srgb(0.35, 0.95, 0.45);
+const CHARGER_LIGHT_INTENSITY: f32 = 2500.0;
+const CHARGER_LIGHT_RANGE: f32 = 6.0;
 /// Connector: a chunky black "transformer" box, **larger** than the glowing cube,
 /// that bridges the gap to the backing wall. The wall slab sits on the *outer* edge
 /// of the neighboring cell, so its inner face is one cell minus one slab thickness
@@ -104,6 +110,18 @@ struct RenderedChunkFloor0ChargerGlow;
 struct RenderedChunkFloor0ChargerConnector;
 
 #[derive(Component)]
+struct RenderedChunkChargerLight;
+
+/// Maps a chunk light entity back to its [`InteractiveEntityMap`] tile for occupancy tinting.
+#[derive(Component)]
+struct ChargerLightMarker {
+    coords: EntityCoordinates,
+}
+
+#[derive(Component)]
+struct RenderedChunkUpperChargerLights;
+
+#[derive(Component)]
 struct RenderedChunkUpperRoad;
 
 #[derive(Component)]
@@ -142,6 +160,7 @@ struct ChunkUpperMeshEntities {
     charger_metal: Entity,
     charger_glow: Entity,
     charger_connector: Entity,
+    charger_lights: Entity,
 }
 
 /// Chunks that must be re-baked after [`Hypermap`](crate::hypermap::Hypermap) cell edits (drained in [`render_chunks_30fps`]).
@@ -306,6 +325,10 @@ impl Plugin for HypermapWorldPlugin {
                 sync_water_visibility
                     .run_if(in_state(GameState::InGame))
                     .run_if(resource_changed::<WaterRenderingEnabled>),
+            )
+            .add_systems(
+                Update,
+                sync_charger_light_colors.run_if(in_state(GameState::InGame)),
             );
     }
 }
@@ -464,7 +487,7 @@ fn setup_hypermap_assets(
 fn refresh_chunk_upper_layers_on_floor_change(
     floor: Res<ActiveFloorLevel>,
     mut prev_floor: Local<Option<i32>>,
-    runtime: Res<HypermapRuntime>,
+    mut runtime: ResMut<HypermapRuntime>,
     mut meshes: ResMut<Assets<Mesh>>,
     assets: Res<HypermapRenderAssets>,
     mut commands: Commands,
@@ -573,6 +596,18 @@ fn refresh_chunk_upper_layers_on_floor_change(
             build_upper_charger_connector_mesh(&prepared.upper_charger_cells, ox, oy),
             assets.charger_connector_material.clone(), assets.empty_mesh.clone(),
         );
+
+        commands.entity(mesh_ids.charger_lights).despawn();
+        let charger_lights = spawn_upper_charger_lights(
+            &mut commands,
+            runtime.chunk_roots[&coord],
+            &prepared.upper_charger_cells,
+            ox,
+            oy,
+        );
+        if let Some(mesh_ids) = runtime.chunk_upper_meshes.get_mut(&coord) {
+            mesh_ids.charger_lights = charger_lights;
+        }
     }
 }
 
@@ -1269,6 +1304,13 @@ fn spawn_chunk_meshes(
             .id();
         commands.entity(chunk_root).add_child(id);
     }
+    spawn_floor0_charger_lights(
+        commands,
+        chunk_root,
+        &prepared.floor0_charger_cells,
+        ox,
+        oy,
+    );
 
     // ── Upper floors ─────────────────────────────────────────────────────────
     let upper_road = spawn_upper_road_entity(
@@ -1402,6 +1444,14 @@ fn spawn_chunk_meshes(
         id
     };
 
+    let upper_charger_lights = spawn_upper_charger_lights(
+        commands,
+        chunk_root,
+        &prepared.upper_charger_cells,
+        ox,
+        oy,
+    );
+
     ChunkUpperMeshEntities {
         road: upper_road,
         road_glass,
@@ -1412,6 +1462,7 @@ fn spawn_chunk_meshes(
         charger_metal: upper_charger_metal,
         charger_glow: upper_charger_glow,
         charger_connector: upper_charger_connector,
+        charger_lights: upper_charger_lights,
     }
 }
 
@@ -1708,6 +1759,119 @@ fn append_charger_metal(
         CHARGER_PAD_HEIGHT,
         size,
     );
+}
+
+/// World position of the glow-cube center (matches [`append_charger_cube`]).
+fn charger_glow_world_position(cx: f32, cz: f32, y_base: f32, facing: ChargerFacing) -> Vec3 {
+    let (dx, dz) = facing.wall_dir();
+    let edge = 0.5 - CHARGER_CUBE_DEPTH * 0.5;
+    Vec3::new(
+        cx + dx * edge,
+        y_base + CHARGER_CUBE_CENTER_Y,
+        cz + dz * edge,
+    )
+}
+
+fn spawn_charger_point_light(
+    commands: &mut Commands,
+    parent: Entity,
+    pos: Vec3,
+    coords: EntityCoordinates,
+    label: &str,
+) -> Entity {
+    let light = commands
+        .spawn((
+            Name::new(format!("Charger light {label}")),
+            RenderedChunkChargerLight,
+            ChargerLightMarker { coords },
+            PointLight {
+                color: CHARGER_LIGHT_COLOR_IDLE,
+                intensity: CHARGER_LIGHT_INTENSITY,
+                range: CHARGER_LIGHT_RANGE,
+                shadows_enabled: false,
+                ..default()
+            },
+            Transform::from_translation(pos),
+        ))
+        .id();
+    commands.entity(parent).add_child(light);
+    light
+}
+
+fn charger_in_use(map: &InteractiveEntityMap, coords: EntityCoordinates) -> bool {
+    map.entities_at(coords)
+        .iter()
+        .filter_map(|e| e.entity.as_charger())
+        .any(|c| c.occupant().is_some())
+}
+
+fn sync_charger_light_colors(
+    interactive: Res<InteractiveEntityMap>,
+    mut lights: Query<(&ChargerLightMarker, &mut PointLight)>,
+) {
+    for (marker, mut light) in &mut lights {
+        let target = if charger_in_use(&interactive, marker.coords) {
+            CHARGER_LIGHT_COLOR_ACTIVE
+        } else {
+            CHARGER_LIGHT_COLOR_IDLE
+        };
+        if light.color != target {
+            light.color = target;
+        }
+    }
+}
+
+fn spawn_floor0_charger_lights(
+    commands: &mut Commands,
+    chunk_root: Entity,
+    cells: &[(i32, i32, CellType)],
+    origin_x: i32,
+    origin_y: i32,
+) {
+    for &(x, y, cell_type) in cells {
+        let CellType::Charger(facing) = cell_type else {
+            continue;
+        };
+        let wx = origin_x + x;
+        let wy = origin_y + y;
+        let cx = wx as f32 + 0.5;
+        let cz = wy as f32 + 0.5;
+        let pos = charger_glow_world_position(cx, cz, 0.0, facing);
+        let coords = EntityCoordinates::new(wx, wy, 0);
+        spawn_charger_point_light(commands, chunk_root, pos, coords, &format!("{x},{y},f0"));
+    }
+}
+
+fn spawn_upper_charger_lights(
+    commands: &mut Commands,
+    chunk_root: Entity,
+    cells: &[(i32, i32, i32, CellType)],
+    origin_x: i32,
+    origin_y: i32,
+) -> Entity {
+    let parent = commands
+        .spawn((
+            Name::new("Chunk upper charger lights"),
+            RenderedChunkUpperChargerLights,
+            Visibility::Inherited,
+        ))
+        .id();
+    commands.entity(chunk_root).add_child(parent);
+
+    for &(x, y, floor, cell_type) in cells {
+        let CellType::Charger(facing) = cell_type else {
+            continue;
+        };
+        let wx = origin_x + x;
+        let wy = origin_y + y;
+        let cx = wx as f32 + 0.5;
+        let cz = wy as f32 + 0.5;
+        let y_base = floor as f32 * HYPERMAP_FLOOR_HEIGHT;
+        let pos = charger_glow_world_position(cx, cz, y_base, facing);
+        let coords = EntityCoordinates::new(wx, wy, floor);
+        spawn_charger_point_light(commands, parent, pos, coords, &format!("{x},{y},f{floor}"));
+    }
+    parent
 }
 
 /// Glowing cube hanging on the [`ChargerFacing`] wall of a charging-station cell.

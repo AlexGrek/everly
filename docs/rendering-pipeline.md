@@ -39,7 +39,10 @@ Each visible chunk is rendered with batched meshes (see `src/map/hypermap_world.
   reaching across the neighboring wall cell to the slab's inner face. Floor 0 and the
   active upper floor each get their own pad + glow + connector entity
   (`build_*_charger_metal_mesh` / `build_*_charger_glow_mesh` /
-  `build_*_charger_connector_mesh`).
+  `build_*_charger_connector_mesh`). Each glow cube also gets a child
+  **`PointLight`** (cool blue when idle, green when the station is in use — see
+  [`InteractiveEntityMap`](../interactive-entities.md) `is_used` / occupant — no
+  shadows) at the cube center so nearby surfaces are lit, not only bloom-tinted.
 - Optional **water** tile mesh when floor `0` has interior void; the plane is
   inset from chunk edges so border cells stay dry — see `hypermap.md`.
 

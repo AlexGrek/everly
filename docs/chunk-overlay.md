@@ -11,7 +11,7 @@ floating above the floor mesh. Layers are driven from the CPU.
 |---|---|---|
 | Temperature | 0.0004 m | Warm tint from [`TemperatureMap`](../src/map/temperature.rs) (`temperature.bin` on Save) |
 | Dirt | 0.0005 m | Black stains from [`DirtMap`](../src/map/dirt.rs) (persisted in `dirt.bin` on Save — [`level-persistence.md`](level-persistence.md)) |
-| Generic | 0.001 m | Writable canvas for any system |
+| Generic | 0.001 m | BlackBot route visualization (cyan path nodes + purple targets); writable canvas for other systems |
 | Occupancy | 0.002 m | Debug: subtile passability flags |
 
 ## Subtile overlays (generic + occupancy)
@@ -149,6 +149,20 @@ Refreshed at **~15 Hz** to limit GPU upload bandwidth.
 One `DoubleBufferedHypermap::with_chunk_read` call snapshots an entire
 128 × 128 tile block under a single `RwLock::read`, then the inner loop
 is pure array access.
+
+---
+
+## Generic layer (BlackBot paths)
+
+The generic layer at 0.001 m is the canvas used to render BlackBot **path waypoints** (cyan outline) and **current targets** (purple with halo) so you can see where selected bots intend to go.
+
+Only the `paint_black_bot_targets` system writes to it; on every frame it clears then re-stamps visible bots' routes.
+
+### Toggle
+
+Click **"Path"** in the HUD bar, or press **F6**. Off by default (planes are not spawned, no painting occurs).
+
+When enabled the generic planes appear and the painter runs (gated like occupancy and temperature overlays).
 
 ---
 

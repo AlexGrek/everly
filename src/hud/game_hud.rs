@@ -12,6 +12,7 @@ use crate::scene::camera::{
 use crate::edit::actor_spawn::{ActorSpawnToggleButton, ActorSpawnToggleLabel};
 use crate::edit::map_edit::{MapEditToggleButton, MapEditToggleLabel};
 use crate::map::chunk_overlay::OccupancyOverlayEnabled;
+use crate::map::chunk_overlay::PathOverlayEnabled;
 use crate::map::dirt::DirtMap;
 use crate::map::hypermap_world::{HypermapChunkRemeshQueue, HypermapRuntime, WaterRenderingEnabled};
 use crate::map::temperature::TemperatureMap;
@@ -58,6 +59,12 @@ struct HeatmapToggleButton;
 
 #[derive(Component)]
 struct HeatmapToggleLabel;
+
+#[derive(Component)]
+struct PathToggleButton;
+
+#[derive(Component)]
+struct PathToggleLabel;
 
 #[derive(Component)]
 struct WaterToggleButton;
@@ -124,6 +131,14 @@ impl Plugin for GameHudPlugin {
                 pause_button_click,
                 sync_pause_ui,
                 update_fps_counter,
+            )
+                .run_if(in_state(GameState::InGame)),
+        )
+        .add_systems(
+            Update,
+            (
+                path_toggle_button,
+                sync_path_toggle_label,
             )
                 .run_if(in_state(GameState::InGame)),
         );
@@ -313,6 +328,33 @@ pub(crate) fn spawn_bottom_hud(mut commands: Commands, camera: Query<Entity, Wit
                     p.spawn((
                         HeatmapToggleLabel,
                         Text::new("Heat: Off"),
+                        TextFont::from_font_size(17.0),
+                        TextColor(TEXT_MAIN),
+                    ));
+                });
+
+            parent
+                .spawn((
+                    Name::new("HUD path overlay toggle"),
+                    PathToggleButton,
+                    Button,
+                    Node {
+                        min_width: Val::Px(100.0),
+                        height: Val::Px(36.0),
+                        padding: UiRect::horizontal(Val::Px(12.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(1.0)),
+                        border_radius: BorderRadius::all(Val::Px(6.0)),
+                        ..default()
+                    },
+                    BorderColor::all(BTN_BORDER),
+                    BackgroundColor(BTN_BG),
+                ))
+                .with_children(|p| {
+                    p.spawn((
+                        PathToggleLabel,
+                        Text::new("Path: Off"),
                         TextFont::from_font_size(17.0),
                         TextColor(TEXT_MAIN),
                     ));
@@ -639,6 +681,31 @@ fn sync_heatmap_toggle_label(
         return;
     }
     let label = if enabled.0 { "Heat: On" } else { "Heat: Off" };
+    for mut text in &mut texts {
+        **text = label.to_string();
+    }
+}
+
+fn path_toggle_button(
+    interactions: Query<&Interaction, (With<PathToggleButton>, Changed<Interaction>)>,
+    mut enabled: ResMut<PathOverlayEnabled>,
+) {
+    for interaction in &interactions {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        enabled.0 = !enabled.0;
+    }
+}
+
+fn sync_path_toggle_label(
+    enabled: Res<PathOverlayEnabled>,
+    mut texts: Query<&mut Text, With<PathToggleLabel>>,
+) {
+    if !enabled.is_changed() {
+        return;
+    }
+    let label = if enabled.0 { "Path: On" } else { "Path: Off" };
     for mut text in &mut texts {
         **text = label.to_string();
     }

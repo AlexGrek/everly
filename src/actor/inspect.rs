@@ -117,6 +117,14 @@ pub fn route_rows(brain: &Brain) -> Vec<InspectRow> {
     ]
 }
 
+/// Debug-tab rows: per-actor tooling flags.
+pub fn debug_rows(force_logs: bool) -> Vec<InspectRow> {
+    vec![InspectRow {
+        label: "force_logs",
+        value: force_logs.to_string(),
+    }]
+}
+
 /// Systems-tab rows: wear and breakage status for each sub-component.
 pub fn systems_rows(b: &Breakable) -> Vec<InspectRow> {
     vec![

@@ -10,7 +10,8 @@ use crate::actor::black_bot::{BotSpecialization, Breakable};
 use crate::actor::brain::Brain;
 use crate::actor::charge::Charge;
 use crate::actor::glitch_bot::GlitchBotVisual;
-use crate::actor::inspect::{display_actor_name, route_rows, status_rows, systems_rows};
+use crate::actor::actor_pick::ActorForceLogs;
+use crate::actor::inspect::{debug_rows, display_actor_name, route_rows, status_rows, systems_rows};
 use crate::actor::ActorObject;
 use crate::edit::actor_spawn::{ActorSpawnState, ActorTool};
 use crate::menu::main_menu::GameState;
@@ -43,6 +44,7 @@ pub enum InspectorTab {
     Status,
     Systems,
     Route,
+    Debug,
 }
 
 #[derive(Resource, Default)]
@@ -102,6 +104,9 @@ struct ActorInspectorActionBtn;
 struct BlackBotResetButton;
 
 #[derive(Component)]
+struct ActorForceLogsToggleButton;
+
+#[derive(Component)]
 struct ActorDeleteButton;
 
 /// Marker on each tab button; carries which tab it activates.
@@ -139,6 +144,7 @@ impl Plugin for ActorInspectorPlugin {
                     actor_inspector_tab_buttons,
                     sync_tab_button_visuals,
                     black_bot_reset_button,
+                    actor_force_logs_toggle_button,
                     actor_delete_button,
                 )
                     .run_if(in_state(GameState::InGame)),
@@ -397,6 +403,7 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                             spawn_tab_button(tabs, "Status", InspectorTab::Status, true);
                             spawn_tab_button(tabs, "Systems", InspectorTab::Systems, false);
                             spawn_tab_button(tabs, "Route", InspectorTab::Route, false);
+                            spawn_tab_button(tabs, "Debug", InspectorTab::Debug, false);
                         });
 
                         // Actions host (Reset, Delete — always visible).
@@ -709,6 +716,65 @@ fn spawn_black_bot_reset_button(parent: &mut ChildSpawnerCommands) {
         });
 }
 
+fn spawn_force_logs_toggle_button(parent: &mut ChildSpawnerCommands, enabled: bool) {
+    let label = if enabled {
+        "Force logs: ON"
+    } else {
+        "Force logs: OFF"
+    };
+    parent
+        .spawn((
+            Name::new("Actor force logs toggle"),
+            ActorInspectorActionBtn,
+            ActorForceLogsToggleButton,
+            Pickable::default(),
+            Button,
+            Node {
+                min_width: Val::Px(120.0),
+                height: Val::Px(32.0),
+                padding: UiRect::horizontal(Val::Px(14.0)),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(6.0)),
+                ..default()
+            },
+            BorderColor::all(if enabled { ACCENT } else { CARD_BORDER }),
+            BackgroundColor(if enabled {
+                Color::srgba(0.12, 0.18, 0.28, 0.95)
+            } else {
+                Color::srgba(0.14, 0.16, 0.22, 0.9)
+            }),
+        ))
+        .with_children(|btn| {
+            btn.spawn((
+                Text::new(label),
+                TextFont::from_font_size(14.0),
+                TextColor(if enabled { ACCENT } else { TEXT_BRIGHT }),
+            ));
+        });
+}
+
+fn actor_force_logs_toggle_button(
+    interactions: Query<&Interaction, (With<ActorForceLogsToggleButton>, Changed<Interaction>)>,
+    mut modal: ResMut<ActorInspectorModal>,
+    mut force_logs: Query<&mut ActorForceLogs>,
+) {
+    for interaction in &interactions {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        let Some(actor) = modal.actor else {
+            continue;
+        };
+        let Ok(mut flag) = force_logs.get_mut(actor) else {
+            continue;
+        };
+        flag.0 = !flag.0;
+        modal.content_stamp = modal.content_stamp.wrapping_add(1);
+    }
+}
+
 fn black_bot_reset_button(
     interactions: Query<&Interaction, (With<BlackBotResetButton>, Changed<Interaction>)>,
     mut modal: ResMut<ActorInspectorModal>,
@@ -803,6 +869,7 @@ fn sync_actor_inspector_modal(
     black: Query<(&Brain, Option<&BotSpecialization>)>,
     glitch: Query<&GlitchBotVisual>,
     actor_extras: Query<(Option<&Charge>, Option<&Breakable>)>,
+    force_logs: Query<&ActorForceLogs>,
     mut state: Local<InspectorBuildState>,
 ) {
     let Ok(mut overlay_vis) = overlay.single_mut() else {
@@ -844,6 +911,8 @@ fn sync_actor_inspector_modal(
         .unwrap_or((None, None));
     let is_black_bot = black.get(actor).is_ok();
 
+    let force_logs_on = force_logs.get(actor).map(|f| f.0).unwrap_or(false);
+
     let kind_label;
     let rows;
     if let Ok((brain, spec)) = black.get(actor) {
@@ -853,6 +922,7 @@ fn sync_actor_inspector_modal(
             InspectorTab::Status => status_rows(obj, charge, Some(brain), None, spec.copied()),
             InspectorTab::Systems => breakable.map(|b| systems_rows(b)).unwrap_or_default(),
             InspectorTab::Route => route_rows(brain),
+            InspectorTab::Debug => debug_rows(force_logs_on),
         };
     } else if let Ok(vis) = glitch.get(actor) {
         kind_label = "GlitchBot";
@@ -860,6 +930,7 @@ fn sync_actor_inspector_modal(
         rows = match *tab {
             InspectorTab::Status => status_rows(obj, charge, None, Some(vis), None),
             InspectorTab::Systems | InspectorTab::Route => Vec::new(),
+            InspectorTab::Debug => debug_rows(force_logs_on),
         };
     } else {
         return;
@@ -896,6 +967,12 @@ fn sync_actor_inspector_modal(
     commands
         .entity(actions_entity)
         .with_children(spawn_actor_delete_button);
+
+    if *tab == InspectorTab::Debug {
+        commands.entity(host).with_children(|parent| {
+            spawn_force_logs_toggle_button(parent, force_logs_on);
+        });
+    }
 
     if rows.is_empty() {
         commands.entity(host).with_children(|parent| {

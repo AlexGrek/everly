@@ -7,7 +7,7 @@
 //!
 //! | Layer | Y offset | Purpose |
 //! |---|---|---|
-//! | Generic | 0.001 m | Writable canvas — any system can paint into it |
+//! | Generic (paths) | 0.001 m | BlackBot path + target markers (toggle: HUD "Path" / **F6**, off by default) |
 //! | Occupancy | 0.002 m | Debug: colours each subtile by its passability flag |
 //!
 //! Both layers use `OVERLAY_RES × OVERLAY_RES = 640 × 640` texels
@@ -16,8 +16,11 @@
 //!
 //! ## Writing to the generic layer
 //!
+//! The generic planes (and `ChunkOverlayState` entries) are only present for
+//! visible chunks while `PathOverlayEnabled` is true (HUD "Path" button or F6).
 //! 1. Add `Res<ChunkOverlayState>`, `ResMut<Assets<Image>>`, and
-//!    `ResMut<Assets<StandardMaterial>>` to your system parameters.
+//!    `ResMut<Assets<StandardMaterial>>` to your system parameters (guard with
+//!    `image_for` returning Some).
 //! 2. For each chunk you want to paint, call `state.image_for(coord)` and
 //!    `state.material_for(coord)` to get the handles.
 //! 3. Write RGBA bytes into `image.data`, then touch the material handle.
@@ -133,6 +136,11 @@ impl ChunkOverlayState {
 #[derive(Resource, Default)]
 pub struct OccupancyOverlayEnabled(pub bool);
 
+/// Set to `true` (and press **F6** at runtime) to enable BlackBot path/target rendering
+/// on the generic overlay layer (cyan waypoints + purple targets). Off by default.
+#[derive(Resource, Default)]
+pub struct PathOverlayEnabled(pub bool);
+
 #[derive(Resource)]
 struct OccupancyOverlayState {
     overlays: HashMap<ChunkCoord, (Entity, Handle<Image>, Handle<StandardMaterial>)>,
@@ -164,11 +172,16 @@ impl Plugin for ChunkOverlayPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ChunkOverlayState>()
             .init_resource::<OccupancyOverlayEnabled>()
-            .add_systems(OnEnter(GameState::InGame), setup_chunk_overlay)
+            .init_resource::<PathOverlayEnabled>()
+            .add_systems(
+                OnEnter(GameState::InGame),
+                (reset_path_overlay_on_enter, setup_chunk_overlay).chain(),
+            )
             .add_systems(
                 Update,
                 (
                     toggle_occupancy_overlay,
+                    toggle_path_overlay,
                     sync_generic_overlays,
                     sync_occupancy_overlays,
                     update_occupancy_overlay_textures,
@@ -191,6 +204,19 @@ fn setup_chunk_overlay(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>)
         overlays: HashMap::new(),
         cadence: Timer::from_seconds(1.0 / 15.0, TimerMode::Repeating),
     });
+}
+
+fn reset_path_overlay_on_enter(
+    mut enabled: ResMut<PathOverlayEnabled>,
+    mut state: ResMut<ChunkOverlayState>,
+    mut commands: Commands,
+    planes: Query<Entity, With<GenericOverlayPlane>>,
+) {
+    enabled.0 = false;
+    for entity in planes.iter() {
+        commands.entity(entity).despawn();
+    }
+    state.overlays.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -263,14 +289,18 @@ fn flags_to_rgba(flags: u64) -> [u8; 4] {
 fn sync_generic_overlays(
     mut commands: Commands,
     runtime: Res<HypermapRuntime>,
+    enabled: Res<PathOverlayEnabled>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     assets: Res<ChunkOverlayAssets>,
     mut state: ResMut<ChunkOverlayState>,
     planes: Query<Entity, With<GenericOverlayPlane>>,
 ) {
-    let desired: std::collections::HashSet<ChunkCoord> =
-        runtime.desired_chunk_coords().into_iter().collect();
+    let desired: std::collections::HashSet<ChunkCoord> = if enabled.0 {
+        runtime.desired_chunk_coords().into_iter().collect()
+    } else {
+        std::collections::HashSet::new()
+    };
 
     let to_remove: Vec<ChunkCoord> = state
         .overlays
@@ -314,6 +344,15 @@ fn toggle_occupancy_overlay(
     mut enabled: ResMut<OccupancyOverlayEnabled>,
 ) {
     if keys.just_pressed(KeyCode::F4) {
+        enabled.0 = !enabled.0;
+    }
+}
+
+fn toggle_path_overlay(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut enabled: ResMut<PathOverlayEnabled>,
+) {
+    if keys.just_pressed(KeyCode::F6) {
         enabled.0 = !enabled.0;
     }
 }

@@ -21,10 +21,14 @@ HUD wiring for the toggle lives in `src/hud/game_hud.rs` (`ActorSpawnToggleButto
 
 1. With the palette open, click **Bot** or **Black**. `ActorSpawnState.tool` is set to
    `ActorTool::Spawn(kind)`.
-2. Move the mouse over the world. A **semi-transparent lime** preview plane (shared
-   `MapEditPreviewMaterial`) marks the target cell center on the **active floor**
-   (`ActiveFloorLevel`, plane height `floor * HYPERMAP_FLOOR_HEIGHT`).
-3. **Left-click** (on release) spawns the actor at the hovered tile center
+2. Move the mouse over the world. A semi-transparent preview plane marks the target
+   cell center on the **active floor** (`ActiveFloorLevel`, plane height
+   `floor * HYPERMAP_FLOOR_HEIGHT`). **Lime** (`MapEditPreviewMaterial`) means the
+   footprint fits at that tile; **red** (`ActorSpawnPreviewInvalidMaterial`) means
+   the placement is blocked (walls/void for BlackBot; walls or occupied subtiles for
+   GlitchBot).
+3. **Left-click** (on release) spawns the actor at the hovered tile center when the
+   preview is lime. Red tiles ignore the click.
    (`tile + 0.5`). The spawn goes through `glitch_bot::spawn_glitch_bot` /
    `black_bot::spawn_black_bot` and consumes the actor's seeded RNG resource
    (`GlitchBotRng` / `BlackBotRng`), so placements stay reproducible per seed.
@@ -66,5 +70,6 @@ Re-gen in the map editor despawns actors on the regenerated chunk.
 | `actor_spawn_pointer_click` | Spawns the chosen actor on left-mouse-up (spawn mode only) |
 | `on_actor_pointer_click` (`actor_inspector.rs`) | Despawns the clicked bot when Kill mode is armed |
 | `actor_spawn_plane_cell` | Cursor → active-floor tile (reuses `ray_intersect_horizontal_plane`) |
+| `actor_spawn_cell_passable` | Footprint probe via `DynamicPassabilityMap::probe_footprint` (per `ActorKind` blocked flags) |
 
 For the actor runtime itself (trait, movement, collision), see [`actor.md`](actor.md).

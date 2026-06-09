@@ -27,7 +27,7 @@ use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 use crate::actor::actor_name::random_actor_name;
-use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
+use crate::actor::actor_pick::{ActorForceLogs, ActorInspectable, ActorPickMesh};
 use crate::actor::brain::{
     generate_patrol_loop, make_high_level, AvoidanceViews, Behavior, Brain, BrainContext,
     BrainEffects, ChargeSelfKeeper, Patroller, RandomWalker,
@@ -48,7 +48,7 @@ use crate::map::level::LevelName;
 use crate::map::passability::{
     DynamicPassabilityMap, SubtilePassability, TryUpdateFootprintError, SUBTILE_COUNT,
 };
-use crate::hud::game_log::{GameLog, LogEntry};
+use crate::hud::game_log::{BreakableSystem, GameLog, LogEntry};
 use crate::menu::main_menu::GameState;
 
 /// Epsilon kept inside the passable subtile when snapping the float center to
@@ -73,13 +73,17 @@ const SENSORY_SYSTEM_WEAR_RATE: f32 = 0.00002;
 
 /// Healthy metallic-black base tint of a BlackBot.
 const BLACK_TINT: Color = Color::srgb(0.02, 0.02, 0.02);
-/// Red used for the persistent stuck state and the transient collision flash.
+/// Red used for the transient collision flash.
 const ALERT_RED: Color = Color::srgb(0.95, 0.15, 0.15);
+/// Yellow used for the transient stuck-route flash.
+const STUCK_YELLOW: Color = Color::srgb(0.97, 0.85, 0.30);
 /// White shown when the control plane breaks.
 const BROKEN_WHITE: Color = Color::srgb(1.0, 1.0, 1.0);
 /// Seconds for the red collision flash to fade fully back to black. Short so a
 /// bump reads as a quick blink rather than a lingering state.
 const COLLISION_FLASH_FADE_SECS: f32 = 0.45;
+/// Seconds for the yellow stuck flash to fade fully back to black.
+const STUCK_FLASH_FADE_SECS: f32 = 2.5;
 
 /// Ring tube (minor) radius in meters — a thin band.
 const RING_TUBE_RADIUS: f32 = 0.04;
@@ -180,6 +184,9 @@ pub struct BlackBotVisual {
     /// decays linearly back to `0.0` so the sphere flashes red and settles to
     /// black. Transient render state — not serialized.
     collision_flash: f32,
+    /// Yellow stuck-flash intensity in `0.0..=1.0`. Relit to `1.0` when
+    /// [`Brain::is_stuck`] is true, then decays over [`STUCK_FLASH_FADE_SECS`].
+    stuck_flash: f32,
     /// Last `base_color` written to the mesh material. The status system only
     /// touches [`Assets<StandardMaterial>`] when the displayed color actually
     /// changes, so a settled bot incurs no per-frame material writes.
@@ -189,11 +196,12 @@ pub struct BlackBotVisual {
     /// map-wide eviction to the offline *transition* so it never repeats every
     /// frame; cleared when the bot is operational again.
     offline_released: bool,
-    /// `true` while the bot is in a head-on collision episode that has already
-    /// been logged, so [`log_black_bot_reroutes`] emits one reroute log per
-    /// collision (rising edge) rather than every frame the bots stay pressed
-    /// together. Cleared once the bot is no longer colliding head-on.
-    reroute_logged: bool,
+    /// `true` once a stuck episode has been logged; cleared when the bot is no
+    /// longer [`Brain::is_stuck`].
+    stuck_logged: bool,
+    /// `true` once charge depletion has been logged; cleared when charge rises
+    /// above zero again.
+    depleted_logged: bool,
 }
 
 impl BlackBotVisual {
@@ -463,8 +471,7 @@ impl Plugin for BlackBotPlugin {
                     .run_if(not(is_paused)),
                 sync_black_bot_transforms.after(process_actors),
                 sync_black_bot_status_visual.after(process_actors),
-                log_black_bot_reroutes.after(process_actors),
-                paint_black_bot_targets.after(process_actors),
+                paint_black_bot_targets.after(process_actors).run_if(|e: Res<crate::map::chunk_overlay::PathOverlayEnabled>| e.0),
             )
                 .run_if(in_state(GameState::InGame)),
         );
@@ -497,6 +504,7 @@ fn black_bot_brain(
         &mut ActorObject,
         &mut Brain,
         &mut BlackBotVisual,
+        &ActorForceLogs,
         Option<&mut Charge>,
         Option<&mut Breakable>,
         Option<&mut Patrol>,
@@ -513,9 +521,10 @@ fn black_bot_brain(
         &remesh,
     );
 
-    for (entity, name, mut obj, mut brain, mut vis, mut charge, mut breakable, mut patrol) in
+    for (entity, name, mut obj, mut brain, mut vis, force_logs, mut charge, mut breakable, mut patrol) in
         &mut query
     {
+        let force = force_logs.0;
         let blocked_flags = obj.inner.blocked_flags();
         let state = obj.inner.state_mut();
 
@@ -524,12 +533,45 @@ fn black_bot_brain(
         vis.main_tile = Some(current_tile);
 
         let depleted = charge.as_ref().is_some_and(|c| c.is_depleted());
+        if depleted {
+            if !vis.depleted_logged {
+                vis.depleted_logged = true;
+                game_log.push_world(
+                    current_tile.x,
+                    current_tile.y,
+                    LogEntry::ChargeDepleted { name: name.to_string() },
+                    force,
+                );
+            }
+        } else {
+            vis.depleted_logged = false;
+        }
 
         // CONTROL_PLANE and SENSORY_SYSTEM wear every non-depleted frame.
         if !depleted {
             if let Some(b) = breakable.as_mut() {
+                let cp_was = b.control_plane.broken;
+                let ss_was = b.sensory_system.broken;
                 b.control_plane.tick(dt, CONTROL_PLANE_WEAR_RATE, tile_changed, brain.rng_mut());
                 b.sensory_system.tick(dt, SENSORY_SYSTEM_WEAR_RATE, tile_changed, brain.rng_mut());
+                log_system_broken(
+                    &game_log,
+                    current_tile,
+                    name,
+                    cp_was,
+                    b.control_plane.broken,
+                    BreakableSystem::ControlPlane,
+                    force,
+                );
+                log_system_broken(
+                    &game_log,
+                    current_tile,
+                    name,
+                    ss_was,
+                    b.sensory_system.broken,
+                    BreakableSystem::SensorySystem,
+                    force,
+                );
             }
         }
 
@@ -602,8 +644,32 @@ fn black_bot_brain(
         // MOVEMENT_ENGINE wears only while actually moving this frame.
         if state.move_buffer.tile_delta != Vec2::ZERO {
             if let Some(b) = breakable.as_mut() {
+                let me_was = b.movement_engine.broken;
                 b.movement_engine.tick(dt, MOVEMENT_ENGINE_WEAR_RATE, tile_changed, brain.rng_mut());
+                log_system_broken(
+                    &game_log,
+                    current_tile,
+                    name,
+                    me_was,
+                    b.movement_engine.broken,
+                    BreakableSystem::MovementEngine,
+                    force,
+                );
             }
+        }
+
+        if brain.is_stuck() {
+            if !vis.stuck_logged {
+                vis.stuck_logged = true;
+                game_log.push_world(
+                    current_tile.x,
+                    current_tile.y,
+                    LogEntry::BotStuck { name: name.to_string() },
+                    force,
+                );
+            }
+        } else {
+            vis.stuck_logged = false;
         }
 
         // Charging lifecycle events. `dock`/`undock` are one-shot phase
@@ -613,6 +679,7 @@ fn black_bot_brain(
                 current_tile.x,
                 current_tile.y,
                 LogEntry::ChargingStarted { name: name.to_string() },
+                force,
             );
         }
         if effects.undock.is_some() {
@@ -620,6 +687,7 @@ fn black_bot_brain(
                 current_tile.x,
                 current_tile.y,
                 LogEntry::ChargingDone { name: name.to_string() },
+                force,
             );
         }
 
@@ -753,9 +821,11 @@ fn lerp_srgb(a: Color, b: Color, t: f32) -> Color {
 ///
 /// Priority order:
 /// 1. Broken control plane => white
-/// 2. Stuck while trying to route => red
+/// 2. Stuck-route flash => black→yellow by [`BlackBotVisual::stuck_flash`],
+///    relit to `1.0` while [`Brain::is_stuck`] and fading over
+///    [`STUCK_FLASH_FADE_SECS`].
 /// 3. Collision flash => black→red by [`BlackBotVisual::collision_flash`],
-///    which is relit to `1.0` on a blocked step and fades back over
+///    relit to `1.0` on a blocked step and fading over
 ///    [`COLLISION_FLASH_FADE_SECS`].
 /// 4. Healthy / settled => default black
 ///
@@ -786,12 +856,15 @@ fn sync_black_bot_status_visual(
             vis.collision_flash = 1.0;
         }
 
+        if brain.is_stuck() {
+            vis.stuck_flash = 1.0;
+        }
+
         let cp_broken = b.control_plane.broken;
-        let stuck = brain.is_stuck();
         let target_color = if cp_broken {
             BROKEN_WHITE
-        } else if stuck {
-            ALERT_RED
+        } else if vis.stuck_flash > 0.0 {
+            lerp_srgb(BLACK_TINT, STUCK_YELLOW, vis.stuck_flash)
         } else {
             lerp_srgb(BLACK_TINT, ALERT_RED, vis.collision_flash)
         };
@@ -805,40 +878,35 @@ fn sync_black_bot_status_visual(
             vis.applied_color = Some(target_color);
         }
 
+        if vis.stuck_flash > 0.0 {
+            vis.stuck_flash = (vis.stuck_flash - dt / STUCK_FLASH_FADE_SECS).max(0.0);
+        }
         if vis.collision_flash > 0.0 {
             vis.collision_flash = (vis.collision_flash - dt / COLLISION_FLASH_FADE_SECS).max(0.0);
         }
     }
 }
 
-/// Logs "rerouting after collision" once per head-on bot-on-bot collision
-/// episode. The head-on `BlockedByOccupancy` condition tested here is exactly
-/// what triggers the bounce/detour in [`FollowPath`], so a rising edge marks a
-/// genuine reroute; the [`BlackBotVisual::reroute_logged`] latch suppresses the
-/// repeat logs that would otherwise fire every frame two bots stay pressed
-/// together. Wall grazes (`BlockedByStatic`) slide rather than reroute and are
-/// not logged. Runs `.after(process_actors)` so `last_movement_error` and the
-/// brain velocity reflect this frame's movement outcome.
-fn log_black_bot_reroutes(
-    game_log: Res<GameLog>,
-    mut bots: Query<(&ActorObject, &Brain, &Name, &mut BlackBotVisual)>,
+#[inline]
+fn log_system_broken(
+    game_log: &GameLog,
+    tile: IVec2,
+    name: &Name,
+    was_broken: bool,
+    now_broken: bool,
+    system: BreakableSystem,
+    force: bool,
 ) {
-    for (obj, brain, name, mut vis) in &mut bots {
-        let state = obj.inner.state();
-        let head_on = matches!(
-            state.last_movement_error,
-            Some(ActorMovementError::BlockedByOccupancy { world_subtile_x, world_subtile_y })
-                if is_front_collision(state.center, brain.velocity(), world_subtile_x, world_subtile_y)
+    if !was_broken && now_broken {
+        game_log.push_world(
+            tile.x,
+            tile.y,
+            LogEntry::SystemBroken {
+                name: name.to_string(),
+                system,
+            },
+            force,
         );
-        if head_on {
-            if !vis.reroute_logged {
-                vis.reroute_logged = true;
-                let tile = actor_main_tile(state.center);
-                game_log.push_world(tile.x, tile.y, LogEntry::BotReroute { name: name.to_string() });
-            }
-        } else {
-            vis.reroute_logged = false;
-        }
     }
 }
 
@@ -896,8 +964,12 @@ fn paint_black_bot_targets(
     overlay: Res<ChunkOverlayState>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    enabled: Res<crate::map::chunk_overlay::PathOverlayEnabled>,
     bots: Query<(&Brain, Option<&Charge>, Option<&Breakable>), With<BlackBotVisual>>,
 ) {
+    if !enabled.0 {
+        return;
+    }
     let mut touched_chunks: HashSet<ChunkCoord> = HashSet::new();
 
     // Clear previous marks on all visible overlay images. Only this system
@@ -1029,13 +1101,16 @@ pub fn spawn_black_bot_from_snapshot(
         .spawn((
             Name::new(name.to_string()),
             ActorInspectable,
+            ActorForceLogs::default(),
             Breakable::from_snapshot(breakable),
             BlackBotVisual {
                 main_tile: None,
                 collision_flash: 0.0,
+                stuck_flash: 0.0,
                 applied_color: None,
                 offline_released: false,
-                reroute_logged: false,
+                stuck_logged: false,
+                depleted_logged: false,
             },
             spec.build_brain(rng_seed),
             ActorObject::new(Box::new(bot)),
@@ -1079,14 +1154,17 @@ pub fn spawn_black_bot(
         .spawn((
             Name::new(random_actor_name()),
             ActorInspectable,
+            ActorForceLogs::default(),
             Charge::random(rng),
             Breakable::new(),
             BlackBotVisual {
                 main_tile: None,
                 collision_flash: 0.0,
+                stuck_flash: 0.0,
                 applied_color: None,
                 offline_released: false,
-                reroute_logged: false,
+                stuck_logged: false,
+                depleted_logged: false,
             },
             spec.build_brain(brain_seed),
             ActorObject::new(Box::new(bot)),

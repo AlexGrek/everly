@@ -104,7 +104,7 @@ Inner union corner pillars (`c*`, concave elbows, `corner_pillars.rs`): **`docs/
 
 ## Chunk overlays (`src/map/chunk_overlay.rs`)
 
-The overlay system provides per-chunk, subtile-resolution RGBA textures (640×640 texels = 128 tiles × 5 subtiles) floating above the floor. Two independent layers exist: a **generic** writable canvas and an **occupancy** debug layer (toggled with F4).
+The overlay system provides per-chunk, subtile-resolution RGBA textures (640×640 texels = 128 tiles × 5 subtiles) floating above the floor. Layers: temperature (F5), dirt (always), generic/paths (BlackBot routes, HUD "Path"/F6, off by default), occupancy (F4, off by default). Generic planes (and the path painter) only exist when the paths toggle is on.
 
 To paint the generic layer from any system:
 

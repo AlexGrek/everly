@@ -1,13 +1,18 @@
 # In-game event log
 
-A top-left overlay that surfaces gameplay events (bot reroutes, charging) as
-short-lived colored lines. Toggled from the bottom HUD ("Log" button), **off by
-default**. Source: [`src/hud/game_log.rs`](../src/hud/game_log.rs).
+A top-left overlay that surfaces gameplay events (stuck bots, breakage, charge,
+charging) as short-lived colored lines. Toggled from the bottom HUD ("Log"
+button), **off by default**. Source: [`src/hud/game_log.rs`](../src/hud/game_log.rs).
 
 ## Behavior
 
 - **Toggle.** The "Log" HUD button flips `GameLog.enabled`. Default off: events
-  are still recorded, just not displayed.
+  are still recorded; only lines with the **FORCE** flag are displayed until the
+  panel is turned on.
+- **FORCE.** Every push carries a `force` bit. When an actor's
+  [`ActorForceLogs`](../src/actor/actor_pick.rs) is enabled (inspector **Debug**
+  tab → "Force logs"), its events are pushed with `force: true` and remain
+  visible even while the global log overlay is off.
 - **Levels & colors.** `err` (red), `warn` (yellow), `info` (white),
   `success` (green), `unexpected` (light blue). See `LogLevel::color`.
 - **Lifetime.** Each line lives `LOG_LIFETIME_SECS` (4 s) then disappears. Ages
@@ -43,7 +48,8 @@ log without exclusive access:
 - Only the queue for **the hypertile the camera is currently on** is ever
   rendered (`render_logs` maps `StrategyCamera.focus` → `ChunkCoord`). Every
   other chunk's events stay as structs and age out unrendered.
-- While disabled, nothing is rendered at all.
+- While disabled, only FORCE-flagged lines on the camera's hypertile are
+  rendered.
 - The UI is rebuilt only when the displayed chunk's queue changed (`dirty`) or
   the camera moved onto a different hypertile (`force`).
 
@@ -51,9 +57,12 @@ log without exclusive access:
 
 | Event | Level | Source |
 |---|---|---|
-| `<name> rerouting after collision` | `unexpected` | `log_black_bot_reroutes` (rising edge of a head-on bot-on-bot collision, the same condition that triggers the `FollowPath` bounce/detour) |
+| `<name> stuck` | `warn` | `black_bot_brain` when [`Brain::is_stuck`](../src/actor/brain/mod.rs) becomes true (rising edge) |
+| `<name> charge depleted` | `err` | `black_bot_brain` / `glitch_bot_think` when [`Charge::is_depleted`](../src/actor/charge.rs) becomes true |
+| `<name> <system> broken` | `err` | `black_bot_brain` when a [`Breakable`](../src/actor/black_bot.rs) part newly breaks (`movement engine`, `control plane`, `sensory system`) |
 | `<name> started charging` | `info` | `black_bot_brain` when `BrainEffects::dock` fires (entering the `Charging` phase) |
 | `<name> finished charging` | `success` | `black_bot_brain` when `BrainEffects::undock` fires (charge reached full) |
 
 To add an event: add a `LogEntry` variant with its `level()` and `render()`, then
-`game_log.push_world(world_x, world_y, ...)` from the relevant system.
+`game_log.push_world(world_x, world_y, entry, force)` from the relevant system
+(`force` from the producing actor's `ActorForceLogs`).

@@ -50,16 +50,17 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
   head-on bot-on-bot response — elastic bounce then either a detour or a
   step-aside-and-pause; rear bumps ignored — tuned by [`FollowTuning`]).
   When `FollowPath` abandons an unfinished route due to no progress, the brain
-  exposes a `stuck` status (`Brain::is_stuck`) and the bot mesh turns red until
-  a new low-level action takes over.
+  exposes a `stuck` status (`Brain::is_stuck`) and the bot mesh flashes yellow,
+  then eases back to black over a few seconds.
 
 ### BlackBot status colors
 
 `sync_black_bot_status_visual` (in `black_bot.rs`, runs `.after(process_actors)`)
-recolors the sphere by priority: **white** when the control plane breaks,
-**red** while `Brain::is_stuck`, otherwise a **collision flash** — a blocked
-movement step relights `BlackBotVisual::collision_flash` to `1.0`, which then
-fades linearly back to black over `COLLISION_FLASH_FADE_SECS` (a quick red
+recolors the sphere by priority: **white** when the control plane breaks, a
+**yellow stuck flash** when `Brain::is_stuck` (relit to full yellow, then
+fading back over `STUCK_FLASH_FADE_SECS`), otherwise a **collision flash** — a
+blocked movement step relights `BlackBotVisual::collision_flash` to `1.0`, which
+then fades linearly back to black over `COLLISION_FLASH_FADE_SECS` (a quick red
 blink). A wall graze (`BlockedByStatic`) always counts, but a bot-on-bot bump
 (`BlockedByOccupancy`) only flashes when it is **head-on** — a rear bump is
 ignored, exactly mirroring the movement response below (both call
@@ -86,8 +87,9 @@ route around other (moving) bots. When a step is rejected with
      previously occupied cell (`track_tiles` records `prev_tile`), but
      `FollowTuning::bot_strafe_chance` (default `0.3`) of the time it **strafes
      left/right** relative to the heading instead (falling back to straight-back
-     if the chosen side is blocked). The pause begins only once the bot *reaches*
-     that cell (`pending_wait` → `contact_wait_s`), so it retreats then waits.
+     if the chosen side is blocked). The pause arms only once the bot *reaches*
+     that cell (`pending_wait` → `contact_wait_s`); it then brakes to a stop with
+     the same deceleration profile as normal travel before the hold timer runs.
 
    A detour is **forced** (regardless of the roll) when no valid step cell is
    known, and the step is the fallback when a rolled detour can't be planned (no
@@ -109,7 +111,13 @@ the start/goal bounding box grown by `DETOUR_PAD_SUBTILES`, and capped at
 `DETOUR_MAX_EXPANDED` expansions. The resulting subtile staircase is collapsed
 to its corners and followed (in tile-space float coordinates) until the bot
 reaches that next node, then the normal tile path resumes. A detour is dropped
-if a fresh bump invalidates it or it runs longer than `stuck_repath_secs`.
+if a **fresh** head-on bump invalidates it (a new blocker subtile, or contact
+after a frame with no occupancy error) or it runs longer than
+`stuck_repath_secs`. While two bots stay pressed together the movement error
+persists every frame, but the response runs only on the **rising edge** — the
+same rising-edge latch pattern as the game-log stuck event — so an in-flight
+detour is not wiped and replanned each tick. Choosing a detour also removes any unreached
+step-aside waypoint that was inserted by an earlier bump on the same path.
 
 This needs occupancy data the rest of the brain doesn't: `BrainContext` carries
 an optional [`AvoidanceViews`](../src/actor/brain/mod.rs) (the dynamic map, the
