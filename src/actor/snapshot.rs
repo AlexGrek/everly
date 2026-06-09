@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::actor::black_bot::{spawn_black_bot_from_snapshot, Breakable};
+use crate::actor::black_bot::{spawn_black_bot_from_snapshot, BotSpecialization, Breakable};
 use crate::actor::brain::Brain;
 use crate::actor::charge::Charge;
 use crate::actor::glitch_bot::{spawn_glitch_bot_from_snapshot, GlitchBotVisual};
@@ -256,6 +256,10 @@ pub enum SavedActor {
         charge: f32,
         #[serde(default)]
         breakable: BreakableSnap,
+        /// Behavior + ring specialization; missing in older saves loads as
+        /// [`BotSpecialization::DoNothing`].
+        #[serde(default)]
+        specialization: BotSpecialization,
     },
 }
 
@@ -278,6 +282,7 @@ impl LevelActorsFile {
             Option<&Charge>,
             Option<&Name>,
             Option<&Breakable>,
+            Option<&BotSpecialization>,
         )>,
     ) -> Self {
         let mut actors = Vec::new();
@@ -289,13 +294,14 @@ impl LevelActorsFile {
                 charge: charge.map_or(1.0, |c| c.level),
             });
         }
-        for (obj, brain, charge, name, breakable) in black_bots.iter() {
+        for (obj, brain, charge, name, breakable, specialization) in black_bots.iter() {
             actors.push(SavedActor::BlackBot {
                 name: saved_name_from_entity(name),
                 state: obj.inner.state().into(),
                 brain: BlackBotBrainSnap { rng_seed: brain.rng_seed() },
                 charge: charge.map_or(1.0, |c| c.level),
                 breakable: breakable.map(|b| b.to_snapshot()).unwrap_or_default(),
+                specialization: specialization.copied().unwrap_or_default(),
             });
         }
         Self {
@@ -354,7 +360,7 @@ pub fn spawn_level_actors(
                 );
                 commands.entity(entity).insert((LevelActor, Charge::new(*charge)));
             }
-            SavedActor::BlackBot { name, state, brain, charge, breakable } => {
+            SavedActor::BlackBot { name, state, brain, charge, breakable, specialization } => {
                 let entity = spawn_black_bot_from_snapshot(
                     commands,
                     meshes,
@@ -363,6 +369,7 @@ pub fn spawn_level_actors(
                     state.clone().into(),
                     brain.rng_seed,
                     breakable.clone(),
+                    *specialization,
                 );
                 commands.entity(entity).insert((LevelActor, Charge::new(*charge)));
             }
@@ -557,6 +564,7 @@ brain:
                     brain: BlackBotBrainSnap { rng_seed: 99 },
                     charge: 0.4,
                     breakable: BreakableSnap::default(),
+                    specialization: BotSpecialization::Patrol,
                 },
             ],
         };

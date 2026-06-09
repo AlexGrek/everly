@@ -20,10 +20,14 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
                      ActorState.move_buffer  ──▶ process_actors → try_move
 ```
 
-- **[`Behavior`](../src/actor/brain/behavior.rs)** — a rule that runs every tick
-  and raises the bot's *wishes*. It receives a [`BrainContext`] (every bot
+- **[`Behavior`](../src/actor/brain/behavior/mod.rs)** — a rule that runs every
+  tick and raises the bot's *wishes*. It receives a [`BrainContext`] (every bot
   property it could need) and mutates the shared [`Priorities`] list. Behaviors
-  may hold their own state (e.g. a hysteresis latch).
+  may hold their own state (e.g. a hysteresis latch). The `Behavior` trait lives
+  in [`behavior/mod.rs`](../src/actor/brain/behavior/mod.rs); **each behavior is
+  its own module** under `behavior/` (`random_walker.rs`, `patroller.rs`,
+  `charge_self_keeper.rs`), with constants shared between them in
+  [`behavior_utils.rs`](../src/actor/brain/behavior/behavior_utils.rs).
 - **[`Priority`](../src/actor/brain/priority.rs)** — a `kind` + a `value`
   (uncapped `f32`). [`Priorities`] is the reused, sorted "wishes array";
   `top()` returns the dominant wish. Value bands:
@@ -132,11 +136,34 @@ owning system applies them. Steady-state ticks allocate nothing (`Priorities`
 reuses its buffer; effects are a fixed-size struct; a path `Vec` is allocated
 only on a re-path).
 
+## Specializations
+
+Every BlackBot has a **specialization** (`BotSpecialization` in
+[`black_bot.rs`](../src/actor/black_bot.rs)) — rolled randomly at spawn
+(`BotSpecialization::roll`: `PATROL` with probability **1/4**, else
+`DO_NOTHING`). A specialization is just a *named behavior set* plus a **ring
+color** rendered around the sphere:
+
+| Specialization | Behaviors | Routine | Ring |
+|----------------|-----------|---------|------|
+| `DO_NOTHING` | `[RandomWalker, ChargeSelfKeeper]` | wander to random cells | black |
+| `PATROL` | `[Patroller, ChargeSelfKeeper]` | stick to a fixed loop of cells | blue |
+
+`BotSpecialization::build_brain` constructs the matching [`Brain`]; both share
+`ChargeSelfKeeper`, so any specialization still leaves its routine to recharge.
+The ring is a flat torus child of the actor root (`spawn_bot_ring`), positioned
+each frame by `sync_black_bot_transforms`; it carries no pick mesh, so the status
+recolor leaves it alone and it keeps its specialization color for life.
+
+The specialization is **persisted** (see [Persistence](#persistence)); the patrol
+*loop* is not — it is regenerated on load.
+
 ## BlackBot wiring
 
 [`src/actor/black_bot.rs`](../src/actor/black_bot.rs):
 
-- Spawns carry a [`Brain`] with behaviors `[RandomWalker, ChargeSelfKeeper]`, the
+- Spawns carry a [`Brain`] whose behavior set is chosen by the bot's
+  [specialization](#specializations) (`BotSpecialization::build_brain`), the
   default `make_high_level` factory, and a seeded `StdRng`.
 - `black_bot_brain` (runs `.after(flush_actor_occupancy).before(process_actors)`,
   sequential) ticks each brain, gates depleted/broken bots (`brain.reset` — wipes
@@ -154,8 +181,14 @@ only on a re-path).
 
 ### Behaviors
 
-- **`RandomWalker`** — always wishes `RandomWalking` at value **15** (routine).
-- **`ChargeSelfKeeper`** — latches once charge ≤ **25%**, releasing only at full.
+Each behavior is a module under [`behavior/`](../src/actor/brain/behavior/); the
+shared routine wish value lives in `behavior_utils.rs`.
+
+- **`RandomWalker`** (`DO_NOTHING`) — always wishes `RandomWalking` at the routine
+  value **15** (`ROUTINE_WISH_VALUE`).
+- **`Patroller`** (`PATROL`) — always wishes `Patrolling` at the same routine
+  value **15**, so a recharge need still pre-empts it.
+- **`ChargeSelfKeeper`** (all specializations) — latches once charge ≤ **25%**, releasing only at full.
   While latched it wishes `RechargeYourself` at `missing-charge%` (≥75 at the
   trigger, rising as charge falls), floored at **50** so a near-full top-up still
   outranks wandering — no early-undock thrash.
@@ -166,6 +199,15 @@ only on a re-path).
   pick a new random reachable target and follow it. Perpetual. If the low-level
   route reports `stuck`, this handler immediately retargets to a different
   random point.
+- **`GoToPatrol`** (serves `Patrolling`) — walks a *fixed* loop of cells forever.
+  The loop lives on the bot's `Patrol` component (generated once, lazily, by
+  `black_bot_brain` via `generate_patrol_loop` from the spawn tile, then never
+  changed) and is surfaced to the action through `BrainContext::patrol_loop`. The
+  action itself is transient — the brain rebuilds it whenever `Patrolling`
+  becomes dominant again (e.g. after a recharge pre-empts it) — so on (re)creation
+  it snaps its cursor to the loop waypoint **nearest the bot**, resuming "where it
+  stopped". On `stuck`, it skips the unreachable waypoint and tries the next.
+  Perpetual.
 - **`GoToChargeStation`** (serves `RechargeYourself`) — `Seeking` → `Traveling` →
   `WaitingQueue` → `Charging`:
   - scan chargers in the bot's 4 nearest hypertiles (current chunk + nearest X/Y
@@ -196,20 +238,30 @@ must trigger recharge (25%) with enough runway to reach a charger.
 
 ## Persistence
 
-Only the brain's `rng_seed` is saved (the behavior set is fixed by actor type); a
-loaded bot rebuilds its brain and re-plans from scratch. See
-[`snapshot.rs`](../src/actor/snapshot.rs) (`BlackBotBrainSnap`) and
-[`level-persistence.md`](level-persistence.md).
+A saved BlackBot stores its brain's `rng_seed` **and its `specialization`** (so a
+loaded bot keeps its role and ring). The behavior set is then fixed by the
+specialization, so nothing else about the brain is serialized: a loaded bot
+rebuilds its brain and re-plans from scratch, and a `PATROL` bot **regenerates its
+patrol loop** on first tick (the loop is not persisted). A `specialization`
+missing from older `actors.yaml` loads as `DO_NOTHING`. See
+[`snapshot.rs`](../src/actor/snapshot.rs) (`BlackBotBrainSnap`, `SavedActor::BlackBot`)
+and [`level-persistence.md`](level-persistence.md).
 
 ## Adding a behavior or action
 
 1. Add a `PriorityKind` variant (`priority.rs`).
-2. Implement a `Behavior` that raises it (`behavior.rs`).
+2. Implement a `Behavior` that raises it in **its own module** under
+   `behavior/` (declare it in `behavior/mod.rs` and re-export it); put any value
+   shared with another behavior in `behavior_utils.rs`.
 3. Implement a `HighLevelAction` that serves it (`high_level.rs`) and map the kind
    in `make_high_level`.
 4. Reuse `FollowPath` / `Wait`, or add a new `LowLevelAction` (`low_level.rs`).
 5. Add unit tests in the touched module (small hand-built `Hypermap<f32>` /
    `InteractiveEntityMap` — see existing tests).
+
+To add a new **specialization** instead, extend `BotSpecialization` in
+`black_bot.rs` (a behavior set + ring color), roll it in `BotSpecialization::roll`,
+and add a `#[serde(default)]`-friendly variant — persistence is automatic.
 
 [`Brain`]: ../src/actor/brain/mod.rs
 [`BrainContext`]: ../src/actor/brain/mod.rs

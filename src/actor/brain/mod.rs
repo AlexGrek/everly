@@ -31,10 +31,10 @@ use crate::map::hypermap::Hypermap;
 use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
 use crate::map::passability::{DynamicPassabilityMap, SubtilePassability};
 
-pub use behavior::{Behavior, ChargeSelfKeeper, RandomWalker};
+pub use behavior::{Behavior, ChargeSelfKeeper, Patroller, RandomWalker};
 pub use high_level::{
-    make_high_level, GoToChargeStation, GoToRandomPoints, HighLevelAction, HighLevelStatus,
-    RECHARGE_PER_S,
+    generate_patrol_loop, make_high_level, GoToChargeStation, GoToPatrol, GoToRandomPoints,
+    HighLevelAction, HighLevelStatus, RECHARGE_PER_S,
 };
 pub use low_level::{FollowPath, FollowTuning, Idle, LowLevelAction, Wait};
 pub use priority::{Priorities, Priority, PriorityKind};
@@ -72,6 +72,11 @@ pub struct BrainContext<'a> {
     pub interactive: &'a InteractiveEntityMap,
     /// Occupancy views for the bot-on-bot subtile detour; `None` disables it.
     pub avoidance: Option<AvoidanceViews<'a>>,
+    /// The bot's fixed patrol route, surfaced from its
+    /// [`Patrol`](crate::actor::black_bot::Patrol) component for
+    /// [`GoToPatrol`](high_level::GoToPatrol). `None` (or empty) for non-patrol
+    /// bots and most tests, which disables patrolling.
+    pub patrol_loop: Option<&'a [(i32, i32)]>,
 }
 
 /// Side effects a high-level action requests, applied by the owning ECS system
@@ -263,6 +268,7 @@ pub(crate) mod test_support {
             passability: empty_passability(),
             interactive: empty_interactive(),
             avoidance: None,
+            patrol_loop: None,
         }
     }
 

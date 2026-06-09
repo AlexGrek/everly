@@ -22,7 +22,7 @@ use crate::map::dirt::DirtMap;
 use crate::map::level::{save_full_generated_level, LevelName};
 use crate::map::temperature::TemperatureMap;
 use crate::actor::glitch_bot::GlitchBotVisual;
-use crate::actor::black_bot::Breakable;
+use crate::actor::black_bot::{Breakable, BotSpecialization};
 use crate::actor::brain::Brain;
 use crate::actor::charge::Charge;
 use crate::actor::snapshot::{save_level_actors, LevelActorsFile};
@@ -403,6 +403,7 @@ fn map_edit_save_button(
         Option<&Charge>,
         Option<&Name>,
         Option<&Breakable>,
+        Option<&BotSpecialization>,
     )>,
 ) {
     if !state.panel_open {

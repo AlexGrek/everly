@@ -24,12 +24,13 @@ use bevy::picking::prelude::Pickable;
 use bevy::prelude::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use serde::{Deserialize, Serialize};
 
 use crate::actor::actor_name::random_actor_name;
 use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
 use crate::actor::brain::{
-    make_high_level, AvoidanceViews, Brain, BrainContext, BrainEffects, ChargeSelfKeeper,
-    RandomWalker,
+    generate_patrol_loop, make_high_level, AvoidanceViews, Behavior, Brain, BrainContext,
+    BrainEffects, ChargeSelfKeeper, Patroller, RandomWalker,
 };
 use crate::actor::charge::Charge;
 use crate::actor::snapshot::{BreakablePartSnap, BreakableSnap};
@@ -78,6 +79,16 @@ const BROKEN_WHITE: Color = Color::srgb(1.0, 1.0, 1.0);
 /// Seconds for the red collision flash to fade fully back to black. Short so a
 /// bump reads as a quick blink rather than a lingering state.
 const COLLISION_FLASH_FADE_SECS: f32 = 0.45;
+
+/// Ring tube (minor) radius in meters — a thin band.
+const RING_TUBE_RADIUS: f32 = 0.04;
+/// Ring major radius, set to [`SPHERE_RADIUS`] so the band hugs the sphere's
+/// equator rather than floating outside it as a detached halo.
+const RING_MAJOR_RADIUS: f32 = SPHERE_RADIUS;
+/// `DO_NOTHING` ring color (black).
+const RING_DO_NOTHING: Color = Color::srgb(0.02, 0.02, 0.02);
+/// `PATROL` ring color (blue).
+const RING_PATROL: Color = Color::srgb(0.10, 0.45, 1.0);
 
 /// State of one breakable sub-component of a [`Breakable`] bot.
 #[derive(Debug, Clone)]
@@ -194,13 +205,70 @@ impl Default for BlackBotRng {
     }
 }
 
-/// Builds a BlackBot brain: wander + keep-self-charged, seeded for determinism.
-fn build_black_bot_brain(seed: u64) -> Brain {
-    Brain::new(
-        vec![Box::new(RandomWalker), Box::new(ChargeSelfKeeper::new())],
-        make_high_level,
-        seed,
-    )
+/// What a BlackBot is *for*. Rolled randomly at spawn ([`BotSpecialization::roll`]),
+/// it fixes both the bot's behavior set (its [`Brain`]) and the color of the ring
+/// rendered around its sphere. Persisted in `actors.yaml` so a loaded bot keeps
+/// its role (the patrol *loop* itself is regenerated on load — see [`Patrol`]).
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BotSpecialization {
+    /// Wander to random reachable cells forever ([`RandomWalker`]). Black ring.
+    #[default]
+    DoNothing,
+    /// Stick to a fixed loop of cells (a [`Patrol`] route, [`Patroller`] +
+    /// [`GoToPatrol`](crate::actor::brain::GoToPatrol)), leaving only to recharge
+    /// and resuming where it stopped. Blue ring.
+    Patrol,
+}
+
+impl BotSpecialization {
+    /// Rolls a specialization at spawn: [`Patrol`](Self::Patrol) with probability
+    /// `1/4`, otherwise [`DoNothing`](Self::DoNothing).
+    pub fn roll(rng: &mut StdRng) -> Self {
+        if rng.gen_range(0..4) == 0 {
+            Self::Patrol
+        } else {
+            Self::DoNothing
+        }
+    }
+
+    /// Color of the ring rendered around this bot's sphere.
+    fn ring_color(self) -> Color {
+        match self {
+            Self::DoNothing => RING_DO_NOTHING,
+            Self::Patrol => RING_PATROL,
+        }
+    }
+
+    /// Human-readable label for the inspector.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DoNothing => "DO_NOTHING",
+            Self::Patrol => "PATROL",
+        }
+    }
+
+    /// Builds the brain whose behavior set encodes this specialization. Every
+    /// specialization keeps itself charged ([`ChargeSelfKeeper`]); only the
+    /// routine behavior differs.
+    fn build_brain(self, seed: u64) -> Brain {
+        let routine: Box<dyn Behavior> = match self {
+            Self::DoNothing => Box::new(RandomWalker),
+            Self::Patrol => Box::new(Patroller),
+        };
+        Brain::new(vec![routine, Box::new(ChargeSelfKeeper::new())], make_high_level, seed)
+    }
+}
+
+/// Fixed patrol route for a [`BotSpecialization::Patrol`] bot: an ordered loop of
+/// world tiles the bot cycles through forever, generated lazily the first
+/// operational frame (see [`black_bot_brain`]) from the bot's spawn tile and then
+/// never changed. Surfaced to the brain via
+/// [`BrainContext::patrol_loop`](crate::actor::brain::BrainContext::patrol_loop).
+/// Only present on `PATROL` bots; not serialized (regenerated on load).
+#[derive(Component, Default)]
+pub struct Patrol {
+    pub loop_tiles: Vec<(i32, i32)>,
 }
 
 pub struct BlackBot {
@@ -410,6 +478,7 @@ fn black_bot_brain(
         &mut BlackBotVisual,
         Option<&mut Charge>,
         Option<&mut Breakable>,
+        Option<&mut Patrol>,
     )>,
 ) {
     let dt = time.delta_secs();
@@ -423,7 +492,7 @@ fn black_bot_brain(
         &remesh,
     );
 
-    for (entity, mut obj, mut brain, mut vis, mut charge, mut breakable) in &mut query {
+    for (entity, mut obj, mut brain, mut vis, mut charge, mut breakable, mut patrol) in &mut query {
         let blocked_flags = obj.inner.blocked_flags();
         let state = obj.inner.state_mut();
 
@@ -460,6 +529,16 @@ fn black_bot_brain(
         }
         vis.offline_released = false;
 
+        // Generate the patrol loop once, lazily, from the bot's current (spawn)
+        // tile. It then never changes — the bot sticks to it forever.
+        if let Some(p) = patrol.as_mut() {
+            if p.loop_tiles.is_empty() {
+                p.loop_tiles =
+                    generate_patrol_loop(brain.rng_mut(), (current_tile.x, current_tile.y), passability);
+            }
+        }
+        let patrol_loop = patrol.as_deref().map(|p| p.loop_tiles.as_slice());
+
         let charge_level = charge.as_ref().map(|c| c.level).unwrap_or(1.0);
         let effects = {
             let ctx = BrainContext {
@@ -480,6 +559,7 @@ fn black_bot_brain(
                     static_subtiles,
                     blocked_flags,
                 }),
+                patrol_loop,
             };
             brain.tick(&ctx, state)
         };
@@ -797,6 +877,53 @@ fn black_bot_material(materials: &mut Assets<StandardMaterial>) -> Handle<Standa
     })
 }
 
+/// Spawns the specialization-colored ring child rendered around a bot's sphere.
+///
+/// The ring is a flat (equatorial) [`Torus`] centered on the sphere; it is added
+/// as a child of the actor root so `sync_black_bot_transforms` keeps its position
+/// glued to the bot each frame. It carries no [`ActorPickMesh`] / [`Pickable`], so
+/// it is ignored by picking and by the status recolor (which only touches the
+/// pick mesh) — the ring keeps its specialization color for the bot's life.
+fn spawn_bot_ring(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    center: Vec2,
+    color: Color,
+) -> Entity {
+    let mesh = meshes.add(Torus {
+        minor_radius: RING_TUBE_RADIUS,
+        major_radius: RING_MAJOR_RADIUS,
+    });
+    // Matte, non-reflective: a black ring reads as flat black (no shiny
+    // highlights), while a colored ring still glows via emissive.
+    let material = materials.add(StandardMaterial {
+        base_color: color,
+        emissive: LinearRgba::from(color) * 2.0,
+        metallic: 0.0,
+        perceptual_roughness: 1.0,
+        reflectance: 0.0,
+        ..default()
+    });
+    commands
+        .spawn((
+            Name::new("BlackBot ring"),
+            Mesh3d(mesh),
+            MeshMaterial3d(material),
+            Transform::from_xyz(center.x, SPHERE_RADIUS + HOVER_HEIGHT, center.y),
+        ))
+        .id()
+}
+
+/// Inserts the specialization marker (and, for `PATROL`, the lazily filled
+/// [`Patrol`] route) onto a freshly spawned BlackBot root.
+fn attach_specialization(commands: &mut Commands, parent: Entity, spec: BotSpecialization) {
+    commands.entity(parent).insert(spec);
+    if matches!(spec, BotSpecialization::Patrol) {
+        commands.entity(parent).insert(Patrol::default());
+    }
+}
+
 /// Spawns a BlackBot from a level snapshot (mesh + restored runtime state). The
 /// brain is rebuilt fresh from `rng_seed` and re-plans from scratch.
 pub fn spawn_black_bot_from_snapshot(
@@ -807,6 +934,7 @@ pub fn spawn_black_bot_from_snapshot(
     state: ActorState,
     rng_seed: u64,
     breakable: BreakableSnap,
+    spec: BotSpecialization,
 ) -> Entity {
     let center = state.center;
     let bot = BlackBot::from_state(state);
@@ -825,12 +953,13 @@ pub fn spawn_black_bot_from_snapshot(
                 applied_color: None,
                 offline_released: false,
             },
-            build_black_bot_brain(rng_seed),
+            spec.build_brain(rng_seed),
             ActorObject::new(Box::new(bot)),
             Transform::default(),
             Visibility::Inherited,
         ))
         .id();
+    attach_specialization(commands, parent, spec);
 
     let mesh_child = commands
         .spawn((
@@ -842,8 +971,9 @@ pub fn spawn_black_bot_from_snapshot(
             Transform::from_xyz(center.x, SPHERE_RADIUS + HOVER_HEIGHT, center.y),
         ))
         .id();
+    let ring_child = spawn_bot_ring(commands, meshes, materials, center, spec.ring_color());
 
-    commands.entity(parent).add_children(&[mesh_child]);
+    commands.entity(parent).add_children(&[mesh_child, ring_child]);
     parent
 }
 
@@ -854,6 +984,7 @@ pub fn spawn_black_bot(
     rng: &mut StdRng,
     center: Vec2,
 ) -> Entity {
+    let spec = BotSpecialization::roll(rng);
     let brain_seed: u64 = rng.gen_range(0..u64::MAX);
     let bot = BlackBot::new(center);
 
@@ -872,12 +1003,13 @@ pub fn spawn_black_bot(
                 applied_color: None,
                 offline_released: false,
             },
-            build_black_bot_brain(brain_seed),
+            spec.build_brain(brain_seed),
             ActorObject::new(Box::new(bot)),
             Transform::default(),
             Visibility::Inherited,
         ))
         .id();
+    attach_specialization(commands, parent, spec);
 
     let mesh_child = commands
         .spawn((
@@ -889,7 +1021,8 @@ pub fn spawn_black_bot(
             Transform::from_xyz(center.x, SPHERE_RADIUS + HOVER_HEIGHT, center.y),
         ))
         .id();
+    let ring_child = spawn_bot_ring(commands, meshes, materials, center, spec.ring_color());
 
-    commands.entity(parent).add_children(&[mesh_child]);
+    commands.entity(parent).add_children(&[mesh_child, ring_child]);
     parent
 }

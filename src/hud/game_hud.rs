@@ -70,6 +70,9 @@ struct PauseButtonLabel;
 #[derive(Component)]
 struct PausedBanner;
 
+#[derive(Component)]
+struct FpsCounterText;
+
 pub struct GameHudPlugin;
 
 impl Plugin for GameHudPlugin {
@@ -83,6 +86,7 @@ impl Plugin for GameHudPlugin {
             (
                 spawn_bottom_hud.after(spawn_camera),
                 spawn_paused_banner.after(spawn_camera),
+                spawn_fps_counter.after(spawn_camera),
             ),
         )
         .add_systems(
@@ -102,6 +106,7 @@ impl Plugin for GameHudPlugin {
                 update_button_visuals,
                 pause_button_click,
                 sync_pause_ui,
+                update_fps_counter,
             )
                 .run_if(in_state(GameState::InGame)),
         );
@@ -685,5 +690,39 @@ fn sync_pause_ui(
     let label = if is_paused { "Resume" } else { "Pause" };
     for mut text in &mut labels {
         **text = label.to_string();
+    }
+}
+
+fn spawn_fps_counter(mut commands: Commands, camera: Query<Entity, With<StrategyCameraRig>>) {
+    let Ok(cam) = camera.single() else {
+        return;
+    };
+
+    commands.spawn((
+        Name::new("FPS counter"),
+        FpsCounterText,
+        UiTargetCamera(cam),
+        Pickable::IGNORE,
+        Text::new("-- fps"),
+        TextFont::from_font_size(14.0),
+        TextColor(Color::srgba(0.85, 0.90, 0.95, 0.70)),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(10.0),
+            right: Val::Px(12.0),
+            ..default()
+        },
+        ZIndex(1500),
+    ));
+}
+
+fn update_fps_counter(time: Res<Time>, mut query: Query<&mut Text, With<FpsCounterText>>) {
+    let dt = time.delta_secs();
+    if dt <= 0.0 {
+        return;
+    }
+    let fps = (1.0 / dt).round() as u32;
+    for mut text in &mut query {
+        **text = format!("{fps} fps");
     }
 }

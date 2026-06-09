@@ -793,6 +793,7 @@ mod tests {
             passability: &passability,
             interactive: &interactive,
             avoidance: None,
+            patrol_loop: None,
         };
         let mut rng = StdRng::seed_from_u64(1);
         fp.execute(&mut state, &ctx, &mut rng, &FollowTuning::default());
@@ -854,6 +855,7 @@ mod tests {
             passability: &passability,
             interactive: &interactive,
             avoidance: None,
+            patrol_loop: None,
         };
         let mut rng = StdRng::seed_from_u64(2);
         // Force a straight step-back (no detour, no strafe) so the target is exact.
@@ -916,6 +918,7 @@ mod tests {
                 static_subtiles: &static_subtiles,
                 blocked_flags: FLAG_BLOCKED | FLAG_VOID,
             }),
+            patrol_loop: None,
         };
         let mut rng = StdRng::seed_from_u64(5);
         // chance 1.0: a bump must detour even though a step-back cell exists.
@@ -956,6 +959,7 @@ mod tests {
                 static_subtiles: &static_subtiles,
                 blocked_flags: FLAG_BLOCKED | FLAG_VOID,
             }),
+            patrol_loop: None,
         };
         let mut rng = StdRng::seed_from_u64(5);
         let original_len = fp.path.len();
@@ -1016,6 +1020,7 @@ mod tests {
             passability,
             interactive,
             avoidance: None,
+            patrol_loop: None,
         }
     }
 
@@ -1137,6 +1142,7 @@ mod tests {
             passability: &passability,
             interactive: &interactive,
             avoidance: None,
+            patrol_loop: None,
         };
         let mut rng = StdRng::seed_from_u64(7);
 
@@ -1186,6 +1192,7 @@ mod tests {
                 passability: &passability,
                 interactive: &interactive,
                 avoidance: None,
+                patrol_loop: None,
             };
             fp.execute(&mut state, &ctx, &mut rng, &tuning);
             // Simulate being physically pinned: position never changes.
@@ -1249,6 +1256,7 @@ mod tests {
                 static_subtiles: &static_subtiles,
                 blocked_flags: FLAG_BLOCKED | FLAG_VOID,
             }),
+            patrol_loop: None,
         };
         let mut rng = StdRng::seed_from_u64(3);
         // Force the detour branch (no strafe step) to exercise detour planning.
@@ -1316,6 +1324,7 @@ mod tests {
                 static_subtiles: &static_subtiles,
                 blocked_flags: FLAG_BLOCKED | FLAG_VOID,
             }),
+            patrol_loop: None,
         };
         let mut rng = StdRng::seed_from_u64(4);
         // Force the detour branch (no strafe step); it must still find no route.

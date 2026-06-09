@@ -28,6 +28,12 @@ const MAX_TARGET_ATTEMPTS: u32 = 8;
 const PATH_CORNER_BUFFER: usize = 1;
 /// Retry delay when no wander target / charger could be found.
 const RETRY_S: f32 = 0.5;
+/// Number of waypoints in a freshly generated [`GoToPatrol`] loop.
+const PATROL_LOOP_LEN: usize = 5;
+/// Radius (tiles) within which patrol-loop waypoints are sampled around the anchor.
+const PATROL_RADIUS: f32 = 12.0;
+/// Sampling attempts before accepting a (possibly shorter) patrol loop.
+const PATROL_GEN_ATTEMPTS: u32 = 64;
 /// A* expansion cap for charger routes.
 const SEARCH_LIMIT: usize = 5000;
 
@@ -90,6 +96,7 @@ pub trait HighLevelAction: Send + Sync {
 pub fn make_high_level(kind: PriorityKind) -> Box<dyn HighLevelAction> {
     match kind {
         PriorityKind::RandomWalking => Box::new(GoToRandomPoints),
+        PriorityKind::Patrolling => Box::new(GoToPatrol::new()),
         PriorityKind::RechargeYourself => Box::new(GoToChargeStation::new()),
     }
 }
@@ -125,6 +132,185 @@ impl HighLevelAction for GoToRandomPoints {
         }
         HighLevelOutcome::running()
     }
+}
+
+// ---------------------------------------------------------------------------
+// GoToPatrol
+// ---------------------------------------------------------------------------
+
+/// Perpetual patrol of a *fixed* loop of cells — the [`Patrol`] route stored on
+/// the entity and surfaced through [`BrainContext::patrol_loop`]. The bot walks
+/// the loop in order forever.
+///
+/// The action itself is transient (the brain rebuilds it whenever `Patrolling`
+/// becomes dominant again, e.g. after a recharge pre-emption), but the loop is
+/// not: it lives on the [`Patrol`] component. On (re)creation the action snaps
+/// its [`cursor`](Self::cursor) to the loop waypoint nearest the bot, so it
+/// "gets back from where it stopped" after a recharge detour. Never reports
+/// `Done`.
+///
+/// [`Patrol`]: crate::actor::black_bot::Patrol
+pub struct GoToPatrol {
+    /// Index of the loop waypoint the bot is currently heading to. `None` until
+    /// the first tick snaps it to the nearest waypoint.
+    cursor: Option<usize>,
+    /// `false` until a route to the current waypoint has been installed. Gates
+    /// the "advance to the next waypoint on arrival" step so the first leg heads
+    /// to the nearest waypoint instead of skipping past it.
+    engaged: bool,
+}
+
+impl GoToPatrol {
+    pub fn new() -> Self {
+        Self { cursor: None, engaged: false }
+    }
+}
+
+impl Default for GoToPatrol {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HighLevelAction for GoToPatrol {
+    fn kind(&self) -> PriorityKind {
+        PriorityKind::Patrolling
+    }
+    fn label(&self) -> String {
+        "GoToPatrol".to_string()
+    }
+    fn update(
+        &mut self,
+        ctx: &BrainContext,
+        low: &mut Box<dyn LowLevelAction>,
+        _rng: &mut StdRng,
+    ) -> HighLevelOutcome {
+        // No usable route yet (loop still generating, or not a patrol bot): hold.
+        let Some(loop_tiles) = ctx.patrol_loop.filter(|l| !l.is_empty()) else {
+            if low.is_finished() {
+                *low = Box::new(Wait::new(RETRY_S));
+            }
+            return HighLevelOutcome::running();
+        };
+
+        let here = (ctx.main_tile.x, ctx.main_tile.y);
+        let len = loop_tiles.len();
+        let mut cursor = match self.cursor {
+            Some(c) => c % len,
+            None => {
+                // Fresh action (spawn, or returning from recharge): resume at the
+                // loop waypoint nearest the bot's current position.
+                self.engaged = false;
+                nearest_loop_index(loop_tiles, here)
+            }
+        };
+
+        if low.is_stuck() || low.is_finished() {
+            // Once we have reached (or abandoned) the waypoint we were heading to,
+            // move on to the next; the first engaged leg keeps the nearest one.
+            if self.engaged {
+                cursor = (cursor + 1) % len;
+            }
+            let mut installed = false;
+            for _ in 0..len {
+                let target = loop_tiles[cursor];
+                if target != here {
+                    if let Some(path) = patrol_path(ctx.passability, here, target) {
+                        *low = Box::new(FollowPath::new(path));
+                        self.engaged = true;
+                        installed = true;
+                        break;
+                    }
+                }
+                cursor = (cursor + 1) % len;
+            }
+            if !installed {
+                // Nothing reachable this tick (or already standing on the only
+                // distinct waypoint) — wait briefly and retry.
+                *low = Box::new(Wait::new(RETRY_S));
+                self.engaged = false;
+            }
+        }
+
+        self.cursor = Some(cursor);
+        HighLevelOutcome::running()
+    }
+}
+
+/// Index of the loop waypoint closest (squared tile distance) to `here`.
+fn nearest_loop_index(loop_tiles: &[(i32, i32)], here: (i32, i32)) -> usize {
+    loop_tiles
+        .iter()
+        .enumerate()
+        .min_by_key(|&(_, &(x, y))| {
+            let dx = (x - here.0) as i64;
+            let dy = (y - here.1) as i64;
+            dx * dx + dy * dy
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+/// Simplified A* path from `from` to `to`, or `None` when unreachable / already
+/// there (single-waypoint result).
+fn patrol_path(
+    passability: &Hypermap<f32>,
+    from: (i32, i32),
+    to: (i32, i32),
+) -> Option<Vec<(i32, i32)>> {
+    match astar_shortest_world_path(
+        passability,
+        from,
+        to,
+        HypermapSearchLimits { max_expanded: 2000 },
+    ) {
+        HypermapPathResult::Found { path, .. } if path.len() > 1 => {
+            Some(simplify_path_line_of_sight(passability, &path, PATH_CORNER_BUFFER))
+        }
+        _ => None,
+    }
+}
+
+/// Builds a fixed patrol loop: up to [`PATROL_LOOP_LEN`] distinct cells, each
+/// reachable from `anchor`, sampled within [`PATROL_RADIUS`]. Following them
+/// cyclically (with A* between, via [`GoToPatrol`]) is the patrol circuit.
+///
+/// May return fewer than [`PATROL_LOOP_LEN`] — or zero, when the area around
+/// `anchor` is unreachable — in which case the caller retries while the loop is
+/// empty. Reachability from a common anchor keeps consecutive waypoints mutually
+/// reachable within the connected region, so the cycle never strands the bot.
+pub fn generate_patrol_loop(
+    rng: &mut StdRng,
+    anchor: (i32, i32),
+    passability: &Hypermap<f32>,
+) -> Vec<(i32, i32)> {
+    let mut loop_tiles: Vec<(i32, i32)> = Vec::new();
+    for _ in 0..PATROL_GEN_ATTEMPTS {
+        if loop_tiles.len() >= PATROL_LOOP_LEN {
+            break;
+        }
+        let dx: f32 = rng.gen_range(-PATROL_RADIUS..PATROL_RADIUS);
+        let dy: f32 = rng.gen_range(-PATROL_RADIUS..PATROL_RADIUS);
+        if dx * dx + dy * dy > PATROL_RADIUS * PATROL_RADIUS {
+            continue;
+        }
+        let tile = (anchor.0 + dx.round() as i32, anchor.1 + dy.round() as i32);
+        if tile == anchor || loop_tiles.contains(&tile) {
+            continue;
+        }
+        if matches!(
+            astar_shortest_world_path(
+                passability,
+                anchor,
+                tile,
+                HypermapSearchLimits { max_expanded: 2000 },
+            ),
+            HypermapPathResult::Found { ref path, .. } if path.len() > 1
+        ) {
+            loop_tiles.push(tile);
+        }
+    }
+    loop_tiles
 }
 
 // ---------------------------------------------------------------------------
@@ -552,7 +738,20 @@ mod tests {
             passability,
             interactive,
             avoidance: None,
+            patrol_loop: None,
         }
+    }
+
+    /// Like [`ctx`] but carries a patrol loop for [`GoToPatrol`] tests.
+    fn ctx_patrol<'a>(
+        passability: &'a Hypermap<f32>,
+        interactive: &'a InteractiveEntityMap,
+        tile: (i32, i32),
+        patrol_loop: &'a [(i32, i32)],
+    ) -> BrainContext<'a> {
+        let mut c = ctx(passability, interactive, 1.0, tile);
+        c.patrol_loop = Some(patrol_loop);
+        c
     }
 
     /// Bot starts on the charger tile so the route is a single waypoint and the
@@ -783,5 +982,57 @@ mod tests {
         assert!(matches!(out.status, HighLevelStatus::Running));
         let (path, _) = low.path().expect("stuck recharge should immediately rerun charger search");
         assert_eq!(path.last().copied(), Some((6, 0)));
+    }
+
+    #[test]
+    fn generate_patrol_loop_yields_reachable_distinct_tiles() {
+        let passability: Hypermap<f32> = Hypermap::new(1.0); // everything walkable
+        let mut rng = StdRng::seed_from_u64(7);
+        let loop_tiles = generate_patrol_loop(&mut rng, (0, 0), &passability);
+
+        assert_eq!(loop_tiles.len(), PATROL_LOOP_LEN, "open map should fill the loop");
+        assert!(!loop_tiles.contains(&(0, 0)), "anchor itself is not a waypoint");
+        let mut sorted = loop_tiles.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), loop_tiles.len(), "waypoints must be distinct");
+    }
+
+    #[test]
+    fn patrol_installs_route_and_cycles_waypoints() {
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let route = [(0, 0), (4, 0), (4, 4)];
+        let mut action = GoToPatrol::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = StdRng::seed_from_u64(0);
+
+        // Standing on (0,0): nearest waypoint is (0,0) itself, so it heads to the
+        // next reachable distinct one.
+        let out = action.update(&ctx_patrol(&passability, &interactive, (0, 0), &route), &mut low, &mut rng);
+        assert!(matches!(out.status, HighLevelStatus::Running));
+        let first = low.path().expect("patrol must install a route").0.last().copied();
+        assert!(first.is_some(), "patrol routes to a loop waypoint");
+
+        // Force "arrived" and tick again: it must advance to a different waypoint.
+        low = Box::new(Idle);
+        action.update(&ctx_patrol(&passability, &interactive, (4, 0), &route), &mut low, &mut rng);
+        let second = low.path().expect("patrol must keep routing").0.last().copied();
+        assert_ne!(second, Some((4, 0)), "must not target the cell it is standing on");
+    }
+
+    #[test]
+    fn patrol_resumes_at_nearest_waypoint_on_creation() {
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let route = [(0, 0), (10, 0), (20, 0)];
+        // Fresh action created near (10,0) (e.g. just back from a recharge): it
+        // should resume there rather than restarting at the loop's head.
+        let mut action = GoToPatrol::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = StdRng::seed_from_u64(0);
+        action.update(&ctx_patrol(&passability, &interactive, (9, 0), &route), &mut low, &mut rng);
+        let target = low.path().expect("patrol routes after resuming").0.last().copied();
+        assert_eq!(target, Some((10, 0)), "resumes at the nearest loop waypoint");
     }
 }

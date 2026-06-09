@@ -29,7 +29,20 @@ Use this skill for:
 - the high-level **brain** layer (`src/actor/brain/`): `Behavior`s raise
   `Priorities`, the dominant one selects a `HighLevelAction`, which dictates the
   `LowLevelAction` (`Wait` / `FollowPath`) that fills `move_buffer`. BlackBot's
-  wander + self-recharge run here. **Read `docs/actor-brain.md` first** for this layer.
+  wander/patrol + self-recharge run here. **Read `docs/actor-brain.md` first** for
+  this layer.
+  - **Each `Behavior` is its own module** under `brain/behavior/`
+    (`random_walker.rs`, `patroller.rs`, `charge_self_keeper.rs`); the `Behavior`
+    trait + re-exports live in `behavior/mod.rs`, and constants shared between
+    behaviors go in `behavior/behavior_utils.rs`. Add a new behavior as a new
+    module, not inline.
+  - A BlackBot's **specialization** (`BotSpecialization` in `black_bot.rs`) is a
+    named behavior set + ring color, rolled at spawn (`PATROL` 1/4, else
+    `DO_NOTHING`) and persisted in `actors.yaml`. `PATROL` adds the `Patrol`
+    component (a fixed loop, generated lazily and surfaced via
+    `BrainContext::patrol_loop`). Per-bot planning state the brain tick needs but
+    that must outlive a `HighLevelAction` (which the brain rebuilds on
+    pre-emption) belongs on a component, read through `BrainContext`.
 
 For generic Bevy API usage, still read `.claude/SKILLS/bevy-engineer/SKILL.md` first.
 

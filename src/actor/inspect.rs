@@ -2,7 +2,7 @@
 
 use bevy::math::IVec2;
 
-use crate::actor::black_bot::{Breakable, BreakablePartState};
+use crate::actor::black_bot::{BotSpecialization, Breakable, BreakablePartState};
 use crate::actor::brain::Brain;
 use crate::actor::glitch_bot::GlitchBotVisual;
 use crate::actor::{actor_main_tile, ActorObject};
@@ -38,12 +38,18 @@ pub fn charge_row(level: f32) -> InspectRow {
     InspectRow { label: "charge", value }
 }
 
-pub fn black_bot_rows(brain: &Brain, main_tile: IVec2) -> Vec<InspectRow> {
+pub fn black_bot_rows(
+    brain: &Brain,
+    main_tile: IVec2,
+    spec: Option<BotSpecialization>,
+) -> Vec<InspectRow> {
     let priority = brain
         .current_priority()
         .map(|p| format!("{:?} ({:.0})", p.kind, p.value))
         .unwrap_or_else(|| "—".to_string());
+    let specialization = spec.map(|s| s.label()).unwrap_or("—");
     vec![
+        InspectRow { label: "specialization", value: specialization.to_string() },
         InspectRow { label: "main_tile", value: format!("({}, {})", main_tile.x, main_tile.y) },
         InspectRow { label: "stuck", value: brain.is_stuck().to_string() },
         InspectRow { label: "priority", value: priority },
@@ -80,6 +86,7 @@ pub fn status_rows(
     charge: Option<f32>,
     black: Option<&Brain>,
     glitch: Option<&GlitchBotVisual>,
+    spec: Option<BotSpecialization>,
 ) -> Vec<InspectRow> {
     let mut rows = common_actor_rows(obj.inner.state());
     if let Some(level) = charge {
@@ -87,7 +94,7 @@ pub fn status_rows(
     }
     if let Some(brain) = black {
         let main_tile = actor_main_tile(obj.inner.state().center);
-        rows.extend(black_bot_rows(brain, main_tile));
+        rows.extend(black_bot_rows(brain, main_tile, spec));
     }
     if let Some(vis) = glitch {
         rows.extend(glitch_bot_rows(vis));

@@ -32,6 +32,8 @@ pub const BAND_EMERGENCY: f32 = 70.0;
 pub enum PriorityKind {
     /// Routine wander. Mapped to [`super::GoToRandomPoints`].
     RandomWalking,
+    /// Routine patrol of a fixed loop of cells. Mapped to [`super::GoToPatrol`].
+    Patrolling,
     /// Top up the battery. Mapped to [`super::GoToChargeStation`].
     RechargeYourself,
 }

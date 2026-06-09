@@ -6,7 +6,7 @@ use bevy::prelude::*;
 use bevy::ui::widget::Button;
 
 use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
-use crate::actor::black_bot::Breakable;
+use crate::actor::black_bot::{BotSpecialization, Breakable};
 use crate::actor::brain::Brain;
 use crate::actor::charge::Charge;
 use crate::actor::glitch_bot::GlitchBotVisual;
@@ -800,7 +800,7 @@ fn sync_actor_inspector_modal(
     existing_rows: Query<Entity, With<ActorInspectorRow>>,
     existing_actions: Query<Entity, With<ActorInspectorActionBtn>>,
     actor_data: Query<(&ActorObject, Option<&Name>), With<ActorInspectable>>,
-    black: Query<&Brain>,
+    black: Query<(&Brain, Option<&BotSpecialization>)>,
     glitch: Query<&GlitchBotVisual>,
     actor_extras: Query<(Option<&Charge>, Option<&Breakable>)>,
     mut state: Local<InspectorBuildState>,
@@ -846,19 +846,19 @@ fn sync_actor_inspector_modal(
 
     let kind_label;
     let rows;
-    if let Ok(vis) = black.get(actor) {
+    if let Ok((brain, spec)) = black.get(actor) {
         kind_label = "BlackBot";
         let Ok((obj, _)) = actor_data.get(actor) else { return };
         rows = match *tab {
-            InspectorTab::Status => status_rows(obj, charge, Some(vis), None),
+            InspectorTab::Status => status_rows(obj, charge, Some(brain), None, spec.copied()),
             InspectorTab::Systems => breakable.map(|b| systems_rows(b)).unwrap_or_default(),
-            InspectorTab::Route => route_rows(vis),
+            InspectorTab::Route => route_rows(brain),
         };
     } else if let Ok(vis) = glitch.get(actor) {
         kind_label = "GlitchBot";
         let Ok((obj, _)) = actor_data.get(actor) else { return };
         rows = match *tab {
-            InspectorTab::Status => status_rows(obj, charge, None, Some(vis)),
+            InspectorTab::Status => status_rows(obj, charge, None, Some(vis), None),
             InspectorTab::Systems | InspectorTab::Route => Vec::new(),
         };
     } else {
