@@ -1,19 +1,27 @@
 //! Lock-free sub-section timers for the actor movement pipeline, shown beneath
 //! the FPS counter.
 //!
-//! Four timers cover each stage of the pipeline:
+//! Six timers cover each stage of the pipeline:
 //!
-//! - `Propose`    -- parallel `par_iter_mut`: `think_low_level` +
-//!                   `prepare_movement` + `propose_move` (static-only slide,
-//!                   shadow fill) and off-screen `advance_unchecked`.
-//! - `ArbConflict`-- owner-grid conflict resolution: stamp proposals, cascade
-//!                   back-off (depth ≤ 4), fill the squeeze pool.
-//! - `ArbApply`   -- apply outcomes to each actor (`center`, error, shadow
-//!                   swap) and stamp accepted footprints into the dynamic map.
-//! - `ArbSqueeze` -- sort + teleport the squeeze pool and off-screen re-entrants.
+//! - `ProposeThink`   -- parallel aggregate: `think_low_level` + `prepare_movement`
+//!                       across all actors (AI/brain work).
+//! - `ProposeSlide`   -- parallel aggregate: `propose_move` static-only slide
+//!                       geometry across all on-screen actors.
+//! - `ProposeAdvance` -- parallel aggregate: `advance_unchecked` across all
+//!                       off-screen actors.
+//! - `ArbConflict`    -- owner-grid conflict resolution: stamp proposals, cascade
+//!                       back-off (depth ≤ 4), fill the squeeze pool.
+//! - `ArbApply`       -- apply outcomes to each actor (`center`, error, shadow
+//!                       swap) and stamp accepted footprints into the dynamic map.
+//! - `ArbSqueeze`     -- sort + teleport the squeeze pool and off-screen re-entrants.
 //!
-//! Storage is pairs of atomics; instrumented code calls `timings.scope()` for a
-//! lock-free RAII record (one relaxed store + one `fetch_max` on drop).
+//! The propose sub-timers are aggregates (sum across all threads) — they show the
+//! total CPU budget consumed by each sub-stage rather than wall-clock latency.
+//!
+//! Storage is pairs of atomics; sequential instrumented code calls `timings.scope()`
+//! for a lock-free RAII record (one relaxed store + one `fetch_max` on drop).
+//! Parallel sub-stages call `timings.record()` directly after draining thread-local
+//! `Parallel<u64>` accumulators.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -27,15 +35,25 @@ use crate::scene::camera::{spawn_camera, StrategyCameraRig};
 #[derive(Clone, Copy)]
 pub enum TimedSystem {
     Propose,
+    ProposeThink,
+    ProposeSlide,
+    ProposeAdvance,
     ArbConflict,
     ArbApply,
     ArbSqueeze,
 }
 
 impl TimedSystem {
-    pub const COUNT: usize = 4;
-    const LABELS: [&'static str; Self::COUNT] =
-        ["propose", "arb_conflict", "arb_apply", "arb_squeeze"];
+    pub const COUNT: usize = 7;
+    const LABELS: [&'static str; Self::COUNT] = [
+        "propose",
+        "prop_think",
+        "prop_slide",
+        "prop_adv",
+        "arb_conflict",
+        "arb_apply",
+        "arb_squeeze",
+    ];
 }
 
 #[derive(Resource)]
@@ -54,7 +72,7 @@ impl Default for SystemTimings {
 }
 
 impl SystemTimings {
-    fn record(&self, sys: TimedSystem, nanos: u64) {
+    pub fn record(&self, sys: TimedSystem, nanos: u64) {
         let i = sys as usize;
         self.last_ns[i].store(nanos, Ordering::Relaxed);
         self.peak_ns[i].fetch_max(nanos, Ordering::Relaxed);

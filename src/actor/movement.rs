@@ -26,23 +26,21 @@
 //! buffer exactly as before, so the brain's avoidance views and the async
 //! pathfinder keep reading the same occupancy after the next `flush`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
 use bevy::prelude::*;
 use bevy::utils::Parallel;
+use std::collections::HashMap;
 
 use crate::hud::game_log::{GameLog, LogEntry};
 use crate::hud::perf_timings::{SystemTimings, TimedSystem};
-use crate::map::hypermap::{
-    world_to_chunk_local, ChunkCoord, Hypermap, HypermapChunkHandle, LocalCoord,
-};
 use crate::map::hypermap_world::HypermapRuntime;
-use crate::map::passability::{baked_circle_shadow, DynamicPassabilityMap, SUBTILE_COUNT};
+use crate::map::passability::{baked_circle_shadow, DynamicPassabilityMap};
 
 use super::{
     resolve_offscreen_collision, Actor, ActorMovementError, ActorObject, OffScreenActor,
 };
-
-/// Owner slot meaning "no actor occupies this subtile".
-const NONE_OWNER: u32 = u32::MAX;
 
 /// Maximum depth of the back-off cascade. When resolving a conflict at this
 /// depth, the touched actor is squeezed (its footprint removed) instead of being
@@ -96,99 +94,53 @@ impl ActorShadow {
 // Owner grid
 // ---------------------------------------------------------------------------
 
-/// Per-tile micro-grid recording which actor (a dense slot index) owns each
-/// subtile during one arbitration pass. `NONE_OWNER` = free.
-#[derive(Clone, Copy, Debug)]
-pub struct SubtileOwners {
-    pub cells: [u32; SUBTILE_COUNT * SUBTILE_COUNT],
-}
-
-impl SubtileOwners {
-    const EMPTY: Self = Self { cells: [NONE_OWNER; SUBTILE_COUNT * SUBTILE_COUNT] };
-}
-
-impl Default for SubtileOwners {
-    fn default() -> Self {
-        Self::EMPTY
-    }
-}
-
-/// Resolves a world-subtile into `(chunk, local_tile, flat_subtile_index)`.
-#[inline]
-fn subtile_addr(cell: IVec2) -> (ChunkCoord, LocalCoord, usize) {
-    let sc = SUBTILE_COUNT as i32;
-    let tile_x = cell.x.div_euclid(sc);
-    let tile_y = cell.y.div_euclid(sc);
-    let local_sx = cell.x.rem_euclid(sc) as usize;
-    let local_sy = cell.y.rem_euclid(sc) as usize;
-    let (coord, local_tile) = world_to_chunk_local(tile_x, tile_y);
-    (coord, local_tile, local_sy * SUBTILE_COUNT + local_sx)
-}
-
-/// Single-threaded owner grid backed by a reused [`Hypermap`]. The arbiter runs
-/// on one thread, so the per-chunk locks are uncontended; each call caches its
-/// chunk handle so a compact footprint resolves its chunk once (rule 2).
+/// Flat map from absolute world-subtile to the actor slot index that owns it
+/// during one arbitration pass. Absent entries are free.
+///
+/// The arbiter is entirely sequential so no locking is needed — all the
+/// `RwLock`/`Arc`/`ArcSwap` overhead of a `Hypermap`-backed grid is replaced
+/// by a plain `HashMap`. The map is cleared at the start of each arbitration
+/// pass and reused across frames (capacity stabilises after the first few frames,
+/// satisfying rule 4).
 pub struct OwnerGrid {
-    map: Hypermap<SubtileOwners>,
+    map: HashMap<IVec2, u32>,
 }
 
 impl OwnerGrid {
     fn new() -> Self {
-        Self { map: Hypermap::new(SubtileOwners::EMPTY) }
+        Self { map: HashMap::default() }
     }
 
-    /// Drops all chunks, returning to the all-free state for the next frame.
-    pub fn clear(&self) {
+    /// Clears all ownership records for the next frame.
+    pub fn clear(&mut self) {
         self.map.clear();
     }
 
     /// First `cells` entry owned by someone other than `self_owner`, with that
     /// owner's slot index. `None` if every cell is free or self-owned.
     pub fn first_foreign(&self, cells: &[IVec2], self_owner: u32) -> Option<(IVec2, u32)> {
-        let mut cached: Option<(ChunkCoord, Option<HypermapChunkHandle<SubtileOwners>>)> = None;
         for &cell in cells {
-            let (coord, local, idx) = subtile_addr(cell);
-            if !matches!(&cached, Some((c, _)) if *c == coord) {
-                cached = Some((coord, self.map.get_chunk(coord)));
-            }
-            let owner = match cached.as_ref().and_then(|(_, h)| h.as_ref()) {
-                Some(h) => h.read().expect("owner chunk poisoned").get_local(local).cells[idx],
-                None => NONE_OWNER,
-            };
-            if owner != NONE_OWNER && owner != self_owner {
-                return Some((cell, owner));
+            if let Some(&o) = self.map.get(&cell) {
+                if o != self_owner {
+                    return Some((cell, o));
+                }
             }
         }
         None
     }
 
     /// Stamps `owner` over every cell.
-    pub fn stamp(&self, cells: &[IVec2], owner: u32) {
-        let mut cached: Option<(ChunkCoord, HypermapChunkHandle<SubtileOwners>)> = None;
+    pub fn stamp(&mut self, cells: &[IVec2], owner: u32) {
         for &cell in cells {
-            let (coord, local, idx) = subtile_addr(cell);
-            if !matches!(&cached, Some((c, _)) if *c == coord) {
-                cached = Some((coord, self.map.get_or_create_chunk(coord)));
-            }
-            let handle = &cached.as_ref().expect("just populated").1;
-            handle.write().expect("owner chunk poisoned").get_local_mut(local).cells[idx] = owner;
+            self.map.insert(cell, owner);
         }
     }
 
     /// Clears every cell currently owned by `owner` (leaves foreign cells alone).
-    pub fn clear_cells(&self, cells: &[IVec2], owner: u32) {
-        let mut cached: Option<(ChunkCoord, Option<HypermapChunkHandle<SubtileOwners>>)> = None;
+    pub fn clear_cells(&mut self, cells: &[IVec2], owner: u32) {
         for &cell in cells {
-            let (coord, local, idx) = subtile_addr(cell);
-            if !matches!(&cached, Some((c, _)) if *c == coord) {
-                cached = Some((coord, self.map.get_chunk(coord)));
-            }
-            if let Some(handle) = cached.as_ref().and_then(|(_, h)| h.as_ref()) {
-                let mut guard = handle.write().expect("owner chunk poisoned");
-                let slot = &mut guard.get_local_mut(local).cells[idx];
-                if *slot == owner {
-                    *slot = NONE_OWNER;
-                }
+            if self.map.get(&cell) == Some(&owner) {
+                self.map.remove(&cell);
             }
         }
     }
@@ -231,7 +183,7 @@ impl MoveRecord {
 /// Runs the deterministic occupancy arbitration over `records` (already in the
 /// desired, e.g. entity-sorted, order). Clears and rebuilds `owners`; fills
 /// `squeeze` with the indices of actors that could not be placed.
-pub fn arbitrate(records: &mut [MoveRecord], owners: &OwnerGrid, squeeze: &mut Vec<usize>) {
+pub fn arbitrate(records: &mut [MoveRecord], owners: &mut OwnerGrid, squeeze: &mut Vec<usize>) {
     owners.clear();
     squeeze.clear();
     for r in records.iter_mut() {
@@ -257,7 +209,7 @@ pub fn arbitrate(records: &mut [MoveRecord], owners: &OwnerGrid, squeeze: &mut V
 /// actor whose current placement touches it. Bounded by [`MAX_BACKOFF_DEPTH`].
 fn back_off(
     records: &mut [MoveRecord],
-    owners: &OwnerGrid,
+    owners: &mut OwnerGrid,
     squeeze: &mut Vec<usize>,
     i: usize,
     depth: u32,
@@ -301,7 +253,7 @@ fn back_off(
 }
 
 /// Removes actor `j`'s currently-stamped footprint from the owner grid.
-fn unplace(records: &mut [MoveRecord], owners: &OwnerGrid, j: usize) {
+fn unplace(records: &mut [MoveRecord], owners: &mut OwnerGrid, j: usize) {
     if !records[j].placed {
         return;
     }
@@ -363,6 +315,13 @@ pub(crate) fn propose_actor_moves(
     let hypermap = &*hypermap;
 
     let reentering: Parallel<Vec<Entity>> = Parallel::default();
+    // Per-frame aggregate CPU time per sub-stage. Stack-allocated; captured by
+    // reference in the closure (AtomicU64: Sync). fetch_add with Relaxed ordering
+    // — same guarantee as the existing timings atomics.
+    let think_ns = AtomicU64::new(0);
+    let slide_ns = AtomicU64::new(0);
+    let advance_ns = AtomicU64::new(0);
+
     actors
         .par_iter_mut()
         .for_each(|(entity, mut actor_obj, off_screen)| {
@@ -373,8 +332,11 @@ pub(crate) fn propose_actor_moves(
                 s.shadow.participates = false;
                 s.shadow.teleported = false;
             }
+
+            let t = Instant::now();
             actor.think_low_level();
             actor.prepare_movement();
+            think_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
             let center = actor.state().center;
             let is_rendered =
@@ -388,7 +350,9 @@ pub(crate) fn propose_actor_moves(
                     });
                     reentering.borrow_local_mut().push(entity);
                 } else {
+                    let t = Instant::now();
                     actor.propose_move(static_cache);
+                    slide_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 }
             } else {
                 if !was_off_screen {
@@ -396,13 +360,19 @@ pub(crate) fn propose_actor_moves(
                         commands.entity(entity).insert(OffScreenActor);
                     });
                 }
+                let t = Instant::now();
                 actor.advance_unchecked();
+                advance_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
         });
 
     arbiter.reentrants.clear();
     let mut reentering = reentering;
     reentering.drain_into(&mut arbiter.reentrants);
+
+    timings.record(TimedSystem::ProposeThink, think_ns.load(Ordering::Relaxed));
+    timings.record(TimedSystem::ProposeSlide, slide_ns.load(Ordering::Relaxed));
+    timings.record(TimedSystem::ProposeAdvance, advance_ns.load(Ordering::Relaxed));
 }
 
 // ---------------------------------------------------------------------------
@@ -451,7 +421,7 @@ pub(crate) fn arbitrate_actor_moves(
     {
         let _t = timings.scope(TimedSystem::ArbConflict);
         let arb = &mut *arbiter;
-        arbitrate(&mut arb.records[..n], &arb.owners, &mut arb.squeeze);
+        arbitrate(&mut arb.records[..n], &mut arb.owners, &mut arb.squeeze);
     }
 
     // Stage: apply outcomes and stamp accepted footprints into the dynamic write buffer.
@@ -566,10 +536,10 @@ mod tests {
 
     #[test]
     fn no_conflict_places_all_at_current() {
-        let owners = OwnerGrid::new();
+        let mut owners = OwnerGrid::new();
         let mut squeeze = Vec::new();
         let mut records = vec![rec(&[c(0, 0)], &[c(-5, 0)]), rec(&[c(10, 10)], &[c(10, 9)])];
-        arbitrate(&mut records, &owners, &mut squeeze);
+        arbitrate(&mut records, &mut owners, &mut squeeze);
         assert!(records[0].placed && !records[0].placed_previous && !records[0].collided);
         assert!(records[1].placed && !records[1].placed_previous && !records[1].collided);
         assert!(squeeze.is_empty());
@@ -578,10 +548,10 @@ mod tests {
     #[test]
     fn two_into_one_cell_lower_index_wins() {
         // Both propose into (0,0); record 0 is processed first and keeps it.
-        let owners = OwnerGrid::new();
+        let mut owners = OwnerGrid::new();
         let mut squeeze = Vec::new();
         let mut records = vec![rec(&[c(0, 0)], &[c(1, 0)]), rec(&[c(0, 0)], &[c(0, 5)])];
-        arbitrate(&mut records, &owners, &mut squeeze);
+        arbitrate(&mut records, &mut owners, &mut squeeze);
         assert!(records[0].placed && !records[0].collided, "first claim wins its proposal");
         assert!(
             records[1].placed && records[1].placed_previous && records[1].collided,
@@ -595,13 +565,13 @@ mod tests {
     fn occupant_priority_mover_yields_via_backoff() {
         // record 0 (mover) steps onto record 1's stationary cell; record 1's
         // previous == current == its cell. The mover must be bounced back.
-        let owners = OwnerGrid::new();
+        let mut owners = OwnerGrid::new();
         let mut squeeze = Vec::new();
         let mut records = vec![
             rec(&[c(5, 5)], &[c(4, 5)]), // mover: was (4,5), wants (5,5)
             rec(&[c(5, 5)], &[c(5, 5)]), // stationary occupant of (5,5)
         ];
-        arbitrate(&mut records, &owners, &mut squeeze);
+        arbitrate(&mut records, &mut owners, &mut squeeze);
         // Processing order: 0 takes (5,5); 1 conflicts, backs off to previous
         // (5,5) which is owned by 0, so 0 is backed off to (4,5); 1 takes (5,5).
         assert!(records[1].placed && records[1].placed_previous);
@@ -615,12 +585,12 @@ mod tests {
         // onto a single contested cell so the cascade exceeds the depth cap.
         // Construct a worst case: every bot's current AND previous is the SAME
         // cell (no escape), so back-off can never free it and the cap triggers.
-        let owners = OwnerGrid::new();
+        let mut owners = OwnerGrid::new();
         let mut squeeze = Vec::new();
         let cell = c(3, 3);
         let mut records: Vec<MoveRecord> =
             (0..8).map(|_| rec(&[cell], &[cell])).collect();
-        arbitrate(&mut records, &owners, &mut squeeze);
+        arbitrate(&mut records, &mut owners, &mut squeeze);
         // Exactly one bot holds the cell; the rest cannot be placed and at least
         // one is squeezed once the back-off cap is hit.
         let placed = records.iter().filter(|r| r.placed).count();
@@ -634,7 +604,7 @@ mod tests {
     #[test]
     fn backed_off_bot_leaves_no_ghost_owner() {
         // After a bot is backed off its old current cells must be free for others.
-        let owners = OwnerGrid::new();
+        let mut owners = OwnerGrid::new();
         let mut squeeze = Vec::new();
         // 0 moves (0,0)->(1,0); 1 sits at (1,0); 2 wants (0,0) (0's vacated cell).
         let mut records = vec![
@@ -642,7 +612,7 @@ mod tests {
             rec(&[c(1, 0)], &[c(1, 0)]),
             rec(&[c(0, 0)], &[c(-5, 0)]),
         ];
-        arbitrate(&mut records, &owners, &mut squeeze);
+        arbitrate(&mut records, &mut owners, &mut squeeze);
         // 1 keeps (1,0); 0 backed off to (0,0); 2 then conflicts on (0,0) and is
         // backed off to its previous (-5,0). No ghost ownership remains.
         assert!(records[1].placed);

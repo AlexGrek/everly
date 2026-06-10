@@ -381,10 +381,13 @@ impl DynamicPassabilityMap {
     /// Stamps an arbitrary list of world-subtiles as creature-blocked in the
     /// write buffer (`FLAG_BLOCKED | FLAG_CREATURE`). Low-level escape hatch;
     /// for circular actor occupancy prefer [`try_update_footprint`].
+    ///
+    /// Uses a [`SubtileWriteCursor`] so a compact footprint (all cells in one
+    /// chunk) pays the global table lookup + `Arc` clone only once, not per cell.
     pub fn write_footprint(&self, footprint: &[IVec2]) {
-        let subtile_map = SubtilePassabilityMap::new(self);
-        for sub in footprint {
-            subtile_map.or_flags_xy(0, 0, sub.x, sub.y, FLAG_BLOCKED | FLAG_CREATURE);
+        let mut cursor = SubtileWriteCursor::new(self.inner.write_map());
+        for &sub in footprint {
+            cursor.or_flags(sub, FLAG_BLOCKED | FLAG_CREATURE);
         }
     }
 }
