@@ -10,7 +10,6 @@ use bevy::prelude::*;
 use bevy::ui::widget::Button;
 
 use crate::actor::black_bot::{self, BlackBotRng};
-use crate::actor::glitch_bot::{self, GlitchBotRng};
 use crate::actor::resurrect::{resurrect_all_button, ResurrectAllButton};
 use crate::edit::map_edit::{
     ray_intersect_horizontal_plane, void_preview_plane, MapEditPaletteRoot, MapEditPreviewMaterial,
@@ -30,8 +29,7 @@ use crate::scene::camera::StrategyCameraRig;
 /// 52 px HUD bar + the 40 px palette row this panel shares with the map-edit palette).
 const ACTOR_DEAD_ZONE_PX: f32 = 120.0;
 
-/// Both spawnable bots use radius-2 subtiles (see `GLITCH_RADIUS_SUBTILES` /
-/// `BLACK_RADIUS_SUBTILES`).
+/// Spawnable bots use radius-2 subtiles (see `BLACK_RADIUS_SUBTILES`).
 const ACTOR_SPAWN_RADIUS_SUBTILES: i32 = 2;
 
 const PALETTE_BG: Color = Color::srgba(0.05, 0.06, 0.09, 0.78);
@@ -47,7 +45,6 @@ const RESURRECT_TEXT: Color = Color::srgb(0.55, 0.95, 0.65);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ActorKind {
-    GlitchBot,
     BlackBot,
 }
 
@@ -149,8 +146,7 @@ pub(crate) fn spawn_actor_spawn_palette(
         ))
         .with_children(|row| {
             for (label, tool) in [
-                ("Bot", ActorTool::Spawn(ActorKind::GlitchBot)),
-                ("Black", ActorTool::Spawn(ActorKind::BlackBot)),
+                ("Bot", ActorTool::Spawn(ActorKind::BlackBot)),
                 ("Kill", ActorTool::Kill),
             ] {
                 let (bg, border, text) = match tool {
@@ -306,7 +302,6 @@ fn actor_spawn_pointer_click(
     hypermap: Res<HypermapRuntime>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut bot_rng: ResMut<GlitchBotRng>,
     mut black_rng: ResMut<BlackBotRng>,
 ) {
     let Some(ActorTool::Spawn(kind)) = state.tool else {
@@ -336,15 +331,6 @@ fn actor_spawn_pointer_click(
 
     let center = Vec2::new(cx as f32 + 0.5, cz as f32 + 0.5);
     match kind {
-        ActorKind::GlitchBot => {
-            glitch_bot::spawn_glitch_bot(
-                &mut commands,
-                &mut meshes,
-                &mut materials,
-                &mut bot_rng.0,
-                center,
-            );
-        }
         ActorKind::BlackBot => {
             black_bot::spawn_black_bot(
                 &mut commands,
@@ -471,7 +457,6 @@ fn actor_spawn_plane_cell(
 
 fn actor_spawn_blocked_flags(kind: ActorKind) -> u64 {
     match kind {
-        ActorKind::GlitchBot => FLAG_BLOCKED,
         ActorKind::BlackBot => FLAG_BLOCKED | FLAG_VOID,
     }
 }

@@ -1210,6 +1210,7 @@ mod tests {
             next_waypoint_hint: None,
             field_main_tile: None,
             dirtiness: 0.0,
+            shadow: crate::actor::ActorShadow::default(),
         };
         let passability = Hypermap::new(1.0);
         let interactive = InteractiveEntityMap::new();
@@ -1273,6 +1274,7 @@ mod tests {
             next_waypoint_hint: None,
             field_main_tile: None,
             dirtiness: 0.0,
+            shadow: crate::actor::ActorShadow::default(),
         };
         let passability = Hypermap::new(1.0);
         let interactive = InteractiveEntityMap::new();
@@ -1467,6 +1469,7 @@ mod tests {
             next_waypoint_hint: None,
             field_main_tile: None,
             dirtiness: 0.0,
+            shadow: crate::actor::ActorShadow::default(),
         };
         (state, Hypermap::new(1.0), InteractiveEntityMap::new())
     }
@@ -1619,6 +1622,7 @@ mod tests {
             next_waypoint_hint: None,
             field_main_tile: None,
             dirtiness: 0.0,
+            shadow: crate::actor::ActorShadow::default(),
         };
         let passability = Hypermap::new(1.0);
         let interactive = InteractiveEntityMap::new();
@@ -1663,6 +1667,7 @@ mod tests {
             next_waypoint_hint: None,
             field_main_tile: None,
             dirtiness: 0.0,
+            shadow: crate::actor::ActorShadow::default(),
         };
         let passability = Hypermap::new(1.0);
         let interactive = InteractiveEntityMap::new();
@@ -1713,6 +1718,7 @@ mod tests {
             next_waypoint_hint: None,
             field_main_tile: None,
             dirtiness: 0.0,
+            shadow: crate::actor::ActorShadow::default(),
         };
         let passability = Hypermap::new(1.0);
         let interactive = InteractiveEntityMap::new();
@@ -1781,6 +1787,7 @@ mod tests {
             next_waypoint_hint: None,
             field_main_tile: None,
             dirtiness: 0.0,
+            shadow: crate::actor::ActorShadow::default(),
         };
         let mut rng = rng::seeded(23);
 
@@ -1844,6 +1851,7 @@ mod tests {
             next_waypoint_hint: None,
             field_main_tile: None,
             dirtiness: 0.0,
+            shadow: crate::actor::ActorShadow::default(),
         };
         let passability = Hypermap::new(1.0);
         let interactive = InteractiveEntityMap::new();
@@ -1893,6 +1901,7 @@ mod tests {
             next_waypoint_hint: None,
             field_main_tile: None,
             dirtiness: 0.0,
+            shadow: crate::actor::ActorShadow::default(),
         }
     }
 

@@ -6,7 +6,7 @@
 //!
 //! 1. [`flush_actor_occupancy`] — flush write→read, clear write buffer.
 //! 2. [`stamp_static_passability`] — stamp wall/void geometry into write.
-//! 3. Actor think systems (e.g. `glitch_bot_think`) fill `move_buffer`.
+//! 3. Actor think systems (e.g. `black_bot_brain`) fill `move_buffer`.
 //! 4. [`process_actors`] — for each actor: clear error, think, prepare, try_move.
 //!
 //! ## Coordinates
@@ -27,23 +27,20 @@ pub mod actor_name;
 pub mod actor_pick;
 pub mod brain;
 pub mod charge;
-pub mod glitch_bot;
 pub mod inspect;
+pub mod movement;
 pub mod resurrect;
 pub mod snapshot;
 
+pub use movement::{ActorShadow, OccupancyArbiter};
+pub(crate) use movement::{arbitrate_actor_moves, propose_actor_moves};
+
 use bevy::prelude::*;
-use bevy::utils::Parallel;
 
 use crate::map::hypermap::Hypermap;
-use crate::map::hypermap_world::HypermapRuntime;
 use crate::map::passability::{
-    DynamicPassabilityMap, SubtilePassability, TryUpdateFootprintError,
-    FLAG_BLOCKED, FLAG_VOID, SUBTILE_COUNT,
+    DynamicPassabilityMap, SubtilePassability, FLAG_BLOCKED, FLAG_VOID, SUBTILE_COUNT,
 };
-#[cfg(test)]
-use crate::map::passability::FLAG_CREATURE;
-use crate::hud::perf_timings::{SystemTimings, TimedSystem};
 use crate::menu::main_menu::GameState;
 
 // ---------------------------------------------------------------------------
@@ -154,6 +151,9 @@ pub struct ActorState {
     /// [`crate::map::field_interactions`]). Actors spawn clean and this is not
     /// serialized in snapshots — a loaded actor starts clean again.
     pub dirtiness: f32,
+    /// Footprint shadow + transient per-frame state for the arbitrated movement
+    /// pipeline (see [`movement`]). Defaulted on construction; not serialized.
+    pub shadow: ActorShadow,
 }
 
 /// Nearest world tile to a tile-space [`Vec2`] center (`round`, not `floor`).
@@ -313,102 +313,65 @@ pub trait Actor: Send + Sync + 'static {
         state.move_buffer = ActorMoveBuffer::default();
     }
 
-    /// Applies the accepted movement transform.
+    /// Proposes this frame's move, validated against **static** geometry only,
+    /// and records it in the actor's [`ActorShadow`] for the occupancy arbiter.
     ///
-    /// - `center` is advanced by the exact float `tile_delta` (smooth, never
-    ///   quantized).
-    /// - `rotation` is advanced by `rotation_shift`.
-    /// - `last_accepted_*` are updated by [`try_move`](Self::try_move) before
-    ///   this runs.
-    fn move_actor(&mut self) -> Result<(), ActorMovementError> {
-        let state = self.state_mut();
-        if state.radius_subtiles < 0 {
-            return Err(ActorMovementError::InvalidRadius(state.radius_subtiles));
-        }
-        state.center += state.move_buffer.tile_delta;
-        state.rotation += state.move_buffer.rotation_shift;
-        state.move_buffer = ActorMoveBuffer::default();
-        Ok(())
-    }
-
-    /// Attempts to move; on collision records an error and keeps position.
+    /// Static geometry is read from the persistent `static_cache` (updated only
+    /// on map edits); the actor's `blocked_flags()` decide which bits are
+    /// impassable. Creature-on-creature conflicts are **not** checked here — the
+    /// sequential [`movement::arbitrate_actor_moves`] resolves those afterward.
     ///
-    /// Static geometry is read from the persistent `static_cache` (updated
-    /// only on map edits). Dynamic creature footprints are read from the
-    /// passability **read** buffer. The actor's `blocked_flags()` determine
-    /// which flag bits are impassable.
+    /// The default tests the combined `(dx, dy)` footprint and cancels the whole
+    /// step if any candidate cell is statically blocked. Classes that want
+    /// wall-sliding (e.g. `BlackBot`) override this with an axis-decomposed
+    /// static probe.
     ///
-    /// Self-overlap (the actor's previous footprint) is always bypassed —
-    /// the actor never collides with itself.
-    ///
-    /// Grid position invariant: the next candidate position is
-    /// `last_accepted_center_subtile + subtile_shift`. The float `center` is
-    /// never consulted for grid position — it drifts for smooth rendering
-    /// only.
-    fn try_move(
-        &mut self,
-        dynamic_passability: &DynamicPassabilityMap,
-        static_cache: &Hypermap<SubtilePassability>,
-    ) {
-        let (radius, grid_pos, requested_shift, previous, actor_blocked) = {
+    /// Grid position invariant: the candidate center is
+    /// `last_accepted_center_subtile + subtile_shift`; the float `center` is
+    /// never consulted for grid position — it drifts for smooth rendering only.
+    fn propose_move(&mut self, static_cache: &Hypermap<SubtilePassability>) {
+        let (origin, previous, radius, blocked, want, tile_delta, rotation) = {
             let s = self.state();
+            let origin = s
+                .last_accepted_center_subtile
+                .unwrap_or_else(|| s.center_subtile_i32());
             let previous = s
                 .last_accepted_center_subtile
                 .map(|c| (c, s.last_accepted_radius_subtiles));
-            let grid_pos = s
-                .last_accepted_center_subtile
-                .unwrap_or_else(|| s.center_subtile_i32());
             (
-                s.radius_subtiles,
-                grid_pos,
-                s.move_buffer.subtile_shift,
+                origin,
                 previous,
+                s.radius_subtiles,
                 self.blocked_flags(),
+                s.move_buffer.subtile_shift,
+                s.move_buffer.tile_delta,
+                s.move_buffer.rotation_shift,
             )
         };
-        let next_center_sub = grid_pos + requested_shift;
-
-        let result = dynamic_passability.try_update_footprint(
-            next_center_sub,
-            radius,
-            previous,
-            actor_blocked,
+        let target = origin + want;
+        let static_block = crate::map::passability::first_static_block(
             static_cache,
+            target,
+            radius,
+            blocked,
+            previous,
         );
+        let (center, delta) = if static_block.is_none() {
+            (target, tile_delta)
+        } else {
+            (origin, Vec2::ZERO)
+        };
 
-        match result {
-            Ok(()) => {
-                {
-                    let state = self.state_mut();
-                    state.last_accepted_center_subtile = Some(next_center_sub);
-                    state.last_accepted_radius_subtiles = radius;
-                }
-                if let Err(err) = self.move_actor() {
-                    self.state_mut().last_movement_error = Some(err);
-                }
-            }
-            Err(err) => {
-                let state = self.state_mut();
-                state.last_movement_error = Some(match err {
-                    TryUpdateFootprintError::InvalidRadius(r) => {
-                        ActorMovementError::InvalidRadius(r)
-                    }
-                    TryUpdateFootprintError::BlockedByOccupancy { world_subtile } => {
-                        ActorMovementError::BlockedByOccupancy {
-                            world_subtile_x: world_subtile.x,
-                            world_subtile_y: world_subtile.y,
-                        }
-                    }
-                    TryUpdateFootprintError::BlockedByStatic { world_subtile } => {
-                        ActorMovementError::BlockedByStatic {
-                            world_subtile_x: world_subtile.x,
-                            world_subtile_y: world_subtile.y,
-                        }
-                    }
-                });
-                state.move_buffer = ActorMoveBuffer::default();
-            }
-        }
+        let s = self.state_mut();
+        s.shadow.world_previous = s.center;
+        s.shadow.proposed_center = center;
+        s.shadow.proposed_delta = delta;
+        s.shadow.proposed_rotation = rotation;
+        s.shadow.static_block = static_block;
+        s.shadow.participates = true;
+        ActorShadow::fill_cells(&mut s.shadow.previous, origin, radius);
+        ActorShadow::fill_cells(&mut s.shadow.current, center, radius);
+        s.move_buffer = ActorMoveBuffer::default();
     }
 }
 
@@ -450,16 +413,22 @@ pub struct ActorPlugin;
 
 impl Plugin for ActorPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Paused>().add_systems(
-            Update,
-            (
-                toggle_pause.run_if(in_state(GameState::InGame)),
-                (flush_actor_occupancy, process_actors)
-                    .chain()
-                    .run_if(in_state(GameState::InGame))
-                    .run_if(not(is_paused)),
-            ),
-        );
+        app.init_resource::<Paused>()
+            .init_resource::<OccupancyArbiter>()
+            .add_systems(
+                Update,
+                (
+                    toggle_pause.run_if(in_state(GameState::InGame)),
+                    (
+                        flush_actor_occupancy,
+                        propose_actor_moves,
+                        arbitrate_actor_moves,
+                    )
+                        .chain()
+                        .run_if(in_state(GameState::InGame))
+                        .run_if(not(is_paused)),
+                ),
+            );
     }
 }
 
@@ -564,105 +533,6 @@ fn resolve_offscreen_collision(
     // If nothing found, leave position unchanged; footprint not stamped.
 }
 
-/// Drives the complete low-level actor pipeline for all registered actors.
-///
-/// On-screen actors (chunk in `chunk_roots`) use full collision detection via
-/// [`Actor::try_move`]. Off-screen actors advance without collision via
-/// [`Actor::advance_unchecked`] and carry an [`OffScreenActor`] marker.
-/// On the frame a chunk becomes rendered, `resolve_offscreen_collision` places
-/// the actor at the nearest valid passable position before normal movement resumes.
-pub(crate) fn process_actors(
-    mut actors: Query<(Entity, &mut ActorObject, Option<&OffScreenActor>)>,
-    dynamic_passability: Res<DynamicPassabilityMap>,
-    hypermap: Res<HypermapRuntime>,
-    par_commands: ParallelCommands,
-    timings: Res<SystemTimings>,
-) {
-    // Parallel-safe by construction: collision reads hit the **read** buffer,
-    // which is immutable for the whole frame (flushed once up front), and writes
-    // accumulate into the **write** buffer as commutative per-chunk `|=` ORs. The
-    // result is therefore independent of actor processing order, so `par_iter_mut`
-    // is deterministic. Each actor mutates only its own disjoint state; the only
-    // shared writes are the order-independent occupancy ORs and deferred
-    // `OffScreenActor` marker changes (one per distinct entity) via `ParallelCommands`.
-    let static_cache = hypermap.static_subtile_cache.as_ref();
-    let dynamic_passability = &*dynamic_passability;
-    let hypermap = &*hypermap;
-
-    // Actors crossing off-screen → on-screen this frame. Their placement is
-    // deferred out of the parallel pass into the sequential one below: re-entry
-    // resolution both reads *and* writes the dynamic write buffer, so it must
-    // run one actor at a time or two simultaneous re-entrants could be packed
-    // onto the same cell. Collected lock-free into per-thread queues (no shared
-    // lock in the parallel pass) and drained + sorted afterward for an
-    // order-independent result. Stays empty (no allocation) when no actor
-    // re-enters this frame.
-    let reentering: Parallel<Vec<Entity>> = Parallel::default();
-
-    {
-    let _t = timings.scope(TimedSystem::ThinkPass);
-    actors.par_iter_mut().for_each(|(_, mut actor_obj, _)| {
-        let actor = actor_obj.inner.as_mut();
-        actor.state_mut().last_movement_error = None;
-        actor.think_low_level();
-        actor.prepare_movement();
-    });
-    } // end ThinkPass
-
-    {
-    let _t = timings.scope(TimedSystem::MovePass);
-    actors
-        .par_iter_mut()
-        .for_each(|(entity, mut actor_obj, off_screen)| {
-            let actor = actor_obj.inner.as_mut();
-            let center = actor.state().center;
-            let is_rendered =
-                hypermap.is_world_pos_rendered(center.x.floor() as i32, center.y.floor() as i32);
-            let was_off_screen = off_screen.is_some();
-
-            if is_rendered {
-                if was_off_screen {
-                    // Transition: off-screen → on-screen. Drop the marker now, but
-                    // defer placement to the sequential pass so re-entrants resolve
-                    // against each other's claims.
-                    par_commands.command_scope(|mut commands| {
-                        commands.entity(entity).remove::<OffScreenActor>();
-                    });
-                    reentering.borrow_local_mut().push(entity);
-                } else {
-                    actor.try_move(dynamic_passability, static_cache);
-                }
-            } else {
-                if !was_off_screen {
-                    par_commands.command_scope(|mut commands| {
-                        commands.entity(entity).insert(OffScreenActor);
-                    });
-                }
-                actor.advance_unchecked();
-            }
-        });
-    } // end MovePass
-
-    {
-    let _t = timings.scope(TimedSystem::ReentryPass);
-    // Sequential re-entry placement. The parallel borrow above has ended, so we
-    // can re-borrow `actors` one entity at a time. By now the write buffer holds
-    // every on-screen actor's new footprint (committed during the parallel pass),
-    // so each re-entrant avoids those too. Sorting by entity makes the placement
-    // order — and therefore the result — independent of the thread scheduling
-    // that filled `reentering`.
-    let mut reentering = reentering;
-    let mut reentered: Vec<Entity> = Vec::new();
-    reentering.drain_into(&mut reentered);
-    reentered.sort_unstable();
-    for entity in reentered {
-        if let Ok((_, mut actor_obj, _)) = actors.get_mut(entity) {
-            resolve_offscreen_collision(actor_obj.inner.as_mut(), dynamic_passability, static_cache);
-        }
-    }
-    } // end ReentryPass
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -725,6 +595,7 @@ mod tests {
                     next_waypoint_hint: None,
                     field_main_tile: None,
                     dirtiness: 0.0,
+                    shadow: ActorShadow::default(),
                 },
             }
         }
@@ -758,115 +629,80 @@ mod tests {
                 next_waypoint_hint: None,
                 field_main_tile: None,
                 dirtiness: 0.0,
+                shadow: ActorShadow::default(),
             },
         }
     }
 
     #[test]
-    fn try_move_updates_center_and_writes_shadow() {
-        let map = DynamicPassabilityMap::new();
+    fn propose_move_clear_sets_proposed_center_and_shadow() {
+        // Static-clear proposal: advances the proposed center, no static block,
+        // and fills the current shadow with the footprint at the new center.
         let sc = empty_static_cache();
         let mut actor = DummyActor::new(Vec2::new(10.0, 10.0), 1);
         actor.state.move_buffer.tile_delta = Vec2::new(1.0, 0.0);
         actor.state.move_buffer.subtile_shift = IVec2::new(5, 0);
-        actor.try_move(&map, &sc);
-        map.flush();
-        let view = SubtilePassabilityMap::new(&map);
+        actor.propose_move(&sc);
 
-        assert_eq!(actor.state.center, Vec2::new(11.0, 10.0));
-        assert_eq!(
-            actor.state.last_accepted_center_subtile,
-            Some(IVec2::new(55, 50)),
-        );
-        assert_eq!(actor.state.last_accepted_radius_subtiles, 1);
-        assert_ne!(view.flags_xy(0, 0, 55, 50) & FLAG_BLOCKED, 0);
-        assert!(actor.state.last_movement_error.is_none());
-    }
-
-    #[test]
-    fn try_move_reports_collision_and_keeps_center() {
-        let map = DynamicPassabilityMap::new();
-        let sc = empty_static_cache();
-        let view = SubtilePassabilityMap::new(&map);
-
-        view.or_flags_xy(0, 0, 51, 50, FLAG_BLOCKED | FLAG_CREATURE);
-        map.flush();
-
-        let mut actor = DummyActor::new(Vec2::new(10.0, 10.0), 0);
-        actor.state.move_buffer.subtile_shift = IVec2::new(1, 0);
-        actor.try_move(&map, &sc);
-
+        assert!(actor.state.shadow.participates);
+        assert_eq!(actor.state.shadow.proposed_center, IVec2::new(55, 50));
+        assert_eq!(actor.state.shadow.proposed_delta, Vec2::new(1.0, 0.0));
+        assert_eq!(actor.state.shadow.static_block, None);
+        // current shadow is the footprint circle centered on the proposed cell.
+        let expected = crate::map::passability::baked_circle_shadow(1).offsets.len();
+        assert_eq!(actor.state.shadow.current.len(), expected);
+        assert!(actor.state.shadow.current.contains(&IVec2::new(55, 50)));
+        // propose does not move `center` — apply (in the arbiter) does.
         assert_eq!(actor.state.center, Vec2::new(10.0, 10.0));
-        assert!(matches!(
-            actor.state.last_movement_error,
-            Some(ActorMovementError::BlockedByOccupancy { .. })
-        ));
     }
 
     #[test]
-    fn try_move_default_actor_blocked_by_static_wall() {
-        // Put a wall (all edges) at tile (11, 10) — subtile row 0 is blocked.
+    fn propose_move_default_blocked_by_static_wall_holds() {
+        // Wall (all edges) at tile (11, 10): the proposed cell is statically
+        // blocked, so the default combined proposal cancels the whole step.
         let sc = static_cache_with_wall(11, 10, WallMask::from_bits(0x0F).unwrap());
-        let map = DynamicPassabilityMap::new();
-
         let mut actor = DummyActor::new(Vec2::new(10.0, 10.0), 0);
         actor.state.move_buffer.subtile_shift = IVec2::new(5, 0);
-        actor.try_move(&map, &sc);
+        actor.propose_move(&sc);
 
-        assert_eq!(actor.state.center, Vec2::new(10.0, 10.0));
-        assert!(matches!(
-            actor.state.last_movement_error,
-            Some(ActorMovementError::BlockedByStatic { .. })
-        ));
+        assert!(actor.state.shadow.static_block.is_some());
+        assert_eq!(actor.state.shadow.proposed_center, IVec2::new(50, 50));
+        assert_eq!(actor.state.shadow.proposed_delta, Vec2::ZERO);
     }
 
     #[test]
-    fn try_move_flying_actor_crosses_void() {
+    fn propose_move_flyer_crosses_void() {
         let sc = static_cache_all_void();
-        let map = DynamicPassabilityMap::new();
-
         let mut actor = fresh_flying(Vec2::new(10.0, 10.0), 0);
-        actor.state.move_buffer.tile_delta = Vec2::new(1.0, 0.0);
         actor.state.move_buffer.subtile_shift = IVec2::new(5, 0);
-        actor.try_move(&map, &sc);
+        actor.propose_move(&sc);
 
-        assert_eq!(actor.state.center, Vec2::new(11.0, 10.0), "flying actor must cross void");
-        assert!(actor.state.last_movement_error.is_none());
+        // Flyer's blocked_flags is FLAG_BLOCKED only, so void is not a block.
+        assert_eq!(actor.state.shadow.static_block, None);
+        assert_eq!(actor.state.shadow.proposed_center, IVec2::new(55, 50));
     }
 
     #[test]
-    fn try_move_flying_actor_stops_at_wall() {
+    fn propose_move_flyer_stops_at_wall() {
         let sc = static_cache_with_wall(11, 10, WallMask::from_bits(0x0F).unwrap());
-        let map = DynamicPassabilityMap::new();
-
         let mut actor = fresh_flying(Vec2::new(10.0, 10.0), 0);
-        actor.state.move_buffer.tile_delta = Vec2::new(1.0, 0.0);
         actor.state.move_buffer.subtile_shift = IVec2::new(5, 0);
-        actor.try_move(&map, &sc);
+        actor.propose_move(&sc);
 
-        assert_eq!(actor.state.center, Vec2::new(10.0, 10.0), "flying actor must stop at wall");
-        assert!(matches!(
-            actor.state.last_movement_error,
-            Some(ActorMovementError::BlockedByStatic { .. })
-        ));
+        assert!(actor.state.shadow.static_block.is_some());
+        assert_eq!(actor.state.shadow.proposed_center, IVec2::new(50, 50));
     }
 
     #[test]
-    fn try_move_self_overlap_after_acceptance_allows_subsequent_step() {
-        let map = DynamicPassabilityMap::new();
+    fn propose_move_previous_shadow_is_origin_footprint() {
+        // The previous shadow is the footprint at last_accepted (here the
+        // first-frame fallback floor(center*5) = (50,50)).
         let sc = empty_static_cache();
-        let mut actor = DummyActor::new(Vec2::new(10.0, 10.0), 2);
-
-        actor.state.move_buffer.tile_delta = Vec2::new(0.2, 0.0);
-        actor.state.move_buffer.subtile_shift = IVec2::new(1, 0);
-        actor.try_move(&map, &sc);
-        assert!(actor.state.last_movement_error.is_none());
-        map.flush();
-
-        actor.state.move_buffer.tile_delta = Vec2::new(0.2, 0.0);
-        actor.state.move_buffer.subtile_shift = IVec2::new(1, 0);
-        actor.try_move(&map, &sc);
-        assert!(actor.state.last_movement_error.is_none());
+        let mut actor = DummyActor::new(Vec2::new(10.0, 10.0), 1);
+        actor.state.move_buffer.subtile_shift = IVec2::new(3, 0);
+        actor.propose_move(&sc);
+        assert!(actor.state.shadow.previous.contains(&IVec2::new(50, 50)));
+        assert_eq!(actor.state.shadow.proposed_center, IVec2::new(53, 50));
     }
 
     #[test]

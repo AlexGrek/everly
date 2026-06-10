@@ -137,6 +137,8 @@ pub enum LogEntry {
     },
     /// A BlackBot's collision pressure hit the reset threshold; brain replans from scratch.
     BotCollisionReset { name: String },
+    /// A bot was wedged with no placeable footprint and got teleported out of the jam.
+    BotSqueezedOut { name: String },
 }
 
 impl LogEntry {
@@ -154,6 +156,7 @@ impl LogEntry {
                 LogLevel::Unexpected
             }
             LogEntry::BotCollisionReset { .. } => LogLevel::Warn,
+            LogEntry::BotSqueezedOut { .. } => LogLevel::Warn,
         }
     }
 
@@ -186,6 +189,7 @@ impl LogEntry {
                 waypoint_y,
             } => format!("{name} skipped patrol waypoint ({waypoint_x}, {waypoint_y})"),
             LogEntry::BotCollisionReset { name } => format!("{name} reset (collision pressure)"),
+            LogEntry::BotSqueezedOut { name } => format!("{name} squeezed out (teleported)"),
         }
     }
 }

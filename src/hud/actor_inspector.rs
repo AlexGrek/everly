@@ -9,7 +9,6 @@ use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
 use crate::actor::black_bot::{BlackBotVisual, BotSpecialization, Breakable};
 use crate::actor::brain::Brain;
 use crate::actor::charge::Charge;
-use crate::actor::glitch_bot::GlitchBotVisual;
 use crate::actor::actor_pick::ActorForceLogs;
 use crate::actor::inspect::{debug_rows, display_actor_name, route_rows, status_rows, systems_rows};
 use crate::actor::ActorObject;
@@ -867,7 +866,6 @@ fn sync_actor_inspector_modal(
     existing_actions: Query<Entity, With<ActorInspectorActionBtn>>,
     actor_data: Query<(&ActorObject, Option<&Name>), With<ActorInspectable>>,
     black: Query<(&Brain, &BlackBotVisual, Option<&BotSpecialization>)>,
-    glitch: Query<&GlitchBotVisual>,
     actor_extras: Query<(Option<&Charge>, Option<&Breakable>)>,
     force_logs: Query<&ActorForceLogs>,
     mut state: Local<InspectorBuildState>,
@@ -923,20 +921,11 @@ fn sync_actor_inspector_modal(
                 obj,
                 charge,
                 Some(brain),
-                None,
                 spec.copied(),
                 Some(vis.collision_pressure()),
             ),
             InspectorTab::Systems => breakable.map(|b| systems_rows(b)).unwrap_or_default(),
             InspectorTab::Route => route_rows(brain),
-            InspectorTab::Debug => debug_rows(force_logs_on),
-        };
-    } else if let Ok(vis) = glitch.get(actor) {
-        kind_label = "GlitchBot";
-        let Ok((obj, _)) = actor_data.get(actor) else { return };
-        rows = match *tab {
-            InspectorTab::Status => status_rows(obj, charge, None, Some(vis), None, None),
-            InspectorTab::Systems | InspectorTab::Route => Vec::new(),
             InspectorTab::Debug => debug_rows(force_logs_on),
         };
     } else {

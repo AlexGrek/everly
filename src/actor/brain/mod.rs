@@ -343,6 +343,7 @@ pub(crate) mod test_support {
             next_waypoint_hint: None,
             field_main_tile: None,
             dirtiness: 0.0,
+            shadow: crate::actor::ActorShadow::default(),
         }
     }
 

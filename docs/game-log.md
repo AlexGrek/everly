@@ -59,7 +59,7 @@ log without exclusive access:
 | Event | Level | Source |
 |---|---|---|
 | `<name> stuck` | `warn` | `black_bot_brain` when [`Brain::is_stuck`](../src/actor/brain/mod.rs) becomes true (rising edge) |
-| `<name> charge depleted` | `err` | `black_bot_brain` / `glitch_bot_think` when [`Charge::is_depleted`](../src/actor/charge.rs) becomes true |
+| `<name> charge depleted` | `err` | `black_bot_brain` when [`Charge::is_depleted`](../src/actor/charge.rs) becomes true |
 | `<name> <system> broken` | `err` | `black_bot_brain` when a [`Breakable`](../src/actor/black_bot.rs) part newly breaks (`movement engine`, `control plane`, `sensory system`) |
 | `<name> started charging` | `info` | `black_bot_brain` when `BrainEffects::dock` fires (entering the `Charging` phase) |
 | `<name> finished charging` | `success` | `black_bot_brain` when `BrainEffects::undock` fires (charge reached full) |

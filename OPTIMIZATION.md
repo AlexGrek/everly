@@ -435,3 +435,55 @@ shadow-cache fallback (documented cold path, never hit).
 
 Verified green: `cargo test -p everly` (246 passed, 0 failed, 2 ignored) and
 `cargo check -p everly --all-targets` warning-clean.
+
+### Arbitrated movement pipeline — sequential owner-grid arbiter replaces contended parallel footprint writes (2026-06)
+
+The actor `move_pass` (the old parallel `try_move`) spiked to ~40 ms under load.
+Each on-screen actor OR-stamped its footprint into the dynamic **write** buffer
+from inside `par_iter_mut`; with many actors clustered in one hypermap chunk, the
+per-chunk `RwLock::write()` taken per subtile serialized every writer on the same
+chunk — lock contention, not useful work. Collisions were also resolved a frame
+late against the immutable read snapshot, so two actors could step onto the same
+cell and overlap until the next flush.
+
+Replaced with a three-phase pipeline
+([`src/actor/movement.rs`](src/actor/movement.rs),
+[`src/actor/mod.rs`](src/actor/mod.rs), `docs/actor.md`):
+
+- **Propose (parallel, rule 5):** [`propose_actor_moves`](src/actor/movement.rs)
+  runs `think`/`prepare`/[`Actor::propose_move`] on `par_iter_mut`. `propose_move`
+  validates the step against **static** geometry only via
+  [`first_static_block`](src/map/passability.rs) (read-only, lock-free chunk
+  reads through the `ArcSwap` snapshot) and writes the proposed footprint into the
+  actor's own [`ActorShadow`] — **no** shared dynamic-map writes, so the parallel
+  phase takes no contended locks at all.
+- **Arbitrate (sequential, deterministic):**
+  [`arbitrate_actor_moves`](src/actor/movement.rs) stamps every proposal into a
+  reused per-frame **owner grid** (`Hypermap<SubtileOwners>`, one slot index per
+  subtile) in entity-sorted order. A contested cell backs the mover off to its
+  previous footprint; a deeper conflict recursively backs off the *touched* actor
+  (depth-capped, then squeezed). One thread, uncontended per-chunk locks, bounded
+  by the visible-actor count — the contended parallel writes are gone.
+- **Allocation-free steady state (rule 4):** the [`OccupancyArbiter`] resource
+  reuses its owner grid (`OwnerGrid::clear` drops chunks via the new
+  [`Hypermap::clear`](src/map/hypermap.rs), same churn profile as the existing
+  per-frame `flush`), `records`/`entities`/`squeeze`/`placements` vectors, and the
+  per-record cell buffers (`clear` + `extend_from_slice`). No per-actor/per-frame
+  allocation.
+- **Hypertile-local (rule 2):** `OwnerGrid::first_foreign`/`stamp`/`clear_cells`
+  cache the chunk handle, so a compact footprint resolves its chunk once.
+
+Downstream contracts preserved (rule 8): accepted footprints are still stamped
+into the `DynamicPassabilityMap` write buffer (`write_footprint`) and flushed, so
+the brain's `AvoidanceViews` and the async pathfinder read identical occupancy;
+`last_movement_error` still carries `BlockedByOccupancy`/`BlockedByStatic` for the
+brain's collision response and pressure tracking. Squeeze/teleport reuses the
+existing `resolve_offscreen_collision` re-entry placement. Determinism: the
+sequential pass is entity-sorted, so the result is independent of the parallel
+propose phase's thread scheduling.
+
+The pure arbiter (`arbitrate` / `back_off`) is unit-tested in `movement.rs`
+(contention → lower-entity wins, occupant priority via back-off, depth-cap
+squeeze, no ghost ownership after a back-off). Perf timers renamed to
+`propose_pass` / `arbitrate_pass`
+([`src/hud/perf_timings.rs`](src/hud/perf_timings.rs)).

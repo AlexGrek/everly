@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use crate::actor::black_bot::{spawn_black_bot_from_snapshot, BotSpecialization, Breakable};
 use crate::actor::brain::Brain;
 use crate::actor::charge::Charge;
-use crate::actor::glitch_bot::{spawn_glitch_bot_from_snapshot, GlitchBotVisual};
 use crate::actor::{ActorMoveBuffer, ActorMovementError, ActorObject, ActorState, LevelActor};
 use crate::map::hypermap_world::HypermapRuntime;
 use crate::map::passability::DynamicPassabilityMap;
@@ -183,6 +182,7 @@ impl From<ActorStateSnap> for ActorState {
             next_waypoint_hint: None,
             field_main_tile: None,
             dirtiness: 0.0,
+            shadow: crate::actor::ActorShadow::default(),
         }
     }
 }
@@ -211,16 +211,6 @@ impl Default for BreakableSnap {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct GlitchBotVisualSnap {
-    pub direction: SerVec2,
-    pub accumulator: SerVec2,
-    pub dir_timer: f32,
-    pub dir_interval: f32,
-    pub collision_streak: u32,
-    pub rng_seed: u64,
-}
-
 /// Persisted brain state for a BlackBot. The behavior set is fixed by the actor
 /// type, so only the RNG seed is stored; the brain re-plans from scratch on load.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -238,14 +228,6 @@ fn default_charge() -> f32 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SavedActor {
-    GlitchBot {
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        name: String,
-        state: ActorStateSnap,
-        visual: GlitchBotVisualSnap,
-        #[serde(default = "default_charge")]
-        charge: f32,
-    },
     BlackBot {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         name: String,
@@ -275,7 +257,6 @@ fn saved_name_from_entity(name: Option<&Name>) -> String {
 
 impl LevelActorsFile {
     pub fn collect(
-        glitch_bots: &Query<(&ActorObject, &GlitchBotVisual, Option<&Charge>, Option<&Name>)>,
         black_bots: &Query<(
             &ActorObject,
             &Brain,
@@ -286,14 +267,6 @@ impl LevelActorsFile {
         )>,
     ) -> Self {
         let mut actors = Vec::new();
-        for (obj, vis, charge, name) in glitch_bots.iter() {
-            actors.push(SavedActor::GlitchBot {
-                name: saved_name_from_entity(name),
-                state: obj.inner.state().into(),
-                visual: vis.to_snapshot(),
-                charge: charge.map_or(1.0, |c| c.level),
-            });
-        }
         for (obj, brain, charge, name, breakable, specialization) in black_bots.iter() {
             actors.push(SavedActor::BlackBot {
                 name: saved_name_from_entity(name),
@@ -349,17 +322,6 @@ pub fn spawn_level_actors(
 ) {
     for saved in &file.actors {
         match saved {
-            SavedActor::GlitchBot { name, state, visual, charge } => {
-                let entity = spawn_glitch_bot_from_snapshot(
-                    commands,
-                    meshes,
-                    materials,
-                    name,
-                    state.clone().into(),
-                    visual.clone(),
-                );
-                commands.entity(entity).insert((LevelActor, Charge::new(*charge)));
-            }
             SavedActor::BlackBot { name, state, brain, charge, breakable, specialization } => {
                 let entity = spawn_black_bot_from_snapshot(
                     commands,
@@ -470,6 +432,7 @@ mod tests {
             next_waypoint_hint: None,
             field_main_tile: None,
             dirtiness: 0.0,
+            shadow: crate::actor::ActorShadow::default(),
         };
         let snap: ActorStateSnap = (&state).into();
         let back: ActorState = snap.into();
@@ -504,16 +467,12 @@ brain:
   rng_seed: 1
 "#;
         let actor: SavedActor = serde_yaml::from_str(yaml).unwrap();
-        match actor {
-            SavedActor::BlackBot { name, charge, breakable, .. } => {
-                assert_eq!(name, "");
-                // No `charge` field in the YAML above → defaults to full.
-                assert_eq!(charge, 1.0);
-                // No `breakable` field → defaults to fresh (0 wear, not broken).
-                assert_eq!(breakable, BreakableSnap::default());
-            }
-            _ => panic!("expected black_bot"),
-        }
+        let SavedActor::BlackBot { name, charge, breakable, .. } = actor;
+        assert_eq!(name, "");
+        // No `charge` field in the YAML above → defaults to full.
+        assert_eq!(charge, 1.0);
+        // No `breakable` field → defaults to fresh (0 wear, not broken).
+        assert_eq!(breakable, BreakableSnap::default());
     }
 
     #[test]
@@ -521,31 +480,6 @@ brain:
         let file = LevelActorsFile {
             version: ACTOR_SNAPSHOT_VERSION,
             actors: vec![
-                SavedActor::GlitchBot {
-                    name: "curious-otter".to_string(),
-                    state: ActorStateSnap {
-                        center: SerVec2 { x: 1.0, y: 2.0 },
-                        radius_subtiles: 2,
-                        rotation: 0.0,
-                        move_buffer: ActorMoveBufferSnap {
-                            tile_delta: SerVec2 { x: 0.0, y: 0.0 },
-                            subtile_shift: SerIVec2 { x: 0, y: 0 },
-                            rotation_shift: 0.0,
-                        },
-                        last_movement_error: None,
-                        last_accepted_center_subtile: Some(SerIVec2 { x: 5, y: 10 }),
-                        last_accepted_radius_subtiles: 2,
-                    },
-                    visual: GlitchBotVisualSnap {
-                        direction: SerVec2 { x: 1.0, y: 0.0 },
-                        accumulator: SerVec2 { x: 0.2, y: 0.0 },
-                        dir_timer: 1.0,
-                        dir_interval: 4.0,
-                        collision_streak: 0,
-                        rng_seed: 42,
-                    },
-                    charge: 0.75,
-                },
                 SavedActor::BlackBot {
                     name: String::new(),
                     state: ActorStateSnap {

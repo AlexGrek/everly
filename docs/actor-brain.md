@@ -2,7 +2,7 @@
 
 The **brain** is the OOP high-level decision layer for smart actors, in
 [`src/actor/brain/`](../src/actor/brain/). It sits *above* the deterministic
-low-level movement pipeline (`Actor::try_move`, `process_actors`) described in
+low-level movement pipeline (`Actor::propose_move`, `arbitrate_actor_moves`) described in
 [`actor.md`](actor.md). BlackBot is its first consumer.
 
 ## Concepts
@@ -17,7 +17,7 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
                      Low-level action   (Wait / PendingPath / FollowPath)
                               │ execute()
                               ▼
-                     ActorState.move_buffer  ──▶ process_actors → try_move
+                     ActorState.move_buffer  ──▶ propose_actor_moves → arbitrate_actor_moves
                               ▲
                      PathfindQueue ──▶ AsyncComputeTaskPool ──▶ PathfindResults
                      (enqueue)         (≤10 in flight)         (take by RequestId)
@@ -94,7 +94,7 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
 
 ### BlackBot status colors
 
-`sync_black_bot_status_visual` (in `black_bot.rs`, runs `.after(process_actors)`)
+`sync_black_bot_status_visual` (in `black_bot.rs`, runs `.after(arbitrate_actor_moves)`)
 recolors the sphere by priority: **white** when the control plane breaks, a
 **yellow stuck flash** when `Brain::is_stuck` (relit to full yellow, then
 fading back over `STUCK_FLASH_FADE_SECS`), otherwise a **collision flash** — a
@@ -109,7 +109,7 @@ the displayed color changes, so a settled bot costs no per-frame asset writes.
 ### Collision pressure reset
 
 BlackBots track a per-entity **collision pressure** counter (inspector:
-`collision_pressure`). Each frame after [`process_actors`](../src/actor/mod.rs),
+`collision_pressure`). Each frame after [`arbitrate_actor_moves`](../src/actor/movement.rs),
 `track_black_bot_collision_pressure` applies the same collision gate as the red
 flash (wall graze or **head-on** bot-on-bot bump; rear bumps ignored):
 
@@ -237,11 +237,11 @@ The specialization is **persisted** (see [Persistence](#persistence)); the patro
   [specialization](#specializations) (`BotSpecialization::build_brain`), the
   default `make_high_level` factory, and a seeded `StdRng`.
 - `black_bot_brain` (runs
-  `.after(flush_actor_occupancy).after(PathfindSet::Collect).before(PathfindSet::Dispatch).before(process_actors)`,
+  `.after(flush_actor_occupancy).after(PathfindSet::Collect).before(PathfindSet::Dispatch).before(propose_actor_moves)`,
   sequential) ticks each brain, gates depleted/broken bots (`brain.reset` — wipes
   the plan and clears movement intent), ticks wear/break, and applies effects via
   `apply_brain_effects`. It runs after the occupancy flush so the bot-on-bot
-  subtile detour reads the same dynamic passability snapshot `process_actors` will
+  subtile detour reads the same dynamic passability snapshot `propose_actor_moves` will
   use this frame, and between pathfind collect/dispatch so bots can enqueue and
   consume route results in the same frame cadence.
   - **Offline eviction:** when a bot first becomes non-operational

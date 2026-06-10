@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use bevy::prelude::*;
 
-use crate::actor::{actor_main_tile, process_actors, ActorObject};
+use crate::actor::{actor_main_tile, arbitrate_actor_moves, ActorObject};
 use crate::map::dirt::{DirtMap, DIRT_TRACK_DEPOSIT};
 use crate::map::hypermap::Hypermap;
 use crate::map::hypermap_world::HypermapRuntime;
@@ -122,10 +122,10 @@ impl Plugin for FieldInteractionsPlugin {
                 Update,
                 (
                     dirt_actor_interaction
-                        .after(process_actors)
+                        .after(arbitrate_actor_moves)
                         .before(crate::map::dirt::flush_dirt_map),
                     bot_occupancy_heat
-                        .after(process_actors)
+                        .after(arbitrate_actor_moves)
                         .before(flush_temperature_map),
                 )
                     .run_if(in_state(GameState::InGame))

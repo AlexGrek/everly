@@ -156,7 +156,7 @@ Full docs: **`docs/pathfind-service.md`**. Brain integration: **`docs/actor-brai
 
 Trait-based actor system. Each actor type implements `Actor` (state accessors, optional `think_low_level`, `blocked_flags` for traversal). Wrapped in `ActorObject` (a `Component` holding `Box<dyn Actor>`).
 
-Per-frame pipeline (run by `process_actors`): clear error → think → prepare → `try_move` (collision gate) → flush passability.
+Per-frame pipeline: `propose_actor_moves` (parallel, static-only checks) → `arbitrate_actor_moves` (sequential, owner grid conflict resolution, squeeze teleport) → field interactions → flush passability.
 
 Movement uses **dual channels**: `tile_delta` (float, smooth rendering) and `subtile_shift` (integer, collision grid). Accumulate float displacement across frames; emit integer steps only on subtile boundary crossings. `1 tile = 5 subtiles`.
 
@@ -165,11 +165,11 @@ Actor classes override `blocked_flags()` to declare traversal rules:
 | Class | `blocked_flags` | Crosses void? |
 |---|---|---|
 | Ground walker (default) | `FLAG_BLOCKED \| FLAG_VOID` | No |
-| Flyer (`GlitchBot`) | `FLAG_BLOCKED` | Yes |
+| Flying (future) | `FLAG_BLOCKED` | Yes |
 
 To add a new actor: follow the checklist in `docs/actor.md#new-actor-checklist`. Read **`.claude/SKILLS/actor-engineer/SKILL.md`** for invariants, coordinate rules, and common pitfalls.
 
-Full docs: **`docs/actor.md`**. Skill: **`.claude/SKILLS/actor-engineer/SKILL.md`**. Source: **`src/actor/mod.rs`**, **`src/actor/glitch_bot.rs`**, **`src/actor/black_bot.rs`**.
+Full docs: **`docs/actor.md`**. Skill: **`.claude/SKILLS/actor-engineer/SKILL.md`**. Source: **`src/actor/mod.rs`**, **`src/actor/black_bot.rs`**, **`src/actor/movement.rs`**.
 
 ## Official references
 

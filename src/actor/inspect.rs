@@ -4,7 +4,6 @@ use bevy::math::IVec2;
 
 use crate::actor::black_bot::{BotSpecialization, Breakable, BreakablePartState};
 use crate::actor::brain::Brain;
-use crate::actor::glitch_bot::GlitchBotVisual;
 use crate::actor::{actor_main_tile, ActorObject};
 
 /// One label/value row in the inspector modal.
@@ -66,19 +65,6 @@ pub fn black_bot_rows(
     ]
 }
 
-pub fn glitch_bot_rows(vis: &GlitchBotVisual) -> Vec<InspectRow> {
-    vec![
-        InspectRow {
-            label: "direction",
-            value: format!("({:.3}, {:.3})", vis.direction().x, vis.direction().y),
-        },
-        InspectRow {
-            label: "collision_streak",
-            value: vis.collision_streak().to_string(),
-        },
-    ]
-}
-
 fn format_part(p: &BreakablePartState) -> String {
     if p.broken {
         format!("{:.3} (BROKEN)", p.wear)
@@ -92,7 +78,6 @@ pub fn status_rows(
     obj: &ActorObject,
     charge: Option<f32>,
     black: Option<&Brain>,
-    glitch: Option<&GlitchBotVisual>,
     spec: Option<BotSpecialization>,
     collision_pressure: Option<u32>,
 ) -> Vec<InspectRow> {
@@ -103,9 +88,6 @@ pub fn status_rows(
     if let Some(brain) = black {
         let main_tile = actor_main_tile(obj.inner.state().center);
         rows.extend(black_bot_rows(brain, main_tile, spec, collision_pressure));
-    }
-    if let Some(vis) = glitch {
-        rows.extend(glitch_bot_rows(vis));
     }
     rows
 }

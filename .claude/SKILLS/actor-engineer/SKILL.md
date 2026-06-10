@@ -24,11 +24,19 @@ paths:
 Use this skill for:
 
 - `Actor` trait design and default method behavior.
-- low-level actor processing systems (`think_low_level`, `prepare_movement`, `try_move`).
-- movement/rotation buffers and per-frame error handling.
-- footprint-based collision and occupancy updates via `DynamicPassabilityMap`.
-- **per-actor static traversal rules** via `Actor::is_static_subtile_passable` (flying, swimming, ground-walking, phasing, …).
-- the high-level **brain** layer (`src/actor/brain/`): `Behavior`s raise
+- The 3-step arbitrated movement pipeline: `propose_actor_moves` (parallel),
+  `arbitrate_actor_moves` (sequential), and the squeeze/teleport tail.
+- Movement/rotation buffers and per-frame error handling.
+- `ActorShadow` — per-actor shadow arrays (`current`/`previous` subtile coords)
+  swapped each accepted frame; allocated once at spawn.
+- `OccupancyArbiter` — per-frame owner grid resource; deterministic conflict
+  resolution, bounded backoff (depth ≤ 4), squeeze-pool teleport fallback.
+- Footprint-based collision and occupancy updates via `DynamicPassabilityMap`.
+- **Per-actor static traversal rules** via `Actor::blocked_flags()` — a bitmask
+  of `SubtilePassability` flags the actor cannot enter (ground walkers block on
+  `FLAG_BLOCKED | FLAG_VOID`; a flying actor blocks only `FLAG_BLOCKED`, so void
+  tiles are traversable).
+- The high-level **brain** layer (`src/actor/brain/`): `Behavior`s raise
   `Priorities`, the dominant one selects a `HighLevelAction`, which dictates the
   `LowLevelAction` (`Wait` / `FollowPath`) that fills `move_buffer`. BlackBot's
   wander/patrol + self-recharge run here. **Read `docs/actor-brain.md` first** for
@@ -41,10 +49,8 @@ Use this skill for:
   - A BlackBot's **specialization** (`BotSpecialization` in `black_bot.rs`) is a
     named behavior set + ring color, rolled at spawn (`PATROL` 1/4, else
     `DO_NOTHING`) and persisted in `actors.yaml`. `PATROL` adds the `Patrol`
-    component (a fixed loop, generated lazily via async reachability checks and
-    surfaced via `BrainContext::patrol_loop`). Per-bot planning state the brain
-    tick needs but that must outlive a `HighLevelAction` (which the brain
-    rebuilds on pre-emption) belongs on a component, read through `BrainContext`.
+    component. Per-bot planning state that must outlive a `HighLevelAction`
+    belongs on a component, read through `BrainContext`.
   - **Async routing:** high-level actions enqueue on `PathfindQueue` and poll
     `PathfindResults` through `BrainContext::pathfind` (`PathfindAccess`). While
     awaiting, the low-level action is `PendingPath::with_velocity(...)` so inertia
@@ -55,18 +61,18 @@ For generic Bevy API usage, still read `.claude/SKILLS/bevy-engineer/SKILL.md` f
 
 ## Invariants
 
-- Low-level actor step clears `last_movement_error` every frame before thinking.
+- `propose_actor_moves` clears `last_movement_error` every frame before thinking.
 - Actor movement intent is written into `move_buffer`, not applied directly.
-- `move_buffer` must have **both** `tile_delta` and `subtile_shift` set each frame; `move_actor` applies the float delta, `try_move` uses the integer shift for collision.
-- `try_move(&dynamic, &static_world)` is the gate: dynamic collision + static collision + occupancy update + transform update.
-- Collision logic belongs in `DynamicPassabilityMap::try_update_footprint_with_static`, not duplicated in actors.
-- **Static traversal rules are per-actor** and live in `Actor::is_static_subtile_passable`. Different actor classes can and must override this — flying actors are not ground walkers.
-- Previous occupancy is stored compactly as `(last_accepted_center_subtile, last_accepted_radius_subtiles)` and reconstructed via the baked `CircleShadow` — **never** materialize a `Vec<IVec2>` per frame for self-overlap testing.
-- Self-overlap bypasses both static and dynamic checks; tested in `O(1)` via `CircleShadow::contains_offset(target - previous_center)`.
+- `move_buffer` must have **both** `tile_delta` and `subtile_shift` set each frame; `apply_outcome` applies the float delta to `center`.
+- `Actor::propose_move` writes `shadow.current`/`shadow.previous` and the proposed center — **never** updates `center` directly.
+- `arbitrate_actor_moves` (sequential) is the single writer of `center`, `last_accepted_center_subtile`, and the dynamic passability write buffer.
+- Collision logic belongs in `DynamicPassabilityMap` and `first_static_block` helpers, not duplicated in actors.
+- **Static traversal rules are per-actor** and live in `Actor::blocked_flags()`. Different actor classes can and must override this — flying actors (future) must return `FLAG_BLOCKED` only (not `FLAG_VOID`), so void tiles are passable for them.
+- Shadow arrays (`current`/`previous`) are allocated once at spawn (size = baked circle footprint); never re-allocated mid-game. Filled via `ActorShadow::fill_cells`.
 - Occupancy writes go to passability **write** buffer; visibility for future checks is after `flush()`.
 - `center` is **never** derived from integer subtile math; it is always advanced by `tile_delta` for smooth rendering.
-- **Grid position comes from `last_accepted_center_subtile`, not from `center_subtile_i32()`.** The float center drifts between subtile boundaries via `tile_delta`; recomputing the grid position from the float can round into a wall cell and permanently deadlock the actor. Only the initial frame (when `last_accepted_center_subtile` is `None`) falls back to float-derived rounding.
-- The hot path (`process_actors → try_move → try_update_footprint_with_static`) must remain allocation-free at steady state.
+- **Grid position comes from `last_accepted_center_subtile`, not from `center_subtile_i32()`.** The float center drifts between subtile boundaries; recomputing from float can round into a wall cell.
+- The hot path (`propose_actor_moves → arbitrate_actor_moves`) must remain allocation-free at steady state (`OccupancyArbiter` reuses all scratch vecs).
 
 ## Coordinates and units
 
@@ -77,42 +83,56 @@ For generic Bevy API usage, still read `.claude/SKILLS/bevy-engineer/SKILL.md` f
   - `subtile_shift: IVec2` — integer subtile steps for the passability collision grid; usually `(0,0)`, non-zero only when accumulated motion crosses a subtile boundary.
 - Continuous-movement actors accumulate `direction * speed * dt` in a float accumulator; the integer part becomes `subtile_shift`, the fractional part carries forward.
 - Radius is integer subtiles; occupied shape is a baked integer circle.
-- The **world-subtile** coordinate (`IVec2`) passed into `is_static_subtile_passable` is absolute, not local; convert to a tile with `world_subtile.div_euclid(SUBTILE_COUNT as i32)`.
+- The **world-subtile** coordinate (`IVec2`) used in passability probes is absolute; convert to a tile with `world_subtile.div_euclid(SUBTILE_COUNT as i32)`.
 - **Main tile** (which world tile the actor is in): always [`actor_main_tile`](../../src/actor/mod.rs) = `round(center)` in tile space. Used by field interactions and `BlackBot` think. Never `floor(center)` for this — see `docs/actor.md` § Main tile.
 - **Subtile grid** (collision): `floor(center * SUBTILE_COUNT)` via `center_subtile_i32` / `last_accepted_center_subtile` — separate from main tile.
 
 ## Per-actor static passability
 
-`Actor::is_static_subtile_passable(&self, world_subtile: IVec2, world: &StaticWorld) -> bool` is the per-class traversal rule.
+`Actor::blocked_flags(&self) -> u64` returns the bitmask of `SubtilePassability`
+flags the actor cannot enter.
 
-`StaticWorld` bundles **two** read-only views:
+- Default impl = ground walker: `FLAG_BLOCKED | FLAG_VOID`.
+- Flying actor (future): return `FLAG_BLOCKED` only — void tiles passable, wall edge strips still block.
+- Phasing actor (future): return `0` — always passable.
 
-- `passability: &Hypermap<f32>` — scalar, `> 0.0` = walkable (ground-walker view).
-- `cell_types: &Hypermap<CellType>` — raw geometry, needed to distinguish `Void` from `Wall(_)` because the scalar map collapses both to `0.0`.
+`first_static_block(static_cache, center, radius, blocked, previous)` (in
+`src/map/passability.rs`) returns the first subtile in the proposed footprint that
+contains any of `blocked`'s flags. `propose_move` calls this during Step 1;
+`arbitrate_actor_moves` never re-checks static geometry (that was already done).
 
-Use `StaticWorld::cell_at_subtile(sub)` / `passability_at_subtile(sub)` / `subtile_to_tile(sub)` helpers — never reach into the raw maps and recompute the subtile-to-tile division yourself.
+## Pipeline overview
 
-- Default impl = ground walker (`world.passability_at_subtile(sub) > 0.0`).
-- Override for flying (`GlitchBot`): **subtile-aware** wall policy — cross void tiles, but block wall edge strips and corner-pillar subtiles.
-- Override for swimming: ground passable OR cell is water.
-- Override for phasing: always `true`.
-- Self-overlap (subtile is in `previous_footprint`) bypasses this check inside `try_update_footprint_with_static`.
-
-The callback is built fresh inside `try_move` from `self`, so it always reflects the current actor's class — never assume one global rule.
+```
+flush_actor_occupancy        (clear dynamic write buffer)
+  ↓
+propose_actor_moves          (parallel par_iter_mut)
+    think_low_level
+    prepare_movement
+    propose_move             ← writes shadow.current / shadow.previous / proposed_center
+                             ← static-only check via first_static_block
+                             ← off-screen: advance_unchecked, no shadow update
+  ↓
+arbitrate_actor_moves        (sequential)
+    entity-sorted MoveRecord build
+    arbitrate()              ← owner grid, backoff cascade (depth ≤ 4), squeeze pool
+    apply_outcome()          ← update center, shadow swap, last_movement_error
+    stamp dynamic write buffer
+    teleport squeezed / re-entrant actors
+  ↓
+dirt_actor_interaction / bot_occupancy_heat / ...   (field interactions)
+  ↓
+flush passability read buffer
+```
 
 ## Preferred workflow
 
 0. Always read documentation before reading any code, for whatever system you need!
 1. Read `docs/actor.md` and `src/actor/mod.rs`.
-2. If movement/collision changes, read `src/map/passability.rs` too.
+2. If movement/collision changes, read `src/map/passability.rs` and
+   `src/actor/movement.rs` too.
 3. Keep actor-side code thin; push shared occupancy rules into passability methods.
-4. Preserve deterministic per-frame order:
-   - clear error
-   - think
-   - prepare movement
-   - try move
-   - flush passability
-   - field interactions (e.g. dirt) — see `.claude/SKILLS/field-interactions/SKILL.md`
+4. Preserve deterministic per-frame order (see pipeline above).
 5. Add/update unit tests in touched modules. **Brain tests assert pathfind
    requests** (enqueued `PathKind`, `PendingPath`, injected `PathOutcome`), not
    real route geometry. Path quality tests belong in `pathfind_service` or
@@ -124,18 +144,25 @@ The callback is built fresh inside `try_move` from `self`, so it always reflects
 
 ## Common pitfalls
 
-- Forgetting to persist old footprint causes false self-collision.
-- Reading from write buffer semantics by accident; collision should use read side.
-- Applying movement before accepted footprint update can desync actor state vs occupancy.
-- Not resetting `move_buffer` on failed movement.
+- Forgetting to fill both `shadow.current` **and** `shadow.previous` in `propose_move` — `arbitrate_actor_moves` uses both.
+- Reading the dynamic passability buffer in `propose_move` — Step 1 is static-only; dynamic reads belong in the brain (before propose) or the arbiter (sequential).
+- Applying movement before `arbitrate_actor_moves` runs — actors must not write `center` in `propose_move`.
+- Not resetting `move_buffer` on collision outcome — the arbiter calls `apply_outcome`, which clears the buffer on a backed-off frame; don't double-clear.
 - Deriving `center` displacement from integer `subtile_shift` instead of float `tile_delta` — this quantizes the rendered position and makes movement look choppy.
 - Forgetting to reset the float accumulator on collision — the actor will "teleport" when it resumes movement.
-- **Letting a flying / phasing actor inherit the ground-walker static check.** If a new actor class can traverse otherwise-blocked geometry, you MUST override `is_static_subtile_passable` — the default is *always* ground-walker.
-- **Confusing "static passability `0.0`" with "wall".** `Void` and `Wall(_)` both have passability `0.0`. A flier that returns `true` for everything will literally fly through walls — branch on `StaticWorld::cell_at_subtile(...)` to tell them apart.
-- **Re-introducing per-frame `Vec<IVec2>` clones for the previous footprint.** Don't. The compact `(last_accepted_center_subtile, last_accepted_radius_subtiles)` representation is the source of truth — reconstruct the circle via `baked_circle_shadow(radius)` if you really need the cell list.
-- **Forgetting to set `last_accepted_radius_subtiles` when initializing `ActorState`.** It must match `radius_subtiles` at construction; mismatching values would re-stamp the wrong-sized circle on the first failed move (though, since `last_accepted_center_subtile` starts as `None`, no re-stamp happens until after the first successful frame).
-- Confusing `world_subtile` (absolute, `SUBTILE_COUNT = 5` per tile) with a local-to-tile subtile index in static-passability callbacks.
+- **Letting a flying / phasing actor inherit the ground-walker `blocked_flags`.** Override `blocked_flags()` for any class with non-standard traversal.
+- **Re-introducing per-frame `Vec<IVec2>` allocation for the footprint.** Shadow arrays are allocated once; use `ActorShadow::fill_cells` to refill in place.
 - Treating `BlockedByStatic` and `BlockedByOccupancy` as interchangeable — they're separate variants so actor behavior (e.g. re-pathing vs waiting) can differ per cause.
+
+## New actor checklist
+
+Follow `docs/actor.md#new-actor-checklist` when adding a new actor class. Key points:
+
+1. Implement the `Actor` trait; override `blocked_flags()` if non-ground-walker.
+2. Override `propose_move()` if axis-decomposed slide or special footprint needed (default is axis-combined, no slide).
+3. Add `shadow: ActorShadow::default()` to the `ActorState` literal at construction.
+4. Wire a brain plugin (if the actor has a brain) `.before(propose_actor_moves)` and `.after(arbitrate_actor_moves)`.
+5. No need to touch `OccupancyArbiter` — it's generic over all actors.
 
 ## Documentation updates
 

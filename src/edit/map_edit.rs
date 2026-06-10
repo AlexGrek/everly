@@ -21,7 +21,6 @@ use crate::map::passability::DynamicPassabilityMap;
 use crate::map::dirt::DirtMap;
 use crate::map::level::{save_full_generated_level, LevelName};
 use crate::map::temperature::TemperatureMap;
-use crate::actor::glitch_bot::GlitchBotVisual;
 use crate::actor::black_bot::{Breakable, BotSpecialization};
 use crate::actor::brain::Brain;
 use crate::actor::charge::Charge;
@@ -396,7 +395,6 @@ fn map_edit_save_button(
     dirt: Res<DirtMap>,
     temperature: Res<TemperatureMap>,
     camera: Query<&StrategyCamera, With<StrategyCameraRig>>,
-    glitch_bots: Query<(&ActorObject, &GlitchBotVisual, Option<&Charge>, Option<&Name>)>,
     black_bots: Query<(
         &ActorObject,
         &Brain,
@@ -440,7 +438,7 @@ fn map_edit_save_button(
             ),
             Err(e) => warn!("save full level failed: {e}"),
         }
-        let actors_file = LevelActorsFile::collect(&glitch_bots, &black_bots);
+        let actors_file = LevelActorsFile::collect(&black_bots);
         match save_level_actors(level_name, &actors_file) {
             Ok(()) => info!(
                 "saved {} actor(s) to `levels/level_{level_name}/actors.yaml`",

@@ -23,7 +23,7 @@ paths:
 
 ## Invariants
 
-- Field systems run **after** [`process_actors`](../../src/actor/mod.rs) and
+- Field systems run **after** [`arbitrate_actor_moves`](../../src/actor/movement.rs) and
   **before** that field's [`flush_dirt_map`](../../src/map/dirt.rs) (or equivalent).
 - Main tile = `(round(center.x), round(center.y))` via [`actor_main_tile`](../../src/actor/mod.rs)
   — shared with [`BlackBot`](../../src/actor/black_bot.rs) (`BlackBotVisual.main_tile`).
@@ -65,7 +65,7 @@ paths:
 
 1. Wrap [`TileFieldMap`](../../src/map/tile_field.rs) like [`TemperatureMap`](../../src/map/temperature.rs).
 2. `fn apply_<field>_on_tile(left_tile: IVec2, …)` in `field_interactions.rs`.
-3. System after `process_actors` calling `collect_main_tile_transitions` once, then
+3. System after `arbitrate_actor_moves` calling `collect_main_tile_transitions` once, then
    each field handler (or one system dispatching all fields).
 4. Conditional `flush_if_pending` + tile overlay (`TILE_FIELD_OVERLAY_RES` = 128).
 5. Extend `docs/field-interactions.md` and this skill.

@@ -246,6 +246,13 @@ where
         f(&mut guard)
     }
 
+    /// Drops every chunk, returning the map to its empty (all-default) state and
+    /// republishing an empty read snapshot atomically. Reused per-frame scratch
+    /// maps (e.g. the movement owner grid) call this instead of reallocating.
+    pub fn clear(&self) {
+        self.drain_chunks();
+    }
+
     /// Removes and returns all chunk handles, leaving the map empty.
     fn drain_chunks(&self) -> ChunkTable<T> {
         let mut chunks = self.chunks.write().expect("hypermap lock poisoned");

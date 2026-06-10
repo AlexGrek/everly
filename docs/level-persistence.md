@@ -42,7 +42,7 @@ Triggered only by the map editor **Save** button (`map_edit_save_button` in
 |------|-------------------|------|
 | 1 | `DirtMap` / `TemperatureMap` | `flush_if_pending()` merges field write buffers into read buffers |
 | 2 | [`save_full_generated_level`](../src/map/level.rs) | All **loaded** chunks across geometry + styles + fields (see below) |
-| 3 | [`save_level_actors`](../src/actor/snapshot.rs) | Every glitch/black bot in the world |
+| 3 | [`save_level_actors`](../src/actor/snapshot.rs) | Every black bot in the world |
 | 4 | [`save_level_camera`](../src/scene/camera_snapshot.rs) | Current `StrategyCamera` state |
 
 ### Which chunks are included
@@ -165,7 +165,7 @@ Binary format implemented in [`src/map/tile_field_level.rs`](../src/map/tile_fie
 ### Actors (`actors.yaml`)
 
 - YAML (`serde_yaml`); `version` field (currently `1`).
-- Tagged union `glitch_bot` / `black_bot` with `state` and `visual` snapshots,
+- Tagged union with a `black_bot` variant carrying `state` and `visual` snapshots,
   plus a `charge` float in `[0.0, 1.0]` (battery level; see
   [`actor.md`](actor.md#charge)). Omitted `charge` defaults to full (`1.0`), so
   pre-charge `actors.yaml` files still load.

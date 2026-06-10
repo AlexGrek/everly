@@ -393,6 +393,42 @@ impl DynamicPassabilityMap {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// First subtile of the radius-`radius` circle at `center` that the **static**
+/// cache blocks for an actor whose impassable bits are `blocked`, skipping any
+/// cell inside the `previous` footprint (self-overlap is always allowed). Returns
+/// `None` when every candidate cell is statically clear.
+///
+/// This is the static half of [`DynamicPassabilityMap::probe_footprint`] with no
+/// dynamic-occupancy check — used by the parallel movement *proposal* pass, which
+/// must consult only read-only static geometry (the dynamic arbiter resolves
+/// creature-on-creature conflicts sequentially afterward).
+pub fn first_static_block(
+    static_cache: &Hypermap<SubtilePassability>,
+    center: IVec2,
+    radius: i32,
+    blocked: u64,
+    previous: Option<(IVec2, i32)>,
+) -> Option<IVec2> {
+    if radius < 0 {
+        return None;
+    }
+    let shadow = baked_circle_shadow(radius);
+    let previous_info = previous.map(|(c, r)| (c, baked_circle_shadow(r.max(0))));
+    let mut cursor = SubtileReadCursor::new(static_cache);
+    for offset in shadow.offsets {
+        let target = center + *offset;
+        if let Some((prev_center, prev_shadow)) = previous_info {
+            if prev_shadow.contains_offset(target - prev_center) {
+                continue;
+            }
+        }
+        if cursor.flags(target) & blocked != 0 {
+            return Some(target);
+        }
+    }
+    None
+}
+
 /// ORs `FLAG_BLOCKED | FLAG_CREATURE` for every subtile in `shadow` centered at
 /// `center` into the given write-side map. Used to stamp actor footprints.
 /// Chunk-local: the cursor resolves each chunk at most once for the whole circle.
@@ -645,7 +681,7 @@ const SHADOW_FAST_CACHE_LEN: usize = 32;
 /// shadows concurrently — critical for parallelizing `process_actors`, which
 /// otherwise serialized on one global `Mutex` ~7× per actor per frame. Only
 /// oversized radii (rare) take a lock.
-fn baked_circle_shadow(radius_subtiles: i32) -> &'static CircleShadow {
+pub fn baked_circle_shadow(radius_subtiles: i32) -> &'static CircleShadow {
     let r = radius_subtiles.max(0);
 
     static FAST: [OnceLock<&'static CircleShadow>; SHADOW_FAST_CACHE_LEN] =

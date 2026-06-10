@@ -14,7 +14,7 @@ main_tile = (round(center.x), round(center.y))   // via actor_main_tile(center)
 
 All gameplay that asks “which tile is the actor in?” shares [`actor_main_tile`](../src/actor/mod.rs) — including field deposits (`ActorState::field_main_tile`). [`BlackBot`](../src/actor/black_bot.rs) path following uses float `center` distance to each waypoint's tile center, not main-tile equality. Collision subtiles still use `floor(center × SUBTILE_COUNT)`; do not mix the two.
 
-[`ActorState::field_main_tile`](../src/actor/mod.rs) is updated only in field interaction systems **after** [`process_actors`](../src/actor/mod.rs) so `center` reflects the completed movement step (including off-screen [`advance_unchecked`] travel).
+[`ActorState::field_main_tile`](../src/actor/mod.rs) is updated only in field interaction systems **after** [`arbitrate_actor_moves`](../src/actor/movement.rs) so `center` reflects the completed movement step (including off-screen [`advance_unchecked`] travel).
 
 When `field_main_tile` was `Some(prev)` and `prev != current`, the actor **left**
 `prev` — field rules apply to **`prev`**, not the destination tile.
@@ -22,13 +22,14 @@ When `field_main_tile` was `Some(prev)` and `prev != current`, the actor **left*
 ## Frame pipeline
 
 ```text
-flush_actor_occupancy → process_actors → dirt_actor_interaction → seed_dirt → flush_dirt_map → dirt overlay
+flush_actor_occupancy → propose_actor_moves → arbitrate_actor_moves → dirt_actor_interaction → seed_dirt → flush_dirt_map → dirt overlay
                       → bot_occupancy_heat → seed_temperature → flush_temperature_map → temperature overlay / GPU diffusion
 ```
 
 | Step | What happens |
 |------|----------------|
-| `process_actors` | Think, prepare, try_move / advance_unchecked |
+| `propose_actor_moves` | Think, prepare, propose_move / advance_unchecked (parallel) |
+| `arbitrate_actor_moves` | Occupancy arbitration, apply movement outcomes, teleport squeezed (sequential) |
 | `dirt_actor_interaction` | Collect main-tile transitions; exchange dirt between each actor and its left tile |
 | `bot_occupancy_heat` | Every 1 s, +3 °C on each **current** main tile occupied by a bot (write buffer; deduped per tile) |
 | `seed_dirt_for_visible_chunks` | One-time procedural dirt (write buffer) |
@@ -70,7 +71,7 @@ See [`level-persistence.md`](level-persistence.md).
 1. Add a hypermap resource (prefer `DoubleBufferedHypermap` for read/write parallelism).
 2. Add helpers in `field_interactions.rs` (or a sibling module) that take
    `&[MainTileTransition]` or reuse `collect_main_tile_transitions`.
-3. Register a system **after** `process_actors`, **before** that field's flush.
+3. Register a system **after** `arbitrate_actor_moves`, **before** that field's flush.
 4. Gate flush and overlay on non-empty writes / dirty chunks.
 5. Document the rule here and in `.claude/SKILLS/field-interactions/SKILL.md`.
 
@@ -85,7 +86,7 @@ overlay repaints. See [`temperature-diffusion.md`](temperature-diffusion.md).
 
 ### Bot occupancy heating
 
-[`bot_occupancy_heat`](../src/map/field_interactions.rs) runs after [`process_actors`](../src/actor/mod.rs)
+[`bot_occupancy_heat`](../src/map/field_interactions.rs) runs after [`arbitrate_actor_moves`](../src/actor/movement.rs)
 on a **1 s** repeating timer ([`BOT_OCCUPANCY_HEAT_INTERVAL_S`](../src/map/temperature.rs)). Each
 tick adds [`BOT_OCCUPANCY_HEAT_DELTA_C`](../src/map/temperature.rs) (**+3 °C**) to every **current**
 main tile that holds at least one bot ([`actor_main_tile`](../src/actor/mod.rs)); multiple bots on

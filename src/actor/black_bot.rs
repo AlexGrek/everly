@@ -35,8 +35,9 @@ use crate::actor::brain::{
 use crate::actor::charge::Charge;
 use crate::actor::snapshot::{BreakablePartSnap, BreakableSnap};
 use crate::actor::{
-    actor_main_tile, flush_actor_occupancy, is_front_collision, is_paused, process_actors, Actor,
-    ActorMoveBuffer, ActorMovementError, ActorObject, ActorState, OffScreenActor,
+    actor_main_tile, arbitrate_actor_moves, flush_actor_occupancy, is_front_collision, is_paused,
+    propose_actor_moves, Actor, ActorMoveBuffer, ActorMovementError, ActorObject, ActorShadow,
+    ActorState, OffScreenActor,
 };
 use crate::map::chunk_overlay::{ChunkOverlayState, OVERLAY_RES};
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap};
@@ -46,7 +47,7 @@ use crate::map::interactive_entity::{
 };
 use crate::map::level::LevelName;
 use crate::map::passability::{
-    DynamicPassabilityMap, SubtilePassability, TryUpdateFootprintError, SUBTILE_COUNT,
+    first_static_block, DynamicPassabilityMap, SubtilePassability, SUBTILE_COUNT,
 };
 use crate::map::pathfind_service::{
     PathOutcome, PathfindQueue, PathfindResults, PathfindSet, RequestId,
@@ -362,6 +363,7 @@ impl BlackBot {
                 next_waypoint_hint: None,
                 field_main_tile: None,
                 dirtiness: 0.0,
+                shadow: ActorShadow::default(),
             },
         }
     }
@@ -376,29 +378,24 @@ impl Actor for BlackBot {
         &mut self.state
     }
 
-    /// Axis-decomposed collision response.
+    /// Axis-decomposed **static** slide proposal.
     ///
-    /// The default [`Actor::try_move`] tests the combined `(shift_x, shift_y)`
-    /// as one footprint update — if any part is blocked, both axes are
-    /// cancelled. For a path-follower this turns every grazing-wall step into a
-    /// full stop, even though sliding along the wall is the natural response.
+    /// The default [`Actor::propose_move`] tests the combined `(shift_x, shift_y)`
+    /// against static geometry as one footprint — if any part is blocked, both
+    /// axes are cancelled. For a path-follower this turns every grazing-wall step
+    /// into a full stop, even though sliding along the wall is the natural
+    /// response.
     ///
-    /// Strategy: probe X-only and Y-only via
-    /// [`DynamicPassabilityMap::probe_footprint`] (no writes), build a final
-    /// shift containing only the axes that passed, and commit at most one
-    /// footprint write. On a blocked axis the float `center` is snapped to just
-    /// inside the far edge of the last accepted subtile in that axis (by
-    /// [`SUBTILE_SNAP_EPSILON`]) so the actor rests against the obstacle.
-    fn try_move(
-        &mut self,
-        dynamic: &DynamicPassabilityMap,
-        static_cache: &Hypermap<SubtilePassability>,
-    ) {
-        let move_buf = std::mem::replace(&mut self.state.move_buffer, ActorMoveBuffer::default());
+    /// Strategy: probe X-only and Y-only against the **static** cache via
+    /// [`first_static_block`] and keep only the axes that passed. On a blocked
+    /// axis the float `center` delta snaps to just inside the far edge of the
+    /// last accepted subtile (by [`SUBTILE_SNAP_EPSILON`]) so the actor rests
+    /// against the wall. Creature-on-creature conflicts are resolved later by the
+    /// occupancy arbiter.
+    fn propose_move(&mut self, static_cache: &Hypermap<SubtilePassability>) {
+        let move_buf = self.state.move_buffer;
         let actor_blocked = self.blocked_flags();
         let radius = self.state.radius_subtiles;
-        self.state.rotation += move_buf.rotation_shift;
-        self.state.last_movement_error = None;
 
         let origin = self
             .state
@@ -409,93 +406,57 @@ impl Actor for BlackBot {
             .last_accepted_center_subtile
             .map(|c| (c, self.state.last_accepted_radius_subtiles));
 
-        let probe = |shift: IVec2| -> Result<(), TryUpdateFootprintError> {
-            dynamic.probe_footprint(origin + shift, radius, previous, actor_blocked, static_cache)
-        };
-
         let want = move_buf.subtile_shift;
-        let x_probe = if want.x == 0 { Ok(()) } else { probe(IVec2::new(want.x, 0)) };
-        let y_probe = if want.y == 0 { Ok(()) } else { probe(IVec2::new(0, want.y)) };
-        let x_ok = x_probe.is_ok();
-        let y_ok = y_probe.is_ok();
-
-        let final_shift = IVec2::new(if x_ok { want.x } else { 0 }, if y_ok { want.y } else { 0 });
-
-        // When `final_shift` keeps at most one axis it equals a shift already
-        // probed above (or the origin, all self-overlap) — known passable, so
-        // commit without a redundant re-probe. Only a diagonal `final_shift`
-        // (both axes kept) needs a full collision check.
-        let needs_probe = final_shift.x != 0 && final_shift.y != 0;
-        let committed = if needs_probe {
-            match dynamic.try_update_footprint(
-                origin + final_shift,
-                radius,
-                previous,
-                actor_blocked,
-                static_cache,
-            ) {
-                Ok(()) => true,
-                Err(e) => {
-                    self.state.last_movement_error = Some(translate_err(e));
-                    false
-                }
-            }
+        let x_block = if want.x == 0 {
+            None
         } else {
-            dynamic.commit_footprint(origin + final_shift, radius);
-            true
+            first_static_block(static_cache, origin + IVec2::new(want.x, 0), radius, actor_blocked, previous)
         };
-        if committed {
-            self.state.last_accepted_center_subtile = Some(origin + final_shift);
-            self.state.last_accepted_radius_subtiles = radius;
-        }
+        let y_block = if want.y == 0 {
+            None
+        } else {
+            first_static_block(static_cache, origin + IVec2::new(0, want.y), radius, actor_blocked, previous)
+        };
+        let x_ok = x_block.is_none();
+        let y_ok = y_block.is_none();
+        let final_shift = IVec2::new(if x_ok { want.x } else { 0 }, if y_ok { want.y } else { 0 });
+        let center = origin + final_shift;
 
         let sc_f = SUBTILE_COUNT as f32;
-        if x_ok {
-            self.state.center.x += move_buf.tile_delta.x;
+        let cur = self.state.center;
+        let dx = if x_ok {
+            move_buf.tile_delta.x
         } else {
-            self.state.center.x = if want.x > 0 {
+            let snapped = if want.x > 0 {
                 (origin.x as f32 + 1.0) / sc_f - SUBTILE_SNAP_EPSILON
             } else {
                 origin.x as f32 / sc_f + SUBTILE_SNAP_EPSILON
             };
-            // First blocked axis sets the error; the second does not overwrite it.
-            if let Err(e) = x_probe {
-                self.state.last_movement_error = Some(translate_err(e));
-            }
-        }
-        if y_ok {
-            self.state.center.y += move_buf.tile_delta.y;
+            snapped - cur.x
+        };
+        let dy = if y_ok {
+            move_buf.tile_delta.y
         } else {
-            self.state.center.y = if want.y > 0 {
+            let snapped = if want.y > 0 {
                 (origin.y as f32 + 1.0) / sc_f - SUBTILE_SNAP_EPSILON
             } else {
                 origin.y as f32 / sc_f + SUBTILE_SNAP_EPSILON
             };
-            if self.state.last_movement_error.is_none() {
-                if let Err(e) = y_probe {
-                    self.state.last_movement_error = Some(translate_err(e));
-                }
-            }
-        }
-    }
-}
+            snapped - cur.y
+        };
+        // First blocked axis reports the static error (the second does not overwrite it).
+        let static_block = x_block.or(y_block);
 
-#[inline]
-fn translate_err(e: TryUpdateFootprintError) -> ActorMovementError {
-    match e {
-        TryUpdateFootprintError::InvalidRadius(r) => ActorMovementError::InvalidRadius(r),
-        TryUpdateFootprintError::BlockedByOccupancy { world_subtile } => {
-            ActorMovementError::BlockedByOccupancy {
-                world_subtile_x: world_subtile.x,
-                world_subtile_y: world_subtile.y,
-            }
-        }
-        TryUpdateFootprintError::BlockedByStatic { world_subtile } => {
-            ActorMovementError::BlockedByStatic {
-                world_subtile_x: world_subtile.x,
-                world_subtile_y: world_subtile.y,
-            }
-        }
+        let s = self.state_mut();
+        s.shadow.world_previous = s.center;
+        s.shadow.proposed_center = center;
+        s.shadow.proposed_delta = Vec2::new(dx, dy);
+        s.shadow.proposed_rotation = move_buf.rotation_shift;
+        s.shadow.static_block = static_block;
+        s.shadow.participates = true;
+        ActorShadow::fill_cells(&mut s.shadow.previous, origin, radius);
+        ActorShadow::fill_cells(&mut s.shadow.current, center, radius);
+        s.move_buffer = ActorMoveBuffer::default();
     }
 }
 
@@ -508,17 +469,17 @@ impl Plugin for BlackBotPlugin {
             (
                 black_bot_brain
                     .after(flush_actor_occupancy)
-                    .before(process_actors)
+                    .before(propose_actor_moves)
                     .after(PathfindSet::Collect)
                     .before(PathfindSet::Dispatch)
                     .run_if(not(is_paused)),
                 reconcile_charger_occupancy
                     .after(black_bot_brain)
                     .before(crate::map::hypermap_world::SyncChargerVisualsSet),
-                sync_black_bot_transforms.after(process_actors),
-                track_black_bot_collision_pressure.after(process_actors),
-                sync_black_bot_status_visual.after(process_actors),
-                paint_black_bot_targets.after(process_actors).run_if(|e: Res<crate::map::chunk_overlay::PathOverlayEnabled>| e.0),
+                sync_black_bot_transforms.after(arbitrate_actor_moves),
+                track_black_bot_collision_pressure.after(arbitrate_actor_moves),
+                sync_black_bot_status_visual.after(arbitrate_actor_moves),
+                paint_black_bot_targets.after(arbitrate_actor_moves).run_if(|e: Res<crate::map::chunk_overlay::PathOverlayEnabled>| e.0),
             )
                 .run_if(in_state(GameState::InGame)),
         );
@@ -580,6 +541,14 @@ fn black_bot_brain(
         let current_tile = actor_main_tile(state.center);
         let tile_changed = vis.main_tile.map_or(false, |prev| prev != current_tile);
         vis.main_tile = Some(current_tile);
+
+        // A squeeze teleport last frame moved the bot non-locally; drop the stale
+        // plan so it re-routes from where it actually landed.
+        if state.shadow.teleported {
+            brain.reset();
+            state.move_buffer = ActorMoveBuffer::default();
+            state.next_waypoint_hint = None;
+        }
 
         let depleted = charge.as_ref().is_some_and(|c| c.is_depleted());
         if depleted {

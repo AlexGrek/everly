@@ -6,9 +6,8 @@ zero the bot is immobilized until something refills it. Implementation lives in
 
 Charge is a plain **ECS component** on the bot entity — it is *not* part of
 [`ActorState`](../src/actor/mod.rs). It sits on the same entity as `ActorObject`
-and the bot's visual ([`BlackBotVisual`](../src/actor/black_bot.rs) /
-[`GlitchBotVisual`](../src/actor/glitch_bot.rs)), so any system can query it
-without reaching into the actor trait object.
+and the bot's visual ([`BlackBotVisual`](../src/actor/black_bot.rs)),
+so any system can query it without reaching into the actor trait object.
 
 ## The `Charge` component
 
@@ -31,7 +30,7 @@ pub struct Charge {
 
 | Path | Starting charge |
 |------|-----------------|
-| Editor spawn ([`spawn_glitch_bot`](../src/actor/glitch_bot.rs) / [`spawn_black_bot`](../src/actor/black_bot.rs)) | `Charge::random` → `0.3..=1.0` |
+| Editor spawn ([`spawn_black_bot`](../src/actor/black_bot.rs)) | `Charge::random` → `0.3..=1.0` |
 | Snapshot load ([`spawn_level_actors`](../src/actor/snapshot.rs)) | Restores the saved `charge`; a missing field defaults to full (`1.0`) |
 
 ### Discharge
@@ -51,25 +50,18 @@ pipeline. Already-depleted bots are skipped (no work, no underflow).
 ### Depletion disables movement
 
 A depleted bot (`is_depleted()`) is stopped **in its think system**, not in
-[`process_actors`](../src/actor/mod.rs):
+[`propose_actor_moves`](../src/actor/movement.rs):
 
-- [`glitch_bot_think`](../src/actor/glitch_bot.rs) and
-  [`black_bot_think`](../src/actor/black_bot.rs) detect depletion at the top of
-  their per-bot loop, zero the [`move_buffer`](../src/actor/mod.rs), and
-  `continue` — skipping pathing/wander logic entirely.
-- The glitch bot additionally leaves its **accumulator frozen**. This is the key
-  reason the gate must live in `think`: its mesh renders from
-  `last_accepted_center_subtile + accumulator`, so if `think` kept advancing the
-  accumulator while `process_actors` discarded the motion, the bot would slide
-  visually without moving on the collision grid. The black bot's mesh follows
-  the float `center`, which only `try_move` advances, so zeroing the buffer is
-  enough there — but both are handled the same way for uniformity.
+- [`black_bot_brain`](../src/actor/black_bot.rs) detects depletion at the top of
+  its per-bot loop, zeros the [`move_buffer`](../src/actor/mod.rs), and
+  `continue` — skipping pathing logic entirely.
 
-Because the buffer is empty, `process_actors`/`try_move` re-stamp the bot's
-existing footprint in place: it holds position and keeps its dynamic-occupancy
-cell. Recharge is handled by BlackBot brain logic (`GoToChargeStation`) which
-seeks accessible chargers from `InteractiveEntityMap`, docks, and applies
-`RECHARGE_PER_S` while charging.
+Because the buffer is empty, `propose_actor_moves` fills `shadow.current` in
+place (no delta), and `arbitrate_actor_moves` re-stamps the bot's existing
+footprint: it holds position and keeps its dynamic-occupancy cell. Recharge is
+handled by BlackBot brain logic (`GoToChargeStation`) which seeks accessible
+chargers from `InteractiveEntityMap`, docks, and applies `RECHARGE_PER_S`
+while charging.
 
 ## Inspector display
 
@@ -112,8 +104,8 @@ All three live in [`src/actor/charge.rs`](../src/actor/charge.rs).
 | Concern | Location |
 |---------|----------|
 | Component + discharge + plugin | [`src/actor/charge.rs`](../src/actor/charge.rs) |
-| Movement gate on depletion | [`glitch_bot.rs`](../src/actor/glitch_bot.rs), [`black_bot.rs`](../src/actor/black_bot.rs) |
-| Spawn (random charge) | editor spawns in the two bot modules |
+| Movement gate on depletion | [`black_bot.rs`](../src/actor/black_bot.rs) |
+| Spawn (random charge) | [`spawn_black_bot`](../src/actor/black_bot.rs) |
 | Inspector row | [`inspect.rs`](../src/actor/inspect.rs), [`actor_inspector.rs`](../src/hud/actor_inspector.rs) |
 | Persistence | [`snapshot.rs`](../src/actor/snapshot.rs) |
 

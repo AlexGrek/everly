@@ -66,7 +66,6 @@ impl Plugin for GamePlugin {
                 actor::ActorPlugin,
                 actor::snapshot::ActorSnapshotPlugin,
                 actor::charge::ChargePlugin,
-                actor::glitch_bot::GlitchBotPlugin,
                 actor::black_bot::BlackBotPlugin,
                 edit::map_edit::MapEditPlugin,
                 edit::actor_spawn::ActorSpawnPlugin,

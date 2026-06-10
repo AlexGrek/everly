@@ -1,16 +1,19 @@
-//! Lock-free sub-section timers for `process_actors`, shown beneath the FPS counter.
+//! Lock-free sub-section timers for the actor movement pipeline, shown beneath
+//! the FPS counter.
 //!
-//! Three timers split `process_actors` into its three sequential phases:
+//! Four timers cover each stage of the pipeline:
 //!
-//! - `ThinkPass`    -- first `par_iter_mut`: `think_low_level` + `prepare_movement`
-//!                     (brain logic, path-following, state machines).
-//! - `MovePass`     -- second `par_iter_mut`: `try_move` / `advance_unchecked`
-//!                     (passability lookup + footprint stamping).
-//! - `ReentryPass`  -- sequential re-entry placement for actors crossing
-//!                     from off-screen to on-screen this frame.
+//! - `Propose`    -- parallel `par_iter_mut`: `think_low_level` +
+//!                   `prepare_movement` + `propose_move` (static-only slide,
+//!                   shadow fill) and off-screen `advance_unchecked`.
+//! - `ArbConflict`-- owner-grid conflict resolution: stamp proposals, cascade
+//!                   back-off (depth ≤ 4), fill the squeeze pool.
+//! - `ArbApply`   -- apply outcomes to each actor (`center`, error, shadow
+//!                   swap) and stamp accepted footprints into the dynamic map.
+//! - `ArbSqueeze` -- sort + teleport the squeeze pool and off-screen re-entrants.
 //!
-//! Storage is three pairs of atomics; instrumented code calls `timings.scope()`
-//! for a lock-free RAII record (one relaxed store + one `fetch_max` on drop).
+//! Storage is pairs of atomics; instrumented code calls `timings.scope()` for a
+//! lock-free RAII record (one relaxed store + one `fetch_max` on drop).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -23,14 +26,16 @@ use crate::scene::camera::{spawn_camera, StrategyCameraRig};
 
 #[derive(Clone, Copy)]
 pub enum TimedSystem {
-    ThinkPass,
-    MovePass,
-    ReentryPass,
+    Propose,
+    ArbConflict,
+    ArbApply,
+    ArbSqueeze,
 }
 
 impl TimedSystem {
-    pub const COUNT: usize = 3;
-    const LABELS: [&'static str; Self::COUNT] = ["think_pass", "move_pass", "reentry_pass"];
+    pub const COUNT: usize = 4;
+    const LABELS: [&'static str; Self::COUNT] =
+        ["propose", "arb_conflict", "arb_apply", "arb_squeeze"];
 }
 
 #[derive(Resource)]
@@ -77,6 +82,7 @@ impl Drop for TimingScope<'_> {
 struct PerfTimingsText;
 
 const REFRESH_S: f32 = 0.25;
+const PEAK_HOLD_S: f32 = 1.0;
 
 pub struct PerfTimingsPlugin;
 
@@ -118,12 +124,15 @@ fn update_perf_timings(
     time: Res<Time>,
     timings: Res<SystemTimings>,
     mut refresh_acc: Local<f32>,
+    mut held_peak_ms: Local<[f64; TimedSystem::COUNT]>,
+    mut held_age_s: Local<[f32; TimedSystem::COUNT]>,
     mut query: Query<&mut Text, With<PerfTimingsText>>,
 ) {
     *refresh_acc += time.delta_secs();
     if *refresh_acc < REFRESH_S {
         return;
     }
+    let dt = *refresh_acc;
     *refresh_acc = 0.0;
 
     let Ok(mut text) = query.single_mut() else { return };
@@ -131,10 +140,22 @@ fn update_perf_timings(
     let mut out = String::with_capacity(TimedSystem::COUNT * 28);
     for i in 0..TimedSystem::COUNT {
         let last_ms = timings.last_ns[i].load(Ordering::Relaxed) as f64 / 1.0e6;
-        let peak_ms = timings.peak_ns[i].swap(0, Ordering::Relaxed) as f64 / 1.0e6;
+        let candidate_ms = timings.peak_ns[i].swap(0, Ordering::Relaxed) as f64 / 1.0e6;
+
+        if candidate_ms > held_peak_ms[i] {
+            held_peak_ms[i] = candidate_ms;
+            held_age_s[i] = 0.0;
+        } else {
+            held_age_s[i] += dt;
+            if held_age_s[i] >= PEAK_HOLD_S {
+                held_peak_ms[i] = 0.0;
+                held_age_s[i] = 0.0;
+            }
+        }
+
         out.push_str(&format!(
             "{:<12} {:>5.2} ^{:>5.2}\n",
-            TimedSystem::LABELS[i], last_ms, peak_ms,
+            TimedSystem::LABELS[i], last_ms, held_peak_ms[i],
         ));
     }
     **text = out;

@@ -5,7 +5,6 @@ use bevy::prelude::*;
 use crate::actor::black_bot::{BlackBotVisual, Breakable};
 use crate::actor::brain::Brain;
 use crate::actor::charge::Charge;
-use crate::actor::glitch_bot::GlitchBotVisual;
 use crate::actor::{ActorMoveBuffer, ActorObject};
 
 /// Minimum charge level applied to every actor by [`resurrect_all_actors`].
@@ -19,7 +18,6 @@ pub fn resurrect_all_actors(
     breakables: &mut Query<&mut Breakable>,
     brains: &mut Query<&mut Brain>,
     black_vis: &mut Query<&mut BlackBotVisual>,
-    glitch_vis: &mut Query<&mut GlitchBotVisual>,
     actors: &mut Query<&mut ActorObject>,
 ) {
     for mut charge in charges.iter_mut() {
@@ -32,9 +30,6 @@ pub fn resurrect_all_actors(
         brain.reset();
     }
     for mut vis in black_vis.iter_mut() {
-        vis.on_resurrect();
-    }
-    for mut vis in glitch_vis.iter_mut() {
         vis.on_resurrect();
     }
     for mut obj in actors.iter_mut() {
@@ -54,7 +49,6 @@ pub fn resurrect_all_button(
     mut breakables: Query<&mut Breakable>,
     mut brains: Query<&mut Brain>,
     mut black_vis: Query<&mut BlackBotVisual>,
-    mut glitch_vis: Query<&mut GlitchBotVisual>,
     mut actors: Query<&mut ActorObject>,
 ) {
     for interaction in &interactions {
@@ -66,7 +60,6 @@ pub fn resurrect_all_button(
             &mut breakables,
             &mut brains,
             &mut black_vis,
-            &mut glitch_vis,
             &mut actors,
         );
     }

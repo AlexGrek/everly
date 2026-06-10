@@ -87,4 +87,4 @@ saved are documented in [`level-persistence.md`](level-persistence.md).
 | `ensure_chunk_generated` | Ensures chunk exists (level geometry file, else procedural + center overlay) before edits |
 | `build_floor0_*` / `build_upper_*` | Shared mesh builders for preview and chunk bake |
 
-For encoding of wall bits and corner tokens in ASCII maps, see [`tilemap.md`](tilemap.md). For how chunks are meshed and updated over time, see [`rendering-pipeline.md`](rendering-pipeline.md). Spawning actors (GlitchBot/BlackBot) is a separate tool — see [`actor-spawner.md`](actor-spawner.md) (its **Actors** HUD toggle sits next to **Edit**).
+For encoding of wall bits and corner tokens in ASCII maps, see [`tilemap.md`](tilemap.md). For how chunks are meshed and updated over time, see [`rendering-pipeline.md`](rendering-pipeline.md). Spawning actors (BlackBot) is a separate tool — see [`actor-spawner.md`](actor-spawner.md) (its **Actors** HUD toggle sits next to **Edit**).
