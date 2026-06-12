@@ -35,7 +35,7 @@ use bevy::platform::collections::HashMap;
 use bevy::utils::Parallel;
 
 use crate::hud::game_log::{GameLog, LogEntry};
-use crate::hud::perf_timings::{SystemTimings, TimedSystem};
+use crate::hud::perf_timings::{PerfCounts, SystemTimings, TimedSystem};
 use crate::map::hypermap_world::HypermapRuntime;
 use crate::map::passability::{baked_circle_shadow, DynamicPassabilityMap};
 
@@ -403,6 +403,7 @@ pub(crate) fn arbitrate_actor_moves(
     hypermap: Res<HypermapRuntime>,
     game_log: Res<GameLog>,
     timings: Res<SystemTimings>,
+    counts: Res<PerfCounts>,
 ) {
     let static_cache = hypermap.static_subtile_cache.as_ref();
 
@@ -437,6 +438,10 @@ pub(crate) fn arbitrate_actor_moves(
 
         let arb = &mut *arbiter;
         arbitrate(&mut arb.records[..n], &mut arb.owners, &mut arb.squeeze);
+
+        let collided = arb.records[..n].iter().filter(|r| r.collided).count() as u64;
+        counts.collided_bots.store(collided, Ordering::Relaxed);
+        counts.squeezed_bots.store(arb.squeeze.len() as u64, Ordering::Relaxed);
     }
 
     // Stage: apply outcomes and stamp accepted footprints into the dynamic write buffer.

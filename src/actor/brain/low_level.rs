@@ -136,8 +136,9 @@ pub trait LowLevelAction: Send + Sync {
         false
     }
 
-    /// `true` while the action is coasting in wait of an async pathfind result
-    /// (perf HUD gauge). Default `false`; only [`PendingPath`] overrides.
+    /// `true` while the action is intentionally holding instead of following a
+    /// route — coasting on a pending async path, braked awaiting a detour, or
+    /// paused after a step-aside (perf HUD `coast` gauge). Default `false`.
     fn is_awaiting_path(&self) -> bool {
         false
     }
@@ -971,6 +972,12 @@ impl LowLevelAction for FollowPath {
 
     fn target_tile(&self) -> Option<(i32, i32)> {
         self.path.last().copied()
+    }
+
+    fn is_awaiting_path(&self) -> bool {
+        // Braked awaiting an async detour, or paused after a step-aside — in
+        // both holding states the bot is intentionally not following its route.
+        self.detour_request.is_some() || self.contact_wait_s > 0.0
     }
 }
 

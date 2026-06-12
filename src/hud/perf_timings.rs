@@ -89,6 +89,10 @@ pub struct PerfCounts {
     pub coasting_bots: AtomicU64,
     /// Bots ticked by the brain this frame.
     pub total_bots: AtomicU64,
+    /// Actors backed off to their previous footprint this frame (arbiter).
+    pub collided_bots: AtomicU64,
+    /// Actors teleported out of a jam this frame (arbiter squeeze pool).
+    pub squeezed_bots: AtomicU64,
 }
 
 #[derive(Resource)]
@@ -214,11 +218,13 @@ fn update_perf_timings(
         ));
     }
     out.push_str(&format!(
-        "pf q={} fly={} coast={}/{}\n",
+        "pf q={} fly={} coast={}/{}\ncollide={} squeeze={}\n",
         counts.pf_pending.load(Ordering::Relaxed),
         counts.pf_in_flight.load(Ordering::Relaxed),
         counts.coasting_bots.load(Ordering::Relaxed),
         counts.total_bots.load(Ordering::Relaxed),
+        counts.collided_bots.load(Ordering::Relaxed),
+        counts.squeezed_bots.load(Ordering::Relaxed),
     ));
     **text = out;
 }
