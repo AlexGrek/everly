@@ -226,8 +226,10 @@ impl Plugin for PathfindServicePlugin {
         app.init_resource::<PathfindQueue>()
             .init_resource::<PathfindResults>()
             .init_resource::<PathfindInFlight>()
+            // Ticks with the fixed 60 Hz movement pipeline: the brain orders
+            // itself between Collect and Dispatch.
             .add_systems(
-                Update,
+                FixedUpdate,
                 (
                     pathfind_collect.in_set(PathfindSet::Collect),
                     pathfind_dispatch.in_set(PathfindSet::Dispatch),

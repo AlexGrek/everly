@@ -13,8 +13,7 @@ use crate::map::dirt::{DirtMap, DIRT_TRACK_DEPOSIT};
 use crate::map::hypermap::Hypermap;
 use crate::map::hypermap_world::HypermapRuntime;
 use crate::map::temperature::{
-    flush_temperature_map, TemperatureMap, BOT_OCCUPANCY_HEAT_DELTA_C,
-    BOT_OCCUPANCY_HEAT_INTERVAL_S,
+    TemperatureMap, BOT_OCCUPANCY_HEAT_DELTA_C, BOT_OCCUPANCY_HEAT_INTERVAL_S,
 };
 use crate::map::world_map::CellType;
 use crate::menu::main_menu::GameState;
@@ -118,16 +117,17 @@ pub struct FieldInteractionsPlugin;
 
 impl Plugin for FieldInteractionsPlugin {
     fn build(&self, app: &mut App) {
+        // Deposits tick with the fixed 60 Hz movement pipeline, right after
+        // arbitration. The field flushes (`flush_dirt_map` /
+        // `flush_temperature_map`) stay in `Update`, which always runs after
+        // the frame's fixed ticks, so a deposit is still flushed the same
+        // render frame — no cross-schedule ordering needed.
         app.init_resource::<BotOccupancyHeatTimer>()
             .add_systems(
-                Update,
+                FixedUpdate,
                 (
-                    dirt_actor_interaction
-                        .after(arbitrate_actor_moves)
-                        .before(crate::map::dirt::flush_dirt_map),
-                    bot_occupancy_heat
-                        .after(arbitrate_actor_moves)
-                        .before(flush_temperature_map),
+                    dirt_actor_interaction.after(arbitrate_actor_moves),
+                    bot_occupancy_heat.after(arbitrate_actor_moves),
                 )
                     .run_if(in_state(GameState::InGame))
                     .run_if(not(crate::actor::is_paused)),
