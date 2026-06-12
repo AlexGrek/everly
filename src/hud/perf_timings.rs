@@ -54,10 +54,26 @@ pub enum TimedSystem {
     PfDispatch,
     /// `pathfind_collect` — draining finished route outcomes.
     PfCollect,
+    /// `dirt_actor_interaction` — per-bot dirt deposits.
+    FieldDirt,
+    /// `bot_occupancy_heat` — per-bot heat deposits.
+    FieldHeat,
+    /// `flush_dirt_map` — dirt double-buffer flush.
+    DirtFlush,
+    /// `flush_temperature_map` — temperature double-buffer flush.
+    TempFlush,
+    /// `diffusion_tick` — GPU temperature diffusion pack/upload/apply.
+    TempDiffusion,
+    /// `sync_generic_overlays` — generic RGBA overlay plane rebuilds.
+    OverlayGeneric,
+    /// `sync_occupancy_overlays` — occupancy overlay plane sync.
+    OverlayOccupancy,
+    /// `update_occupancy_overlay_textures` — occupancy texture re-upload.
+    OverlayTextures,
 }
 
 impl TimedSystem {
-    pub const COUNT: usize = 15;
+    pub const COUNT: usize = 23;
     const LABELS: [&'static str; Self::COUNT] = [
         "propose",
         "prop_par",
@@ -74,6 +90,14 @@ impl TimedSystem {
         "brain",
         "pf_dispatch",
         "pf_collect",
+        "f_dirt",
+        "f_heat",
+        "dirt_flush",
+        "temp_flush",
+        "t_diffuse",
+        "ovl_gen",
+        "ovl_occ",
+        "ovl_tex",
     ];
 }
 
