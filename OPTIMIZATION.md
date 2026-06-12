@@ -487,3 +487,90 @@ The pure arbiter (`arbitrate` / `back_off`) is unit-tested in `movement.rs`
 squeeze, no ghost ownership after a back-off). Perf timers renamed to
 `propose_pass` / `arbitrate_pass`
 ([`src/hud/perf_timings.rs`](src/hud/perf_timings.rs)).
+
+### Arbitrated movement — compact footprints, lock-free owner grid, foldhash chunk table (2026-06)
+
+Deeper pass on the new pipeline after HUD timers showed `arb_conflict`/`arb_apply`
+dominating. Three fixes (the first two supersede the owner-grid implementation
+notes in the previous entry):
+
+1. **Footprints are compact `(center, radius)` end-to-end** (rules 4, 3).
+   The circle footprint was materialized as `Vec<IVec2>` **four times per actor
+   per frame**: `propose_move` filled `shadow.previous` + `shadow.current`
+   (both impls), then `arbitrate_actor_moves` copied both into the
+   `MoveRecord` cell buffers. All four lists were exactly
+   `baked_circle_shadow(radius)` translated by a center — rule 4's literal
+   example. Now [`ActorShadow`](src/actor/movement.rs) stores only
+   `proposed_center` + `origin` (back-off center), [`MoveRecord`] is plain
+   `Copy` data (`current`/`previous` centers + `radius`), and
+   [`OwnerGrid`](src/actor/movement.rs) ops expand through the `&'static`
+   baked offsets at the point of use. The apply stage stamps via the existing
+   check-free [`commit_footprint`](src/map/passability.rs) instead of a cell
+   list. `ActorShadow::fill_cells` deleted.
+
+2. **Owner grid is a flat foldhash `HashMap<IVec2, u32>`** (rule 1). The grid
+   was first a `Hypermap<SubtileOwners>` (per-cell ArcSwap load + chunk-table
+   lookup + `Arc` clone + `RwLock` acquire — all pure overhead on a
+   **sequential** pass), then briefly a `std::collections::HashMap` (SipHash:
+   ~3× slower per op for 8-byte keys, buying DoS resistance nothing needs
+   here). Now `bevy::platform::collections::HashMap` (foldhash), cleared and
+   reused each frame. Also folded the entity collect/sort/snapshot into the
+   `ArbConflict` timer scope so the HUD accounts for the whole stage.
+
+3. **Hypermap `ChunkTable` switched to the foldhash `HashMap`**
+   ([`src/map/hypermap.rs`](src/map/hypermap.rs), rules 1–2). Every chunk
+   resolution in the codebase — passability cursors, owner-grid-era lookups,
+   pathfind workers, meshing — hashed `ChunkCoord` with SipHash through the
+   `ArcSwap` snapshot. Iteration order was already documented as unspecified,
+   so the hasher swap is observable only as speed.
+
+Also stamped on the same pass: [`write_footprint`](src/map/passability.rs) now
+uses a `SubtileWriteCursor` (chunk resolved once per compact footprint, not per
+cell — rule 2); it remains as the cell-list escape hatch while the movement
+pipeline itself uses `commit_footprint`.
+
+Verified green: `cargo test -p everly` (250 passed, 0 failed, 2 ignored) and
+`cargo check -p everly --all-targets` warning-clean at every step. Docs updated:
+`docs/actor.md`, `docs/charge.md`, `.claude/SKILLS/actor-engineer/SKILL.md`.
+
+### Dynamic passability — single-floor chunks + recycled flush (2026-06)
+
+HUD timers attributed `arb_apply` ≈ 1.2 ms/frame to footprint stamping, but the
+stamping was innocent: the dynamic occupancy buffer is **dropped and rebuilt
+every frame** (`flush()` drains the write map), so each frame's first stamp into
+a chunk re-allocated it — `vec![EMPTY; 128 × 128 × 10 floors]` of 200-byte
+`SubtilePassability` = **~33 MB of alloc + fill per chunk per frame** to carry a
+few dozen meaningful cells. The same churn plausibly drove the system-wide
+hitches seen as `propose` wall-clock spikes (allocator pressure / page faults).
+Two fixes in [`src/map/hypermap.rs`](src/map/hypermap.rs):
+
+1. **Per-map floor count** (rule 4). `Hypermap`/`HypermapChunk` now carry a
+   `floors` field instead of baking `HYPERMAP_FLOOR_COUNT` into the cell index;
+   `Hypermap::new_single_floor` / `DoubleBufferedHypermap::new_single_floor`
+   allocate one floor. The two `SubtilePassability` maps — the dynamic
+   occupancy buffer ([`src/map/passability.rs`](src/map/passability.rs)) and
+   `static_subtile_cache`
+   ([`src/map/hypermap_world.rs`](src/map/hypermap_world.rs)) — only ever
+   address floor 0 and are now flat: 33 MB → 3.3 MB per chunk (the static cache
+   saves that **persistently** per loaded chunk). The geometry, `f32`
+   pathfinding, style, and field maps genuinely use floors and keep 10.
+
+2. **Chunk recycling with dirty spot-reset** (rules 4, 1). Recycling maps
+   (`new_single_floor` double buffers) log written cell indices per chunk
+   (`DirtyLog`, saturating to a full refill if most of a chunk is touched).
+   `flush()` now returns displaced read chunks to a write-side pool after
+   resetting **only the dirty cells** — so the steady state allocates nothing
+   and clears ~25 cells per actor instead of memsetting megabytes. A displaced
+   chunk still referenced by a concurrent reader (old `ArcSwap` table snapshot
+   held by an async pathfind worker) is detected via `Arc::strong_count` and
+   dropped instead of reused, preserving the fully-old-or-fully-new snapshot
+   invariant exactly. The pool `Mutex` is taken only on chunk creation and
+   flush (a handful of ops per frame, uncontended — rule 1's documented
+   cold-path exception). `flush_merge` recycles its drained write chunks the
+   same way.
+
+Semantics pinned by `recycled_chunk_reads_as_default` (no ghost occupancy
+through a reused chunk) and `recycled_pool_chunk_is_reused_not_reallocated`;
+the existing passability flush-cycle suite now runs against the recycling
+buffer. Verified green: `cargo test -p everly` (252 passed, 0 failed,
+2 ignored), `cargo check -p everly --all-targets` warning-clean.

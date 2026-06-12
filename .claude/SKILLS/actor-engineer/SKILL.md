@@ -64,11 +64,11 @@ For generic Bevy API usage, still read `.claude/SKILLS/bevy-engineer/SKILL.md` f
 - `propose_actor_moves` clears `last_movement_error` every frame before thinking.
 - Actor movement intent is written into `move_buffer`, not applied directly.
 - `move_buffer` must have **both** `tile_delta` and `subtile_shift` set each frame; `apply_outcome` applies the float delta to `center`.
-- `Actor::propose_move` writes `shadow.current`/`shadow.previous` and the proposed center — **never** updates `center` directly.
+- `Actor::propose_move` writes `shadow.proposed_center` / `shadow.origin` (compact `(center, radius)` footprints) — **never** updates `center` directly.
 - `arbitrate_actor_moves` (sequential) is the single writer of `center`, `last_accepted_center_subtile`, and the dynamic passability write buffer.
 - Collision logic belongs in `DynamicPassabilityMap` and `first_static_block` helpers, not duplicated in actors.
 - **Static traversal rules are per-actor** and live in `Actor::blocked_flags()`. Different actor classes can and must override this — flying actors (future) must return `FLAG_BLOCKED` only (not `FLAG_VOID`), so void tiles are passable for them.
-- Shadow arrays (`current`/`previous`) are allocated once at spawn (size = baked circle footprint); never re-allocated mid-game. Filled via `ActorShadow::fill_cells`.
+- Footprints are **never** stored as cell lists. `ActorShadow` holds only centers (`proposed_center`, `origin`); the cells are derived from the `&'static` baked `CircleShadow` for `radius_subtiles` wherever they are needed.
 - Occupancy writes go to passability **write** buffer; visibility for future checks is after `flush()`.
 - `center` is **never** derived from integer subtile math; it is always advanced by `tile_delta` for smooth rendering.
 - **Grid position comes from `last_accepted_center_subtile`, not from `center_subtile_i32()`.** The float center drifts between subtile boundaries; recomputing from float can round into a wall cell.
@@ -109,7 +109,7 @@ flush_actor_occupancy        (clear dynamic write buffer)
 propose_actor_moves          (parallel par_iter_mut)
     think_low_level
     prepare_movement
-    propose_move             ← writes shadow.current / shadow.previous / proposed_center
+    propose_move             ← writes shadow.proposed_center / shadow.origin
                              ← static-only check via first_static_block
                              ← off-screen: advance_unchecked, no shadow update
   ↓
@@ -144,14 +144,14 @@ flush passability read buffer
 
 ## Common pitfalls
 
-- Forgetting to fill both `shadow.current` **and** `shadow.previous` in `propose_move` — `arbitrate_actor_moves` uses both.
+- Forgetting to set both `shadow.proposed_center` **and** `shadow.origin` in `propose_move` — `arbitrate_actor_moves` uses both.
 - Reading the dynamic passability buffer in `propose_move` — Step 1 is static-only; dynamic reads belong in the brain (before propose) or the arbiter (sequential).
 - Applying movement before `arbitrate_actor_moves` runs — actors must not write `center` in `propose_move`.
 - Not resetting `move_buffer` on collision outcome — the arbiter calls `apply_outcome`, which clears the buffer on a backed-off frame; don't double-clear.
 - Deriving `center` displacement from integer `subtile_shift` instead of float `tile_delta` — this quantizes the rendered position and makes movement look choppy.
 - Forgetting to reset the float accumulator on collision — the actor will "teleport" when it resumes movement.
 - **Letting a flying / phasing actor inherit the ground-walker `blocked_flags`.** Override `blocked_flags()` for any class with non-standard traversal.
-- **Re-introducing per-frame `Vec<IVec2>` allocation for the footprint.** Shadow arrays are allocated once; use `ActorShadow::fill_cells` to refill in place.
+- **Re-introducing explicit `Vec<IVec2>` footprints.** Footprints stay compact `(center, radius)` end-to-end (shadow → `MoveRecord` → owner grid → `commit_footprint`); expand through `baked_circle_shadow` only at the point of use.
 - Treating `BlockedByStatic` and `BlockedByOccupancy` as interchangeable — they're separate variants so actor behavior (e.g. re-pathing vs waiting) can differ per cause.
 
 ## New actor checklist

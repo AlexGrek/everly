@@ -5,7 +5,7 @@
 //! Each chunk has its own lock so disconnected regions can be accessed concurrently.
 
 use bevy::platform::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use arc_swap::ArcSwap;
 
@@ -13,7 +13,6 @@ pub const HYPERMAP_CHUNK_SIZE: i32 = 128;
 const HYPERMAP_CHUNK_AREA: usize = (HYPERMAP_CHUNK_SIZE as usize) * (HYPERMAP_CHUNK_SIZE as usize);
 /// Number of vertical floors per column (indices `0..HYPERMAP_FLOOR_COUNT`).
 pub const HYPERMAP_FLOOR_COUNT: usize = 10;
-const HYPERMAP_CHUNK_CELL_COUNT: usize = HYPERMAP_CHUNK_AREA * HYPERMAP_FLOOR_COUNT;
 
 /// Chunk-space coordinate (can be positive or negative).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -56,26 +55,83 @@ where
     T: Clone + Send + Sync + 'static,
 {
     cells: Vec<T>,
+    /// Floors allocated per tile column (`1` for flat maps like the subtile
+    /// passability grids; [`HYPERMAP_FLOOR_COUNT`] for storeyed maps).
+    floors: usize,
+    /// Written-cell log for recycled maps — `None` when the owning map does not
+    /// recycle chunks. Lets [`clear_dirty`](Self::clear_dirty) spot-reset only
+    /// the touched cells instead of refilling the whole chunk.
+    dirty: Option<DirtyLog>,
+}
+
+/// Indices written since the last reset. Saturates (falls back to a full-chunk
+/// refill on recycle) if a pathological writer touches most of the chunk.
+#[derive(Debug, Default)]
+struct DirtyLog {
+    idxs: Vec<u32>,
+    saturated: bool,
 }
 
 impl<T> HypermapChunk<T>
 where
     T: Clone + Send + Sync + 'static,
 {
-    fn new(fill: &T) -> Self {
+    fn new(fill: &T, floors: usize, track_dirty: bool) -> Self {
         Self {
-            cells: vec![fill.clone(); HYPERMAP_CHUNK_CELL_COUNT],
+            cells: vec![fill.clone(); HYPERMAP_CHUNK_AREA * floors],
+            floors,
+            dirty: track_dirty.then(DirtyLog::default),
         }
     }
 
     #[inline]
+    fn index(&self, local: LocalCoord, floor: i32) -> usize {
+        debug_assert!(floor >= 0 && (floor as usize) < self.floors);
+        local_to_index(local) * self.floors + floor as usize
+    }
+
+    #[inline]
+    fn mark_dirty(&mut self, idx: usize) {
+        let Some(log) = &mut self.dirty else { return };
+        if log.saturated {
+            return;
+        }
+        if log.idxs.len() >= self.cells.len() {
+            log.saturated = true;
+            log.idxs.clear();
+            return;
+        }
+        log.idxs.push(idx as u32);
+    }
+
+    /// Resets every cell written since the last reset back to `default`,
+    /// reusing the allocation. Cheap when the chunk held only a few stamps
+    /// (the per-frame occupancy case); falls back to a full refill if the
+    /// dirty log saturated.
+    fn clear_dirty(&mut self, default: &T) {
+        let Some(mut log) = self.dirty.take() else { return };
+        if log.saturated {
+            self.cells.fill(default.clone());
+        } else {
+            for &idx in &log.idxs {
+                self.cells[idx as usize] = default.clone();
+            }
+        }
+        log.idxs.clear();
+        log.saturated = false;
+        self.dirty = Some(log);
+    }
+
+    #[inline]
     pub fn get_local_floor(&self, local: LocalCoord, floor: i32) -> &T {
-        &self.cells[local_floor_to_index(local, floor)]
+        &self.cells[self.index(local, floor)]
     }
 
     #[inline]
     pub fn set_local_floor(&mut self, local: LocalCoord, floor: i32, value: T) {
-        self.cells[local_floor_to_index(local, floor)] = value;
+        let idx = self.index(local, floor);
+        self.mark_dirty(idx);
+        self.cells[idx] = value;
     }
 
     /// Ground floor (`0`); same as [`Self::get_local_floor`](Self::get_local_floor)(`local`, `0`).
@@ -87,7 +143,9 @@ where
     /// cloning the cell value (hot path for subtile footprint stamping).
     #[inline]
     pub fn get_local_mut(&mut self, local: LocalCoord) -> &mut T {
-        &mut self.cells[local_floor_to_index(local, 0)]
+        let idx = self.index(local, 0);
+        self.mark_dirty(idx);
+        &mut self.cells[idx]
     }
 
     /// Writes ground floor (`0`).
@@ -120,6 +178,16 @@ where
     chunks: RwLock<ChunkTable<T>>,
     snapshot: ArcSwap<ChunkTable<T>>,
     default_tile: T,
+    /// Floors allocated per tile column in this map's chunks. Flat maps
+    /// (subtile passability grids) use `1`, cutting per-chunk memory and the
+    /// cost of creating a chunk by 10× versus [`HYPERMAP_FLOOR_COUNT`].
+    floors: usize,
+    /// When `true`, chunks log written cells and dropped chunks are spot-reset
+    /// and reused via `recycle_pool` instead of reallocated (per-frame
+    /// double-buffered maps). The `Mutex` is off the hot path: it is taken only
+    /// on chunk creation and during `flush`, a handful of times per frame.
+    track_dirty: bool,
+    recycle_pool: Mutex<Vec<HypermapChunkHandle<T>>>,
 }
 
 /// Two [`Hypermap`]s in a front/back arrangement.
@@ -140,11 +208,26 @@ impl<T> Hypermap<T>
 where
     T: Clone + Send + Sync + 'static,
 {
+    /// Storeyed map with [`HYPERMAP_FLOOR_COUNT`] floors per tile column.
     pub fn new(default_tile: T) -> Self {
+        Self::with_floors(default_tile, HYPERMAP_FLOOR_COUNT, false)
+    }
+
+    /// Flat map: a single ground floor per tile column. Use for per-subtile
+    /// grids and other maps that never address floors above `0` — chunk
+    /// creation and memory cost drop 10× versus [`Self::new`].
+    pub fn new_single_floor(default_tile: T) -> Self {
+        Self::with_floors(default_tile, 1, false)
+    }
+
+    fn with_floors(default_tile: T, floors: usize, track_dirty: bool) -> Self {
         Self {
             chunks: RwLock::new(HashMap::new()),
             snapshot: ArcSwap::from_pointee(HashMap::new()),
             default_tile,
+            floors,
+            track_dirty,
+            recycle_pool: Mutex::new(Vec::new()),
         }
     }
 
@@ -191,8 +274,7 @@ where
         let (chunk_coord, local) = world_to_chunk_local(world_x, world_y);
         let chunk_handle = self.get_or_create_chunk(chunk_coord);
         let mut guard = chunk_handle.write().expect("chunk lock poisoned");
-        let idx = local_floor_to_index(local, 0);
-        f(&mut guard.cells[idx]);
+        f(guard.get_local_mut(local));
     }
 
     pub fn has_chunk(&self, coord: ChunkCoord) -> bool {
@@ -220,7 +302,16 @@ where
         let mut chunks = self.chunks.write().expect("hypermap lock poisoned");
         let handle = chunks
             .entry(coord)
-            .or_insert_with(|| Arc::new(RwLock::new(HypermapChunk::new(&self.default_tile))))
+            .or_insert_with(|| {
+                if let Some(recycled) = self.recycle_pool.lock().expect("pool poisoned").pop() {
+                    return recycled;
+                }
+                Arc::new(RwLock::new(HypermapChunk::new(
+                    &self.default_tile,
+                    self.floors,
+                    self.track_dirty,
+                )))
+            })
             .clone();
         self.republish(&chunks);
         handle
@@ -261,14 +352,39 @@ where
         taken
     }
 
-    /// Replaces the chunk table wholesale. Previous contents are dropped. The
+    /// Replaces the chunk table wholesale, returning the displaced chunks. The
     /// new table is published to readers with a single atomic snapshot store, so
     /// a concurrent reader never observes a partially-replaced table.
-    fn replace_chunks(&self, new_chunks: ChunkTable<T>) {
+    fn replace_chunks(&self, new_chunks: ChunkTable<T>) -> ChunkTable<T> {
         let published = Arc::new(new_chunks);
         let mut chunks = self.chunks.write().expect("hypermap lock poisoned");
-        *chunks = (*published).clone();
+        let displaced = std::mem::replace(&mut *chunks, (*published).clone());
         self.snapshot.store(published);
+        displaced
+    }
+
+    /// Spot-resets displaced chunks and returns them to the reuse pool, so the
+    /// next `get_or_create_chunk` recycles an allocation instead of building a
+    /// fresh multi-MB chunk (rule 4). Only chunks this map exclusively owns are
+    /// recycled — a chunk still referenced by an old reader snapshot (e.g. an
+    /// async pathfind worker mid-read) is dropped instead, preserving the
+    /// fully-old-or-fully-new invariant for that reader. No-op for maps without
+    /// dirty tracking.
+    fn recycle_chunks(&self, displaced: ChunkTable<T>) {
+        if !self.track_dirty {
+            return;
+        }
+        let mut pool = self.recycle_pool.lock().expect("pool poisoned");
+        for (_, handle) in displaced {
+            if Arc::strong_count(&handle) != 1 {
+                continue;
+            }
+            handle
+                .write()
+                .expect("chunk lock poisoned")
+                .clear_dirty(&self.default_tile);
+            pool.push(handle);
+        }
     }
 }
 
@@ -280,6 +396,16 @@ where
         Self {
             read: Hypermap::new(default_tile.clone()),
             write: Hypermap::new(default_tile),
+        }
+    }
+
+    /// Flat (single-floor) variant of [`Self::new`] with chunk recycling: the
+    /// per-frame [`flush`](Self::flush) spot-resets and reuses displaced chunks
+    /// instead of dropping them, so the steady state allocates nothing.
+    pub fn new_single_floor(default_tile: T) -> Self {
+        Self {
+            read: Hypermap::with_floors(default_tile.clone(), 1, true),
+            write: Hypermap::with_floors(default_tile, 1, true),
         }
     }
 
@@ -346,20 +472,23 @@ where
 
     // --- double-buffer lifecycle ---
 
-    /// Promotes the write buffer to the read side and resets the write
-    /// buffer to a clean state (all chunks dropped, reads return `default_tile`).
+    /// Promotes the write buffer to the read side and resets the write buffer
+    /// to a clean state (reads return `default_tile`). Displaced read chunks
+    /// are spot-reset and pooled for reuse when the map recycles (see
+    /// [`Self::new_single_floor`]); otherwise they are dropped.
     pub fn flush(&self) {
         let write_chunks = self.write.drain_chunks();
-        self.read.replace_chunks(write_chunks);
+        let displaced = self.read.replace_chunks(write_chunks);
+        self.write.recycle_chunks(displaced);
     }
 
     /// Copies every write-buffer chunk into the matching read-buffer chunk, then
     /// clears the write buffer. Unchanged read chunks are preserved (unlike [`flush`]).
     pub fn flush_merge(&self) {
         let write_chunks = self.write.drain_chunks();
-        for (coord, handle) in write_chunks {
+        for (coord, handle) in &write_chunks {
             let src = handle.read().expect("chunk lock poisoned");
-            self.read.with_chunk_write(coord, |dst| {
+            self.read.with_chunk_write(*coord, |dst| {
                 for y in 0..HYPERMAP_CHUNK_SIZE {
                     for x in 0..HYPERMAP_CHUNK_SIZE {
                         let local = LocalCoord::new(x, y);
@@ -368,6 +497,7 @@ where
                 }
             });
         }
+        self.write.recycle_chunks(write_chunks);
     }
 
     /// Direct access to the read-side [`Hypermap`].
@@ -398,11 +528,6 @@ fn local_to_index(local: LocalCoord) -> usize {
 }
 
 #[inline]
-fn local_floor_to_index(local: LocalCoord, floor: i32) -> usize {
-    debug_assert!(floor >= 0 && (floor as usize) < HYPERMAP_FLOOR_COUNT);
-    local_to_index(local) * HYPERMAP_FLOOR_COUNT + floor as usize
-}
-
 fn floor_div(a: i32, b: i32) -> i32 {
     a.div_euclid(b)
 }
@@ -415,6 +540,43 @@ fn floor_mod(a: i32, b: i32) -> i32 {
 mod tests {
     use super::*;
     use std::thread;
+
+    #[test]
+    fn recycled_chunk_reads_as_default() {
+        // A recycling double buffer must never leak a previous frame's values
+        // through a reused chunk ("ghost occupancy").
+        let db = DoubleBufferedHypermap::new_single_floor(0i32);
+        db.set(3, 4, 7);
+        db.set(200, 4, 9); // second chunk
+        db.flush(); // read = {7, 9}
+        db.flush(); // read = empty; both chunks displaced into the pool
+
+        db.set(5, 5, 11); // recycles a pooled chunk for chunk (0,0)
+        db.flush();
+        assert_eq!(db.get(5, 5), 11);
+        assert_eq!(db.get(3, 4), 0, "recycled chunk must read as default");
+        assert_eq!(db.get(200, 4), 0);
+    }
+
+    #[test]
+    fn recycled_pool_chunk_is_reused_not_reallocated() {
+        let db = DoubleBufferedHypermap::new_single_floor(0u8);
+        db.set(0, 0, 1);
+        db.flush();
+        db.flush(); // chunk displaced → pooled
+        assert_eq!(
+            db.write_map().recycle_pool.lock().unwrap().len(),
+            1,
+            "displaced chunk must land in the write-side pool"
+        );
+        db.set(0, 0, 2);
+        assert!(
+            db.write_map().recycle_pool.lock().unwrap().is_empty(),
+            "chunk creation must take from the pool first"
+        );
+        db.flush();
+        assert_eq!(db.get(0, 0), 2);
+    }
 
     #[test]
     fn maps_negative_world_coords_to_correct_chunk_and_local() {

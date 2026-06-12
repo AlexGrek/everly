@@ -140,8 +140,10 @@ runs on `par_iter_mut` with no shared writes.
 ### Arbitration — `OccupancyArbiter`
 
 `arbitrate_actor_moves` (sequential, entity-sorted for determinism) stamps every
-proposal into a reused per-frame **owner grid** (`Hypermap<SubtileOwners>`, one
-actor slot index per subtile). For each actor in order:
+proposal into a reused per-frame **owner grid** (a flat lock-free
+`HashMap<IVec2, u32>` from world-subtile to actor slot index — the arbiter is
+sequential, so no chunked/locked structure is needed). Footprints travel as
+compact `(center, radius)` circles end-to-end. For each actor in order:
 
 - if its proposed cells are all free, it takes them;
 - if a cell is owned by another actor, it is **backed off** to its previous
@@ -153,7 +155,7 @@ actor slot index per subtile). For each actor in order:
 This makes occupancy authoritative **within** the frame — two actors can never
 overlap, unlike the old read-snapshot model where both stepped into a free cell
 and resolved a frame late. Accepted footprints are then stamped into the dynamic
-**write** buffer (`write_footprint`) so the brain's avoidance views and the async
+**write** buffer (`commit_footprint`) so the brain's avoidance views and the async
 pathfinder read identical occupancy after the next flush.
 
 ### Apply + squeeze
@@ -208,9 +210,8 @@ are no shared writes and the phase is order-independent. The **arbitrate** phase
 is single-threaded by design — it is the authority that serializes occupancy — and
 processes actors in **entity-sorted** order, so its result is independent of the
 parallel propose phase's thread scheduling. The sequential pass touches each
-visible actor's footprint once over the owner grid (uncontended per-chunk locks),
-which is why it replaced the old contended parallel footprint OR-writes (see
-`OPTIMIZATION.md`).
+visible actor's footprint once over the lock-free owner grid, which is why it
+replaced the old contended parallel footprint OR-writes (see `OPTIMIZATION.md`).
 
 ### Off-screen culling and re-entry
 
@@ -396,7 +397,7 @@ Use this when introducing a new actor class:
 - [ ] Spawn the actor as `ActorObject::new(Box::new(...))` and add a `Name`.
 - [ ] If the actor has a brain plugin, wire it `.before(propose_actor_moves)` and `.after(arbitrate_actor_moves)`.
 - [ ] Add/adjust unit tests for:
-  - [ ] successful `propose_move` (shadow.current matches expected footprint)
+  - [ ] successful `propose_move` (`shadow.proposed_center` / `shadow.origin` match the expected centers)
   - [ ] dynamic-occupancy blocked path (`BlockedByOccupancy` after arbitration)
   - [ ] static-geometry blocked path (`BlockedByStatic`) — at least one test confirming the actor's `blocked_flags`
 - [ ] Run:

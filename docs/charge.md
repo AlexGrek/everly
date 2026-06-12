@@ -56,7 +56,7 @@ A depleted bot (`is_depleted()`) is stopped **in its think system**, not in
   its per-bot loop, zeros the [`move_buffer`](../src/actor/mod.rs), and
   `continue` — skipping pathing logic entirely.
 
-Because the buffer is empty, `propose_actor_moves` fills `shadow.current` in
+Because the buffer is empty, `propose_actor_moves` records the held footprint (`proposed_center == origin`) in
 place (no delta), and `arbitrate_actor_moves` re-stamps the bot's existing
 footprint: it holds position and keeps its dynamic-occupancy cell. Recharge is
 handled by BlackBot brain logic (`GoToChargeStation`) which seeks accessible

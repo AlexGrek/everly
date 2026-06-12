@@ -122,7 +122,7 @@ pub enum TryUpdateFootprintError {
 impl DynamicPassabilityMap {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(DoubleBufferedHypermap::new(SubtilePassability::EMPTY)),
+            inner: Arc::new(DoubleBufferedHypermap::new_single_floor(SubtilePassability::EMPTY)),
         }
     }
 
@@ -938,7 +938,7 @@ mod tests {
     }
 
     fn empty_cache() -> Hypermap<SubtilePassability> {
-        Hypermap::new(SubtilePassability::EMPTY)
+        Hypermap::new_single_floor(SubtilePassability::EMPTY)
     }
 
     #[test]

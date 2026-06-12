@@ -393,7 +393,7 @@ pub(crate) fn setup_hypermap_runtime(mut commands: Commands) {
     commands.insert_resource(HypermapRuntime {
         map: Arc::new(Hypermap::new(CellType::Road)),
         static_passability_map: Arc::new(Hypermap::new(cell_passability(CellType::Road))),
-        static_subtile_cache: Arc::new(Hypermap::new(SubtilePassability::EMPTY)),
+        static_subtile_cache: Arc::new(Hypermap::new_single_floor(SubtilePassability::EMPTY)),
         style_floor_map: Arc::new(Hypermap::new(TileStyle::DEFAULT)),
         style_wall_map: Arc::new(Hypermap::new(TileStyle::DEFAULT)),
         decoration_lamp_map: Arc::new(Hypermap::new(LampDecoration::None)),
