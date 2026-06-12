@@ -8,7 +8,8 @@
 //! 1. [`propose_actor_moves`] (parallel) — each on-screen actor runs
 //!    `think_low_level` + `prepare_movement` + [`Actor::propose_move`], which
 //!    validates the step against **static** geometry only (read-only, lock-free)
-//!    and records its proposed footprint cells in [`ActorShadow::current`].
+//!    and records its proposed footprint compactly in [`ActorShadow`]
+//!    (`proposed_center` / `origin` + radius — never explicit cell lists).
 //!    Off-screen actors `advance_unchecked`; re-entrants are queued.
 //! 2. [`arbitrate_actor_moves`] (sequential) — the [`OccupancyArbiter`] stamps
 //!    every proposal into an **owner grid** in a deterministic (entity-sorted)
@@ -30,8 +31,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use bevy::prelude::*;
+use bevy::platform::collections::HashMap;
 use bevy::utils::Parallel;
-use std::collections::HashMap;
 
 use crate::hud::game_log::{GameLog, LogEntry};
 use crate::hud::perf_timings::{SystemTimings, TimedSystem};
@@ -54,13 +55,16 @@ pub const MAX_BACKOFF_DEPTH: u32 = 4;
 /// Per-actor footprint shadow plus the transient state the movement pipeline
 /// refreshes every frame. Lives on [`ActorState`](super::ActorState); defaulted
 /// on construction and **not** serialized.
+///
+/// Footprints are always baked circles, so they are stored compactly as a
+/// center (`origin` for the back-off target, `proposed_center` for this frame's
+/// candidate) plus the actor's `radius_subtiles` — never as explicit cell lists
+/// (OPTIMIZATION rule 4).
 #[derive(Debug, Clone, Default)]
 pub struct ActorShadow {
-    /// Absolute subtile cells of the footprint **proposed** this frame (Step 1).
-    pub current: Vec<IVec2>,
-    /// Absolute subtile cells of the last accepted footprint — the fall-back
-    /// target an actor is backed off to on a dynamic conflict.
-    pub previous: Vec<IVec2>,
+    /// Grid center of the last accepted footprint — the fall-back target an
+    /// actor is backed off to on a dynamic conflict.
+    pub origin: IVec2,
     /// Float `center` one frame ago — momentum seed for a squeeze teleport.
     pub world_previous: Vec2,
     /// Proposed grid center this frame (Step 1 output, after the static slide).
@@ -79,17 +83,6 @@ pub struct ActorShadow {
     pub teleported: bool,
 }
 
-impl ActorShadow {
-    /// Refills `buf` with the radius-`radius` footprint cells centered at
-    /// `center`, reusing the buffer's capacity (no steady-state allocation).
-    pub fn fill_cells(buf: &mut Vec<IVec2>, center: IVec2, radius: i32) {
-        buf.clear();
-        for offset in baked_circle_shadow(radius).offsets {
-            buf.push(center + *offset);
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Owner grid
 // ---------------------------------------------------------------------------
@@ -99,9 +92,11 @@ impl ActorShadow {
 ///
 /// The arbiter is entirely sequential so no locking is needed — all the
 /// `RwLock`/`Arc`/`ArcSwap` overhead of a `Hypermap`-backed grid is replaced
-/// by a plain `HashMap`. The map is cleared at the start of each arbitration
-/// pass and reused across frames (capacity stabilises after the first few frames,
-/// satisfying rule 4).
+/// by a plain foldhash `HashMap` (rule 1: SipHash is ~3× slower per op for
+/// 8-byte keys and buys nothing single-threaded). Footprints arrive compactly
+/// as `(center, radius)` and are expanded through the `&'static` baked circle
+/// offsets — no cell lists (rule 4). The map is cleared at the start of each
+/// pass and reused across frames, so capacity stabilises after the first few.
 pub struct OwnerGrid {
     map: HashMap<IVec2, u32>,
 }
@@ -116,10 +111,17 @@ impl OwnerGrid {
         self.map.clear();
     }
 
-    /// First `cells` entry owned by someone other than `self_owner`, with that
-    /// owner's slot index. `None` if every cell is free or self-owned.
-    pub fn first_foreign(&self, cells: &[IVec2], self_owner: u32) -> Option<(IVec2, u32)> {
-        for &cell in cells {
+    /// First cell of the radius-`radius` circle at `center` owned by someone
+    /// other than `self_owner`, with that owner's slot index. `None` if every
+    /// cell is free or self-owned.
+    pub fn first_foreign(
+        &self,
+        center: IVec2,
+        radius: i32,
+        self_owner: u32,
+    ) -> Option<(IVec2, u32)> {
+        for offset in baked_circle_shadow(radius).offsets {
+            let cell = center + *offset;
             if let Some(&o) = self.map.get(&cell) {
                 if o != self_owner {
                     return Some((cell, o));
@@ -129,16 +131,18 @@ impl OwnerGrid {
         None
     }
 
-    /// Stamps `owner` over every cell.
-    pub fn stamp(&mut self, cells: &[IVec2], owner: u32) {
-        for &cell in cells {
-            self.map.insert(cell, owner);
+    /// Stamps `owner` over every cell of the circle.
+    pub fn stamp(&mut self, center: IVec2, radius: i32, owner: u32) {
+        for offset in baked_circle_shadow(radius).offsets {
+            self.map.insert(center + *offset, owner);
         }
     }
 
-    /// Clears every cell currently owned by `owner` (leaves foreign cells alone).
-    pub fn clear_cells(&mut self, cells: &[IVec2], owner: u32) {
-        for &cell in cells {
+    /// Clears every circle cell currently owned by `owner` (leaves foreign
+    /// cells alone).
+    pub fn clear_cells(&mut self, center: IVec2, radius: i32, owner: u32) {
+        for offset in baked_circle_shadow(radius).offsets {
+            let cell = center + *offset;
             if self.map.get(&cell) == Some(&owner) {
                 self.map.remove(&cell);
             }
@@ -150,17 +154,20 @@ impl OwnerGrid {
 // Pure arbitration core
 // ---------------------------------------------------------------------------
 
-/// One actor's footprint candidates and arbitration outcome for a frame. The
-/// cell vectors are reused buffers (cleared + refilled per frame).
-#[derive(Default, Clone)]
+/// One actor's footprint candidates and arbitration outcome for a frame.
+/// Footprints are compact `(center, radius)` circles (rule 4) — plain `Copy`
+/// data, no per-record buffers.
+#[derive(Default, Clone, Copy)]
 pub struct MoveRecord {
-    /// Proposed footprint cells this frame.
-    pub current: Vec<IVec2>,
-    /// Previous (last accepted) footprint cells — the back-off target.
-    pub previous: Vec<IVec2>,
+    /// Proposed footprint center this frame.
+    pub current: IVec2,
+    /// Previous (last accepted) footprint center — the back-off target.
+    pub previous: IVec2,
+    /// Circle radius (subtiles) shared by both footprints.
+    pub radius: i32,
     /// `true` once a footprint was stamped into the owner grid.
     pub placed: bool,
-    /// Which buffer is currently stamped (`true` = `previous`).
+    /// Which center is currently stamped (`true` = `previous`).
     pub placed_previous: bool,
     /// `true` if the actor failed to take its proposal (backed off or squeezed).
     pub collided: bool,
@@ -190,9 +197,10 @@ pub fn arbitrate(records: &mut [MoveRecord], owners: &mut OwnerGrid, squeeze: &m
         r.reset();
     }
     for i in 0..records.len() {
-        match owners.first_foreign(&records[i].current, i as u32) {
+        let r = records[i];
+        match owners.first_foreign(r.current, r.radius, i as u32) {
             None => {
-                owners.stamp(&records[i].current, i as u32);
+                owners.stamp(r.current, r.radius, i as u32);
                 records[i].placed = true;
                 records[i].placed_previous = false;
             }
@@ -220,9 +228,10 @@ fn back_off(
     // where i wants to go after being backed off). Squeeze j to break the cycle.
     let mut last_j: Option<usize> = None;
     loop {
-        match owners.first_foreign(&records[i].previous, i as u32) {
+        let r = records[i];
+        match owners.first_foreign(r.previous, r.radius, i as u32) {
             None => {
-                owners.stamp(&records[i].previous, i as u32);
+                owners.stamp(r.previous, r.radius, i as u32);
                 records[i].placed = true;
                 records[i].placed_previous = true;
                 return;
@@ -254,14 +263,12 @@ fn back_off(
 
 /// Removes actor `j`'s currently-stamped footprint from the owner grid.
 fn unplace(records: &mut [MoveRecord], owners: &mut OwnerGrid, j: usize) {
-    if !records[j].placed {
+    let r = records[j];
+    if !r.placed {
         return;
     }
-    if records[j].placed_previous {
-        owners.clear_cells(&records[j].previous, j as u32);
-    } else {
-        owners.clear_cells(&records[j].current, j as u32);
-    }
+    let center = if r.placed_previous { r.previous } else { r.current };
+    owners.clear_cells(center, r.radius, j as u32);
     records[j].placed = false;
 }
 
@@ -392,34 +399,35 @@ pub(crate) fn arbitrate_actor_moves(
 ) {
     let static_cache = hypermap.static_subtile_cache.as_ref();
 
-    // Collect participating entities and sort for deterministic arbitration.
-    arbiter.entities.clear();
-    for (entity, actor_obj, _) in actors.iter() {
-        if actor_obj.inner.state().shadow.participates {
-            arbiter.entities.push(entity);
-        }
-    }
-    arbiter.entities.sort_unstable();
-    let n = arbiter.entities.len();
-    while arbiter.records.len() < n {
-        arbiter.records.push(MoveRecord::default());
-    }
-
-    // Snapshot each actor's proposed/previous footprint cells into the records.
-    for k in 0..n {
-        let entity = arbiter.entities[k];
-        let Ok((_, actor_obj, _)) = actors.get(entity) else { continue };
-        let shadow = &actor_obj.inner.state().shadow;
-        let rec = &mut arbiter.records[k];
-        rec.current.clear();
-        rec.current.extend_from_slice(&shadow.current);
-        rec.previous.clear();
-        rec.previous.extend_from_slice(&shadow.previous);
-    }
-
-    // Stage: owner-grid conflict resolution.
+    // Stage: collect + snapshot + owner-grid conflict resolution.
+    let n;
     {
         let _t = timings.scope(TimedSystem::ArbConflict);
+
+        // Collect participating entities and sort for deterministic arbitration.
+        arbiter.entities.clear();
+        for (entity, actor_obj, _) in actors.iter() {
+            if actor_obj.inner.state().shadow.participates {
+                arbiter.entities.push(entity);
+            }
+        }
+        arbiter.entities.sort_unstable();
+        n = arbiter.entities.len();
+        while arbiter.records.len() < n {
+            arbiter.records.push(MoveRecord::default());
+        }
+
+        // Snapshot each actor's compact footprint into the records.
+        for k in 0..n {
+            let entity = arbiter.entities[k];
+            let Ok((_, actor_obj, _)) = actors.get(entity) else { continue };
+            let state = actor_obj.inner.state();
+            let rec = &mut arbiter.records[k];
+            rec.current = state.shadow.proposed_center;
+            rec.previous = state.shadow.origin;
+            rec.radius = state.radius_subtiles;
+        }
+
         let arb = &mut *arbiter;
         arbitrate(&mut arb.records[..n], &mut arb.owners, &mut arb.squeeze);
     }
@@ -432,10 +440,10 @@ pub(crate) fn arbitrate_actor_moves(
             if let Ok((_, mut actor_obj, _)) = actors.get_mut(entity) {
                 apply_outcome(actor_obj.inner.as_mut(), &arbiter.records[k]);
             }
-            let rec = &arbiter.records[k];
+            let rec = arbiter.records[k];
             if rec.placed && !rec.squeezed {
-                let cells = if rec.placed_previous { &rec.previous } else { &rec.current };
-                dynamic.write_footprint(cells);
+                let center = if rec.placed_previous { rec.previous } else { rec.current };
+                dynamic.commit_footprint(center, rec.radius);
             }
         }
     }
@@ -522,12 +530,9 @@ fn apply_outcome(actor: &mut dyn Actor, record: &MoveRecord) {
 mod tests {
     use super::*;
 
-    fn rec(current: &[IVec2], previous: &[IVec2]) -> MoveRecord {
-        MoveRecord {
-            current: current.to_vec(),
-            previous: previous.to_vec(),
-            ..Default::default()
-        }
+    /// Radius-0 record: the footprint is exactly the single center cell.
+    fn rec(current: IVec2, previous: IVec2) -> MoveRecord {
+        MoveRecord { current, previous, radius: 0, ..Default::default() }
     }
 
     fn c(x: i32, y: i32) -> IVec2 {
@@ -538,7 +543,7 @@ mod tests {
     fn no_conflict_places_all_at_current() {
         let mut owners = OwnerGrid::new();
         let mut squeeze = Vec::new();
-        let mut records = vec![rec(&[c(0, 0)], &[c(-5, 0)]), rec(&[c(10, 10)], &[c(10, 9)])];
+        let mut records = vec![rec(c(0, 0), c(-5, 0)), rec(c(10, 10), c(10, 9))];
         arbitrate(&mut records, &mut owners, &mut squeeze);
         assert!(records[0].placed && !records[0].placed_previous && !records[0].collided);
         assert!(records[1].placed && !records[1].placed_previous && !records[1].collided);
@@ -550,7 +555,7 @@ mod tests {
         // Both propose into (0,0); record 0 is processed first and keeps it.
         let mut owners = OwnerGrid::new();
         let mut squeeze = Vec::new();
-        let mut records = vec![rec(&[c(0, 0)], &[c(1, 0)]), rec(&[c(0, 0)], &[c(0, 5)])];
+        let mut records = vec![rec(c(0, 0), c(1, 0)), rec(c(0, 0), c(0, 5))];
         arbitrate(&mut records, &mut owners, &mut squeeze);
         assert!(records[0].placed && !records[0].collided, "first claim wins its proposal");
         assert!(
@@ -568,8 +573,8 @@ mod tests {
         let mut owners = OwnerGrid::new();
         let mut squeeze = Vec::new();
         let mut records = vec![
-            rec(&[c(5, 5)], &[c(4, 5)]), // mover: was (4,5), wants (5,5)
-            rec(&[c(5, 5)], &[c(5, 5)]), // stationary occupant of (5,5)
+            rec(c(5, 5), c(4, 5)), // mover: was (4,5), wants (5,5)
+            rec(c(5, 5), c(5, 5)), // stationary occupant of (5,5)
         ];
         arbitrate(&mut records, &mut owners, &mut squeeze);
         // Processing order: 0 takes (5,5); 1 conflicts, backs off to previous
@@ -589,7 +594,7 @@ mod tests {
         let mut squeeze = Vec::new();
         let cell = c(3, 3);
         let mut records: Vec<MoveRecord> =
-            (0..8).map(|_| rec(&[cell], &[cell])).collect();
+            (0..8).map(|_| rec(cell, cell)).collect();
         arbitrate(&mut records, &mut owners, &mut squeeze);
         // Exactly one bot holds the cell; the rest cannot be placed and at least
         // one is squeezed once the back-off cap is hit.
@@ -608,9 +613,9 @@ mod tests {
         let mut squeeze = Vec::new();
         // 0 moves (0,0)->(1,0); 1 sits at (1,0); 2 wants (0,0) (0's vacated cell).
         let mut records = vec![
-            rec(&[c(1, 0)], &[c(0, 0)]),
-            rec(&[c(1, 0)], &[c(1, 0)]),
-            rec(&[c(0, 0)], &[c(-5, 0)]),
+            rec(c(1, 0), c(0, 0)),
+            rec(c(1, 0), c(1, 0)),
+            rec(c(0, 0), c(-5, 0)),
         ];
         arbitrate(&mut records, &mut owners, &mut squeeze);
         // 1 keeps (1,0); 0 backed off to (0,0); 2 then conflicts on (0,0) and is

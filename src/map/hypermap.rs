@@ -4,7 +4,7 @@
 //! into fixed 128x128 chunks that are allocated lazily on first write.
 //! Each chunk has its own lock so disconnected regions can be accessed concurrently.
 
-use std::collections::HashMap;
+use bevy::platform::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use arc_swap::ArcSwap;

@@ -364,13 +364,12 @@ pub trait Actor: Send + Sync + 'static {
 
         let s = self.state_mut();
         s.shadow.world_previous = s.center;
+        s.shadow.origin = origin;
         s.shadow.proposed_center = center;
         s.shadow.proposed_delta = delta;
         s.shadow.proposed_rotation = rotation;
         s.shadow.static_block = static_block;
         s.shadow.participates = true;
-        ActorShadow::fill_cells(&mut s.shadow.previous, origin, radius);
-        ActorShadow::fill_cells(&mut s.shadow.current, center, radius);
         s.move_buffer = ActorMoveBuffer::default();
     }
 }
@@ -637,7 +636,7 @@ mod tests {
     #[test]
     fn propose_move_clear_sets_proposed_center_and_shadow() {
         // Static-clear proposal: advances the proposed center, no static block,
-        // and fills the current shadow with the footprint at the new center.
+        // and records the compact footprint centers for the arbiter.
         let sc = empty_static_cache();
         let mut actor = DummyActor::new(Vec2::new(10.0, 10.0), 1);
         actor.state.move_buffer.tile_delta = Vec2::new(1.0, 0.0);
@@ -648,10 +647,8 @@ mod tests {
         assert_eq!(actor.state.shadow.proposed_center, IVec2::new(55, 50));
         assert_eq!(actor.state.shadow.proposed_delta, Vec2::new(1.0, 0.0));
         assert_eq!(actor.state.shadow.static_block, None);
-        // current shadow is the footprint circle centered on the proposed cell.
-        let expected = crate::map::passability::baked_circle_shadow(1).offsets.len();
-        assert_eq!(actor.state.shadow.current.len(), expected);
-        assert!(actor.state.shadow.current.contains(&IVec2::new(55, 50)));
+        // The back-off origin is the pre-move grid center.
+        assert_eq!(actor.state.shadow.origin, IVec2::new(50, 50));
         // propose does not move `center` — apply (in the arbiter) does.
         assert_eq!(actor.state.center, Vec2::new(10.0, 10.0));
     }
@@ -695,13 +692,13 @@ mod tests {
 
     #[test]
     fn propose_move_previous_shadow_is_origin_footprint() {
-        // The previous shadow is the footprint at last_accepted (here the
+        // The back-off origin is the last accepted grid center (here the
         // first-frame fallback floor(center*5) = (50,50)).
         let sc = empty_static_cache();
         let mut actor = DummyActor::new(Vec2::new(10.0, 10.0), 1);
         actor.state.move_buffer.subtile_shift = IVec2::new(3, 0);
         actor.propose_move(&sc);
-        assert!(actor.state.shadow.previous.contains(&IVec2::new(50, 50)));
+        assert_eq!(actor.state.shadow.origin, IVec2::new(50, 50));
         assert_eq!(actor.state.shadow.proposed_center, IVec2::new(53, 50));
     }
 

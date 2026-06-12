@@ -449,13 +449,12 @@ impl Actor for BlackBot {
 
         let s = self.state_mut();
         s.shadow.world_previous = s.center;
+        s.shadow.origin = origin;
         s.shadow.proposed_center = center;
         s.shadow.proposed_delta = Vec2::new(dx, dy);
         s.shadow.proposed_rotation = move_buf.rotation_shift;
         s.shadow.static_block = static_block;
         s.shadow.participates = true;
-        ActorShadow::fill_cells(&mut s.shadow.previous, origin, radius);
-        ActorShadow::fill_cells(&mut s.shadow.current, center, radius);
         s.move_buffer = ActorMoveBuffer::default();
     }
 }

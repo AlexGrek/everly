@@ -32,7 +32,8 @@
       "Bash(cargo tree *)",
       "Bash(xargs -I{} echo \"errors+warnings: {}\")",
       "Bash(pkill -f \"cargo test\")",
-      "Bash(pkill -f \"everly\")"
+      "Bash(pkill -f \"everly\")",
+      "WebFetch(domain:consensual.family)"
     ],
     "additionalDirectories": [
       "/tmp"
