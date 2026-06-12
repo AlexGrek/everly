@@ -407,26 +407,28 @@ impl ActorObject {
 // Plugin + systems
 // ---------------------------------------------------------------------------
 
-/// Plugin that runs low-level actor processing every in-game frame.
+/// Plugin that runs low-level actor processing every fixed (60 Hz) tick.
 pub struct ActorPlugin;
 
 impl Plugin for ActorPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Paused>()
             .init_resource::<OccupancyArbiter>()
+            // Input sampling stays on the render frame — `just_pressed` edges
+            // can be missed by fixed ticks at high frame rates.
+            .add_systems(Update, toggle_pause.run_if(in_state(GameState::InGame)))
+            // The movement pipeline runs on the fixed 60 Hz schedule so bot
+            // pace is independent of the render frame rate (see `GamePlugin`).
             .add_systems(
-                Update,
+                FixedUpdate,
                 (
-                    toggle_pause.run_if(in_state(GameState::InGame)),
-                    (
-                        flush_actor_occupancy,
-                        propose_actor_moves,
-                        arbitrate_actor_moves,
-                    )
-                        .chain()
-                        .run_if(in_state(GameState::InGame))
-                        .run_if(not(is_paused)),
-                ),
+                    flush_actor_occupancy,
+                    propose_actor_moves,
+                    arbitrate_actor_moves,
+                )
+                    .chain()
+                    .run_if(in_state(GameState::InGame))
+                    .run_if(not(is_paused)),
             );
     }
 }

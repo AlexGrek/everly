@@ -23,7 +23,12 @@ pub struct GamePlugin;
 
 impl Plugin for GamePlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(ClearColor(Color::BLACK))
+        // Bot movement (brain → propose → arbitrate → field deposits) runs on
+        // the fixed schedule at 60 Hz, decoupled from the render frame rate: a
+        // slow render frame catches up with extra fixed ticks instead of
+        // slowing the bots down.
+        app.insert_resource(Time::<Fixed>::from_hz(60.0))
+            .insert_resource(ClearColor(Color::BLACK))
             // No fill light unless we add one on a camera; keeps the void emissive-only.
             .insert_resource(GlobalAmbientLight::NONE)
             // SSR runs after deferred lighting; opaque `StandardMaterial` must use the

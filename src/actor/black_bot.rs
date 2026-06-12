@@ -464,25 +464,38 @@ pub struct BlackBotPlugin;
 
 impl Plugin for BlackBotPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<BlackBotRng>().add_systems(
-            Update,
-            (
-                black_bot_brain
-                    .after(flush_actor_occupancy)
-                    .before(propose_actor_moves)
-                    .after(PathfindSet::Collect)
-                    .before(PathfindSet::Dispatch)
-                    .run_if(not(is_paused)),
-                reconcile_charger_occupancy
-                    .after(black_bot_brain)
-                    .before(crate::map::hypermap_world::SyncChargerVisualsSet),
-                sync_black_bot_transforms.after(arbitrate_actor_moves),
-                track_black_bot_collision_pressure.after(arbitrate_actor_moves),
-                sync_black_bot_status_visual.after(arbitrate_actor_moves),
-                paint_black_bot_targets.after(arbitrate_actor_moves).run_if(|e: Res<crate::map::chunk_overlay::PathOverlayEnabled>| e.0),
+        app.init_resource::<BlackBotRng>()
+            // Planning and post-arbitration state tracking tick with the fixed
+            // 60 Hz movement pipeline.
+            .add_systems(
+                FixedUpdate,
+                (
+                    black_bot_brain
+                        .after(flush_actor_occupancy)
+                        .before(propose_actor_moves)
+                        .after(PathfindSet::Collect)
+                        .before(PathfindSet::Dispatch)
+                        .run_if(not(is_paused)),
+                    // `SyncChargerVisualsSet` lives in `Update`, which always runs
+                    // after the fixed ticks of the same frame — no explicit
+                    // ordering needed across schedules.
+                    reconcile_charger_occupancy.after(black_bot_brain),
+                    track_black_bot_collision_pressure.after(arbitrate_actor_moves),
+                )
+                    .run_if(in_state(GameState::InGame)),
             )
-                .run_if(in_state(GameState::InGame)),
-        );
+            // Render-facing syncs run once per render frame and read the state
+            // the fixed ticks just produced.
+            .add_systems(
+                Update,
+                (
+                    sync_black_bot_transforms,
+                    sync_black_bot_status_visual,
+                    paint_black_bot_targets
+                        .run_if(|e: Res<crate::map::chunk_overlay::PathOverlayEnabled>| e.0),
+                )
+                    .run_if(in_state(GameState::InGame)),
+            );
     }
 }
 
