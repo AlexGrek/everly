@@ -112,6 +112,8 @@ display, and persistence.
 ## Movement and collision
 
 Collision is split into a parallel **proposal** and a sequential **arbitration**.
+`docs/movement.md` is the deep, end-to-end reference for this pipeline; the
+sections below cover what the actor runtime itself contributes.
 
 ### Proposal — `Actor::propose_move`
 

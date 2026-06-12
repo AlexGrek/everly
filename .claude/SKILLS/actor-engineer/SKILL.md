@@ -10,6 +10,7 @@ paths:
   - "src/map/passability.rs"
   - "src/map/field_interactions.rs"
   - "docs/actor.md"
+  - "docs/movement.md"
   - "docs/actor-brain.md"
   - "docs/pathfind-service.md"
   - "src/map/pathfind_service.rs"
