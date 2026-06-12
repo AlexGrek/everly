@@ -22,6 +22,7 @@ use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task};
 use futures_lite::future;
 
+use crate::hud::perf_timings::{PerfCounts, SystemTimings, TimedSystem};
 use crate::map::hypermap::{DoubleBufferedHypermap, Hypermap};
 use crate::map::hypermap_pathfind::{
     astar_shortest_world_path, astar_subtile_detour, simplify_path_line_of_sight,
@@ -241,7 +242,9 @@ fn pathfind_collect(
     time: Res<Time>,
     mut in_flight: ResMut<PathfindInFlight>,
     results: Res<PathfindResults>,
+    timings: Res<SystemTimings>,
 ) {
+    let _t = timings.scope(TimedSystem::PfCollect);
     let mut still: Vec<(RequestId, Task<PathOutcome>)> = Vec::with_capacity(in_flight.tasks.len());
     for (id, mut task) in in_flight.tasks.drain(..) {
         match future::block_on(future::poll_once(&mut task)) {
@@ -263,7 +266,10 @@ fn pathfind_dispatch(
     mut in_flight: ResMut<PathfindInFlight>,
     game_log: Res<GameLog>,
     camera: Query<&StrategyCamera>,
+    timings: Res<SystemTimings>,
+    counts: Res<PerfCounts>,
 ) {
+    let _t = timings.scope(TimedSystem::PfDispatch);
     let pool = AsyncComputeTaskPool::get();
     while in_flight.tasks.len() < MAX_IN_FLIGHT {
         let Some((id, kind)) = queue.pop() else {
@@ -286,6 +292,10 @@ fn pathfind_dispatch(
     }
 
     let backlog = queue.len();
+    counts.pf_pending.store(backlog as u64, std::sync::atomic::Ordering::Relaxed);
+    counts
+        .pf_in_flight
+        .store(in_flight.tasks.len() as u64, std::sync::atomic::Ordering::Relaxed);
     if backlog > BACKLOG_WARN {
         let (wx, wy) = camera
             .iter()

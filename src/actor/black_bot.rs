@@ -519,6 +519,8 @@ fn black_bot_brain(
         Option<&mut Breakable>,
         Option<&mut Patrol>,
     )>,
+    timings: Res<SystemTimings>,
+    counts: Res<PerfCounts>,
 ) {
     let _t = timings.scope(TimedSystem::Brain);
     let dt = time.delta_secs();
@@ -772,6 +774,8 @@ fn black_bot_brain(
 
         apply_brain_effects(entity, &effects, &mut interactive, charge.as_deref_mut());
     }
+    counts.coasting_bots.store(coasting, std::sync::atomic::Ordering::Relaxed);
+    counts.total_bots.store(total, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn refresh_charger_index(
