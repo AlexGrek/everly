@@ -265,6 +265,11 @@ impl Brain {
         self.low_level.label()
     }
 
+    /// `true` while the bot is coasting in wait of an async pathfind result.
+    pub fn is_awaiting_path(&self) -> bool {
+        self.low_level.is_awaiting_path()
+    }
+
     pub fn target_tile(&self) -> Option<(i32, i32)> {
         self.low_level.target_tile()
     }

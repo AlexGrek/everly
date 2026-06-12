@@ -1,27 +1,20 @@
-//! Lock-free sub-section timers for the actor movement pipeline, shown beneath
-//! the FPS counter.
+//! Lock-free sub-section timers for the actor movement pipeline and the chunk
+//! streaming systems, shown beneath the FPS counter.
 //!
-//! Six timers cover each stage of the pipeline:
+//! Rows come in two flavors (see [`TimedSystem`] for the full list):
 //!
-//! - `ProposeThink`   -- parallel aggregate: `think_low_level` + `prepare_movement`
-//!                       across all actors (AI/brain work).
-//! - `ProposeSlide`   -- parallel aggregate: `propose_move` static-only slide
-//!                       geometry across all on-screen actors.
-//! - `ProposeAdvance` -- parallel aggregate: `advance_unchecked` across all
-//!                       off-screen actors.
-//! - `ArbConflict`    -- owner-grid conflict resolution: stamp proposals, cascade
-//!                       back-off (depth ≤ 4), fill the squeeze pool.
-//! - `ArbApply`       -- apply outcomes to each actor (`center`, error, shadow
-//!                       swap) and stamp accepted footprints into the dynamic map.
-//! - `ArbSqueeze`     -- sort + teleport the squeeze pool and off-screen re-entrants.
+//! - **Wall-clock scopes** (`propose`, `prop_par`, `arb_*`, `chunk_*`) — RAII
+//!   [`TimingScope`]s around a system or section. Note `prop_par` wraps a
+//!   `par_iter_mut`: while its scope waits for batches, the thread can execute
+//!   an unrelated queued task, so a `prop_par` spike with a flat `prop_body`
+//!   means *stolen* time (look at the `chunk_*` rows), not actor work.
+//! - **Parallel aggregates** (`prop_body`, `prop_think`, `prop_slide`,
+//!   `prop_adv`) — CPU time summed across all worker threads via per-frame
+//!   `AtomicU64` accumulators; they show budget, not latency.
 //!
-//! The propose sub-timers are aggregates (sum across all threads) — they show the
-//! total CPU budget consumed by each sub-stage rather than wall-clock latency.
-//!
-//! Storage is pairs of atomics; sequential instrumented code calls `timings.scope()`
-//! for a lock-free RAII record (one relaxed store + one `fetch_max` on drop).
-//! Parallel sub-stages call `timings.record()` directly after draining thread-local
-//! `Parallel<u64>` accumulators.
+//! Storage is pairs of atomics; `timings.scope()` is a lock-free RAII record
+//! (one relaxed store + one `fetch_max` on drop), `timings.record()` stores an
+//! already-measured aggregate.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -35,25 +28,67 @@ use crate::scene::camera::{spawn_camera, StrategyCameraRig};
 #[derive(Clone, Copy)]
 pub enum TimedSystem {
     Propose,
+    /// Wall-clock of the `par_iter_mut` call alone. When this spikes while
+    /// `ProposeBody` stays flat, the time went to task-pool dispatch — the
+    /// waiting thread can pick up and run an unrelated queued task (e.g. a
+    /// chunk-mesh system), which bills that task's duration here.
+    ProposePar,
+    /// Aggregate CPU of the whole per-actor closure (superset of
+    /// think/slide/advance — any gap is per-actor work outside those three).
+    ProposeBody,
     ProposeThink,
     ProposeSlide,
     ProposeAdvance,
     ArbConflict,
     ArbApply,
     ArbSqueeze,
+    /// `update_visible_hypermap_chunks` — chunk visibility / load queueing.
+    ChunkVisibility,
+    /// `render_chunks_30fps` — chunk mesh build + spawn/despawn.
+    ChunkRender,
+    /// `refresh_chunk_upper_layers_on_floor_change` — floor-switch remesh.
+    ChunkFloors,
+    /// `black_bot_brain` — sequential planning tick over all bots.
+    Brain,
+    /// `pathfind_dispatch` — spawning queued searches onto the async pool.
+    PfDispatch,
+    /// `pathfind_collect` — draining finished route outcomes.
+    PfCollect,
 }
 
 impl TimedSystem {
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 15;
     const LABELS: [&'static str; Self::COUNT] = [
         "propose",
+        "prop_par",
+        "prop_body",
         "prop_think",
         "prop_slide",
         "prop_adv",
         "arb_conflict",
         "arb_apply",
         "arb_squeeze",
+        "chunk_vis",
+        "chunk_render",
+        "chunk_floors",
+        "brain",
+        "pf_dispatch",
+        "pf_collect",
     ];
+}
+
+/// Live gauge counters shown beneath the timers — set each frame by the
+/// systems that own the values (relaxed atomic stores; lock-free).
+#[derive(Resource, Default)]
+pub struct PerfCounts {
+    /// Pathfind requests waiting in the queue (not yet dispatched).
+    pub pf_pending: AtomicU64,
+    /// Pathfind searches currently running on the async pool.
+    pub pf_in_flight: AtomicU64,
+    /// Bots coasting on `PendingPath` (waiting for an async route).
+    pub coasting_bots: AtomicU64,
+    /// Bots ticked by the brain this frame.
+    pub total_bots: AtomicU64,
 }
 
 #[derive(Resource)]
@@ -107,6 +142,7 @@ pub struct PerfTimingsPlugin;
 impl Plugin for PerfTimingsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SystemTimings>()
+            .init_resource::<PerfCounts>()
             .add_systems(
                 OnEnter(GameState::InGame),
                 spawn_perf_timings.after(spawn_camera),
@@ -141,6 +177,7 @@ fn spawn_perf_timings(mut commands: Commands, camera: Query<Entity, With<Strateg
 fn update_perf_timings(
     time: Res<Time>,
     timings: Res<SystemTimings>,
+    counts: Res<PerfCounts>,
     mut refresh_acc: Local<f32>,
     mut held_peak_ms: Local<[f64; TimedSystem::COUNT]>,
     mut held_age_s: Local<[f32; TimedSystem::COUNT]>,
@@ -176,5 +213,12 @@ fn update_perf_timings(
             TimedSystem::LABELS[i], last_ms, held_peak_ms[i],
         ));
     }
+    out.push_str(&format!(
+        "pf q={} fly={} coast={}/{}\n",
+        counts.pf_pending.load(Ordering::Relaxed),
+        counts.pf_in_flight.load(Ordering::Relaxed),
+        counts.coasting_bots.load(Ordering::Relaxed),
+        counts.total_bots.load(Ordering::Relaxed),
+    ));
     **text = out;
 }

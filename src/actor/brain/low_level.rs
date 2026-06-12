@@ -136,6 +136,12 @@ pub trait LowLevelAction: Send + Sync {
         false
     }
 
+    /// `true` while the action is coasting in wait of an async pathfind result
+    /// (perf HUD gauge). Default `false`; only [`PendingPath`] overrides.
+    fn is_awaiting_path(&self) -> bool {
+        false
+    }
+
     /// Final destination tile, if any (overlay / inspector).
     fn target_tile(&self) -> Option<(i32, i32)> {
         None
@@ -316,6 +322,9 @@ impl LowLevelAction for PendingPath {
     }
     fn velocity(&self) -> Vec2 {
         self.velocity
+    }
+    fn is_awaiting_path(&self) -> bool {
+        true
     }
 }
 

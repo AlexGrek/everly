@@ -325,58 +325,65 @@ pub(crate) fn propose_actor_moves(
     // Per-frame aggregate CPU time per sub-stage. Stack-allocated; captured by
     // reference in the closure (AtomicU64: Sync). fetch_add with Relaxed ordering
     // — same guarantee as the existing timings atomics.
+    let body_ns = AtomicU64::new(0);
     let think_ns = AtomicU64::new(0);
     let slide_ns = AtomicU64::new(0);
     let advance_ns = AtomicU64::new(0);
 
-    actors
-        .par_iter_mut()
-        .for_each(|(entity, mut actor_obj, off_screen)| {
-            let actor = actor_obj.inner.as_mut();
-            {
-                let s = actor.state_mut();
-                s.last_movement_error = None;
-                s.shadow.participates = false;
-                s.shadow.teleported = false;
-            }
-
-            let t = Instant::now();
-            actor.think_low_level();
-            actor.prepare_movement();
-            think_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-
-            let center = actor.state().center;
-            let is_rendered =
-                hypermap.is_world_pos_rendered(center.x.floor() as i32, center.y.floor() as i32);
-            let was_off_screen = off_screen.is_some();
-
-            if is_rendered {
-                if was_off_screen {
-                    par_commands.command_scope(|mut commands| {
-                        commands.entity(entity).remove::<OffScreenActor>();
-                    });
-                    reentering.borrow_local_mut().push(entity);
-                } else {
-                    let t = Instant::now();
-                    actor.propose_move(static_cache);
-                    slide_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    {
+        let _par = timings.scope(TimedSystem::ProposePar);
+        actors
+            .par_iter_mut()
+            .for_each(|(entity, mut actor_obj, off_screen)| {
+                let body_start = Instant::now();
+                let actor = actor_obj.inner.as_mut();
+                {
+                    let s = actor.state_mut();
+                    s.last_movement_error = None;
+                    s.shadow.participates = false;
+                    s.shadow.teleported = false;
                 }
-            } else {
-                if !was_off_screen {
-                    par_commands.command_scope(|mut commands| {
-                        commands.entity(entity).insert(OffScreenActor);
-                    });
-                }
+
                 let t = Instant::now();
-                actor.advance_unchecked();
-                advance_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            }
-        });
+                actor.think_low_level();
+                actor.prepare_movement();
+                think_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+                let center = actor.state().center;
+                let is_rendered = hypermap
+                    .is_world_pos_rendered(center.x.floor() as i32, center.y.floor() as i32);
+                let was_off_screen = off_screen.is_some();
+
+                if is_rendered {
+                    if was_off_screen {
+                        par_commands.command_scope(|mut commands| {
+                            commands.entity(entity).remove::<OffScreenActor>();
+                        });
+                        reentering.borrow_local_mut().push(entity);
+                    } else {
+                        let t = Instant::now();
+                        actor.propose_move(static_cache);
+                        slide_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    }
+                } else {
+                    if !was_off_screen {
+                        par_commands.command_scope(|mut commands| {
+                            commands.entity(entity).insert(OffScreenActor);
+                        });
+                    }
+                    let t = Instant::now();
+                    actor.advance_unchecked();
+                    advance_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+                body_ns.fetch_add(body_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            });
+    }
 
     arbiter.reentrants.clear();
     let mut reentering = reentering;
     reentering.drain_into(&mut arbiter.reentrants);
 
+    timings.record(TimedSystem::ProposeBody, body_ns.load(Ordering::Relaxed));
     timings.record(TimedSystem::ProposeThink, think_ns.load(Ordering::Relaxed));
     timings.record(TimedSystem::ProposeSlide, slide_ns.load(Ordering::Relaxed));
     timings.record(TimedSystem::ProposeAdvance, advance_ns.load(Ordering::Relaxed));

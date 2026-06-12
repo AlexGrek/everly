@@ -183,16 +183,25 @@ counter, `last ^peak` (peaks hold for 1 s):
 | Row | Meaning |
 |---|---|
 | `propose` | wall-clock of the whole parallel propose pass |
-| `prop_think` | aggregate CPU across threads: `think_low_level` + `prepare_movement` |
+| `prop_par` | wall-clock of just the `par_iter_mut` dispatch + join |
+| `prop_body` | aggregate CPU across threads: the entire per-actor closure |
+| `prop_think` | aggregate CPU: `think_low_level` + `prepare_movement` |
 | `prop_slide` | aggregate CPU: `propose_move` static slides |
 | `prop_adv` | aggregate CPU: off-screen `advance_unchecked` |
 | `arb_conflict` | collect + sort + snapshot + owner-grid resolution |
 | `arb_apply` | outcome application + dynamic-buffer stamping |
 | `arb_squeeze` | squeeze/re-entry teleports |
+| `chunk_vis` | `update_visible_hypermap_chunks` (visibility / load queueing) |
+| `chunk_render` | `render_chunks_30fps` (chunk mesh build + spawn/despawn) |
+| `chunk_floors` | floor-switch remesh |
 
-`propose` is wall-clock while the `prop_*` rows are summed CPU time, so
-`propose` ≫ `prop_*` indicates parallel-dispatch overhead or an external stall
-(task-pool contention, allocator pressure), not actor work.
+Reading the rows: the `prop_*` aggregates are summed CPU time, the rest are
+wall-clock. A `prop_par` spike with a flat `prop_body` means the time was
+**stolen**, not spent: while a `par_iter_mut` scope waits for its batches, the
+waiting thread executes other queued tasks from the shared compute pool, so an
+expensive concurrent system (typically `chunk_render` building meshes for a
+freshly streamed chunk) gets billed to the propose pass. In that case the row
+to optimize is the spiking `chunk_*` one.
 
 ## Where things live
 
