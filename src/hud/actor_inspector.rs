@@ -7,8 +7,6 @@
 //! [`SelectedActor`] resource, which also drives the world-space selection
 //! overlay (glowing marker + waypoints) in `crate::actor::selection_overlay`.
 
-use std::time::Duration;
-
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::picking::prelude::*;
 use bevy::prelude::*;

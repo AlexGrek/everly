@@ -72,6 +72,7 @@ impl Plugin for GamePlugin {
                 actor::snapshot::ActorSnapshotPlugin,
                 actor::charge::ChargePlugin,
                 actor::black_bot::BlackBotPlugin,
+                actor::selection_overlay::SelectionOverlayPlugin,
                 edit::map_edit::MapEditPlugin,
                 edit::actor_spawn::ActorSpawnPlugin,
                 edit::map_selection::MapSelectionPlugin,

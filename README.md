@@ -76,7 +76,7 @@ cargo run --features dev
 | Pan camera  | `W` `A` `S` `D` or arrows   |
 | Zoom        | Mouse wheel / trackpad scroll (disabled while placing **Wall** or **Corner** in map edit mode; wheel then cycles variants) |
 | Pause       | `Space`                     |
-| Debug: bulk-spawn 100 bots | `Shift` + `B` (near camera focus; for scale testing) |
+| Bulk-spawn 100 bots | **Spawn 100** button in the Actors palette, or `Shift` + `B` (near camera focus; for scale testing) |
 
 ## Faster iterative builds
 

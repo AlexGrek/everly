@@ -107,24 +107,34 @@ impl Plugin for ActorSpawnPlugin {
                         .chain(),
                     actor_spawn_right_click_cancel,
                     resurrect_all_button,
-                    debug_bulk_spawn_bots,
+                    bulk_spawn_bots,
                 )
                     .run_if(in_state(GameState::InGame)),
             );
     }
 }
 
-/// How many bots [`debug_bulk_spawn_bots`] drops per keypress.
-const DEBUG_BULK_SPAWN_COUNT: usize = 100;
+/// How many bots a bulk spawn drops per trigger (button or **Shift+B**).
+const BULK_SPAWN_COUNT: usize = 100;
 /// Cap on the outward cell-scan radius so a boxed-in camera can't loop forever.
-const DEBUG_BULK_SPAWN_SCAN_RADIUS: i32 = 80;
+const BULK_SPAWN_SCAN_RADIUS: i32 = 80;
 
-/// Debug-only mass spawn: **Shift+B** drops [`DEBUG_BULK_SPAWN_COUNT`] BlackBots
-/// on passable cells spiralling out from the camera focus. Enables testing the
-/// movement pipeline at scale (hundreds of bots) without hundreds of clicks.
-fn debug_bulk_spawn_bots(
+const BULK_BTN_BG: Color = Color::srgba(0.10, 0.16, 0.24, 0.85);
+const BULK_BTN_BORDER: Color = Color::srgba(0.35, 0.55, 0.85, 0.6);
+const BULK_TEXT: Color = Color::srgb(0.6, 0.78, 0.98);
+
+/// Marker on the "Spawn 100" palette button.
+#[derive(Component)]
+struct BulkSpawnButton;
+
+/// Triggers a bulk spawn from either the **Shift+B** keybind or the
+/// "Spawn 100" button. Drops [`BULK_SPAWN_COUNT`] BlackBots on passable cells
+/// spiralling out from the camera focus — for testing the movement pipeline at
+/// scale (hundreds of bots) without hundreds of clicks.
+fn bulk_spawn_bots(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
+    buttons: Query<&Interaction, (With<BulkSpawnButton>, Changed<Interaction>)>,
     cameras: Query<&StrategyCamera>,
     dynamic_passability: Res<DynamicPassabilityMap>,
     hypermap: Res<HypermapRuntime>,
@@ -133,7 +143,9 @@ fn debug_bulk_spawn_bots(
     mut black_rng: ResMut<BlackBotRng>,
 ) {
     let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
-    if !(shift && keys.just_pressed(KeyCode::KeyB)) {
+    let key_trigger = shift && keys.just_pressed(KeyCode::KeyB);
+    let button_trigger = buttons.iter().any(|i| *i == Interaction::Pressed);
+    if !(key_trigger || button_trigger) {
         return;
     }
     let Ok(camera) = cameras.single() else { return };
@@ -143,7 +155,7 @@ fn debug_bulk_spawn_bots(
 
     let mut spawned = 0usize;
     // Outward square rings from the focus tile; spawn on each passable cell.
-    'scan: for ring in 0..=DEBUG_BULK_SPAWN_SCAN_RADIUS {
+    'scan: for ring in 0..=BULK_SPAWN_SCAN_RADIUS {
         for dz in -ring..=ring {
             for dx in -ring..=ring {
                 // Only the perimeter of this ring (interior was covered already).
@@ -169,13 +181,13 @@ fn debug_bulk_spawn_bots(
                     center,
                 );
                 spawned += 1;
-                if spawned >= DEBUG_BULK_SPAWN_COUNT {
+                if spawned >= BULK_SPAWN_COUNT {
                     break 'scan;
                 }
             }
         }
     }
-    info!("debug bulk spawn: {spawned} BlackBots near ({origin_x}, {origin_z})");
+    info!("bulk spawn: {spawned} BlackBots near ({origin_x}, {origin_z})");
 }
 
 pub(crate) fn spawn_actor_spawn_palette(
@@ -265,6 +277,30 @@ pub(crate) fn spawn_actor_spawn_palette(
                     Text::new("Resurrect all"),
                     TextFont::from_font_size(15.0),
                     TextColor(RESURRECT_TEXT),
+                ));
+            });
+            row.spawn((
+                Name::new("Actor spawn bulk 100"),
+                BulkSpawnButton,
+                Button,
+                Node {
+                    min_width: Val::Px(96.0),
+                    height: Val::Px(32.0),
+                    padding: UiRect::horizontal(Val::Px(12.0)),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    border: UiRect::all(Val::Px(1.0)),
+                    border_radius: BorderRadius::all(Val::Px(5.0)),
+                    ..default()
+                },
+                BorderColor::all(BULK_BTN_BORDER),
+                BackgroundColor(BULK_BTN_BG),
+            ))
+            .with_children(|p| {
+                p.spawn((
+                    Text::new("Spawn 100"),
+                    TextFont::from_font_size(15.0),
+                    TextColor(BULK_TEXT),
                 ));
             });
         });
