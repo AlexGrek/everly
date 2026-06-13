@@ -52,6 +52,7 @@ use crate::map::passability::{
 use crate::map::pathfind_service::{
     PathOutcome, PathfindQueue, PathfindResults, PathfindSet, RequestId,
 };
+use crate::hud::actor_inspector::SelectedActor;
 use crate::hud::game_log::{BreakableSystem, GameLog, LogEntry};
 use crate::hud::perf_timings::{PerfCounts, SystemTimings, TimedSystem};
 use crate::menu::main_menu::GameState;
@@ -531,9 +532,11 @@ fn black_bot_brain(
         Option<&mut Charge>,
         Option<&mut Breakable>,
         Option<&mut Patrol>,
+        Option<&OffScreenActor>,
     )>,
     timings: Res<SystemTimings>,
     counts: Res<PerfCounts>,
+    selected: Res<SelectedActor>,
 ) {
     let _t = timings.scope(TimedSystem::Brain);
     let dt = time.delta_secs();
@@ -549,7 +552,7 @@ fn black_bot_brain(
 
     let mut coasting: u64 = 0;
     let mut total: u64 = 0;
-    for (entity, name, mut obj, mut brain, mut vis, force_logs, mut charge, mut breakable, mut patrol) in
+    for (entity, name, mut obj, mut brain, mut vis, force_logs, mut charge, mut breakable, mut patrol, off_screen) in
         &mut query
     {
         total += 1;
@@ -709,6 +712,8 @@ fn black_bot_brain(
                     static_subtiles,
                     blocked_flags,
                 }),
+                on_screen: off_screen.is_none(),
+                trace: (selected.entity == Some(entity)).then_some(&*game_log),
                 patrol_loop,
                 pathfind: Some(PathfindAccess {
                     queue: &pathfind_queue,

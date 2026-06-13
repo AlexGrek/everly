@@ -42,7 +42,7 @@ a frame, and its contended parallel writes were the biggest per-frame hot spot
 The whole pipeline runs on Bevy's **`FixedUpdate` schedule at 60 Hz**
 (`Time::<Fixed>::from_hz(60.0)` in `GamePlugin`), decoupled from the render
 frame rate: a slow render frame runs extra fixed ticks to catch up, so bot
-pace never depends on fps. Inside `FixedUpdate`, `Res<Time>` yields the fixed
+pace never depends on fps. Inside `FixedUpdate`, `Res<Time>` yields the fixed`
 `dt` automatically.
 
 ```

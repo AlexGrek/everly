@@ -122,6 +122,19 @@ wipes the plan, movement intent is cleared, charger queue slots are released via
 and the in-game log records `<name> reset (collision pressure)`. Pressure is
 zeroed. Depleted and broken bots do not accumulate pressure.
 
+### Proactive look-ahead avoidance
+
+Before a collision even happens, an actively-moving **on-screen** bot probes the
+**single subtile just beyond its leading edge** along its heading
+(`radius_subtiles + 1` subtiles ahead, reusing the maintained unit `direction`
+so there's no per-tick `sqrt`). If that one cell holds another creature
+(`FLAG_CREATURE` in the dynamic read buffer — `subtile_has_creature`), the bot
+**enqueues a subtile detour** toward its next path node and holds, steering
+around the obstacle instead of pressing into it. It's one subtile read per
+moving bot per tick — no footprint scan. Gated by `BrainContext::on_screen`
+(off-screen bots advance without occupancy, so probing is pointless) and skipped
+while already detouring / stepping / waiting, or below `LOOKAHEAD_MIN_SPEED_SQ`.
+
 ### Bot-on-bot collision response
 
 `FollowPath`'s tile path is planned on **static** geometry only, so it does not
@@ -136,23 +149,32 @@ route around other (moving) bots. When a step is rejected with
 2. **Bounce** the velocity elastically off the contact normal (recoil; feel only).
 3. **Roll the response (`FollowTuning::bot_detour_chance`, default `0.5`).**
    - *Detour* → enqueue a **subtile-level detour** search (see below) toward the
-     next path node and hold until the result lands (or step aside on `NoPath` /
-     timeout).
-   - *Step aside + pause* → step to an adjacent cell and hold there for a random
-     0.5–1.5 s (`STEP_BACK_WAIT_*_SECS`). The step is usually **straight back** to the
-     previously occupied cell (`track_tiles` records `prev_tile`), but
-     `FollowTuning::bot_strafe_chance` (default `0.3`) of the time it **strafes
-     left/right** relative to the heading instead (falling back to straight-back
-     if the chosen side is blocked). The pause arms only once the bot *reaches*
-     that cell (`pending_wait` → `contact_wait_s`); it then brakes to a stop with
-     the same deceleration profile as normal travel before the hold timer runs.
-
-   A detour is **forced** (regardless of the roll) when no valid step cell is
-   known, and the step is the fallback when a rolled detour can't be planned (no
-   avoidance data / no clear route).
+     next path node and hold until the result lands (or step aside / wait on
+     `NoPath` / timeout).
+   - *Step aside + pause* → probe **all eight** Moore-neighbour cells, keep the
+     ones whose whole footprint is free (`neighbor_free` → `probe_footprint`,
+     static + dynamic), and pick one at random — **preferring cells ahead of the
+     heading** (positive dot product) so the bot slips forward around the blocker
+     rather than retreating. It then holds at that cell for a random 0.5–1.5 s
+     (`STEP_BACK_WAIT_*_SECS`); the pause arms only once the bot *reaches* it
+     (`pending_wait` → `contact_wait_s`), braking with the normal decel profile.
+   - *Wait in place* → if **every** neighbour is taken, the bot has nowhere to go,
+     so it just brakes and waits in place for the same 0.5–1.5 s
+     (`begin_wait_in_place`) for the jam to clear — it does **not** force a detour
+     or push on.
 
 This applies to bot-on-bot bumps only; a wall graze (`BlockedByStatic`) is left
 to the normal wall-slide / stuck-repath path.
+
+### Debugging a single bot (selected-bot trace)
+
+`BrainContext::trace(text)` pushes a diagnostic line to the in-game
+[`GameLog`](../src/hud/game_log.rs) **only for the currently selected bot**
+(`SelectedActor` in `actor_inspector.rs`); it is a no-op for every other bot.
+`FollowPath` traces its decisions — look-ahead detour, bump → detour/step/wait,
+stuck → escape (with center / main-tile), no-free-escape abandon, escape
+reached / stalled. **Select a misbehaving bot in-game and read its log** instead
+of adding console prints.
 
 The subtile detour is a *second, finer* pathfinding pass for short distances.
 [`FollowPath`](../src/actor/brain/low_level.rs) enqueues

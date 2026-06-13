@@ -26,6 +26,7 @@ use bevy::prelude::*;
 use crate::rng::{self, StdRng};
 
 use crate::actor::{ActorMoveBuffer, ActorState};
+use crate::hud::game_log::{GameLog, LogEntry, LogLevel};
 use crate::map::hypermap::Hypermap;
 use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
 use crate::map::passability::{DynamicPassabilityMap, SubtilePassability};
@@ -81,6 +82,15 @@ pub struct BrainContext<'a> {
     pub interactive: &'a InteractiveEntityMap,
     /// Occupancy views for the bot-on-bot subtile detour; `None` disables it.
     pub avoidance: Option<AvoidanceViews<'a>>,
+    /// `true` when the bot is on a rendered chunk. Proactive look-ahead
+    /// avoidance ([`FollowPath`](low_level::FollowPath)) runs only on-screen —
+    /// off-screen bots advance without collision, so probing is wasted work.
+    pub on_screen: bool,
+    /// In-game event log, present **only for the currently selected bot**, so
+    /// movement/brain code can trace its decisions (stuck, escape, step-aside,
+    /// detour) to the on-screen log. `None` for every other bot — keeps the log
+    /// readable and the trace cost off the hot path. See `Brain::trace`.
+    pub trace: Option<&'a GameLog>,
     /// The bot's fixed patrol route, surfaced from its
     /// [`Patrol`](crate::actor::black_bot::Patrol) component for
     /// [`GoToPatrol`](high_level::GoToPatrol). `None` (or empty) for non-patrol
@@ -89,6 +99,23 @@ pub struct BrainContext<'a> {
     /// Async pathfinding handles. `None` disables route requests (most unit
     /// tests that exercise only movement / priority selection).
     pub pathfind: Option<PathfindAccess<'a>>,
+}
+
+impl BrainContext<'_> {
+    /// Pushes a diagnostic line to the in-game log **iff this is the selected
+    /// bot** (`trace` is `Some`). No-op otherwise — so call sites can trace
+    /// freely without gating. Forced, so it shows even with the panel collapsed.
+    #[inline]
+    pub fn trace(&self, text: impl Into<String>) {
+        if let Some(log) = self.trace {
+            log.push_world(
+                self.main_tile.x,
+                self.main_tile.y,
+                LogEntry::Message { level: LogLevel::Info, text: text.into() },
+                true,
+            );
+        }
+    }
 }
 
 /// One-shot gameplay event a high-level action wants logged by the owning system.
@@ -330,6 +357,8 @@ pub(crate) mod test_support {
             broken: false,
             passability: empty_passability(),
             interactive: empty_interactive(),
+            on_screen: true,
+            trace: None,
             avoidance: None,
             patrol_loop: None,
             pathfind: None,

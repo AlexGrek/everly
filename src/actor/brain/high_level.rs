@@ -1220,6 +1220,8 @@ mod tests {
             passability,
             interactive,
             avoidance: None,
+            on_screen: true,
+            trace: None,
             patrol_loop,
             pathfind: Some(pf),
         }
