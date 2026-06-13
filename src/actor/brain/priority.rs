@@ -34,6 +34,9 @@ pub enum PriorityKind {
     RandomWalking,
     /// Routine patrol of a fixed loop of cells. Mapped to [`super::GoToPatrol`].
     Patrolling,
+    /// Routine fixer duty: loiter near the home depot, claim repair requests, and
+    /// deliver parts to stranded bots. Mapped to [`super::GoFixBots`].
+    Fixing,
     /// Top up the battery. Mapped to [`super::GoToChargeStation`].
     RechargeYourself,
 }

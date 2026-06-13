@@ -25,6 +25,7 @@ pub mod priority;
 use bevy::prelude::*;
 use crate::rng::{self, StdRng};
 
+use crate::actor::dispatch::{DispatchQueue, RepairPart};
 use crate::actor::{ActorMoveBuffer, ActorState};
 use crate::hud::game_log::{GameLog, LogEntry, LogLevel};
 use crate::map::hypermap::Hypermap;
@@ -32,10 +33,11 @@ use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
 use crate::map::passability::{DynamicPassabilityMap, SubtilePassability};
 use crate::map::pathfind_service::{PathfindQueue, PathfindResults};
 
-pub use behavior::{Behavior, ChargeSelfKeeper, Patroller, RandomWalker};
+pub use behavior::{Behavior, ChargeSelfKeeper, FixerDuty, Patroller, RandomWalker};
 pub use high_level::{
-    assemble_patrol_loop, enqueue_patrol_candidates, make_high_level, GoToChargeStation,
-    GoToPatrol, GoToRandomPoints, HighLevelAction, HighLevelStatus, RECHARGE_PER_S,
+    assemble_patrol_loop, enqueue_patrol_candidates, make_high_level, GoFixBots,
+    GoToChargeStation, GoToPatrol, GoToRandomPoints, HighLevelAction, HighLevelStatus,
+    RECHARGE_PER_S,
 };
 pub use low_level::{FollowPath, FollowTuning, Idle, LowLevelAction, PendingPath, Wait};
 pub use priority::{Priorities, Priority, PriorityKind};
@@ -63,6 +65,20 @@ pub struct AvoidanceViews<'a> {
 pub struct PathfindAccess<'a> {
     pub queue: &'a PathfindQueue,
     pub results: &'a PathfindResults,
+}
+
+/// Everything a fixer bot's [`GoFixBots`](high_level::GoFixBots) needs that other
+/// bots don't: the shared dispatch board, the bot's home depot, and what it is
+/// carrying. Bundled into one optional so non-fixer bots (and most tests) pass
+/// `None`. `dispatch` is interior-mutable, so claims/releases work through `&`.
+#[derive(Clone, Copy)]
+pub struct FixerContext<'a> {
+    /// Shared repair-request board.
+    pub dispatch: &'a DispatchQueue,
+    /// The fixer's home parts depot (lazily located at spawn); `None` until found.
+    pub home_depot: Option<EntityCoordinates>,
+    /// The part the fixer is currently carrying, if any.
+    pub carried: Option<RepairPart>,
 }
 
 /// Read-only snapshot of every bot property a behavior / high-level action may
@@ -99,6 +115,9 @@ pub struct BrainContext<'a> {
     /// Async pathfinding handles. `None` disables route requests (most unit
     /// tests that exercise only movement / priority selection).
     pub pathfind: Option<PathfindAccess<'a>>,
+    /// Fixer-only context (dispatch board, home depot, carried part). `Some` only
+    /// for [`Fixer`](crate::actor::black_bot::BotSpecialization::Fixer) bots.
+    pub fixer: Option<FixerContext<'a>>,
 }
 
 impl BrainContext<'_> {
@@ -145,6 +164,13 @@ pub struct BrainEffects {
     pub undock: Option<EntityCoordinates>,
     /// Add this much charge (`0.0..=1.0` units) to the bot this frame.
     pub recharge: f32,
+    /// Set this bot's carried inventory part (fixer picked a part up at the depot).
+    pub pickup_part: Option<RepairPart>,
+    /// Clear this bot's carried inventory (part delivered or dropped on pre-empt).
+    pub clear_inventory: bool,
+    /// Repair `part` on the target bot (reset its wear and clear the broken flag):
+    /// a fixer delivering a part to a stranded bot.
+    pub repair_target: Option<(Entity, RepairPart)>,
     /// Optional in-game log line for this tick.
     pub log: Option<BrainLogEvent>,
 }
@@ -170,6 +196,15 @@ fn merge_brain_effects(into: &mut BrainEffects, add: BrainEffects) {
     }
     if add.recharge > 0.0 {
         into.recharge += add.recharge;
+    }
+    if let Some(v) = add.pickup_part {
+        into.pickup_part = Some(v);
+    }
+    if add.clear_inventory {
+        into.clear_inventory = true;
+    }
+    if let Some(v) = add.repair_target {
+        into.repair_target = Some(v);
     }
     if let Some(v) = add.log {
         into.log = Some(v);
@@ -368,6 +403,7 @@ pub(crate) mod test_support {
             avoidance: None,
             patrol_loop: None,
             pathfind: None,
+            fixer: None,
         }
     }
 

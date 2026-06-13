@@ -1390,6 +1390,7 @@ mod tests {
             avoidance: None,
             patrol_loop: None,
             pathfind: None,
+            fixer: None,
         };
         let mut rng = rng::seeded(1);
         fp.execute(&mut state, &ctx, &mut rng, &FollowTuning::default());
@@ -1455,6 +1456,7 @@ mod tests {
             avoidance: None,
             patrol_loop: None,
             pathfind: None,
+            fixer: None,
         };
         let mut rng = rng::seeded(2);
         // No detour, so the bot steps aside. With every neighbour statically
@@ -1542,6 +1544,7 @@ mod tests {
                 queue: &queue,
                 results: &results,
             }),
+            fixer: None,
         };
         let mut rng = rng::seeded(5);
         let tuning = FollowTuning {
@@ -1595,6 +1598,7 @@ mod tests {
             }),
             patrol_loop: None,
             pathfind: None,
+            fixer: None,
         };
         let mut rng = rng::seeded(5);
         let original_len = fp.path.len();
@@ -1664,6 +1668,7 @@ mod tests {
             trace: None,
             patrol_loop: None,
             pathfind: None,
+            fixer: None,
         }
     }
 
@@ -1850,6 +1855,7 @@ mod tests {
             avoidance: None,
             patrol_loop: None,
             pathfind: None,
+            fixer: None,
         };
         let mut rng = rng::seeded(7);
 
@@ -1904,6 +1910,7 @@ mod tests {
                 avoidance: None,
                 patrol_loop: None,
             pathfind: None,
+            fixer: None,
             };
             fp.execute(&mut state, &ctx, &mut rng, &tuning);
             // Simulate being physically pinned: position never changes.
@@ -1957,6 +1964,7 @@ mod tests {
                 avoidance: None,
                 patrol_loop: None,
             pathfind: None,
+            fixer: None,
             };
             fp.execute(&mut state, &ctx, &mut rng, &tuning);
             state.move_buffer = ActorMoveBuffer::default();
@@ -2025,6 +2033,7 @@ mod tests {
             }),
             patrol_loop: None,
             pathfind: None,
+            fixer: None,
         };
 
         for _ in 0..4 {
@@ -2093,6 +2102,7 @@ mod tests {
                 avoidance: None,
                 patrol_loop: None,
             pathfind: None,
+            fixer: None,
             };
             wait.execute(&mut state, &ctx, &mut rng::seeded(1), &tuning);
         }
