@@ -84,6 +84,10 @@ pub enum PathfindReason {
     PatrolLoopGen,
     ChargerSeek,
     ChargerDockApproach,
+    FixerLoiter,
+    FixerFetchPart,
+    FixerDeliver,
+    FixerReturnHome,
     SubtileDetour,
 }
 

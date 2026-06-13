@@ -9,6 +9,7 @@
 use bevy::ecs::entity::Entity;
 use crate::rng::{self, StdRng};
 
+use crate::actor::dispatch::{RepairPart, RepairRequest};
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap, HYPERMAP_CHUNK_SIZE};
 use crate::map::hypermap_pathfind::{manhattan, world_tile_walkable};
 use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
@@ -16,7 +17,7 @@ use crate::map::pathfind_service::{PathKind, PathOutcome, PathfindReason, Reques
 
 use super::low_level::{FollowPath, LowLevelAction, PendingPath, Wait};
 use super::priority::PriorityKind;
-use super::{BrainContext, BrainEffects, BrainLogEvent, PathfindAccess};
+use super::{BrainContext, BrainEffects, BrainLogEvent, FixerContext, PathfindAccess};
 
 /// Wander radius (tiles) for [`GoToRandomPoints`].
 const WANDER_RADIUS: f32 = 15.0;
@@ -163,6 +164,7 @@ pub fn make_high_level(kind: PriorityKind) -> Box<dyn HighLevelAction> {
     match kind {
         PriorityKind::RandomWalking => Box::new(GoToRandomPoints::default()),
         PriorityKind::Patrolling => Box::new(GoToPatrol::new()),
+        PriorityKind::Fixing => Box::new(GoFixBots::new()),
         PriorityKind::RechargeYourself => Box::new(GoToChargeStation::new()),
     }
 }
@@ -564,6 +566,464 @@ pub fn assemble_patrol_loop(resolved: &[((i32, i32), bool)]) -> Vec<(i32, i32)> 
         }
     }
     loop_tiles
+}
+
+// ---------------------------------------------------------------------------
+// GoFixBots
+// ---------------------------------------------------------------------------
+
+/// Manhattan radius (tiles) around the home depot within which a fixer loiters
+/// and watches the dispatch queue. Outside it, the fixer heads back and ignores
+/// the queue.
+const FIXER_LOITER_RADIUS: i32 = 10;
+/// Squared tile distance at which a fixer is "close enough" to a stranded bot to
+/// repair it — near but not touching (avoids a collision with the target).
+const FIX_REACH_SQ: f32 = 2.25; // 1.5 tiles
+
+/// Phase of the perpetual fixer routine.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FixPhase {
+    /// No task: loiter near the home depot and watch the dispatch queue.
+    Loiter,
+    /// Claimed a task: travel to the home depot to pick up the part.
+    FetchPart,
+    /// Carrying the part: travel to the stranded bot and repair on contact.
+    Deliver,
+    /// Delivered: travel back to the home depot, then loiter.
+    ReturnHome,
+}
+
+/// Outcome of polling an in-flight fixer route.
+enum RoutePoll {
+    /// No result yet.
+    Waiting,
+    /// Route arrived (more than one tile to walk).
+    Route(Vec<(i32, i32)>),
+    /// Already standing on the goal tile (`raw_len <= 1`).
+    AtGoal,
+    /// Search failed (no path / limit) or timed out.
+    Failed,
+}
+
+/// Perpetual fixer routine: loiter near the home parts depot watching the
+/// [`DispatchQueue`](crate::actor::dispatch::DispatchQueue); on a claimed request,
+/// fetch the part from the depot into the bot's
+/// [`BotInventory`](crate::actor::dispatch::BotInventory), drive to the stranded
+/// bot, repair it on contact, then return home. Never reports `Done`.
+///
+/// Like [`GoToPatrol`] the action is transient (rebuilt whenever `Fixing` becomes
+/// dominant again after a recharge); the home depot lives on the bot's
+/// [`Fixer`](crate::actor::black_bot::Fixer) component and the claim lives on the
+/// shared dispatch board, so a recharge detour resumes cleanly.
+pub struct GoFixBots {
+    phase: FixPhase,
+    /// The repair request this fixer claimed (its broken bot, part, location).
+    claim: Option<RepairRequest>,
+    awaiting: Option<RequestId>,
+    await_elapsed: f32,
+    leg: Option<LegDeadline>,
+    prev_low_stuck: bool,
+    prev_low_finished: bool,
+}
+
+impl GoFixBots {
+    pub fn new() -> Self {
+        Self {
+            phase: FixPhase::Loiter,
+            claim: None,
+            awaiting: None,
+            await_elapsed: 0.0,
+            leg: None,
+            prev_low_stuck: false,
+            prev_low_finished: false,
+        }
+    }
+
+    /// Enqueues a world route to `goal` and parks the bot in [`PendingPath`].
+    fn start_route(
+        &mut self,
+        pf: PathfindAccess,
+        ctx: &BrainContext,
+        low: &mut Box<dyn LowLevelAction>,
+        goal: (i32, i32),
+        reason: PathfindReason,
+    ) {
+        let here = (ctx.main_tile.x, ctx.main_tile.y);
+        let id = pf.queue.enqueue(
+            PathKind::WorldRoute {
+                start: here,
+                goal,
+                max_expanded: WANDER_SEARCH_LIMIT,
+                simplify_buffer: PATH_CORNER_BUFFER,
+            },
+            ctx.entity,
+            reason,
+        );
+        self.awaiting = Some(id);
+        self.await_elapsed = 0.0;
+        self.leg = Some(LegDeadline::new(here, goal));
+        *low = Box::new(PendingPath::with_velocity(low.velocity()));
+    }
+
+    /// Polls the in-flight route request, consuming it when it lands.
+    fn poll_route(&mut self, pf: PathfindAccess, dt: f32) -> RoutePoll {
+        let Some(id) = self.awaiting else {
+            return RoutePoll::Failed;
+        };
+        self.await_elapsed += dt;
+        if let Some(outcome) = pf.results.take(id) {
+            self.awaiting = None;
+            match outcome {
+                PathOutcome::Route { path, raw_len } if raw_len > 1 => RoutePoll::Route(path),
+                PathOutcome::Route { .. } => RoutePoll::AtGoal,
+                _ => RoutePoll::Failed,
+            }
+        } else if self.await_elapsed >= PATH_WAIT_RETRY_S {
+            self.awaiting = None;
+            RoutePoll::Failed
+        } else {
+            RoutePoll::Waiting
+        }
+    }
+
+    /// Picks a fresh loiter destination: head back toward `home` when displaced
+    /// beyond the loiter radius, otherwise wander to a walkable tile within it.
+    fn start_loiter_wander(
+        &mut self,
+        pf: PathfindAccess,
+        ctx: &BrainContext,
+        low: &mut Box<dyn LowLevelAction>,
+        rng: &mut StdRng,
+        home: (i32, i32),
+    ) {
+        let here = (ctx.main_tile.x, ctx.main_tile.y);
+        if manhattan(here, home) > FIXER_LOITER_RADIUS {
+            self.start_route(pf, ctx, low, home, PathfindReason::FixerReturnHome);
+            return;
+        }
+        match sample_tile_within_radius(rng, home, FIXER_LOITER_RADIUS as f32, ctx.passability) {
+            Some(goal) => self.start_route(pf, ctx, low, goal, PathfindReason::FixerLoiter),
+            None => {
+                self.awaiting = None;
+                self.leg = None;
+                *low = Box::new(Wait::retry(RETRY_S));
+            }
+        }
+    }
+
+    /// Drops the current claim (back to the pool) and clears carried inventory —
+    /// used on give-up and pre-emption so a stuck task frees up for another fixer.
+    fn abandon_claim(&mut self, fx: FixerContext, entity: Entity, effects: &mut BrainEffects) {
+        if self.claim.take().is_some() {
+            fx.dispatch.release(entity);
+        }
+        effects.clear_inventory = true;
+    }
+}
+
+impl Default for GoFixBots {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HighLevelAction for GoFixBots {
+    fn kind(&self) -> PriorityKind {
+        PriorityKind::Fixing
+    }
+    fn label(&self) -> String {
+        match self.phase {
+            FixPhase::Loiter => "GoFixBots (loiter)".to_string(),
+            FixPhase::FetchPart => "GoFixBots (fetch part)".to_string(),
+            FixPhase::Deliver => "GoFixBots (deliver)".to_string(),
+            FixPhase::ReturnHome => "GoFixBots (return)".to_string(),
+        }
+    }
+    fn preempt(&mut self, ctx: &BrainContext) -> BrainEffects {
+        let mut effects = BrainEffects::default();
+        if let Some(fx) = ctx.fixer {
+            self.abandon_claim(fx, ctx.entity, &mut effects);
+        }
+        self.phase = FixPhase::Loiter;
+        self.awaiting = None;
+        self.leg = None;
+        effects
+    }
+    fn update(
+        &mut self,
+        ctx: &BrainContext,
+        low: &mut Box<dyn LowLevelAction>,
+        rng: &mut StdRng,
+    ) -> HighLevelOutcome {
+        let (Some(pf), Some(fx)) = (ctx.pathfind, ctx.fixer) else {
+            return HighLevelOutcome::running();
+        };
+        // No reachable home depot located yet: hold until one is found.
+        let Some(home) = fx.home_depot else {
+            *low = Box::new(Wait::retry(RETRY_S));
+            return HighLevelOutcome::running();
+        };
+        let here = (ctx.main_tile.x, ctx.main_tile.y);
+        let home_tile = (home.x, home.y);
+
+        let outcome = match self.phase {
+            FixPhase::Loiter => self.update_loiter(pf, fx, ctx, low, rng, here, home_tile),
+            FixPhase::FetchPart => self.update_fetch(pf, fx, ctx, low, here, home_tile),
+            FixPhase::Deliver => self.update_deliver(pf, fx, ctx, low, here, home_tile),
+            FixPhase::ReturnHome => self.update_return(pf, ctx, low, here, home_tile),
+        };
+        self.prev_low_stuck = low.is_stuck();
+        self.prev_low_finished = low.is_finished();
+        outcome
+    }
+}
+
+impl GoFixBots {
+    fn update_loiter(
+        &mut self,
+        pf: PathfindAccess,
+        fx: FixerContext,
+        ctx: &BrainContext,
+        low: &mut Box<dyn LowLevelAction>,
+        rng: &mut StdRng,
+        here: (i32, i32),
+        home_tile: (i32, i32),
+    ) -> HighLevelOutcome {
+        // Resolve any in-flight loiter route first.
+        if self.awaiting.is_some() {
+            match self.poll_route(pf, ctx.dt) {
+                RoutePoll::Waiting => return HighLevelOutcome::running(),
+                RoutePoll::Route(path) => {
+                    if let Some(leg) = &mut self.leg {
+                        leg.reset_elapsed();
+                    }
+                    *low = Box::new(FollowPath::new(path));
+                    return HighLevelOutcome::running();
+                }
+                RoutePoll::AtGoal | RoutePoll::Failed => self.leg = None,
+            }
+        }
+
+        // Watch the dispatch queue only while near the home depot.
+        if manhattan(here, home_tile) <= FIXER_LOITER_RADIUS {
+            if let Some(req) = fx.dispatch.claim_nearest(ctx.entity, ctx.main_tile) {
+                self.claim = Some(req);
+                self.phase = FixPhase::FetchPart;
+                self.leg = None;
+                low.halt();
+                self.start_route(pf, ctx, low, home_tile, PathfindReason::FixerFetchPart);
+                return HighLevelOutcome::running();
+            }
+        }
+
+        // Wander leg travel budget.
+        if let Some(leg) = &mut self.leg {
+            if is_follow_path(low.as_ref()) && !low.is_finished() && leg.tick(ctx.dt) {
+                self.leg = None;
+                low.halt();
+                self.start_loiter_wander(pf, ctx, low, rng, home_tile);
+                return HighLevelOutcome::running();
+            }
+        }
+
+        // Pick a new loiter destination when idle / arrived / stuck.
+        if low_level_needs_replan(low.as_ref(), self.prev_low_stuck, self.prev_low_finished) {
+            self.start_loiter_wander(pf, ctx, low, rng, home_tile);
+        }
+        HighLevelOutcome::running()
+    }
+
+    fn update_fetch(
+        &mut self,
+        pf: PathfindAccess,
+        fx: FixerContext,
+        ctx: &BrainContext,
+        low: &mut Box<dyn LowLevelAction>,
+        here: (i32, i32),
+        home_tile: (i32, i32),
+    ) -> HighLevelOutcome {
+        let Some(req) = self.claim else {
+            self.phase = FixPhase::Loiter;
+            return HighLevelOutcome::running();
+        };
+
+        if self.awaiting.is_some() {
+            match self.poll_route(pf, ctx.dt) {
+                RoutePoll::Waiting => return HighLevelOutcome::running(),
+                RoutePoll::Route(path) => {
+                    if let Some(leg) = &mut self.leg {
+                        leg.reset_elapsed();
+                    }
+                    *low = Box::new(FollowPath::new(path));
+                    return HighLevelOutcome::running();
+                }
+                RoutePoll::AtGoal => {
+                    // Standing on the depot: pick up the part and head to the bot.
+                    return self.pick_up_and_deliver(pf, ctx, low, req);
+                }
+                RoutePoll::Failed => {
+                    *low = Box::new(Wait::retry(RETRY_S));
+                    return HighLevelOutcome::running();
+                }
+            }
+        }
+
+        // Reached the depot tile? Pick up.
+        if manhattan(here, home_tile) == 0 {
+            return self.pick_up_and_deliver(pf, ctx, low, req);
+        }
+
+        // Leg budget / arrival / stuck handling: re-route to the depot.
+        let leg_expired = self
+            .leg
+            .as_mut()
+            .map(|leg| is_follow_path(low.as_ref()) && !low.is_finished() && leg.tick(ctx.dt))
+            .unwrap_or(false);
+        if leg_expired
+            || low_level_needs_replan(low.as_ref(), self.prev_low_stuck, self.prev_low_finished)
+        {
+            self.leg = None;
+            low.halt();
+            self.start_route(pf, ctx, low, home_tile, PathfindReason::FixerFetchPart);
+        }
+        let _ = fx;
+        HighLevelOutcome::running()
+    }
+
+    /// At the depot with a claim: load the part into inventory and route to the
+    /// stranded bot.
+    fn pick_up_and_deliver(
+        &mut self,
+        pf: PathfindAccess,
+        ctx: &BrainContext,
+        low: &mut Box<dyn LowLevelAction>,
+        req: RepairRequest,
+    ) -> HighLevelOutcome {
+        self.phase = FixPhase::Deliver;
+        self.leg = None;
+        low.halt();
+        self.start_route(pf, ctx, low, (req.location.x, req.location.y), PathfindReason::FixerDeliver);
+        HighLevelOutcome::running_with(BrainEffects {
+            pickup_part: Some(req.part),
+            ..BrainEffects::default()
+        })
+    }
+
+    fn update_deliver(
+        &mut self,
+        pf: PathfindAccess,
+        fx: FixerContext,
+        ctx: &BrainContext,
+        low: &mut Box<dyn LowLevelAction>,
+        here: (i32, i32),
+        home_tile: (i32, i32),
+    ) -> HighLevelOutcome {
+        let Some(req) = self.claim else {
+            self.phase = FixPhase::ReturnHome;
+            return HighLevelOutcome::running();
+        };
+
+        // Close enough to repair? Fix on proximity, before colliding with the bot.
+        let target_center = Vec2::new(req.location.x as f32 + 0.5, req.location.y as f32 + 0.5);
+        if (ctx.center - target_center).length_squared() <= FIX_REACH_SQ {
+            low.halt();
+            fx.dispatch.complete(req.broken_bot);
+            self.claim = None;
+            self.phase = FixPhase::ReturnHome;
+            self.leg = None;
+            self.start_route(pf, ctx, low, home_tile, PathfindReason::FixerReturnHome);
+            return HighLevelOutcome::running_with(BrainEffects {
+                repair_target: Some((req.broken_bot, req.part)),
+                clear_inventory: true,
+                ..BrainEffects::default()
+            });
+        }
+
+        if self.awaiting.is_some() {
+            match self.poll_route(pf, ctx.dt) {
+                RoutePoll::Waiting => return HighLevelOutcome::running(),
+                RoutePoll::Route(path) => {
+                    if let Some(leg) = &mut self.leg {
+                        leg.reset_elapsed();
+                    }
+                    *low = Box::new(FollowPath::new(path));
+                    return HighLevelOutcome::running();
+                }
+                // Can't reach the bot's tile (it's occupied / boxed in): give up,
+                // drop the part, return home so the task frees for another fixer.
+                RoutePoll::AtGoal | RoutePoll::Failed => {
+                    let mut effects = BrainEffects::default();
+                    self.abandon_claim(fx, ctx.entity, &mut effects);
+                    self.phase = FixPhase::ReturnHome;
+                    self.leg = None;
+                    self.start_route(pf, ctx, low, home_tile, PathfindReason::FixerReturnHome);
+                    return HighLevelOutcome::running_with(effects);
+                }
+            }
+        }
+
+        let leg_expired = self
+            .leg
+            .as_mut()
+            .map(|leg| is_follow_path(low.as_ref()) && !low.is_finished() && leg.tick(ctx.dt))
+            .unwrap_or(false);
+        if leg_expired
+            || low_level_needs_replan(low.as_ref(), self.prev_low_stuck, self.prev_low_finished)
+        {
+            self.leg = None;
+            low.halt();
+            self.start_route(pf, ctx, low, (req.location.x, req.location.y), PathfindReason::FixerDeliver);
+        }
+        HighLevelOutcome::running()
+    }
+
+    fn update_return(
+        &mut self,
+        pf: PathfindAccess,
+        ctx: &BrainContext,
+        low: &mut Box<dyn LowLevelAction>,
+        here: (i32, i32),
+        home_tile: (i32, i32),
+    ) -> HighLevelOutcome {
+        if self.awaiting.is_some() {
+            match self.poll_route(pf, ctx.dt) {
+                RoutePoll::Waiting => return HighLevelOutcome::running(),
+                RoutePoll::Route(path) => {
+                    if let Some(leg) = &mut self.leg {
+                        leg.reset_elapsed();
+                    }
+                    *low = Box::new(FollowPath::new(path));
+                    return HighLevelOutcome::running();
+                }
+                RoutePoll::AtGoal | RoutePoll::Failed => {
+                    self.phase = FixPhase::Loiter;
+                    self.leg = None;
+                    return HighLevelOutcome::running();
+                }
+            }
+        }
+
+        if manhattan(here, home_tile) <= FIXER_LOITER_RADIUS {
+            // Back within the loiter zone: resume loitering.
+            self.phase = FixPhase::Loiter;
+            self.leg = None;
+            return HighLevelOutcome::running();
+        }
+
+        let leg_expired = self
+            .leg
+            .as_mut()
+            .map(|leg| is_follow_path(low.as_ref()) && !low.is_finished() && leg.tick(ctx.dt))
+            .unwrap_or(false);
+        if leg_expired
+            || low_level_needs_replan(low.as_ref(), self.prev_low_stuck, self.prev_low_finished)
+        {
+            self.leg = None;
+            low.halt();
+            self.start_route(pf, ctx, low, home_tile, PathfindReason::FixerReturnHome);
+        }
+        HighLevelOutcome::running()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1224,6 +1684,7 @@ mod tests {
             trace: None,
             patrol_loop,
             pathfind: Some(pf),
+            fixer: None,
         }
     }
 
