@@ -913,13 +913,40 @@ impl LowLevelAction for FollowPath {
                             self.detour_wait_elapsed = 0.0;
                             self.detour_fallback = step;
                         }
-                        None => {
-                            match step {
-                                Some(c) => ctx.trace(format!("bump at {blocker:?} → step aside to {c:?}")),
-                                None => ctx.trace(format!("bump at {blocker:?} → all neighbours taken, wait")),
+                        None => match step {
+                            Some(c) => {
+                                ctx.trace(format!("bump at {blocker:?} → step aside to {c:?}"));
+                                self.begin_step_aside(step, rng);
                             }
-                            self.step_aside_or_wait(step, rng);
-                        }
+                            // Genuine wedge: no free immediate neighbour. A bare
+                            // wait-in-place here would suspend BOTH the stuck-timer
+                            // escape (skipped by the early return) and the
+                            // collision-pressure relocate (gated off while
+                            // `is_recovering`), so two big bots pressed together in
+                            // open space deadlock forever. Try the wider escape
+                            // search (nearest fully-free cell, radius
+                            // `ESCAPE_SEARCH_TILES`) first; only wait if even that
+                            // finds nothing (genuinely boxed in / no avoidance data).
+                            None => {
+                                if let Some(target) = self.find_escape_cell(state, ctx) {
+                                    ctx.trace(format!(
+                                        "bump at {blocker:?} → neighbours taken, escape to {target:?}"
+                                    ));
+                                    self.escape_target = Some(target);
+                                    self.clear_detour();
+                                    self.last_head_on_bump = None;
+                                    self.pending_wait = None;
+                                    self.stuck_timer = 0.0;
+                                    self.stuck_reference_pos = Some(center);
+                                    self.run_escape(state, ctx, t, dt);
+                                    return;
+                                }
+                                ctx.trace(format!(
+                                    "bump at {blocker:?} → neighbours taken, no escape → wait"
+                                ));
+                                self.begin_wait_in_place(rng);
+                            }
+                        },
                     }
                 }
             }
@@ -1695,10 +1722,11 @@ mod tests {
     }
 
     #[test]
-    fn follow_path_waits_in_place_when_all_neighbors_taken() {
-        // Front bump with every neighbour footprint blocked (fully-blocked static
-        // cache) and no pathfind handle → no step cell, no detour: the bot must
-        // just wait in place (arm contact_wait_s, insert no waypoint).
+    fn follow_path_waits_in_place_when_fully_boxed_in() {
+        // Front bump with every neighbour footprint blocked **and** no free cell
+        // anywhere in the escape-search radius (fully boxed in) and no pathfind
+        // handle → no step cell, no escape, no detour: the bot must just wait in
+        // place (arm contact_wait_s, insert no waypoint).
         use crate::actor::brain::AvoidanceViews;
         use crate::map::passability::{SubtilePassability, FLAG_BLOCKED};
 
@@ -1709,13 +1737,14 @@ mod tests {
 
         let (mut state, passability, interactive) = bump_ctx_state(IVec2::new(26, 25));
         let dynamic = DynamicPassabilityMap::new();
-        // Block every tile whose subtiles a neighbour footprint could touch.
+        // Block every tile across the whole escape-search radius (and a margin) so
+        // not just the neighbours but also `find_escape_cell` find nothing free.
         // NB: a *missing* chunk reads as 0 flags (not the map default), so the
         // blocked tiles must be written explicitly, not set as the default.
         let blocked_tile = SubtilePassability { cells: [FLAG_BLOCKED; SUBTILE_COUNT * SUBTILE_COUNT] };
         let static_subtiles: Hypermap<SubtilePassability> = Hypermap::new(SubtilePassability::EMPTY);
-        for ty in 2..=8 {
-            for tx in 2..=8 {
+        for ty in 0..=10 {
+            for tx in 0..=10 {
                 static_subtiles.set(tx, ty, blocked_tile);
             }
         }
@@ -1753,9 +1782,63 @@ mod tests {
         assert!(fp.detour.is_empty(), "no pathfind handle → no detour");
         assert!(
             fp.contact_wait_s > 0.0,
-            "all neighbours taken → bot waits in place, got {}",
+            "fully boxed in → bot waits in place, got {}",
             fp.contact_wait_s
         );
+        assert!(fp.escape_target.is_none(), "no free cell anywhere → no escape");
+    }
+
+    #[test]
+    fn follow_path_escapes_when_wedged_but_free_cell_beyond_neighbours() {
+        // Front bump where every *immediate* neighbour footprint is blocked but a
+        // free cell exists further out (open space with one big neighbour). Rather
+        // than wait in place forever — which would suspend both the stuck-escape
+        // and the collision-pressure relocate and deadlock two bots — the bot must
+        // begin an escape to the nearest free cell.
+        use crate::actor::brain::AvoidanceViews;
+        use crate::map::passability::{SubtilePassability, FLAG_BLOCKED};
+
+        let mut fp = FollowPath::new(vec![(8, 5)]);
+        fp.velocity = Vec2::new(1.0, 0.0);
+        fp.direction = Vec2::new(1.0, 0.0);
+        fp.prev_tile = Some(IVec2::new(4, 5));
+
+        let (mut state, passability, interactive) = bump_ctx_state(IVec2::new(26, 25));
+        let dynamic = DynamicPassabilityMap::new();
+        // Block only the 3×3 immediate-neighbour band (tiles 4..=6); everything
+        // beyond stays free, so `step_target` yields None but `find_escape_cell`
+        // finds a reachable free cell.
+        let blocked_tile = SubtilePassability { cells: [FLAG_BLOCKED; SUBTILE_COUNT * SUBTILE_COUNT] };
+        let static_subtiles: Hypermap<SubtilePassability> = Hypermap::new(SubtilePassability::EMPTY);
+        for ty in 4..=6 {
+            for tx in 4..=6 {
+                static_subtiles.set(tx, ty, blocked_tile);
+            }
+        }
+        let mut ctx = bump_ctx(&state, &passability, &interactive);
+        ctx.avoidance = Some(AvoidanceViews {
+            dynamic: &dynamic,
+            static_subtiles: &static_subtiles,
+            blocked_flags: FLAG_BLOCKED,
+        });
+        let mut rng = rng::seeded(8);
+        let tuning = FollowTuning {
+            bot_detour_chance: 0.0,
+            ..FollowTuning::default()
+        };
+
+        assert_eq!(
+            fp.step_target(&state, &ctx, Vec2::new(1.0, 0.0), &mut rng),
+            None,
+            "all immediate neighbours blocked → no step cell"
+        );
+
+        fp.execute(&mut state, &ctx, &mut rng, &tuning);
+        assert!(
+            fp.escape_target.is_some(),
+            "wedged with a free cell beyond the neighbours → escape, not wait"
+        );
+        assert_eq!(fp.contact_wait_s, 0.0, "escaping, not waiting in place");
     }
 
     #[test]

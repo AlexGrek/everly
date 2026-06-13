@@ -169,10 +169,16 @@ route around other (moving) bots. When a step is rejected with
      rather than retreating. It then holds at that cell for a random 0.5–1.5 s
      (`STEP_BACK_WAIT_*_SECS`); the pause arms only once the bot *reaches* it
      (`pending_wait` → `contact_wait_s`), braking with the normal decel profile.
-   - *Wait in place* → if **every** neighbour is taken, the bot has nowhere to go,
-     so it just brakes and waits in place for the same 0.5–1.5 s
-     (`begin_wait_in_place`) for the jam to clear — it does **not** force a detour
-     or push on.
+   - *Escape, then wait* → if **every** immediate neighbour is taken, the bot
+     first tries the wider **escape** search (`find_escape_cell`,
+     `ESCAPE_SEARCH_TILES` radius) for the nearest cell whose whole footprint is
+     free, and relocates there if one exists. Only when even that finds nothing
+     (genuinely boxed in / no avoidance data) does it `begin_wait_in_place` and
+     brake for 0.5–1.5 s. **This is what breaks open-space two-bot wedges:** a bare
+     wait-in-place reports `is_recovering`, which suspends *both* the stuck-timer
+     escape (skipped by the wait's early return) and the collision-pressure
+     relocate (gated off while recovering), so two large bots pressed together with
+     no free neighbour but open space around them would otherwise deadlock forever.
 
 This applies to bot-on-bot bumps only; a wall graze (`BlockedByStatic`) is left
 to the normal wall-slide / stuck-repath path.
