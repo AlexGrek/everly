@@ -574,3 +574,41 @@ through a reused chunk) and `recycled_pool_chunk_is_reused_not_reallocated`;
 the existing passability flush-cycle suite now runs against the recycling
 buffer. Verified green: `cargo test -p everly` (252 passed, 0 failed,
 2 ignored), `cargo check -p everly --all-targets` warning-clean.
+
+### Propose phase made sequential — off the global ComputeTaskPool (2026-06)
+
+The HUD propose timers showed `prop_par` peaking ~29 ms while `prop_body` (the
+summed per-actor work) stayed at ~0.02 ms — i.e. the propose pass was spending
+~29 ms doing *no actor work*. Root cause, confirmed from `bevy_tasks`
+`task_pool.rs`: `Query::par_iter_mut` runs on the global `ComputeTaskPool` via
+`scope(tick_task_pool_executor = true)`. While waiting for its own (tiny)
+batches, the calling thread loops on `executor.tick()`, **executing arbitrary
+other tasks queued on the global compute pool** (render batching, visibility,
+transform propagation, etc.). That foreign runtime is billed to the propose
+scope. With the movement pipeline now in `FixedUpdate` at 60 Hz, a slow render
+frame runs several catch-up ticks, each absorbing more queued compute — a
+self-amplifying, frame-rate-coupled stall where bots appeared to slow in sync
+while fps and every instrumented system read ~0.
+
+Fix ([`src/actor/movement.rs`](src/actor/movement.rs)): `propose_actor_moves`
+now iterates `actors.iter_mut()` **sequentially on the main thread** instead of
+`par_iter_mut`. `ParallelCommands` → `Commands`, `Parallel<Vec<Entity>>` →
+the arbiter's reused `reentrants` Vec, per-thread `AtomicU64` timers → plain
+locals. The per-bot work is a single static-slide probe (`first_static_block`,
+lock-free static-cache reads) — microseconds for the whole crowd — so
+single-threaded costs nothing measurable and removes the pool coupling
+entirely.
+
+This is a deliberate, documented exception to rule 5 (design for parallelism):
+parallelism only pays when the per-entity work is large enough to amortize the
+scheduling, and here it is ~0.02 ms total. A *private* `TaskPool` would also
+isolate propose, but `par_iter_mut` is hard-wired to `ComputeTaskPool`, so a
+custom pool needs manual `unsafe` chunking of a `&mut` query plus extra OS
+threads contending for cores — all to parallelize 0.02 ms. Reconsider a private
+pool only if per-bot propose work grows heavy (hundreds of bots). The
+`prop_par` HUD row is kept as a regression sentinel: it now tracks `prop_body`,
+and a divergence means pool coupling was re-introduced.
+
+Verified green: `cargo test -p everly` (252 passed, 0 failed, 2 ignored) and
+`cargo check -p everly --all-targets` warning-clean. Docs updated:
+`docs/movement.md`, `docs/actor.md`, `.claude/SKILLS/actor-engineer/SKILL.md`.

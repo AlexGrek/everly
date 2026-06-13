@@ -25,8 +25,9 @@ paths:
 Use this skill for:
 
 - `Actor` trait design and default method behavior.
-- The 3-step arbitrated movement pipeline: `propose_actor_moves` (parallel),
-  `arbitrate_actor_moves` (sequential), and the squeeze/teleport tail.
+- The 3-step arbitrated movement pipeline: `propose_actor_moves` (sequential —
+  off the global `ComputeTaskPool` on purpose), `arbitrate_actor_moves`
+  (sequential), and the squeeze/teleport tail.
 - Movement/rotation buffers and per-frame error handling.
 - `ActorShadow` — per-actor shadow arrays (`current`/`previous` subtile coords)
   swapped each accepted frame; allocated once at spawn.
@@ -62,7 +63,8 @@ For generic Bevy API usage, still read `.claude/SKILLS/bevy-engineer/SKILL.md` f
 
 ## Invariants
 
-- `propose_actor_moves` clears `last_movement_error` every frame before thinking.
+- The movement pipeline (brain → propose → arbitrate → field deposits) runs on **`FixedUpdate` at 60 Hz**, decoupled from the render frame; render-facing syncs stay in `Update`. See `docs/movement.md`.
+- `propose_actor_moves` clears `last_movement_error` every tick before thinking.
 - Actor movement intent is written into `move_buffer`, not applied directly.
 - `move_buffer` must have **both** `tile_delta` and `subtile_shift` set each frame; `apply_outcome` applies the float delta to `center`.
 - `Actor::propose_move` writes `shadow.proposed_center` / `shadow.origin` (compact `(center, radius)` footprints) — **never** updates `center` directly.
@@ -107,7 +109,7 @@ contains any of `blocked`'s flags. `propose_move` calls this during Step 1;
 ```
 flush_actor_occupancy        (clear dynamic write buffer)
   ↓
-propose_actor_moves          (parallel par_iter_mut)
+propose_actor_moves          (sequential, main thread)
     think_low_level
     prepare_movement
     propose_move             ← writes shadow.proposed_center / shadow.origin

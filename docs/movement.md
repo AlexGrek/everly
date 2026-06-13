@@ -10,38 +10,67 @@ bot wants to go is in `docs/actor-brain.md` / `docs/pathfind-service.md`.
 
 Movement is split into three phases per frame:
 
-1. **Propose** (parallel) — every on-screen actor computes one candidate step,
-   validated against **static** geometry only.
+1. **Propose** (sequential) — every on-screen actor computes one candidate
+   step, validated against **static** geometry only.
 2. **Arbitrate** (sequential, deterministic) — a single authority resolves all
    actor-vs-actor occupancy conflicts within the frame.
 3. **Apply + squeeze** (inside the arbitrate system) — outcomes are written
    back to the actors; hopelessly wedged bots are teleported out.
 
-The split exists because the two halves want opposite execution models. Static
-collision is read-only and embarrassingly parallel, so it runs on
-`par_iter_mut` with zero shared writes. Occupancy is a shared resource that
-must be allocated authoritatively — two bots must never hold the same subtile
-in the same frame — so it is resolved by one thread in a deterministic order.
-The previous design (each actor checking last frame's occupancy snapshot and
-OR-stamping its footprint in parallel) allowed two actors to claim the same
-free cell and overlap for a frame, and its contended parallel writes were the
-biggest per-frame hot spot (see `OPTIMIZATION.md`).
+The split exists because propose is read-only against the static geometry
+(each actor touches only its own state) while arbitrate is the single authority
+over shared occupancy — two bots must never hold the same subtile in the same
+frame, so it is resolved by one thread in a deterministic order. The previous
+design (each actor checking last frame's occupancy snapshot and OR-stamping its
+footprint in parallel) let two actors claim the same free cell and overlap for
+a frame, and its contended parallel writes were the biggest per-frame hot spot
+(see `OPTIMIZATION.md`).
 
-## Frame lifecycle
+> **Why propose is sequential, not `par_iter_mut`.** The per-bot work is a
+> single static slide probe — single-digit microseconds for the whole crowd.
+> Running it on Bevy's global `ComputeTaskPool` (via `par_iter_mut`) was a net
+> loss: that pool's `scope` ticks the *global* executor while waiting for its
+> own batches, so a propose tick absorbed unrelated queued compute work (render
+> batching, etc.) and, at 60 Hz fixed catch-up ticks, compounded into
+> frame-rate-coupled stalls. Sequential execution on the main thread removes the
+> coupling for no measurable compute cost. A private thread pool would isolate
+> propose too, but only matters if per-bot work grows heavy (hundreds of bots);
+> at this scale it adds `unsafe` query chunking and core contention for nothing.
+
+## Tick lifecycle — fixed 60 Hz
+
+The whole pipeline runs on Bevy's **`FixedUpdate` schedule at 60 Hz**
+(`Time::<Fixed>::from_hz(60.0)` in `GamePlugin`), decoupled from the render
+frame rate: a slow render frame runs extra fixed ticks to catch up, so bot
+pace never depends on fps. Inside `FixedUpdate`, `Res<Time>` yields the fixed
+`dt` automatically.
 
 ```
-flush_actor_occupancy        promote occupancy write buffer → read; reset write
-  ↓
-black_bot_brain              planning: fills move_buffer (sequential, owns RNG)
-  ↓
-propose_actor_moves          PHASE 1 (parallel)
-  ↓
-arbitrate_actor_moves        PHASES 2 + 3 (sequential)
-  ↓
-dirt_actor_interaction, …    field interactions read final positions
+FixedUpdate (×N per render frame, 60 Hz real-time)
+  pathfind_collect             drain finished async route results
+    ↓
+  flush_actor_occupancy        promote occupancy write buffer → read; reset write
+    ↓
+  black_bot_brain              planning: fills move_buffer (sequential, owns RNG)
+    ↓
+  pathfind_dispatch            spawn queued searches (≤10 in flight)
+    ↓
+  propose_actor_moves          PHASE 1 (sequential)
+    ↓
+  arbitrate_actor_moves        PHASES 2 + 3 (sequential)
+    ↓
+  dirt_actor_interaction, …    field deposits read final positions
+
+Update (once per render frame, after all fixed ticks)
+  sync_black_bot_transforms    actor state → render transforms
+  flush_dirt_map / …           field double-buffer flushes, overlays, HUD
 ```
 
-All systems are gated on `GameState::InGame` and not-paused.
+`FixedUpdate` always completes before `Update` within a frame, so
+render-facing systems read the state the fixed ticks just produced without any
+cross-schedule ordering. Input edge detection (`toggle_pause`) stays in
+`Update` — `just_pressed` edges can be missed by fixed ticks at high frame
+rates. All systems are gated on `GameState::InGame` and not-paused.
 
 ## Movement intent: `move_buffer`
 
@@ -59,9 +88,9 @@ computes the candidate grid cell as `last_accepted_center_subtile +
 subtile_shift` — never by re-quantizing the float center, which can round into
 a wall.
 
-## Phase 1 — propose (parallel)
+## Phase 1 — propose (sequential)
 
-`propose_actor_moves` runs `par_iter_mut` over all actors. Per actor:
+`propose_actor_moves` iterates all actors on the main thread. Per actor:
 
 1. Clear `last_movement_error` and the per-frame shadow flags.
 2. `think_low_level()` + `prepare_movement()` — light per-frame logic that
@@ -168,9 +197,8 @@ chunks + recycled flush").
 
 ## Determinism
 
-- Phase 1 is order-independent (each actor touches only its own state).
-- Phase 2/3 process in sorted-entity order, so results are reproducible
-  regardless of thread scheduling.
+- Phase 1 is sequential and each actor touches only its own state.
+- Phase 2/3 process in sorted-entity order, so results are reproducible.
 - Bot RNG lives in the sequential brain system and is seeded (`StdRng`).
 - The only non-determinism in the wider movement stack is the **arrival
   frame** of async pathfind results (`docs/pathfind-service.md`).
@@ -182,26 +210,34 @@ counter, `last ^peak` (peaks hold for 1 s):
 
 | Row | Meaning |
 |---|---|
-| `propose` | wall-clock of the whole parallel propose pass |
-| `prop_par` | wall-clock of just the `par_iter_mut` dispatch + join |
-| `prop_body` | aggregate CPU across threads: the entire per-actor closure |
-| `prop_think` | aggregate CPU: `think_low_level` + `prepare_movement` |
-| `prop_slide` | aggregate CPU: `propose_move` static slides |
-| `prop_adv` | aggregate CPU: off-screen `advance_unchecked` |
+| `propose` | wall-clock of the whole propose system |
+| `prop_par` | wall-clock of the per-actor loop (≡ `prop_body` now propose is sequential) |
+| `prop_body` | total CPU of the per-actor loop body |
+| `prop_think` | `think_low_level` + `prepare_movement` |
+| `prop_slide` | `propose_move` static slides |
+| `prop_adv` | off-screen `advance_unchecked` |
 | `arb_conflict` | collect + sort + snapshot + owner-grid resolution |
 | `arb_apply` | outcome application + dynamic-buffer stamping |
 | `arb_squeeze` | squeeze/re-entry teleports |
 | `chunk_vis` | `update_visible_hypermap_chunks` (visibility / load queueing) |
 | `chunk_render` | `render_chunks_30fps` (chunk mesh build + spawn/despawn) |
 | `chunk_floors` | floor-switch remesh |
+| `brain` | `black_bot_brain` sequential planning tick |
+| `pf_dispatch` / `pf_collect` | async pathfind queue spawn / drain |
+| `f_dirt` / `f_heat` | per-bot field deposits |
+| `dirt_flush` / `temp_flush` | field double-buffer flushes |
+| `t_diffuse` | GPU temperature diffusion tick |
+| `ovl_*` | occupancy / generic overlay rebuilds |
 
-Reading the rows: the `prop_*` aggregates are summed CPU time, the rest are
-wall-clock. A `prop_par` spike with a flat `prop_body` means the time was
-**stolen**, not spent: while a `par_iter_mut` scope waits for its batches, the
-waiting thread executes other queued tasks from the shared compute pool, so an
-expensive concurrent system (typically `chunk_render` building meshes for a
-freshly streamed chunk) gets billed to the propose pass. In that case the row
-to optimize is the spiking `chunk_*` one.
+Plus two gauge lines: `pf q=… fly=… coast=…/…` (pathfind queue depth /
+in-flight / coasting bots) and `collide=… squeeze=…` (arbiter back-offs /
+teleports this tick).
+
+`prop_par` and `prop_body` should now track each other. A divergence means
+something re-introduced pool coupling into propose (e.g. switching it back to
+`par_iter_mut`): the loop would again tick the global `ComputeTaskPool`
+executor and bill unrelated queued compute (chunk meshing, render prep) to the
+propose pass — historically the cause of the frame-rate-coupled propose spike.
 
 ## Where things live
 

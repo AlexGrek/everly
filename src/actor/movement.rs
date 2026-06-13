@@ -27,12 +27,11 @@
 //! buffer exactly as before, so the brain's avoidance views and the async
 //! pathfinder keep reading the same occupancy after the next `flush`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use bevy::prelude::*;
 use bevy::platform::collections::HashMap;
-use bevy::utils::Parallel;
 
 use crate::hud::game_log::{GameLog, LogEntry};
 use crate::hud::perf_timings::{PerfCounts, SystemTimings, TimedSystem};
@@ -303,90 +302,85 @@ impl Default for OccupancyArbiter {
 }
 
 // ---------------------------------------------------------------------------
-// Step 1 — parallel proposal
+// Step 1 — sequential proposal
 // ---------------------------------------------------------------------------
 
-/// Parallel proposal pass. On-screen actors think, prepare, and propose a
+/// Proposal pass. On-screen actors think, prepare, and propose a
 /// statically-validated footprint; off-screen actors advance without collision;
 /// re-entrants are queued for sequential placement. Touches only the read-only
-/// static cache, so it is fully parallel and order-independent.
+/// static cache.
+///
+/// **Deliberately sequential.** The per-bot work here is tiny (a static slide
+/// probe — single-digit microseconds for the whole crowd). The previous
+/// `par_iter_mut` ran on Bevy's global `ComputeTaskPool`, whose `scope` ticks
+/// the *global* executor while waiting for its batches: a propose tick would
+/// absorb unrelated queued compute work (render batching, etc.) and bill it
+/// here, and at 60 Hz fixed catch-up ticks this compounded into frame-rate-
+/// coupled stalls. Running on the main thread removes that coupling entirely
+/// for no measurable compute cost. See `docs/movement.md` and `OPTIMIZATION.md`.
 pub(crate) fn propose_actor_moves(
     mut actors: Query<(Entity, &mut ActorObject, Option<&OffScreenActor>)>,
     hypermap: Res<HypermapRuntime>,
     mut arbiter: ResMut<OccupancyArbiter>,
-    par_commands: ParallelCommands,
+    mut commands: Commands,
     timings: Res<SystemTimings>,
 ) {
     let _t = timings.scope(TimedSystem::Propose);
     let static_cache = hypermap.static_subtile_cache.as_ref();
     let hypermap = &*hypermap;
 
-    let reentering: Parallel<Vec<Entity>> = Parallel::default();
-    // Per-frame aggregate CPU time per sub-stage. Stack-allocated; captured by
-    // reference in the closure (AtomicU64: Sync). fetch_add with Relaxed ordering
-    // — same guarantee as the existing timings atomics.
-    let body_ns = AtomicU64::new(0);
-    let think_ns = AtomicU64::new(0);
-    let slide_ns = AtomicU64::new(0);
-    let advance_ns = AtomicU64::new(0);
-
-    {
-        let _par = timings.scope(TimedSystem::ProposePar);
-        actors
-            .par_iter_mut()
-            .for_each(|(entity, mut actor_obj, off_screen)| {
-                let body_start = Instant::now();
-                let actor = actor_obj.inner.as_mut();
-                {
-                    let s = actor.state_mut();
-                    s.last_movement_error = None;
-                    s.shadow.participates = false;
-                    s.shadow.teleported = false;
-                }
-
-                let t = Instant::now();
-                actor.think_low_level();
-                actor.prepare_movement();
-                think_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-
-                let center = actor.state().center;
-                let is_rendered = hypermap
-                    .is_world_pos_rendered(center.x.floor() as i32, center.y.floor() as i32);
-                let was_off_screen = off_screen.is_some();
-
-                if is_rendered {
-                    if was_off_screen {
-                        par_commands.command_scope(|mut commands| {
-                            commands.entity(entity).remove::<OffScreenActor>();
-                        });
-                        reentering.borrow_local_mut().push(entity);
-                    } else {
-                        let t = Instant::now();
-                        actor.propose_move(static_cache);
-                        slide_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    }
-                } else {
-                    if !was_off_screen {
-                        par_commands.command_scope(|mut commands| {
-                            commands.entity(entity).insert(OffScreenActor);
-                        });
-                    }
-                    let t = Instant::now();
-                    actor.advance_unchecked();
-                    advance_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                }
-                body_ns.fetch_add(body_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            });
-    }
-
     arbiter.reentrants.clear();
-    let mut reentering = reentering;
-    reentering.drain_into(&mut arbiter.reentrants);
+    // `prop_par` now equals `prop_body` (sequential): a divergence would signal
+    // pool coupling was re-introduced. Kept as a regression sentinel.
+    let mut think_ns = 0u64;
+    let mut slide_ns = 0u64;
+    let mut advance_ns = 0u64;
 
-    timings.record(TimedSystem::ProposeBody, body_ns.load(Ordering::Relaxed));
-    timings.record(TimedSystem::ProposeThink, think_ns.load(Ordering::Relaxed));
-    timings.record(TimedSystem::ProposeSlide, slide_ns.load(Ordering::Relaxed));
-    timings.record(TimedSystem::ProposeAdvance, advance_ns.load(Ordering::Relaxed));
+    let par = Instant::now();
+    for (entity, mut actor_obj, off_screen) in actors.iter_mut() {
+        let actor = actor_obj.inner.as_mut();
+        {
+            let s = actor.state_mut();
+            s.last_movement_error = None;
+            s.shadow.participates = false;
+            s.shadow.teleported = false;
+        }
+
+        let t = Instant::now();
+        actor.think_low_level();
+        actor.prepare_movement();
+        think_ns += t.elapsed().as_nanos() as u64;
+
+        let center = actor.state().center;
+        let is_rendered =
+            hypermap.is_world_pos_rendered(center.x.floor() as i32, center.y.floor() as i32);
+        let was_off_screen = off_screen.is_some();
+
+        if is_rendered {
+            if was_off_screen {
+                commands.entity(entity).remove::<OffScreenActor>();
+                arbiter.reentrants.push(entity);
+            } else {
+                let t = Instant::now();
+                actor.propose_move(static_cache);
+                slide_ns += t.elapsed().as_nanos() as u64;
+            }
+        } else {
+            if !was_off_screen {
+                commands.entity(entity).insert(OffScreenActor);
+            }
+            let t = Instant::now();
+            actor.advance_unchecked();
+            advance_ns += t.elapsed().as_nanos() as u64;
+        }
+    }
+    let body_ns = par.elapsed().as_nanos() as u64;
+    timings.record(TimedSystem::ProposePar, body_ns);
+
+    timings.record(TimedSystem::ProposeBody, body_ns);
+    timings.record(TimedSystem::ProposeThink, think_ns);
+    timings.record(TimedSystem::ProposeSlide, slide_ns);
+    timings.record(TimedSystem::ProposeAdvance, advance_ns);
 }
 
 // ---------------------------------------------------------------------------

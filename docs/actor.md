@@ -27,7 +27,7 @@ order: [`level-persistence.md`](level-persistence.md).
 The movement pipeline runs in three phases (see `src/actor/movement.rs`):
 
 1. `flush_actor_occupancy` — promote passability write→read, clear write.
-2. **Propose** (`propose_actor_moves`, parallel `par_iter_mut`): for each actor,
+2. **Propose** (`propose_actor_moves`, sequential): for each actor,
    clear `last_movement_error`, `think_low_level()`, `prepare_movement()`, then
    `propose_move(static_cache)` — a **static-only** validated step recorded in the
    actor's [`ActorShadow`]. Off-screen actors `advance_unchecked`; re-entrants are
@@ -136,8 +136,12 @@ The default cancels the whole step if any cell is statically blocked; `BlackBot`
 overrides `propose_move` with an **axis-decomposed** static slide so a grazing
 wall keeps the free axis and snaps the blocked one to the wall edge.
 
-Because the proposal touches only the read-only static cache, the propose phase
-runs on `par_iter_mut` with no shared writes.
+The proposal touches only the read-only static cache, so it has no shared
+writes. It runs **sequentially** on the main thread — the per-bot work is a few
+microseconds for the whole crowd, and keeping it off Bevy's global
+`ComputeTaskPool` avoids the work-stealing coupling that made the old
+`par_iter_mut` version absorb unrelated compute work (see `docs/movement.md`
+and `OPTIMIZATION.md`).
 
 ### Arbitration — `OccupancyArbiter`
 
@@ -204,16 +208,18 @@ The collision core has **no process-global lock on the hot path**:
   `SubtilePassability` by reference (no 200-byte clone). The only locks taken are
   fine-grained per-chunk `RwLock`s, acquired exactly when a cell is touched.
 
-### Parallel proposal, sequential arbitration
+### Sequential proposal, sequential arbitration
 
-The **propose** phase runs via `par_iter_mut` + `ParallelCommands`: each actor
-mutates only its own state and reads only the immutable static cache, so there
-are no shared writes and the phase is order-independent. The **arbitrate** phase
-is single-threaded by design — it is the authority that serializes occupancy — and
-processes actors in **entity-sorted** order, so its result is independent of the
-parallel propose phase's thread scheduling. The sequential pass touches each
-visible actor's footprint once over the lock-free owner grid, which is why it
-replaced the old contended parallel footprint OR-writes (see `OPTIMIZATION.md`).
+The **propose** phase iterates actors on the main thread: each mutates only its
+own state and reads only the immutable static cache. It is deliberately *not*
+`par_iter_mut` — the per-bot work is a few microseconds for the whole crowd, and
+Bevy's global `ComputeTaskPool` would tick the global executor while waiting,
+absorbing unrelated compute work into the propose tick (see `OPTIMIZATION.md`).
+The **arbitrate** phase is single-threaded by design — it is the authority that
+serializes occupancy — and processes actors in **entity-sorted** order. The
+sequential pass touches each visible actor's footprint once over the lock-free
+owner grid, which is why it replaced the old contended parallel footprint
+OR-writes (see `OPTIMIZATION.md`).
 
 ### Off-screen culling and re-entry
 
