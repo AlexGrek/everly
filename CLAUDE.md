@@ -88,7 +88,7 @@ everly/
     │   └── sun.rs                #   SunPlugin (directional light)
     ├── hud/                      # 2D UI overlay
     │   ├── game_hud.rs           #   GameHudPlugin (bottom bar, floor selector, edit/actors toggles)
-    │   ├── actor_inspector.rs    #   ActorInspectorPlugin (click-to-inspect modal)
+    │   ├── actor_inspector.rs    #   ActorInspectorPlugin (click-to-select right-side panel, live 2 Hz)
     │   └── panel_anim.rs         #   PanelAnim (slide-in/out helper)
     ├── menu/                     # pre-gameplay screens (run only in MainMenu state)
     │   └── main_menu.rs          #   MainMenuPlugin + GameState (MainMenu / InGame), level picker
@@ -98,6 +98,7 @@ everly/
     │   ├── black_bot.rs          #   BlackBot (A*-based path follower)
     │   ├── charge.rs             #   ChargePlugin (battery discharge, depletion gate)
     │   ├── snapshot.rs           #   ActorSnapshotPlugin (actors.yaml save/load)
+    │   ├── selection_overlay.rs  #   SelectionOverlayPlugin (selected-bot glowing marker + waypoint gizmos)
     │   └── inspect.rs            #   collect_inspect_rows (inspector row builders)
     ├── map/                      # world data + rendering + pathfinding
     │   ├── hypermap.rs           #   chunked, concurrent tile store

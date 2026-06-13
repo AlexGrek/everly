@@ -5,9 +5,12 @@
 //! picking an actor clears any active tile brush and vice versa — so a single click
 //! never both paints a tile and spawns an actor.
 
+use std::collections::HashSet;
+
 use bevy::light::{NotShadowCaster, NotShadowReceiver};
 use bevy::prelude::*;
 use bevy::ui::widget::Button;
+use rand::Rng;
 
 use crate::actor::black_bot::{self, BlackBotRng};
 use crate::actor::resurrect::{resurrect_all_button, ResurrectAllButton};
@@ -18,12 +21,12 @@ use crate::edit::map_edit::{
 use crate::hud::panel_anim::PanelAnim;
 use crate::map::floor_level::{ActiveFloorLevel, HYPERMAP_FLOOR_HEIGHT};
 use crate::map::hypermap_world::HypermapRuntime;
-use crate::map::hypermap::Hypermap;
+use crate::map::hypermap::{Hypermap, HYPERMAP_CHUNK_SIZE};
 use crate::map::passability::{
     DynamicPassabilityMap, SubtilePassability, FLAG_BLOCKED, FLAG_VOID, SUBTILE_COUNT,
 };
 use crate::menu::main_menu::GameState;
-use crate::scene::camera::{StrategyCamera, StrategyCameraRig};
+use crate::scene::camera::StrategyCameraRig;
 
 /// Pixels from the bottom of the window where spawn clicks are suppressed (covers the
 /// 52 px HUD bar + the 40 px palette row this panel shares with the map-edit palette).
@@ -116,8 +119,6 @@ impl Plugin for ActorSpawnPlugin {
 
 /// How many bots a bulk spawn drops per trigger (button or **Shift+B**).
 const BULK_SPAWN_COUNT: usize = 100;
-/// Cap on the outward cell-scan radius so a boxed-in camera can't loop forever.
-const BULK_SPAWN_SCAN_RADIUS: i32 = 80;
 
 const BULK_BTN_BG: Color = Color::srgba(0.10, 0.16, 0.24, 0.85);
 const BULK_BTN_BORDER: Color = Color::srgba(0.35, 0.55, 0.85, 0.6);
@@ -128,14 +129,14 @@ const BULK_TEXT: Color = Color::srgb(0.6, 0.78, 0.98);
 struct BulkSpawnButton;
 
 /// Triggers a bulk spawn from either the **Shift+B** keybind or the
-/// "Spawn 100" button. Drops [`BULK_SPAWN_COUNT`] BlackBots on passable cells
-/// spiralling out from the camera focus — for testing the movement pipeline at
-/// scale (hundreds of bots) without hundreds of clicks.
+/// "Spawn 100" button. Scatters [`BULK_SPAWN_COUNT`] BlackBots on passable cells
+/// **spread across every loaded chunk** of the hypermap (seeded sampling, one bot
+/// per tile) — for testing the movement pipeline at scale without clustering them
+/// in one spot.
 fn bulk_spawn_bots(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
     buttons: Query<&Interaction, (With<BulkSpawnButton>, Changed<Interaction>)>,
-    cameras: Query<&StrategyCamera>,
     dynamic_passability: Res<DynamicPassabilityMap>,
     hypermap: Res<HypermapRuntime>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -148,46 +149,65 @@ fn bulk_spawn_bots(
     if !(key_trigger || button_trigger) {
         return;
     }
-    let Ok(camera) = cameras.single() else { return };
-    let static_cache = hypermap.static_subtile_cache.as_ref();
-    let origin_x = camera.focus.x.floor() as i32;
-    let origin_z = camera.focus.z.floor() as i32;
 
-    let mut spawned = 0usize;
-    // Outward square rings from the focus tile; spawn on each passable cell.
-    'scan: for ring in 0..=BULK_SPAWN_SCAN_RADIUS {
-        for dz in -ring..=ring {
-            for dx in -ring..=ring {
-                // Only the perimeter of this ring (interior was covered already).
-                if ring > 0 && dx.abs() != ring && dz.abs() != ring {
-                    continue;
-                }
-                let (cx, cz) = (origin_x + dx, origin_z + dz);
-                if !actor_spawn_cell_passable(
-                    ActorKind::BlackBot,
-                    cx,
-                    cz,
-                    &dynamic_passability,
-                    static_cache,
-                ) {
-                    continue;
-                }
-                let center = Vec2::new(cx as f32 + 0.5, cz as f32 + 0.5);
-                black_bot::spawn_black_bot(
-                    &mut commands,
-                    &mut meshes,
-                    &mut materials,
-                    &mut black_rng.0,
-                    center,
-                );
-                spawned += 1;
-                if spawned >= BULK_SPAWN_COUNT {
-                    break 'scan;
-                }
-            }
-        }
+    // Tile-space bounds spanning every loaded chunk.
+    let chunks = hypermap.map.loaded_chunks();
+    let Some(first) = chunks.first().copied() else {
+        warn!("bulk spawn: no loaded chunks");
+        return;
+    };
+    let (mut min_cx, mut max_cx) = (first.x, first.x);
+    let (mut min_cy, mut max_cy) = (first.y, first.y);
+    for c in &chunks {
+        min_cx = min_cx.min(c.x);
+        max_cx = max_cx.max(c.x);
+        min_cy = min_cy.min(c.y);
+        max_cy = max_cy.max(c.y);
     }
-    info!("bulk spawn: {spawned} BlackBots near ({origin_x}, {origin_z})");
+    let min_x = min_cx * HYPERMAP_CHUNK_SIZE;
+    let max_x = (max_cx + 1) * HYPERMAP_CHUNK_SIZE - 1;
+    let min_z = min_cy * HYPERMAP_CHUNK_SIZE;
+    let max_z = (max_cy + 1) * HYPERMAP_CHUNK_SIZE - 1;
+
+    let static_cache = hypermap.static_subtile_cache.as_ref();
+    // Reject duplicate tiles so two bots never spawn on the same cell (the
+    // dynamic map isn't updated until the pipeline runs, so passability alone
+    // can't see bots queued earlier this call).
+    let mut taken: HashSet<(i32, i32)> = HashSet::with_capacity(BULK_SPAWN_COUNT);
+    let mut spawned = 0usize;
+    let max_attempts = BULK_SPAWN_COUNT * 400;
+    for _ in 0..max_attempts {
+        if spawned >= BULK_SPAWN_COUNT {
+            break;
+        }
+        let cx = black_rng.0.gen_range(min_x..=max_x);
+        let cz = black_rng.0.gen_range(min_z..=max_z);
+        if !taken.insert((cx, cz)) {
+            continue;
+        }
+        if !actor_spawn_cell_passable(
+            ActorKind::BlackBot,
+            cx,
+            cz,
+            &dynamic_passability,
+            static_cache,
+        ) {
+            continue;
+        }
+        let center = Vec2::new(cx as f32 + 0.5, cz as f32 + 0.5);
+        black_bot::spawn_black_bot(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            &mut black_rng.0,
+            center,
+        );
+        spawned += 1;
+    }
+    info!(
+        "bulk spawn: {spawned} BlackBots scattered across {} chunks",
+        chunks.len()
+    );
 }
 
 pub(crate) fn spawn_actor_spawn_palette(

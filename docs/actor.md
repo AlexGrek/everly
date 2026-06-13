@@ -109,6 +109,29 @@ immobilized **in its think system** (zeroing `move_buffer`), not in
 why the gate must live in `think`, the discharge rate, spawn ranges, inspector
 display, and persistence.
 
+## Selection and inspection
+
+Left-clicking a bot's mesh sets the [`SelectedActor`](../src/hud/actor_inspector.rs)
+resource (mesh picking) and opens a **non-blocking, right-docked properties
+panel** ([`ActorInspectorPlugin`](../src/hud/actor_inspector.rs)). The panel
+live-refreshes its rows **twice a second** while the same bot stays selected; the
+rest of the screen stays interactive (the camera keeps panning/zooming, except
+mouse-wheel over the panel scrolls the panel). Closing the panel (its **X** or
+**Escape**) or clicking a different bot updates the selection; killing/deleting
+the selected bot clears it.
+
+While a bot is selected, [`SelectionOverlayPlugin`](../src/actor/selection_overlay.rs)
+draws two world-space cues for that bot only:
+
+- a small **glowing green cube** hovering above it (a bobbing, spinning emissive
+  marker), and
+- its remaining route as **waypoint gizmos** — a polyline from the bot through
+  each upcoming simplified-path waypoint tile center, with a node marker at each.
+  This is independent of the global path overlay
+  ([`paint_black_bot_targets`](../src/actor/black_bot.rs), gated on
+  `PathOverlayEnabled`): the selection waypoints are always shown for the
+  selection regardless of that toggle.
+
 ## Movement and collision
 
 Collision is split into a parallel **proposal** and a sequential **arbitration**.
