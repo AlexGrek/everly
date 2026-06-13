@@ -36,9 +36,10 @@ use crate::actor::charge::Charge;
 use crate::actor::snapshot::{BreakablePartSnap, BreakableSnap};
 use crate::actor::{
     actor_main_tile, arbitrate_actor_moves, flush_actor_occupancy, is_front_collision, is_paused,
-    propose_actor_moves, Actor, ActorMoveBuffer, ActorMovementError, ActorObject, ActorShadow,
-    ActorState, OffScreenActor,
+    propose_actor_moves, resolve_offscreen_collision, Actor, ActorMoveBuffer, ActorMovementError,
+    ActorObject, ActorShadow, ActorState, OffScreenActor,
 };
+use std::collections::HashMap;
 use crate::map::chunk_overlay::{ChunkOverlayState, OVERLAY_RES};
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap};
 use crate::map::hypermap_world::{HypermapChunkRemeshQueue, HypermapRuntime};
@@ -53,7 +54,7 @@ use crate::map::pathfind_service::{
     PathOutcome, PathfindQueue, PathfindResults, PathfindSet, RequestId,
 };
 use crate::hud::actor_inspector::SelectedActor;
-use crate::hud::game_log::{BreakableSystem, GameLog, LogEntry};
+use crate::hud::game_log::{BreakableSystem, GameLog, LogEntry, LogLevel};
 use crate::hud::perf_timings::{PerfCounts, SystemTimings, TimedSystem};
 use crate::menu::main_menu::GameState;
 
@@ -94,6 +95,11 @@ const COLLISION_PRESSURE_PER_HIT: u32 = 5;
 const COLLISION_PRESSURE_DECAY: u32 = 1;
 /// Collision pressure at which the bot's brain is reset and queues cleared.
 const COLLISION_PRESSURE_RESET: u32 = 50;
+/// Squared tile distance a bot must move in a frame to count as "made progress".
+/// Below this, a frame with a movement error is a genuine wedge (not a healthy
+/// wall-slide or a brief bump the bot is still moving through). At max speed a
+/// bot covers ~0.02 tiles/frame, so this is comfortably below real motion.
+const COLLISION_PROGRESS_EPS_SQ: f32 = 1.0e-4;
 /// Seconds for the yellow stuck flash to fade fully back to black.
 const STUCK_FLASH_FADE_SECS: f32 = 2.5;
 
@@ -958,12 +964,24 @@ fn tick_collision_pressure(pressure: u32, collided: bool) -> (u32, bool) {
     }
 }
 
-/// Tracks per-frame collision pressure and resets jammed bots once pressure
-/// reaches [`COLLISION_PRESSURE_RESET`]. Runs after [`process_actors`] so
-/// `last_movement_error` reflects the current frame.
+/// Tracks per-frame collision pressure and **relocates** jammed bots once
+/// pressure reaches [`COLLISION_PRESSURE_RESET`]. Runs after
+/// `arbitrate_actor_moves` so `last_movement_error` reflects the current frame.
+///
+/// Pressure only accumulates on a frame the bot **made no progress** (`center`
+/// barely moved) *and* its step was blocked — so a healthy wall-slide or a brief
+/// bump the bot is still moving through never builds toward a reset. Only a
+/// genuine wedge (two bots pressed together, or a corner trap) does. On reset the
+/// bot is **teleported to the nearest free cell** ([`resolve_offscreen_collision`])
+/// before its plan is wiped — replanning in place would just re-wedge, which is
+/// the loop that left jammed bots resetting forever.
 fn track_black_bot_collision_pressure(
     game_log: Res<GameLog>,
+    hypermap: Res<HypermapRuntime>,
+    dynamic: Res<DynamicPassabilityMap>,
+    selected: Res<SelectedActor>,
     mut interactive: ResMut<InteractiveEntityMap>,
+    mut prev_center: Local<HashMap<Entity, Vec2>>,
     mut query: Query<(
         Entity,
         &Name,
@@ -975,18 +993,29 @@ fn track_black_bot_collision_pressure(
         Option<&Breakable>,
     )>,
 ) {
+    let static_cache = hypermap.static_subtile_cache.as_ref();
     for (entity, name, mut obj, mut brain, mut vis, force_logs, charge, breakable) in &mut query {
         let depleted = charge.is_some_and(|c| c.is_depleted());
         let broken = breakable
             .as_ref()
             .map_or(false, |b| b.movement_engine.broken || b.control_plane.broken);
+        let center = obj.inner.state().center;
+        let moved = prev_center
+            .get(&entity)
+            .map_or(true, |p| (center - *p).length_squared() > COLLISION_PROGRESS_EPS_SQ);
+        prev_center.insert(entity, center);
         if depleted || broken {
             vis.collision_pressure = 0;
             continue;
         }
 
+        // A wedge = blocked, not moving, and **not** mid-recovery. Suspending
+        // pressure during a detour / step-aside / escape lets those maneuvers
+        // finish instead of being reset every ~0.17 s before the bot can move.
+        let recovering = brain.is_recovering();
         let state = obj.inner.state();
-        let collided = black_bot_frame_collided(state, brain.velocity());
+        let collided =
+            !moved && !recovering && black_bot_frame_collided(state, brain.velocity());
         let (next, should_reset) = tick_collision_pressure(vis.collision_pressure, collided);
         vis.collision_pressure = next;
 
@@ -994,11 +1023,17 @@ fn track_black_bot_collision_pressure(
             continue;
         }
 
+        let reason = describe_movement_error(&state.last_movement_error);
         let tile = actor_main_tile(state.center);
+        // Teleport out of the jam to a nearby free cell, then wipe the plan so
+        // the bot replans from a position it can actually move from.
+        resolve_offscreen_collision(obj.inner.as_mut(), &dynamic, static_cache);
+        let relocated = obj.inner.state().center;
         brain.reset();
         let state = obj.inner.state_mut();
         state.move_buffer = ActorMoveBuffer::default();
         state.next_waypoint_hint = None;
+        prev_center.insert(entity, relocated);
         interactive.evict_actor_everywhere(entity);
         game_log.push_world(
             tile.x,
@@ -1006,6 +1041,35 @@ fn track_black_bot_collision_pressure(
             LogEntry::BotCollisionReset { name: name.to_string() },
             force_logs.0,
         );
+        if selected.entity == Some(entity) {
+            game_log.push_world(
+                tile.x,
+                tile.y,
+                LogEntry::Message {
+                    level: LogLevel::Warn,
+                    text: format!(
+                        "wedged ({reason}) → relocated ({:.2},{:.2})→({:.2},{:.2})",
+                        center.x, center.y, relocated.x, relocated.y
+                    ),
+                },
+                true,
+            );
+        }
+    }
+    prev_center.retain(|e, _| query.get(*e).is_ok());
+}
+
+/// One-line description of a movement error for the selected-bot trace.
+fn describe_movement_error(err: &Option<ActorMovementError>) -> String {
+    match err {
+        Some(ActorMovementError::BlockedByOccupancy { world_subtile_x, world_subtile_y }) => {
+            format!("bot at subtile ({world_subtile_x},{world_subtile_y})")
+        }
+        Some(ActorMovementError::BlockedByStatic { world_subtile_x, world_subtile_y }) => {
+            format!("wall at subtile ({world_subtile_x},{world_subtile_y})")
+        }
+        Some(ActorMovementError::InvalidRadius(r)) => format!("invalid radius {r}"),
+        None => "no error".to_string(),
     }
 }
 

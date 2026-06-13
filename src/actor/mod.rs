@@ -462,7 +462,7 @@ pub(crate) fn flush_actor_occupancy(passability: Res<DynamicPassabilityMap>) {
 ///
 /// If nothing is passable the actor is left in place without stamping a
 /// footprint; it will retry next frame.
-fn resolve_offscreen_collision(
+pub(crate) fn resolve_offscreen_collision(
     actor: &mut dyn Actor,
     dynamic: &DynamicPassabilityMap,
     static_cache: &Hypermap<SubtilePassability>,

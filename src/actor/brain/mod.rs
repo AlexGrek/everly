@@ -297,6 +297,12 @@ impl Brain {
         self.low_level.is_awaiting_path()
     }
 
+    /// `true` while the bot is running a collision-recovery maneuver (detour /
+    /// step-aside / escape). Collision pressure is suspended during these.
+    pub fn is_recovering(&self) -> bool {
+        self.low_level.is_recovering()
+    }
+
     pub fn target_tile(&self) -> Option<(i32, i32)> {
         self.low_level.target_tile()
     }

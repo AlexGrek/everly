@@ -154,6 +154,15 @@ pub trait LowLevelAction: Send + Sync {
         false
     }
 
+    /// `true` while the action is running a **collision-recovery maneuver** —
+    /// awaiting/threading a detour, stepping aside, pausing after a step, or
+    /// escaping a jam. Collision pressure is suspended during these (they make
+    /// the bot legitimately hold or move slowly), so a reset can't abort the
+    /// recovery before it completes. Default `false`.
+    fn is_recovering(&self) -> bool {
+        false
+    }
+
     /// Final destination tile, if any (overlay / inspector).
     fn target_tile(&self) -> Option<(i32, i32)> {
         None
@@ -1092,6 +1101,17 @@ impl LowLevelAction for FollowPath {
         // Braked awaiting an async detour, or paused after a step-aside — in
         // both holding states the bot is intentionally not following its route.
         self.detour_request.is_some() || self.contact_wait_s > 0.0
+    }
+
+    fn is_recovering(&self) -> bool {
+        // Any active collision-recovery maneuver: detour (awaited or threading),
+        // step-aside (pending move or post-step pause), or jam escape.
+        self.detour_request.is_some()
+            || !self.detour.is_empty()
+            || self.contact_wait_s > 0.0
+            || self.pending_wait.is_some()
+            || self.step_aside_at.is_some()
+            || self.escape_target.is_some()
     }
 }
 
