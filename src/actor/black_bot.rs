@@ -1009,13 +1009,13 @@ fn track_black_bot_collision_pressure(
             continue;
         }
 
-        // A wedge = blocked, not moving, and **not** mid-recovery. Suspending
-        // pressure during a detour / step-aside / escape lets those maneuvers
-        // finish instead of being reset every ~0.17 s before the bot can move.
-        let recovering = brain.is_recovering();
+        // A wedge = blocked, not moving, and neither mid-recovery (detour /
+        // step-aside / escape) nor awaiting a route (PendingPath). Suspending
+        // pressure during those lets the maneuver finish instead of resetting
+        // every ~0.17 s before the bot can move.
+        let busy = brain.is_recovering() || brain.is_awaiting_path();
         let state = obj.inner.state();
-        let collided =
-            !moved && !recovering && black_bot_frame_collided(state, brain.velocity());
+        let collided = !moved && !busy && black_bot_frame_collided(state, brain.velocity());
         let (next, should_reset) = tick_collision_pressure(vis.collision_pressure, collided);
         vis.collision_pressure = next;
 

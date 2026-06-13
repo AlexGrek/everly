@@ -110,17 +110,28 @@ the displayed color changes, so a settled bot costs no per-frame asset writes.
 
 BlackBots track a per-entity **collision pressure** counter (inspector:
 `collision_pressure`). Each frame after [`arbitrate_actor_moves`](../src/actor/movement.rs),
-`track_black_bot_collision_pressure` applies the same collision gate as the red
-flash (wall graze or **head-on** bot-on-bot bump; rear bumps ignored):
+`track_black_bot_collision_pressure` decides whether the bot is genuinely
+**wedged** this frame — which requires *all* of:
 
-- blocked frame → **+5**
-- clear frame → **−1**, floored at **0**
+- a counted collision (wall graze or **head-on** bot-on-bot bump; rear bumps ignored), **and**
+- **no progress** — `center` barely moved (`COLLISION_PROGRESS_EPS_SQ`); a healthy
+  wall-slide or a bump the bot is still moving through does **not** count, **and**
+- **not busy** — the bot is neither mid-recovery (`Brain::is_recovering`: detour,
+  step-aside, escape) nor awaiting a route (`PendingPath`). This is the key fix
+  for the old **reset-loop**: pressure used to reach the threshold (~0.17 s) faster
+  than a recovery maneuver could move the bot, so every step-aside / detour was
+  aborted by a reset and jammed bots reset forever. Suspending pressure while a
+  maneuver is in flight lets it finish.
 
-When pressure reaches **50**, the bot is reset: [`Brain::reset`](../src/actor/brain/mod.rs)
-wipes the plan, movement intent is cleared, charger queue slots are released via
+Wedged frame → **+5**; otherwise → **−1** floored at **0**. When pressure reaches
+**50**, the bot is **relocated to the nearest free cell**
+([`resolve_offscreen_collision`](../src/actor/mod.rs)) — replanning *in place*
+would just re-wedge — then [`Brain::reset`](../src/actor/brain/mod.rs) wipes the
+plan, charger slots are released via
 [`InteractiveEntityMap::evict_actor_everywhere`](../src/map/interactive_entity.rs),
-and the in-game log records `<name> reset (collision pressure)`. Pressure is
-zeroed. Depleted and broken bots do not accumulate pressure.
+and the log records `<name> reset (collision pressure)` (plus a detailed
+`wedged (...) → relocated` line for the selected bot). Pressure is zeroed.
+Depleted and broken bots do not accumulate pressure.
 
 ### Proactive look-ahead avoidance
 
