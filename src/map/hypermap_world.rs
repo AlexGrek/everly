@@ -61,7 +61,7 @@ const CHARGER_LIGHT_COLOR_IDLE: Color = Color::srgb(0.35, 0.82, 1.0);
 const CHARGER_LIGHT_COLOR_ACTIVE: Color = Color::srgb(0.40, 1.0, 0.50);
 /// Idle stations rely on emissive mesh only; point light turns on when docked.
 const CHARGER_LIGHT_INTENSITY_IDLE: f32 = 0.0;
-const CHARGER_LIGHT_INTENSITY_ACTIVE: f32 = 12_000.0;
+const CHARGER_LIGHT_INTENSITY_ACTIVE: f32 = 24_000.0;
 const CHARGER_LIGHT_RANGE: f32 = 4.0;
 /// Point light hangs this far above the metal docking pad top.
 const CHARGER_DOCK_LIGHT_CLEARANCE: f32 = 1.22;
@@ -88,7 +88,7 @@ const LAMP_WALL_OFFSET: f32 = LAMP_SLAB_INSET - WALL_THICKNESS * 0.5 - LAMP_SIZE
 const LAMP_WALL_HEIGHT: f32 = 2.0;
 /// Warm white lamp light.
 const LAMP_LIGHT_COLOR: Color = Color::srgb(1.0, 0.88, 0.60);
-const LAMP_LIGHT_INTENSITY: f32 = 6_000.0;
+const LAMP_LIGHT_INTENSITY: f32 = 12_000.0;
 const LAMP_LIGHT_RANGE: f32 = 7.0;
 /// Emissive warm-white glow for the lamp cube.
 const LAMP_EMISSIVE: LinearRgba = LinearRgba::rgb(3.5, 2.8, 1.2);

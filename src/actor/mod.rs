@@ -30,6 +30,7 @@ pub mod charge;
 pub mod inspect;
 pub mod movement;
 pub mod resurrect;
+pub mod selection_overlay;
 pub mod snapshot;
 
 pub use movement::{ActorShadow, OccupancyArbiter};

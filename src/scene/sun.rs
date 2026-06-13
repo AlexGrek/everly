@@ -24,10 +24,10 @@ impl Default for SunEnabled {
     }
 }
 
-/// Direct sunlight strength, in lux. Just above Bevy's `OVERCAST_DAY` (1 000)
-/// — a soft fill that defines surfaces without competing with the emissive
-/// columns and bloom that carry the scene's mood.
-pub const SUN_ILLUMINANCE: f32 = lux::OVERCAST_DAY * 1.5;
+/// Direct sunlight strength, in lux. Below Bevy's `OVERCAST_DAY` (1 000) — a
+/// dim fill that defines surfaces while letting the emissive columns, bloom,
+/// and the point lights (lamps/chargers) carry the scene's mood.
+pub const SUN_ILLUMINANCE: f32 = lux::OVERCAST_DAY * 0.75;
 
 /// Slight golden-hour tint so the white ground reads as "lit" instead of "self-emissive".
 const SUN_COLOR: Color = Color::srgb(1.0, 0.96, 0.88);

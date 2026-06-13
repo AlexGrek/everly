@@ -1,15 +1,24 @@
-//! Actor hover label and click-to-inspect modal (mesh picking).
+//! Actor hover label and click-to-select side panel (mesh picking).
+//!
+//! Selecting a bot (left-click on its mesh) opens a non-blocking, right-docked
+//! properties panel that live-refreshes twice a second. The panel does not
+//! capture the rest of the screen: the world stays interactive while it is open.
+//! Closing the panel (X / Escape) or selecting a different bot updates the
+//! [`SelectedActor`] resource, which also drives the world-space selection
+//! overlay (glowing marker + waypoints) in `crate::actor::selection_overlay`.
+
+use std::time::Duration;
 
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::picking::prelude::*;
 use bevy::prelude::*;
 use bevy::ui::widget::Button;
 
+use crate::actor::actor_pick::ActorForceLogs;
 use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
 use crate::actor::black_bot::{BlackBotVisual, BotSpecialization, Breakable};
 use crate::actor::brain::Brain;
 use crate::actor::charge::Charge;
-use crate::actor::actor_pick::ActorForceLogs;
 use crate::actor::inspect::{debug_rows, display_actor_name, route_rows, status_rows, systems_rows};
 use crate::actor::ActorObject;
 use crate::edit::actor_spawn::{ActorSpawnState, ActorTool};
@@ -19,13 +28,15 @@ use crate::scene::camera::StrategyCameraRig;
 /// Bottom HUD + palette dead zone (see `map_edit::HUD_DEAD_ZONE_PX`).
 const PLAYFIELD_BOTTOM_MARGIN_PX: f32 = 120.0;
 
+/// Width of the docked properties panel.
+const PANEL_WIDTH_PX: f32 = 340.0;
+
 const ACCENT: Color = Color::srgb(0.48, 0.78, 0.96);
 const TEXT_BRIGHT: Color = Color::srgba(0.97, 0.98, 1.0, 0.96);
 const TEXT_MUTED: Color = Color::srgba(0.72, 0.76, 0.82, 0.88);
 const TOOLTIP_BG: Color = Color::srgba(0.07, 0.09, 0.12, 0.9);
 const TOOLTIP_BORDER: Color = Color::srgba(0.48, 0.78, 0.96, 0.55);
-const SCRIM: Color = Color::srgba(0.02, 0.03, 0.06, 0.68);
-const CARD_BG: Color = Color::srgba(0.09, 0.11, 0.15, 0.96);
+const CARD_BG: Color = Color::srgba(0.09, 0.11, 0.15, 0.97);
 const CARD_BORDER: Color = Color::srgba(0.55, 0.62, 0.72, 0.35);
 const ROW_DIVIDER: Color = Color::srgba(0.4, 0.45, 0.52, 0.25);
 
@@ -36,7 +47,10 @@ const TAB_INACTIVE_BG: Color = Color::srgba(0.12, 0.14, 0.18, 0.7);
 /// Logical pixels per mouse-wheel line (matches Bevy UI scroll example).
 const SCROLL_LINE_HEIGHT: f32 = 21.0;
 
-/// Which tab is currently active in the actor inspector modal.
+/// Panel content refresh cadence — the live properties update twice a second.
+const PANEL_REFRESH_INTERVAL_S: f32 = 0.5;
+
+/// Which tab is currently active in the actor inspector panel.
 #[derive(Resource, Default, PartialEq, Clone, Copy, Debug)]
 pub enum InspectorTab {
     #[default]
@@ -52,13 +66,28 @@ struct HoveredActor {
     pick_mesh: Option<Entity>,
 }
 
+/// The currently selected actor (the one shown in the side panel). `None` means
+/// nothing is selected and the panel is closed. Read by the world-space
+/// selection overlay (marker + waypoints).
 #[derive(Resource, Default)]
-pub struct ActorInspectorModal {
-    pub open: bool,
-    actor: Option<Entity>,
-    /// Bumped when modal body (rows/actions) should rebuild while staying open.
+pub struct SelectedActor {
+    pub entity: Option<Entity>,
+    /// Bumped when the panel body (rows/actions) should rebuild while the same
+    /// actor stays selected (tab switch, toggle press).
     content_stamp: u32,
 }
+
+impl SelectedActor {
+    pub fn is_some(&self) -> bool {
+        self.entity.is_some()
+    }
+}
+
+/// `true` while the cursor is hovering the docked panel. The strategy camera
+/// reads this to suppress zoom-on-scroll over the panel (the panel scrolls
+/// instead), keeping the camera free everywhere else.
+#[derive(Resource, Default)]
+pub struct InspectorPointerOver(pub bool);
 
 #[derive(Component)]
 struct ActorInspectorUiRoot;
@@ -69,11 +98,9 @@ struct ActorHoverTooltip;
 #[derive(Component)]
 struct ActorHoverTooltipText;
 
+/// The docked properties card.
 #[derive(Component)]
-struct ActorInspectorOverlay;
-
-#[derive(Component)]
-struct ActorInspectorScrim;
+struct ActorInspectorPanel;
 
 #[derive(Component)]
 struct ActorInspectorCloseButton;
@@ -89,9 +116,6 @@ struct ActorInspectorRowsHost;
 
 #[derive(Component)]
 struct ActorInspectorRow;
-
-#[derive(Component)]
-struct ActorInspectorCard;
 
 #[derive(Component)]
 struct ActorInspectorActionsHost;
@@ -117,7 +141,8 @@ pub struct ActorInspectorPlugin;
 impl Plugin for ActorInspectorPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<HoveredActor>()
-            .init_resource::<ActorInspectorModal>()
+            .init_resource::<SelectedActor>()
+            .init_resource::<InspectorPointerOver>()
             .init_resource::<InspectorTab>()
             .add_observer(on_actor_pointer_over)
             .add_observer(on_actor_pointer_out)
@@ -129,8 +154,10 @@ impl Plugin for ActorInspectorPlugin {
             .add_systems(
                 Update,
                 (
+                    clear_dead_selection,
                     sync_actor_hover_tooltip,
-                    sync_actor_inspector_modal,
+                    sync_inspector_pointer_over,
+                    sync_actor_inspector_panel,
                     animate_actor_inspector,
                     actor_inspector_close_input,
                     actor_inspector_wheel_scroll,
@@ -206,7 +233,7 @@ fn on_actor_pointer_click(
     inspectable: Query<(), With<ActorInspectable>>,
     spawn_state: Res<ActorSpawnState>,
     mut commands: Commands,
-    mut modal: ResMut<ActorInspectorModal>,
+    mut selection: ResMut<SelectedActor>,
 ) {
     if click.event().button != PointerButton::Primary {
         return;
@@ -218,11 +245,14 @@ fn on_actor_pointer_click(
         return;
     };
     if matches!(spawn_state.tool, Some(ActorTool::Kill)) {
+        if selection.entity == Some(root) {
+            selection.entity = None;
+        }
         commands.entity(root).despawn();
         return;
     }
-    modal.open = true;
-    modal.actor = Some(root);
+    // Selecting a different bot replaces the selection (the old one deselects).
+    selection.entity = Some(root);
 }
 
 fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<StrategyCameraRig>>) {
@@ -269,169 +299,141 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                 ));
             });
 
+            // Right-docked, non-blocking properties panel. Pickable so its
+            // buttons work and the cursor-over check captures it, but it never
+            // covers the rest of the screen, so the world stays interactive.
             root.spawn((
-                Name::new("Actor inspector overlay"),
-                ActorInspectorOverlay,
-                Pickable::IGNORE,
+                Name::new("Actor inspector panel"),
+                ActorInspectorPanel,
+                Pickable::default(),
                 Visibility::Hidden,
                 Node {
                     position_type: PositionType::Absolute,
-                    width: Val::Percent(100.0),
-                    height: Val::Percent(100.0),
-                    align_items: AlignItems::Center,
-                    justify_content: JustifyContent::Center,
+                    right: Val::Px(14.0),
+                    top: Val::Px(72.0),
+                    bottom: Val::Px(132.0),
+                    width: Val::Px(PANEL_WIDTH_PX),
+                    flex_direction: FlexDirection::Column,
+                    padding: UiRect::all(Val::Px(18.0)),
+                    row_gap: Val::Px(12.0),
+                    border: UiRect::all(Val::Px(1.0)),
+                    border_radius: BorderRadius::all(Val::Px(12.0)),
+                    overflow: Overflow::clip(),
                     ..default()
                 },
+                BackgroundColor(CARD_BG),
+                BorderColor::all(CARD_BORDER),
             ))
-            .with_children(|overlay| {
-                overlay
-                    .spawn((
-                        Name::new("Actor inspector scrim"),
-                        ActorInspectorScrim,
-                        Pickable::default(),
-                        Button,
-                        Node {
-                            position_type: PositionType::Absolute,
-                            width: Val::Percent(100.0),
-                            height: Val::Percent(100.0),
-                            ..default()
-                        },
-                        BackgroundColor(SCRIM),
-                        ZIndex(0),
-                    ))
-                    .observe(close_modal_on_scrim_click);
-
-                overlay
-                    .spawn((
-                        Name::new("Actor inspector card"),
-                        ActorInspectorCard,
-                        Pickable::default(),
-                        Node {
-                            width: Val::Px(520.0),
-                            max_height: Val::Percent(80.0),
+            .with_children(|card| {
+                // Header: kind badge + title + close button.
+                card.spawn(Node {
+                    width: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::FlexStart,
+                    column_gap: Val::Px(12.0),
+                    ..default()
+                })
+                .with_children(|header| {
+                    header
+                        .spawn(Node {
                             flex_direction: FlexDirection::Column,
-                            padding: UiRect::all(Val::Px(20.0)),
-                            row_gap: Val::Px(14.0),
-                            border: UiRect::all(Val::Px(1.0)),
-                            border_radius: BorderRadius::all(Val::Px(12.0)),
-                            overflow: Overflow::clip(),
-                            ..default()
-                        },
-                        BackgroundColor(CARD_BG),
-                        BorderColor::all(CARD_BORDER),
-                        ZIndex(1),
-                    ))
-                    .with_children(|card| {
-                        // Header: kind badge + title + close button.
-                        card.spawn(Node {
-                            width: Val::Percent(100.0),
-                            flex_direction: FlexDirection::Row,
-                            justify_content: JustifyContent::SpaceBetween,
-                            align_items: AlignItems::FlexStart,
-                            column_gap: Val::Px(12.0),
+                            row_gap: Val::Px(6.0),
+                            flex_grow: 1.0,
                             ..default()
                         })
-                        .with_children(|header| {
-                            header
-                                .spawn(Node {
-                                    flex_direction: FlexDirection::Column,
-                                    row_gap: Val::Px(6.0),
-                                    flex_grow: 1.0,
-                                    ..default()
-                                })
-                                .with_children(|titles| {
-                                    titles.spawn((
-                                        ActorInspectorKindBadge,
-                                        Text::new("Actor"),
-                                        TextFont::from_font_size(12.0),
-                                        TextColor(ACCENT),
-                                    ));
-                                    titles.spawn((
-                                        ActorInspectorTitle,
-                                        Text::new("-"),
-                                        TextFont::from_font_size(24.0),
-                                        TextColor(TEXT_BRIGHT),
-                                    ));
-                                });
-
-                            header
-                                .spawn((
-                                    Name::new("Actor inspector close"),
-                                    ActorInspectorCloseButton,
-                                    Pickable::default(),
-                                    Button,
-                                    Node {
-                                        width: Val::Px(32.0),
-                                        height: Val::Px(32.0),
-                                        justify_content: JustifyContent::Center,
-                                        align_items: AlignItems::Center,
-                                        border: UiRect::all(Val::Px(1.0)),
-                                        border_radius: BorderRadius::all(Val::Px(8.0)),
-                                        ..default()
-                                    },
-                                    BorderColor::all(CARD_BORDER),
-                                    BackgroundColor(Color::srgba(0.14, 0.16, 0.2, 0.8)),
-                                ))
-                                .with_children(|btn| {
-                                    btn.spawn((
-                                        Text::new("X"),
-                                        TextFont::from_font_size(20.0),
-                                        TextColor(TEXT_MUTED),
-                                    ));
-                                });
+                        .with_children(|titles| {
+                            titles.spawn((
+                                ActorInspectorKindBadge,
+                                Text::new("Actor"),
+                                TextFont::from_font_size(12.0),
+                                TextColor(ACCENT),
+                            ));
+                            titles.spawn((
+                                ActorInspectorTitle,
+                                Text::new("-"),
+                                TextFont::from_font_size(22.0),
+                                TextColor(TEXT_BRIGHT),
+                            ));
                         });
 
-                        // Accent divider.
-                        card.spawn((
+                    header
+                        .spawn((
+                            Name::new("Actor inspector close"),
+                            ActorInspectorCloseButton,
+                            Pickable::default(),
+                            Button,
                             Node {
-                                width: Val::Percent(100.0),
-                                height: Val::Px(2.0),
+                                width: Val::Px(32.0),
+                                height: Val::Px(32.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border: UiRect::all(Val::Px(1.0)),
+                                border_radius: BorderRadius::all(Val::Px(8.0)),
                                 ..default()
                             },
-                            BackgroundColor(ACCENT.with_alpha(0.45)),
-                        ));
-
-                        // Tab bar: Status | Systems
-                        card.spawn(Node {
-                            width: Val::Percent(100.0),
-                            flex_direction: FlexDirection::Row,
-                            column_gap: Val::Px(6.0),
-                            ..default()
-                        })
-                        .with_children(|tabs| {
-                            spawn_tab_button(tabs, "Status", InspectorTab::Status, true);
-                            spawn_tab_button(tabs, "Systems", InspectorTab::Systems, false);
-                            spawn_tab_button(tabs, "Route", InspectorTab::Route, false);
-                            spawn_tab_button(tabs, "Debug", InspectorTab::Debug, false);
+                            BorderColor::all(CARD_BORDER),
+                            BackgroundColor(Color::srgba(0.14, 0.16, 0.2, 0.8)),
+                        ))
+                        .with_children(|btn| {
+                            btn.spawn((
+                                Text::new("X"),
+                                TextFont::from_font_size(20.0),
+                                TextColor(TEXT_MUTED),
+                            ));
                         });
+                });
 
-                        // Actions host (Reset, Delete — always visible).
-                        card.spawn((
-                            ActorInspectorActionsHost,
-                            Node {
-                                width: Val::Percent(100.0),
-                                flex_direction: FlexDirection::Row,
-                                column_gap: Val::Px(8.0),
-                                ..default()
-                            },
-                        ));
+                // Accent divider.
+                card.spawn((
+                    Node {
+                        width: Val::Percent(100.0),
+                        height: Val::Px(2.0),
+                        ..default()
+                    },
+                    BackgroundColor(ACCENT.with_alpha(0.45)),
+                ));
 
-                        // Rows host: content varies by active tab.
-                        card.spawn((
-                            ActorInspectorRowsHost,
-                            Node {
-                                width: Val::Percent(100.0),
-                                flex_direction: FlexDirection::Column,
-                                flex_grow: 1.0,
-                                flex_shrink: 1.0,
-                                min_height: Val::Px(0.0),
-                                row_gap: Val::Px(8.0),
-                                overflow: Overflow::scroll_y(),
-                                ..default()
-                            },
-                            ScrollPosition(Vec2::ZERO),
-                        ));
-                    });
+                // Tab bar: Status | Systems | Route | Debug
+                card.spawn(Node {
+                    width: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(6.0),
+                    ..default()
+                })
+                .with_children(|tabs| {
+                    spawn_tab_button(tabs, "Status", InspectorTab::Status, true);
+                    spawn_tab_button(tabs, "Systems", InspectorTab::Systems, false);
+                    spawn_tab_button(tabs, "Route", InspectorTab::Route, false);
+                    spawn_tab_button(tabs, "Debug", InspectorTab::Debug, false);
+                });
+
+                // Actions host (Reset, Delete — always visible).
+                card.spawn((
+                    ActorInspectorActionsHost,
+                    Node {
+                        width: Val::Percent(100.0),
+                        flex_direction: FlexDirection::Row,
+                        column_gap: Val::Px(8.0),
+                        ..default()
+                    },
+                ));
+
+                // Rows host: content varies by active tab.
+                card.spawn((
+                    ActorInspectorRowsHost,
+                    Node {
+                        width: Val::Percent(100.0),
+                        flex_direction: FlexDirection::Column,
+                        flex_grow: 1.0,
+                        flex_shrink: 1.0,
+                        min_height: Val::Px(0.0),
+                        row_gap: Val::Px(8.0),
+                        overflow: Overflow::scroll_y(),
+                        ..default()
+                    },
+                    ScrollPosition(Vec2::ZERO),
+                ));
             });
         });
 }
@@ -446,7 +448,7 @@ fn spawn_tab_button(parent: &mut ChildSpawnerCommands, label: &str, tab: Inspect
             Button,
             Node {
                 height: Val::Px(28.0),
-                padding: UiRect::horizontal(Val::Px(14.0)),
+                padding: UiRect::horizontal(Val::Px(11.0)),
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
                 border: UiRect::all(Val::Px(1.0)),
@@ -465,45 +467,52 @@ fn spawn_tab_button(parent: &mut ChildSpawnerCommands, label: &str, tab: Inspect
         });
 }
 
-fn close_modal_on_scrim_click(
-    _click: On<Pointer<Click>>,
-    mut modal: ResMut<ActorInspectorModal>,
+/// Drops the selection when the selected actor entity no longer exists (killed
+/// via the palette tool, the Delete action, or any other despawn).
+fn clear_dead_selection(
+    mut selection: ResMut<SelectedActor>,
+    actors: Query<(), With<ActorInspectable>>,
 ) {
-    modal.open = false;
-    modal.actor = None;
+    if let Some(e) = selection.entity {
+        if actors.get(e).is_err() {
+            selection.entity = None;
+        }
+    }
+}
+
+/// Tracks whether the cursor is over the docked panel (used to suppress camera
+/// zoom and route mouse-wheel scroll to the panel).
+fn sync_inspector_pointer_over(
+    selection: Res<SelectedActor>,
+    window: Query<&Window>,
+    camera: Query<&Camera, With<StrategyCameraRig>>,
+    panel: Query<(&ComputedNode, &UiGlobalTransform), With<ActorInspectorPanel>>,
+    mut over: ResMut<InspectorPointerOver>,
+) {
+    let mut result = false;
+    if selection.is_some() {
+        if let (Ok(window), Ok(camera), Ok((node, tf))) =
+            (window.single(), camera.single(), panel.single())
+        {
+            if let (Some(cursor), Some(viewport)) =
+                (window.physical_cursor_position(), camera.physical_viewport_rect())
+            {
+                result = node.contains_point(*tf, cursor - viewport.min.as_vec2());
+            }
+        }
+    }
+    if over.0 != result {
+        over.0 = result;
+    }
 }
 
 fn actor_inspector_wheel_scroll(
-    modal: Res<ActorInspectorModal>,
+    selection: Res<SelectedActor>,
+    over: Res<InspectorPointerOver>,
     mut wheel: MessageReader<MouseWheel>,
-    window: Query<&Window>,
-    camera: Query<&Camera, With<StrategyCameraRig>>,
-    card: Query<(&ComputedNode, &UiGlobalTransform), With<ActorInspectorCard>>,
     mut rows: Query<(&mut ScrollPosition, &Node, &ComputedNode), With<ActorInspectorRowsHost>>,
 ) {
-    if !modal.open {
-        return;
-    }
-
-    let Ok(window) = window.single() else {
-        return;
-    };
-    let Some(cursor) = window.physical_cursor_position() else {
-        return;
-    };
-
-    let Ok(camera) = camera.single() else {
-        return;
-    };
-    let Ok((card_node, card_tf)) = card.single() else {
-        return;
-    };
-
-    let Some(viewport) = camera.physical_viewport_rect() else {
-        return;
-    };
-    let cursor_in_card = card_node.contains_point(*card_tf, cursor - viewport.min.as_vec2());
-    if !cursor_in_card {
+    if !selection.is_some() || !over.0 {
         return;
     }
 
@@ -535,17 +544,15 @@ fn actor_inspector_wheel_scroll(
 fn actor_inspector_close_input(
     interactions: Query<&Interaction, (With<ActorInspectorCloseButton>, Changed<Interaction>)>,
     keys: Res<ButtonInput<KeyCode>>,
-    mut modal: ResMut<ActorInspectorModal>,
+    mut selection: ResMut<SelectedActor>,
 ) {
     for interaction in &interactions {
         if *interaction == Interaction::Pressed {
-            modal.open = false;
-            modal.actor = None;
+            selection.entity = None;
         }
     }
-    if keys.just_pressed(KeyCode::Escape) && modal.open {
-        modal.open = false;
-        modal.actor = None;
+    if keys.just_pressed(KeyCode::Escape) && selection.is_some() {
+        selection.entity = None;
     }
 }
 
@@ -553,12 +560,12 @@ fn actor_inspector_close_input(
 fn actor_inspector_tab_buttons(
     interactions: Query<(&Interaction, &ActorInspectorTabBtn), Changed<Interaction>>,
     mut tab: ResMut<InspectorTab>,
-    mut modal: ResMut<ActorInspectorModal>,
+    mut selection: ResMut<SelectedActor>,
 ) {
     for (interaction, btn) in &interactions {
         if *interaction == Interaction::Pressed && *tab != btn.0 {
             *tab = btn.0;
-            modal.content_stamp = modal.content_stamp.wrapping_add(1);
+            selection.content_stamp = selection.content_stamp.wrapping_add(1);
         }
     }
 }
@@ -586,7 +593,6 @@ fn sync_tab_button_visuals(
 
 fn sync_actor_hover_tooltip(
     hovered: Res<HoveredActor>,
-    modal: Res<ActorInspectorModal>,
     window: Query<&Window>,
     cameras: Query<(&Camera, &GlobalTransform), With<StrategyCameraRig>>,
     pick_meshes: Query<&GlobalTransform, With<ActorPickMesh>>,
@@ -598,13 +604,11 @@ fn sync_actor_hover_tooltip(
         return;
     };
 
-    let show = hovered.root.is_some() && !modal.open && cursor_in_playfield(&window);
-
     let Some(root) = hovered.root else {
         *vis = Visibility::Hidden;
         return;
     };
-    if !show {
+    if !cursor_in_playfield(&window) {
         *vis = Visibility::Hidden;
         return;
     }
@@ -655,33 +659,29 @@ fn ease_out_cubic(t: f32) -> f32 {
     1.0 - (1.0 - t).powi(3)
 }
 
+/// Slides the panel in from the right edge when a bot is selected.
 fn animate_actor_inspector(
-    modal: Res<ActorInspectorModal>,
+    selection: Res<SelectedActor>,
     time: Res<Time>,
     mut progress: Local<f32>,
     mut was_open: Local<bool>,
-    mut card: Query<&mut Transform, With<ActorInspectorCard>>,
-    mut scrim: Query<&mut BackgroundColor, With<ActorInspectorScrim>>,
+    mut panel: Query<&mut Transform, With<ActorInspectorPanel>>,
 ) {
-    if modal.open && !*was_open {
+    let open = selection.is_some();
+    if open && !*was_open {
         *progress = 0.0;
     }
-    *was_open = modal.open;
+    *was_open = open;
 
-    if !modal.open {
+    if !open {
         return;
     }
 
     *progress = (*progress + time.delta_secs() / ANIM_DURATION_S).min(1.0);
     let t = ease_out_cubic(*progress);
 
-    if let Ok(mut tf) = card.single_mut() {
-        let s = 0.94 + 0.06 * t;
-        tf.scale = Vec3::new(s, s, 1.0);
-        tf.translation.y = 10.0 * (1.0 - t);
-    }
-    if let Ok(mut bg) = scrim.single_mut() {
-        bg.0 = SCRIM.with_alpha(SCRIM.alpha() * t);
+    if let Ok(mut tf) = panel.single_mut() {
+        tf.translation.x = (PANEL_WIDTH_PX + 28.0) * (1.0 - t);
     }
 }
 
@@ -694,9 +694,9 @@ fn spawn_black_bot_reset_button(parent: &mut ChildSpawnerCommands) {
             Pickable::default(),
             Button,
             Node {
-                min_width: Val::Px(72.0),
+                min_width: Val::Px(64.0),
                 height: Val::Px(32.0),
-                padding: UiRect::horizontal(Val::Px(14.0)),
+                padding: UiRect::horizontal(Val::Px(12.0)),
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
                 border: UiRect::all(Val::Px(1.0)),
@@ -756,41 +756,41 @@ fn spawn_force_logs_toggle_button(parent: &mut ChildSpawnerCommands, enabled: bo
 
 fn actor_force_logs_toggle_button(
     interactions: Query<&Interaction, (With<ActorForceLogsToggleButton>, Changed<Interaction>)>,
-    mut modal: ResMut<ActorInspectorModal>,
+    mut selection: ResMut<SelectedActor>,
     mut force_logs: Query<&mut ActorForceLogs>,
 ) {
     for interaction in &interactions {
         if *interaction != Interaction::Pressed {
             continue;
         }
-        let Some(actor) = modal.actor else {
+        let Some(actor) = selection.entity else {
             continue;
         };
         let Ok(mut flag) = force_logs.get_mut(actor) else {
             continue;
         };
         flag.0 = !flag.0;
-        modal.content_stamp = modal.content_stamp.wrapping_add(1);
+        selection.content_stamp = selection.content_stamp.wrapping_add(1);
     }
 }
 
 fn black_bot_reset_button(
     interactions: Query<&Interaction, (With<BlackBotResetButton>, Changed<Interaction>)>,
-    mut modal: ResMut<ActorInspectorModal>,
+    mut selection: ResMut<SelectedActor>,
     mut brains: Query<&mut Brain, With<ActorInspectable>>,
 ) {
     for interaction in &interactions {
         if *interaction != Interaction::Pressed {
             continue;
         }
-        let Some(actor) = modal.actor else {
+        let Some(actor) = selection.entity else {
             continue;
         };
         let Ok(mut brain) = brains.get_mut(actor) else {
             continue;
         };
         brain.reset();
-        modal.content_stamp = modal.content_stamp.wrapping_add(1);
+        selection.content_stamp = selection.content_stamp.wrapping_add(1);
     }
 }
 
@@ -807,9 +807,9 @@ fn spawn_actor_delete_button(parent: &mut ChildSpawnerCommands) {
             Pickable::default(),
             Button,
             Node {
-                min_width: Val::Px(72.0),
+                min_width: Val::Px(64.0),
                 height: Val::Px(32.0),
-                padding: UiRect::horizontal(Val::Px(14.0)),
+                padding: UiRect::horizontal(Val::Px(12.0)),
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
                 border: UiRect::all(Val::Px(1.0)),
@@ -831,33 +831,43 @@ fn spawn_actor_delete_button(parent: &mut ChildSpawnerCommands) {
 fn actor_delete_button(
     interactions: Query<&Interaction, (With<ActorDeleteButton>, Changed<Interaction>)>,
     mut commands: Commands,
-    mut modal: ResMut<ActorInspectorModal>,
+    mut selection: ResMut<SelectedActor>,
 ) {
     for interaction in &interactions {
         if *interaction != Interaction::Pressed {
             continue;
         }
-        let Some(actor) = modal.actor else {
+        let Some(actor) = selection.entity else {
             continue;
         };
         commands.entity(actor).despawn();
-        modal.open = false;
-        modal.actor = None;
+        selection.entity = None;
     }
 }
 
-/// Persistent state for the inspector rebuild logic.
-#[derive(Default)]
-struct InspectorBuildState {
+/// Persistent state for the panel rebuild logic.
+struct PanelBuildState {
     last_stamp: u32,
     last_actor: Option<Entity>,
+    refresh: Timer,
 }
 
-fn sync_actor_inspector_modal(
+impl Default for PanelBuildState {
+    fn default() -> Self {
+        Self {
+            last_stamp: 0,
+            last_actor: None,
+            refresh: Timer::from_seconds(PANEL_REFRESH_INTERVAL_S, TimerMode::Repeating),
+        }
+    }
+}
+
+fn sync_actor_inspector_panel(
     mut commands: Commands,
-    modal: Res<ActorInspectorModal>,
+    time: Res<Time>,
+    selection: Res<SelectedActor>,
     tab: Res<InspectorTab>,
-    mut overlay: Query<&mut Visibility, With<ActorInspectorOverlay>>,
+    mut panel: Query<&mut Visibility, With<ActorInspectorPanel>>,
     mut title: Query<&mut Text, With<ActorInspectorTitle>>,
     mut badge: Query<&mut Text, (With<ActorInspectorKindBadge>, Without<ActorInspectorTitle>)>,
     actions_host: Query<Entity, With<ActorInspectorActionsHost>>,
@@ -868,14 +878,14 @@ fn sync_actor_inspector_modal(
     black: Query<(&Brain, &BlackBotVisual, Option<&BotSpecialization>)>,
     actor_extras: Query<(Option<&Charge>, Option<&Breakable>)>,
     force_logs: Query<&ActorForceLogs>,
-    mut state: Local<InspectorBuildState>,
+    mut state: Local<PanelBuildState>,
 ) {
-    let Ok(mut overlay_vis) = overlay.single_mut() else {
+    let Ok(mut panel_vis) = panel.single_mut() else {
         return;
     };
 
-    if !modal.open {
-        *overlay_vis = Visibility::Hidden;
+    if !selection.is_some() {
+        *panel_vis = Visibility::Hidden;
         state.last_stamp = 0;
         state.last_actor = None;
         for row in &existing_rows {
@@ -887,19 +897,23 @@ fn sync_actor_inspector_modal(
         return;
     }
 
-    *overlay_vis = Visibility::Inherited;
+    *panel_vis = Visibility::Inherited;
 
-    let content_changed = modal.is_changed()
+    // Twice-a-second live refresh keeps displayed values current while the same
+    // bot stays selected, on top of the explicit change triggers below.
+    let ticked = state.refresh.tick(time.delta()).just_finished();
+    let content_changed = ticked
+        || selection.is_changed()
         || tab.is_changed()
-        || state.last_stamp != modal.content_stamp
-        || state.last_actor != modal.actor;
+        || state.last_stamp != selection.content_stamp
+        || state.last_actor != selection.entity;
     if !content_changed {
         return;
     }
-    state.last_stamp = modal.content_stamp;
-    state.last_actor = modal.actor;
+    state.last_stamp = selection.content_stamp;
+    state.last_actor = selection.entity;
 
-    let Some(actor) = modal.actor else {
+    let Some(actor) = selection.entity else {
         return;
     };
 
@@ -915,7 +929,9 @@ fn sync_actor_inspector_modal(
     let rows;
     if let Ok((brain, vis, spec)) = black.get(actor) {
         kind_label = "BlackBot";
-        let Ok((obj, _)) = actor_data.get(actor) else { return };
+        let Ok((obj, _)) = actor_data.get(actor) else {
+            return;
+        };
         rows = match *tab {
             InspectorTab::Status => status_rows(
                 obj,
@@ -946,8 +962,12 @@ fn sync_actor_inspector_modal(
         **text = display_name.clone();
     }
 
-    let Ok(actions_entity) = actions_host.single() else { return };
-    let Ok(host) = rows_host.single() else { return };
+    let Ok(actions_entity) = actions_host.single() else {
+        return;
+    };
+    let Ok(host) = rows_host.single() else {
+        return;
+    };
     for row in &existing_rows {
         commands.entity(row).despawn();
     }
@@ -972,17 +992,18 @@ fn sync_actor_inspector_modal(
 
     if rows.is_empty() {
         commands.entity(host).with_children(|parent| {
-            parent.spawn((
-                ActorInspectorRow,
-                Node { padding: UiRect::vertical(Val::Px(8.0)), ..default() },
-            ))
-            .with_children(|block| {
-                block.spawn((
-                    Text::new("No data for this tab."),
-                    TextFont::from_font_size(14.0),
-                    TextColor(TEXT_MUTED),
-                ));
-            });
+            parent
+                .spawn((
+                    ActorInspectorRow,
+                    Node { padding: UiRect::vertical(Val::Px(8.0)), ..default() },
+                ))
+                .with_children(|block| {
+                    block.spawn((
+                        Text::new("No data for this tab."),
+                        TextFont::from_font_size(14.0),
+                        TextColor(TEXT_MUTED),
+                    ));
+                });
         });
         return;
     }

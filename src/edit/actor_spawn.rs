@@ -23,7 +23,7 @@ use crate::map::passability::{
     DynamicPassabilityMap, SubtilePassability, FLAG_BLOCKED, FLAG_VOID, SUBTILE_COUNT,
 };
 use crate::menu::main_menu::GameState;
-use crate::scene::camera::StrategyCameraRig;
+use crate::scene::camera::{StrategyCamera, StrategyCameraRig};
 
 /// Pixels from the bottom of the window where spawn clicks are suppressed (covers the
 /// 52 px HUD bar + the 40 px palette row this panel shares with the map-edit palette).
@@ -107,10 +107,75 @@ impl Plugin for ActorSpawnPlugin {
                         .chain(),
                     actor_spawn_right_click_cancel,
                     resurrect_all_button,
+                    debug_bulk_spawn_bots,
                 )
                     .run_if(in_state(GameState::InGame)),
             );
     }
+}
+
+/// How many bots [`debug_bulk_spawn_bots`] drops per keypress.
+const DEBUG_BULK_SPAWN_COUNT: usize = 100;
+/// Cap on the outward cell-scan radius so a boxed-in camera can't loop forever.
+const DEBUG_BULK_SPAWN_SCAN_RADIUS: i32 = 80;
+
+/// Debug-only mass spawn: **Shift+B** drops [`DEBUG_BULK_SPAWN_COUNT`] BlackBots
+/// on passable cells spiralling out from the camera focus. Enables testing the
+/// movement pipeline at scale (hundreds of bots) without hundreds of clicks.
+fn debug_bulk_spawn_bots(
+    mut commands: Commands,
+    keys: Res<ButtonInput<KeyCode>>,
+    cameras: Query<&StrategyCamera>,
+    dynamic_passability: Res<DynamicPassabilityMap>,
+    hypermap: Res<HypermapRuntime>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut black_rng: ResMut<BlackBotRng>,
+) {
+    let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    if !(shift && keys.just_pressed(KeyCode::KeyB)) {
+        return;
+    }
+    let Ok(camera) = cameras.single() else { return };
+    let static_cache = hypermap.static_subtile_cache.as_ref();
+    let origin_x = camera.focus.x.floor() as i32;
+    let origin_z = camera.focus.z.floor() as i32;
+
+    let mut spawned = 0usize;
+    // Outward square rings from the focus tile; spawn on each passable cell.
+    'scan: for ring in 0..=DEBUG_BULK_SPAWN_SCAN_RADIUS {
+        for dz in -ring..=ring {
+            for dx in -ring..=ring {
+                // Only the perimeter of this ring (interior was covered already).
+                if ring > 0 && dx.abs() != ring && dz.abs() != ring {
+                    continue;
+                }
+                let (cx, cz) = (origin_x + dx, origin_z + dz);
+                if !actor_spawn_cell_passable(
+                    ActorKind::BlackBot,
+                    cx,
+                    cz,
+                    &dynamic_passability,
+                    static_cache,
+                ) {
+                    continue;
+                }
+                let center = Vec2::new(cx as f32 + 0.5, cz as f32 + 0.5);
+                black_bot::spawn_black_bot(
+                    &mut commands,
+                    &mut meshes,
+                    &mut materials,
+                    &mut black_rng.0,
+                    center,
+                );
+                spawned += 1;
+                if spawned >= DEBUG_BULK_SPAWN_COUNT {
+                    break 'scan;
+                }
+            }
+        }
+    }
+    info!("debug bulk spawn: {spawned} BlackBots near ({origin_x}, {origin_z})");
 }
 
 pub(crate) fn spawn_actor_spawn_palette(

@@ -11,7 +11,7 @@ use bevy::prelude::*;
 use bevy::render::view::Hdr;
 
 use crate::edit::map_edit::{MapEditState, MapTileKind};
-use crate::hud::actor_inspector::ActorInspectorModal;
+use crate::hud::actor_inspector::InspectorPointerOver;
 use crate::map::floor_level::{
     ActiveFloorLevel, CAMERA_FLOOR_Y_SMOOTH_PER_S, HYPERMAP_FLOOR_HEIGHT,
 };
@@ -230,11 +230,12 @@ fn pan_camera(keys: Res<ButtonInput<KeyCode>>, time: Res<Time>, mut cameras: Que
 
 fn zoom_camera(
     map_edit: Option<Res<MapEditState>>,
-    inspector: Option<Res<ActorInspectorModal>>,
+    panel_over: Option<Res<InspectorPointerOver>>,
     mut wheel_messages: MessageReader<MouseWheel>,
     mut cameras: Query<&mut StrategyCamera>,
 ) {
-    if inspector.as_ref().is_some_and(|m| m.open) {
+    // Scrolling over the docked inspector panel scrolls the panel, not the camera.
+    if panel_over.as_ref().is_some_and(|p| p.0) {
         return;
     }
 
