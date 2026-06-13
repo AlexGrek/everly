@@ -244,16 +244,17 @@ a search does not block the tick on A\*.
 
 Every BlackBot has a **specialization** (`BotSpecialization` in
 [`black_bot.rs`](../src/actor/black_bot.rs)) — rolled randomly at spawn
-(`BotSpecialization::roll`: `PATROL` with probability **1/4**, else
-`DO_NOTHING`). A specialization is just a *named behavior set* plus a **ring
-color** rendered around the sphere:
+(`BotSpecialization::roll`: `FIXER` with probability **1/8** (rarest), else
+`PATROL` at **1/4** of the rest, else `DO_NOTHING`). A specialization is just a
+*named behavior set* plus a **ring color** rendered around the sphere:
 
 | Specialization | Behaviors | Routine | Ring |
 |----------------|-----------|---------|------|
 | `DO_NOTHING` | `[RandomWalker, ChargeSelfKeeper]` | wander to random cells | black |
 | `PATROL` | `[Patroller, ChargeSelfKeeper]` | stick to a fixed loop of cells | blue |
+| `FIXER` | `[FixerDuty, ChargeSelfKeeper]` | loiter near home depot, repair stranded bots | red |
 
-`BotSpecialization::build_brain` constructs the matching [`Brain`]; both share
+`BotSpecialization::build_brain` constructs the matching [`Brain`]; all share
 `ChargeSelfKeeper`, so any specialization still leaves its routine to recharge.
 The ring is a flat torus child of the actor root (`spawn_bot_ring`), positioned
 each frame by `sync_black_bot_transforms`; it carries no pick mesh, so the status
@@ -294,6 +295,8 @@ shared routine wish value lives in `behavior_utils.rs`.
   value **15** (`ROUTINE_WISH_VALUE`).
 - **`Patroller`** (`PATROL`) — always wishes `Patrolling` at the same routine
   value **15**, so a recharge need still pre-empts it.
+- **`FixerDuty`** (`FIXER`) — always wishes `Fixing` at the same routine value
+  **15**; the loiter/claim/fetch/deliver machine lives in `GoFixBots`.
 - **`ChargeSelfKeeper`** (all specializations) — latches once charge ≤ **25%**, releasing only at full.
   While latched it wishes `RechargeYourself` at `missing-charge%` (≥75 at the
   trigger, rising as charge falls), floored at **50** so a near-full top-up still
@@ -321,6 +324,25 @@ shared routine wish value lives in `behavior_utils.rs`.
   it skips the unreachable waypoint and tries the next. Each leg uses the same
   **initial Manhattan distance × 3 s** travel budget; on expiry the bot logs
   `skipped patrol waypoint` and advances to the next loop tile. Perpetual.
+- **`GoFixBots`** (serves `Fixing`) — perpetual fixer routine, phases
+  `Loiter` → `FetchPart` → `Deliver` → `ReturnHome`:
+  - **Loiter:** wander within **10** Manhattan tiles of the home depot (returning
+    toward it when displaced beyond that), and — *only while inside the loiter
+    radius* — `claim_nearest` an open [`RepairRequest`] from the
+    [`DispatchQueue`](../src/actor/dispatch.rs). When far from the depot it does
+    **not** watch the queue.
+  - **FetchPart:** route to the home depot tile; on arrival emit
+    `pickup_part` (the bot's [`BotInventory`] now carries the part, rendered as a
+    floating marker) and head to the stranded bot.
+  - **Deliver:** route to the stranded bot's location; the moment the fixer is
+    within **1.5 tiles** (`FIX_REACH_SQ`, *near but not colliding*), emit
+    `repair_target` (reset that part's wear + clear its broken flag on the target
+    bot) and `clear_inventory`, `complete` the request, and return home. If the
+    bot's tile is unreachable, drop the claim and return so another fixer can try.
+  - **ReturnHome:** route back to the depot, then `Loiter` again.
+  The home depot lives on the bot's `Fixer` component (closest *reachable* depot,
+  located lazily at spawn via `find_accessible_within`); the claim lives on the
+  shared board. `preempt` (recharge) releases the claim and drops the carried part.
 - **`GoToChargeStation`** (serves `RechargeYourself`) — `Seeking` → `Traveling` →
   `WaitingQueue` → `Charging`:
   - gather chargers in the bot's 4 nearest hypertiles (current chunk + nearest X/Y
@@ -350,14 +372,23 @@ a brain decision: queue add/remove requests update station wanting/waiting queue
 when docking succeeds. A depleted bot is immobilized **before** the tick, so a bot
 must trigger recharge (25%) with enough runway to reach a charger.
 
+Fixer effects are applied alongside in `black_bot_brain`: `pickup_part` /
+`clear_inventory` mutate the fixer's own [`BotInventory`]; `repair_target` is
+collected and applied in a **second pass** over the bot query (it resets a
+*different* bot's `Breakable` than the one being iterated). Dispatch-board
+claims/releases are not effects — fixers mutate the interior-mutable
+[`DispatchQueue`] through `&` during the tick. See [`dispatch.md`](dispatch.md).
+
 ## Persistence
 
 A saved BlackBot stores its brain's `rng_seed` **and its `specialization`** (so a
 loaded bot keeps its role and ring). The behavior set is then fixed by the
 specialization, so nothing else about the brain is serialized: a loaded bot
-rebuilds its brain and re-plans from scratch, and a `PATROL` bot **regenerates its
-patrol loop** on first tick (the loop is not persisted). A `specialization`
-missing from older `actors.yaml` loads as `DO_NOTHING`. See
+rebuilds its brain and re-plans from scratch, a `PATROL` bot **regenerates its
+patrol loop** on first tick, and a `FIXER` bot **re-locates its home depot** and
+starts with empty inventory (neither the loop, the home depot, nor the carried
+part is persisted). A `specialization` missing from older `actors.yaml` loads as
+`DO_NOTHING`. See
 [`snapshot.rs`](../src/actor/snapshot.rs) (`BlackBotBrainSnap`, `SavedActor::BlackBot`)
 and [`level-persistence.md`](level-persistence.md).
 
@@ -392,3 +423,6 @@ and add a `#[serde(default)]`-friendly variant — persistence is automatic.
 [`PathKind`]: ../src/map/pathfind_service.rs
 [`PathOutcome`]: ../src/map/pathfind_service.rs
 [`ChargerEntity`]: ../src/map/interactive_entity.rs
+[`DispatchQueue`]: ../src/actor/dispatch.rs
+[`RepairRequest`]: ../src/actor/dispatch.rs
+[`BotInventory`]: ../src/actor/dispatch.rs

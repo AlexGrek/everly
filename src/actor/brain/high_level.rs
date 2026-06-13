@@ -7,9 +7,10 @@
 //! [`HighLevelStatus::Done`] the brain drops it and re-plans next tick.
 
 use bevy::ecs::entity::Entity;
+use bevy::math::Vec2;
 use crate::rng::{self, StdRng};
 
-use crate::actor::dispatch::{RepairPart, RepairRequest};
+use crate::actor::dispatch::RepairRequest;
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap, HYPERMAP_CHUNK_SIZE};
 use crate::map::hypermap_pathfind::{manhattan, world_tile_walkable};
 use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
@@ -697,7 +698,7 @@ impl GoFixBots {
         home: (i32, i32),
     ) {
         let here = (ctx.main_tile.x, ctx.main_tile.y);
-        if manhattan(here, home) > FIXER_LOITER_RADIUS {
+        if manhattan(here, home) as i32 > FIXER_LOITER_RADIUS {
             self.start_route(pf, ctx, low, home, PathfindReason::FixerReturnHome);
             return;
         }
@@ -805,7 +806,7 @@ impl GoFixBots {
         }
 
         // Watch the dispatch queue only while near the home depot.
-        if manhattan(here, home_tile) <= FIXER_LOITER_RADIUS {
+        if manhattan(here, home_tile) as i32 <= FIXER_LOITER_RADIUS {
             if let Some(req) = fx.dispatch.claim_nearest(ctx.entity, ctx.main_tile) {
                 self.claim = Some(req);
                 self.phase = FixPhase::FetchPart;
@@ -915,7 +916,7 @@ impl GoFixBots {
         fx: FixerContext,
         ctx: &BrainContext,
         low: &mut Box<dyn LowLevelAction>,
-        here: (i32, i32),
+        _here: (i32, i32),
         home_tile: (i32, i32),
     ) -> HighLevelOutcome {
         let Some(req) = self.claim else {
@@ -1003,7 +1004,7 @@ impl GoFixBots {
             }
         }
 
-        if manhattan(here, home_tile) <= FIXER_LOITER_RADIUS {
+        if manhattan(here, home_tile) as i32 <= FIXER_LOITER_RADIUS {
             // Back within the loiter zone: resume loitering.
             self.phase = FixPhase::Loiter;
             self.leg = None;
@@ -1396,6 +1397,32 @@ pub fn sample_wander_goal(
         }
         let target = (current_tile.0 + dx.round() as i32, current_tile.1 + dy.round() as i32);
         if target == current_tile {
+            continue;
+        }
+        if world_tile_walkable(passability, target.0, target.1) {
+            return Some(target);
+        }
+    }
+    None
+}
+
+/// Picks a random *walkable* tile within `radius` (Euclidean, tiles) of `center`,
+/// or `None` when none was found this tick. Used by a loitering fixer to wander
+/// near its home depot.
+pub fn sample_tile_within_radius(
+    rng: &mut StdRng,
+    center: (i32, i32),
+    radius: f32,
+    passability: &Hypermap<f32>,
+) -> Option<(i32, i32)> {
+    for _ in 0..MAX_TARGET_ATTEMPTS {
+        let dx: f32 = rng::range(rng, -radius..radius);
+        let dy: f32 = rng::range(rng, -radius..radius);
+        if dx * dx + dy * dy > radius * radius {
+            continue;
+        }
+        let target = (center.0 + dx.round() as i32, center.1 + dy.round() as i32);
+        if target == center {
             continue;
         }
         if world_tile_walkable(passability, target.0, target.1) {
@@ -2270,5 +2297,139 @@ mod tests {
         let routes = pf.drain_world_routes();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0], ((9, 0), (10, 0)), "resumes at the nearest loop waypoint");
+    }
+
+    // --- GoFixBots ----------------------------------------------------------
+
+    use crate::actor::dispatch::{DispatchQueue, RepairPart};
+
+    /// A `BrainContext` with the fixer bundle filled in.
+    fn fixer_ctx<'a>(
+        passability: &'a Hypermap<f32>,
+        interactive: &'a InteractiveEntityMap,
+        tile: (i32, i32),
+        pf: PathfindAccess<'a>,
+        dispatch: &'a DispatchQueue,
+        home: Option<EntityCoordinates>,
+        carried: Option<RepairPart>,
+    ) -> BrainContext<'a> {
+        let mut c = ctx(passability, interactive, 1.0, tile, pf, None);
+        c.fixer = Some(FixerContext { dispatch, home_depot: home, carried });
+        c
+    }
+
+    #[test]
+    fn fixer_without_home_waits_and_enqueues_nothing() {
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let dispatch = DispatchQueue::default();
+        let pf = PathfindFixture::new();
+        let mut action = GoFixBots::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = rng::seeded(1);
+
+        let c = fixer_ctx(&passability, &interactive, (0, 0), pf.access(), &dispatch, None, None);
+        action.update(&c, &mut low, &mut rng);
+
+        assert!(!is_pending(low.as_ref()), "no home depot → hold, don't route");
+        assert!(pf.queue.is_empty(), "no routes until a home depot exists");
+    }
+
+    #[test]
+    fn fixer_claims_open_request_and_routes_to_depot() {
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let dispatch = DispatchQueue::default();
+        let broken = Entity::from_bits(0xB0B);
+        dispatch.post(broken, RepairPart::MovementEngine, IVec2::new(3, 4));
+
+        let pf = PathfindFixture::new();
+        let mut action = GoFixBots::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = rng::seeded(2);
+        let home = EntityCoordinates::ground(0, 0);
+
+        let c = fixer_ctx(&passability, &interactive, (0, 0), pf.access(), &dispatch, Some(home), None);
+        action.update(&c, &mut low, &mut rng);
+
+        // The request is now claimed by this fixer, and a route to the depot is queued.
+        let claim = dispatch.claim_of(Entity::PLACEHOLDER).expect("claimed");
+        assert_eq!(claim.broken_bot, broken);
+        assert!(is_pending(low.as_ref()), "fixer parks while routing to the depot");
+        let routes = pf.drain_world_routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0], ((0, 0), (0, 0)), "routes to the home depot tile");
+    }
+
+    #[test]
+    fn fixer_full_flow_picks_up_part_then_repairs_on_contact() {
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let dispatch = DispatchQueue::default();
+        let broken = Entity::from_bits(0xDEAD);
+        dispatch.post(broken, RepairPart::ControlPlane, IVec2::new(3, 3));
+
+        let pf = PathfindFixture::new();
+        let mut action = GoFixBots::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = rng::seeded(3);
+        let home = EntityCoordinates::ground(0, 0);
+
+        // Tick 1 (loiter @ home): claim + route to depot.
+        let c = fixer_ctx(&passability, &interactive, (0, 0), pf.access(), &dispatch, Some(home), None);
+        action.update(&c, &mut low, &mut rng);
+        pf.resolve_all_routes(vec![(0, 0)], 1); // already on the depot tile
+
+        // Tick 2 (fetch): poll resolves AtGoal → pick up the part, route to the bot.
+        let c = fixer_ctx(&passability, &interactive, (0, 0), pf.access(), &dispatch, Some(home), None);
+        let out = action.update(&c, &mut low, &mut rng);
+        assert_eq!(out.effects.pickup_part, Some(RepairPart::ControlPlane), "part picked up at depot");
+        let routes = pf.drain_world_routes();
+        assert!(routes.iter().any(|(_, goal)| *goal == (3, 3)), "routes toward the stranded bot");
+
+        // Tick 3 (deliver): standing next to the bot → repair on proximity.
+        let c = fixer_ctx(
+            &passability,
+            &interactive,
+            (3, 3),
+            pf.access(),
+            &dispatch,
+            Some(home),
+            Some(RepairPart::ControlPlane),
+        );
+        let out = action.update(&c, &mut low, &mut rng);
+        assert_eq!(
+            out.effects.repair_target,
+            Some((broken, RepairPart::ControlPlane)),
+            "repairs the stranded bot's part"
+        );
+        assert!(out.effects.clear_inventory, "carried part is consumed");
+        assert!(dispatch.is_empty(), "completed request leaves the board");
+    }
+
+    #[test]
+    fn fixer_preempt_releases_claim_and_drops_part() {
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let dispatch = DispatchQueue::default();
+        let broken = Entity::from_bits(7);
+        dispatch.post(broken, RepairPart::MovementEngine, IVec2::new(2, 2));
+
+        let pf = PathfindFixture::new();
+        let mut action = GoFixBots::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = rng::seeded(4);
+        let home = EntityCoordinates::ground(0, 0);
+
+        let c = fixer_ctx(&passability, &interactive, (0, 0), pf.access(), &dispatch, Some(home), None);
+        action.update(&c, &mut low, &mut rng);
+        assert!(dispatch.claim_of(Entity::PLACEHOLDER).is_some(), "claimed before pre-empt");
+
+        let effects = action.preempt(&c);
+        assert!(effects.clear_inventory, "pre-empt drops any carried part");
+        assert!(
+            dispatch.claim_of(Entity::PLACEHOLDER).is_none(),
+            "pre-empt releases the claim back to the pool"
+        );
     }
 }

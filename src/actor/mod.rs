@@ -27,6 +27,7 @@ pub mod actor_name;
 pub mod actor_pick;
 pub mod brain;
 pub mod charge;
+pub mod dispatch;
 pub mod inspect;
 pub mod movement;
 pub mod resurrect;

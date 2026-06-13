@@ -29,10 +29,13 @@ use crate::actor::actor_name::random_actor_name;
 use crate::actor::actor_pick::{ActorForceLogs, ActorInspectable, ActorPickMesh};
 use crate::actor::brain::{
     assemble_patrol_loop, enqueue_patrol_candidates, make_high_level, AvoidanceViews, Behavior,
-    Brain, BrainContext, BrainEffects, BrainLogEvent, ChargeSelfKeeper, PathfindAccess, Patroller,
-    RandomWalker,
+    Brain, BrainContext, BrainEffects, BrainLogEvent, ChargeSelfKeeper, FixerContext, FixerDuty,
+    PathfindAccess, Patroller, RandomWalker,
 };
 use crate::actor::charge::Charge;
+use crate::actor::dispatch::{
+    spawn_inventory_marker, BotInventory, DispatchQueue, InventoryMarker, RepairPart,
+};
 use crate::actor::snapshot::{BreakablePartSnap, BreakableSnap};
 use crate::actor::{
     actor_main_tile, arbitrate_actor_moves, flush_actor_occupancy, is_front_collision, is_paused,
@@ -44,7 +47,8 @@ use crate::map::chunk_overlay::{ChunkOverlayState, OVERLAY_RES};
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap};
 use crate::map::hypermap_world::{HypermapChunkRemeshQueue, HypermapRuntime};
 use crate::map::interactive_entity::{
-    sync_chargers_for_chunks, EntityCoordinates, InteractiveEntityMap,
+    sync_chargers_for_chunks, sync_parts_depots_for_chunks, EntityCoordinates, EntityType,
+    InteractiveEntityMap,
 };
 use crate::map::level::LevelName;
 use crate::map::passability::{
@@ -112,6 +116,8 @@ const RING_MAJOR_RADIUS: f32 = SPHERE_RADIUS;
 const RING_DO_NOTHING: Color = Color::srgb(0.02, 0.02, 0.02);
 /// `PATROL` ring color (blue).
 const RING_PATROL: Color = Color::srgb(0.10, 0.45, 1.0);
+/// `FIXER` ring color (red).
+const RING_FIXER: Color = Color::srgb(1.0, 0.12, 0.12);
 
 /// State of one breakable sub-component of a [`Breakable`] bot.
 #[derive(Debug, Clone)]
@@ -273,13 +279,21 @@ pub enum BotSpecialization {
     /// [`GoToPatrol`](crate::actor::brain::GoToPatrol)), leaving only to recharge
     /// and resuming where it stopped. Blue ring.
     Patrol,
+    /// Repair stranded bots: loiter near the home parts depot ([`FixerDuty`] +
+    /// [`GoFixBots`](crate::actor::brain::GoFixBots)), claim
+    /// [`DispatchQueue`](crate::actor::dispatch::DispatchQueue) requests, fetch the
+    /// part, and deliver it. Red ring. Rarer than [`Patrol`](Self::Patrol).
+    Fixer,
 }
 
 impl BotSpecialization {
-    /// Rolls a specialization at spawn: [`Patrol`](Self::Patrol) with probability
-    /// `1/4`, otherwise [`DoNothing`](Self::DoNothing).
+    /// Rolls a specialization at spawn: [`Fixer`](Self::Fixer) with probability
+    /// `1/8` (the rarest), else [`Patrol`](Self::Patrol) at `1/4` of the rest,
+    /// otherwise [`DoNothing`](Self::DoNothing).
     pub fn roll(rng: &mut StdRng) -> Self {
-        if rng::one_in(rng, 4) {
+        if rng::one_in(rng, 8) {
+            Self::Fixer
+        } else if rng::one_in(rng, 4) {
             Self::Patrol
         } else {
             Self::DoNothing
@@ -291,6 +305,7 @@ impl BotSpecialization {
         match self {
             Self::DoNothing => RING_DO_NOTHING,
             Self::Patrol => RING_PATROL,
+            Self::Fixer => RING_FIXER,
         }
     }
 
@@ -299,6 +314,7 @@ impl BotSpecialization {
         match self {
             Self::DoNothing => "DO_NOTHING",
             Self::Patrol => "PATROL",
+            Self::Fixer => "FIXER",
         }
     }
 
@@ -309,6 +325,7 @@ impl BotSpecialization {
         let routine: Box<dyn Behavior> = match self {
             Self::DoNothing => Box::new(RandomWalker),
             Self::Patrol => Box::new(Patroller),
+            Self::Fixer => Box::new(FixerDuty),
         };
         Brain::new(vec![routine, Box::new(ChargeSelfKeeper::new())], make_high_level, seed)
     }
@@ -339,6 +356,25 @@ pub struct Patrol {
     /// so a pruned / never-returned result can't stall generation forever.
     gen_elapsed: f32,
 }
+
+/// Per-bot state for a [`BotSpecialization::Fixer`]: the home parts depot it
+/// loiters near, located lazily the first operational frame (see
+/// [`black_bot_brain`]) and then fixed for life. Surfaced to the brain via
+/// [`FixerContext`]. Only present on `FIXER` bots; not serialized (re-located on
+/// load).
+#[derive(Component, Default)]
+pub struct Fixer {
+    /// Closest reachable parts depot, or `None` until one is located.
+    pub home_depot: Option<EntityCoordinates>,
+    /// Seconds until the next home-depot search while `home_depot` is `None`
+    /// (depots may stream in after spawn). `0.0` searches immediately.
+    retry_cooldown: f32,
+}
+
+/// Max BFS steps when a fixer searches for its closest reachable home depot.
+const FIXER_DEPOT_SEARCH_STEPS: u32 = 256;
+/// Backoff between failed home-depot searches (no reachable depot yet).
+const FIXER_DEPOT_RETRY_SECS: f32 = 1.0;
 
 /// Backoff between empty [`Patrol::loop_tiles`] generation attempts — see
 /// [`Patrol::retry_cooldown`].
@@ -507,7 +543,7 @@ impl Plugin for BlackBotPlugin {
 }
 
 #[derive(Default)]
-struct IndexedChargerChunks {
+pub(crate) struct IndexedChargerChunks {
     level: String,
     chunks: HashSet<ChunkCoord>,
 }
@@ -517,7 +553,7 @@ struct IndexedChargerChunks {
 ///
 /// Sequential by design: it mutates the [`InteractiveEntityMap`] resource and
 /// the per-bot RNG lives in the brain, so it must not run on `par_iter`.
-fn black_bot_brain(
+pub(crate) fn black_bot_brain(
     time: Res<Time>,
     level_name: Res<LevelName>,
     hypermap: Res<HypermapRuntime>,
@@ -526,6 +562,7 @@ fn black_bot_brain(
     pathfind_queue: Res<PathfindQueue>,
     pathfind_results: Res<PathfindResults>,
     mut interactive: ResMut<InteractiveEntityMap>,
+    dispatch: Res<DispatchQueue>,
     game_log: Res<GameLog>,
     mut indexed: Local<IndexedChargerChunks>,
     mut query: Query<(
@@ -538,6 +575,8 @@ fn black_bot_brain(
         Option<&mut Charge>,
         Option<&mut Breakable>,
         Option<&mut Patrol>,
+        Option<&mut Fixer>,
+        Option<&mut BotInventory>,
         Option<&OffScreenActor>,
     )>,
     timings: Res<SystemTimings>,
@@ -556,9 +595,13 @@ fn black_bot_brain(
         &remesh,
     );
 
+    // Repairs requested by fixers this tick, applied in a second pass below
+    // (they mutate a *different* bot's `Breakable` than the one being iterated).
+    let mut repairs: Vec<(Entity, RepairPart)> = Vec::new();
+
     let mut coasting: u64 = 0;
     let mut total: u64 = 0;
-    for (entity, name, mut obj, mut brain, mut vis, force_logs, mut charge, mut breakable, mut patrol, off_screen) in
+    for (entity, name, mut obj, mut brain, mut vis, force_logs, mut charge, mut breakable, mut patrol, mut fixer, mut inventory, off_screen) in
         &mut query
     {
         total += 1;
@@ -577,6 +620,7 @@ fn black_bot_brain(
         // plan so it re-routes from where it actually landed.
         if state.shadow.teleported {
             brain.reset();
+            release_fixer_work(entity, &dispatch, inventory.as_deref_mut());
             state.move_buffer = ActorMoveBuffer::default();
             state.next_waypoint_hint = None;
         }
@@ -633,6 +677,7 @@ fn black_bot_brain(
         // hold (once, on the offline transition) so they stop blocking working bots.
         if depleted || broken {
             brain.reset();
+            release_fixer_work(entity, &dispatch, inventory.as_deref_mut());
             state.move_buffer = ActorMoveBuffer::default();
             state.next_waypoint_hint = None;
             if !vis.offline_released {
@@ -642,6 +687,25 @@ fn black_bot_brain(
             continue;
         }
         vis.offline_released = false;
+
+        // Locate the fixer's home depot once, lazily — the closest *reachable*
+        // parts depot from the bot's current (spawn) tile. Retries with a backoff
+        // while none is reachable (depots may still be streaming in).
+        if let Some(f) = fixer.as_mut() {
+            if f.home_depot.is_none() {
+                if f.retry_cooldown > 0.0 {
+                    f.retry_cooldown -= dt;
+                } else if let Some(depot) = nearest_reachable_depot(
+                    &interactive,
+                    passability,
+                    current_tile,
+                ) {
+                    f.home_depot = Some(depot);
+                } else {
+                    f.retry_cooldown = FIXER_DEPOT_RETRY_SECS;
+                }
+            }
+        }
 
         // Generate the patrol loop once, lazily, from the bot's current (spawn)
         // tile. It then never changes — the bot sticks to it forever. Generation
@@ -698,6 +762,13 @@ fn black_bot_brain(
         }
         let patrol_loop = patrol.as_deref().map(|p| p.loop_tiles.as_slice());
 
+        // Fixer-only context: shared dispatch board + home depot + carried part.
+        let fixer_ctx = fixer.as_deref().map(|f| FixerContext {
+            dispatch: &dispatch,
+            home_depot: f.home_depot,
+            carried: inventory.as_deref().and_then(|inv| inv.carried),
+        });
+
         let charge_level = charge.as_ref().map(|c| c.level).unwrap_or(1.0);
         let effects = {
             let ctx = BrainContext {
@@ -725,9 +796,24 @@ fn black_bot_brain(
                     queue: &pathfind_queue,
                     results: &pathfind_results,
                 }),
+                fixer: fixer_ctx,
             };
             brain.tick(&ctx, state)
         };
+
+        // Fixer inventory: pick up a part at the depot / clear it on delivery.
+        if let Some(inv) = inventory.as_deref_mut() {
+            if let Some(part) = effects.pickup_part {
+                inv.carried = Some(part);
+            }
+            if effects.clear_inventory {
+                inv.carried = None;
+            }
+        }
+        // A delivered repair targets a *different* bot; collect for the 2nd pass.
+        if let Some((target, part)) = effects.repair_target {
+            repairs.push((target, part));
+        }
 
         // MOVEMENT_ENGINE wears only while actually moving this frame.
         if state.move_buffer.tile_delta != Vec2::ZERO {
@@ -798,8 +884,73 @@ fn black_bot_brain(
 
         apply_brain_effects(entity, &effects, &mut interactive, charge.as_deref_mut());
     }
+
+    // Second pass: apply fixer-delivered repairs to the *target* bots (a fixer
+    // can't mutate another bot's `Breakable` while that bot's row is borrowed in
+    // the main loop). Resets the delivered part's wear and clears its broken flag.
+    for (target, part) in repairs.drain(..) {
+        let Ok((_, name, obj, _, _, force_logs, _, mut breakable, _, _, _, _)) = query.get_mut(target)
+        else {
+            continue;
+        };
+        let Some(b) = breakable.as_mut() else { continue };
+        let p = match part {
+            RepairPart::MovementEngine => &mut b.movement_engine,
+            RepairPart::ControlPlane => &mut b.control_plane,
+            RepairPart::SensorySystem => &mut b.sensory_system,
+        };
+        p.wear = 0.0;
+        p.broken = false;
+        let tile = actor_main_tile(obj.inner.state().center);
+        game_log.push_world(
+            tile.x,
+            tile.y,
+            LogEntry::Message {
+                level: LogLevel::Success,
+                text: format!("{} {} repaired", name.as_str(), part.label()),
+            },
+            force_logs.0,
+        );
+    }
+
     counts.coasting_bots.store(coasting, std::sync::atomic::Ordering::Relaxed);
     counts.total_bots.store(total, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Releases any dispatch claim held by `entity` and drops its carried part. Used
+/// wherever a fixer's brain is force-reset (teleport, offline, collision) so a
+/// claimed repair task doesn't stay orphaned on the board.
+fn release_fixer_work(
+    entity: Entity,
+    dispatch: &DispatchQueue,
+    inventory: Option<&mut BotInventory>,
+) {
+    dispatch.release(entity);
+    if let Some(inv) = inventory {
+        inv.carried = None;
+    }
+}
+
+/// Closest reachable [`CellType::PartsDepot`](crate::map::world_map::CellType)
+/// (4-neighbour BFS over static passability, bounded by [`FIXER_DEPOT_SEARCH_STEPS`])
+/// to `from` on the ground floor, picked by Manhattan distance. `None` when no
+/// depot is reachable.
+fn nearest_reachable_depot(
+    interactive: &InteractiveEntityMap,
+    passability: &Hypermap<f32>,
+    from: IVec2,
+) -> Option<EntityCoordinates> {
+    interactive
+        .find_accessible_within(
+            passability,
+            (from.x, from.y),
+            0,
+            FIXER_DEPOT_SEARCH_STEPS,
+            Some(EntityType::PartsDepot),
+        )
+        .into_iter()
+        .min_by_key(|e| (e.coordinates.x - from.x).abs() + (e.coordinates.y - from.y).abs())
+        .map(|e| e.coordinates)
 }
 
 fn refresh_charger_index(
@@ -829,6 +980,7 @@ fn refresh_charger_index(
 
     if !sync_chunks.is_empty() {
         sync_chargers_for_chunks(map, interactive, sync_chunks.iter().copied());
+        sync_parts_depots_for_chunks(map, interactive, sync_chunks.iter().copied());
         indexed.chunks.extend(sync_chunks);
     }
     indexed.chunks.retain(|chunk| loaded_set.contains(chunk));
@@ -920,7 +1072,7 @@ fn charger_occupant(map: &InteractiveEntityMap, coords: EntityCoordinates) -> Op
 
 fn sync_black_bot_transforms(
     actors: Query<(&ActorObject, &Children, Option<&Breakable>), (With<BlackBotVisual>, Without<OffScreenActor>)>,
-    mut children_data: Query<Option<&mut Transform>, Without<ActorObject>>,
+    mut children_data: Query<Option<&mut Transform>, (Without<ActorObject>, Without<InventoryMarker>)>,
 ) {
     for (obj, children, breakable) in &actors {
         let world_pos = obj.inner.state().center;
@@ -981,6 +1133,7 @@ fn track_black_bot_collision_pressure(
     dynamic: Res<DynamicPassabilityMap>,
     selected: Res<SelectedActor>,
     mut interactive: ResMut<InteractiveEntityMap>,
+    dispatch: Res<DispatchQueue>,
     mut prev_center: Local<HashMap<Entity, Vec2>>,
     mut query: Query<(
         Entity,
@@ -991,10 +1144,11 @@ fn track_black_bot_collision_pressure(
         &ActorForceLogs,
         Option<&Charge>,
         Option<&Breakable>,
+        Option<&mut BotInventory>,
     )>,
 ) {
     let static_cache = hypermap.static_subtile_cache.as_ref();
-    for (entity, name, mut obj, mut brain, mut vis, force_logs, charge, breakable) in &mut query {
+    for (entity, name, mut obj, mut brain, mut vis, force_logs, charge, breakable, mut inventory) in &mut query {
         let depleted = charge.is_some_and(|c| c.is_depleted());
         let broken = breakable
             .as_ref()
@@ -1035,6 +1189,7 @@ fn track_black_bot_collision_pressure(
         state.next_waypoint_hint = None;
         prev_center.insert(entity, relocated);
         interactive.evict_actor_everywhere(entity);
+        release_fixer_work(entity, &dispatch, inventory.as_deref_mut());
         game_log.push_world(
             tile.x,
             tile.y,
@@ -1335,8 +1490,14 @@ fn spawn_bot_ring(
 /// [`Patrol`] route) onto a freshly spawned BlackBot root.
 fn attach_specialization(commands: &mut Commands, parent: Entity, spec: BotSpecialization) {
     commands.entity(parent).insert(spec);
-    if matches!(spec, BotSpecialization::Patrol) {
-        commands.entity(parent).insert(Patrol::default());
+    match spec {
+        BotSpecialization::Patrol => {
+            commands.entity(parent).insert(Patrol::default());
+        }
+        BotSpecialization::Fixer => {
+            commands.entity(parent).insert(Fixer::default());
+        }
+        BotSpecialization::DoNothing => {}
     }
 }
 
@@ -1376,6 +1537,7 @@ pub fn spawn_black_bot_from_snapshot(
             },
             spec.build_brain(rng_seed),
             ActorObject::new(Box::new(bot)),
+            BotInventory::default(),
             Transform::default(),
             Visibility::Inherited,
         ))
@@ -1393,8 +1555,11 @@ pub fn spawn_black_bot_from_snapshot(
         ))
         .id();
     let ring_child = spawn_bot_ring(commands, meshes, materials, center, spec.ring_color());
+    let inventory_child = spawn_inventory_marker(commands, meshes, materials, center);
 
-    commands.entity(parent).add_children(&[mesh_child, ring_child]);
+    commands
+        .entity(parent)
+        .add_children(&[mesh_child, ring_child, inventory_child]);
     parent
 }
 
@@ -1431,6 +1596,7 @@ pub fn spawn_black_bot(
             },
             spec.build_brain(brain_seed),
             ActorObject::new(Box::new(bot)),
+            BotInventory::default(),
             Transform::default(),
             Visibility::Inherited,
         ))
@@ -1448,8 +1614,11 @@ pub fn spawn_black_bot(
         ))
         .id();
     let ring_child = spawn_bot_ring(commands, meshes, materials, center, spec.ring_color());
+    let inventory_child = spawn_inventory_marker(commands, meshes, materials, center);
 
-    commands.entity(parent).add_children(&[mesh_child, ring_child]);
+    commands
+        .entity(parent)
+        .add_children(&[mesh_child, ring_child, inventory_child]);
     parent
 }
 

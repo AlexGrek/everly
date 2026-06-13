@@ -692,7 +692,10 @@ fn inner_doors_make_all_rooms_accessible() {
     // Slab bits on a walkable cell, or None when the cell cannot be walked.
     let cell_bits = |draft: &MapDraft, x: i32, z: i32| -> Option<u8> {
         match draft.get(x, z) {
-            DraftTile::Open | DraftTile::Corner(_) | DraftTile::Charger(_) => Some(0),
+            DraftTile::Open
+            | DraftTile::Corner(_)
+            | DraftTile::Charger(_)
+            | DraftTile::PartsDepot(_) => Some(0),
             DraftTile::Wall(bits) => Some(bits),
             DraftTile::Void => None,
         }
@@ -1004,7 +1007,10 @@ fn inner_doors_make_all_rooms_accessible_with_wide_doors() {
 
     let cell_bits = |draft: &MapDraft, x: i32, z: i32| -> Option<u8> {
         match draft.get(x, z) {
-            DraftTile::Open | DraftTile::Corner(_) | DraftTile::Charger(_) => Some(0),
+            DraftTile::Open
+            | DraftTile::Corner(_)
+            | DraftTile::Charger(_)
+            | DraftTile::PartsDepot(_) => Some(0),
             DraftTile::Wall(bits) => Some(bits),
             DraftTile::Void => None,
         }

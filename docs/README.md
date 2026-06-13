@@ -16,6 +16,7 @@ Current behavior docs:
 - `docs/actor.md` — actor trait runtime loop, movement buffer, footprint collision flow, **main tile** (`round(center)`), and usage examples.
 - `docs/actor-brain.md` — BlackBot brain: behaviors, priorities, high/low-level actions, stuck/escape, async routing integration.
 - `docs/pathfind-service.md` — async pathfinding queue (`PathfindQueue` / `PathfindResults`), scheduling, bot enqueue/await flow, test split.
+- `docs/dispatch.md` — **DISPATCH_QUEUE** repair board + bot **inventory**: stranded bots post requests, `FIXER` bots claim/fetch/deliver parts (`GoFixBots`).
 - `docs/charge.md` — bot **battery charge**: `Charge` component, discharge system, depletion → movement disabled, inspector display, persistence.
 - `docs/chunk-overlay.md` — per-chunk RGBA overlays: temperature heatmap (F5), dirt, generic/paths layer (F6), occupancy debug (F4).
 - `docs/tile-fields.md` — tile-resolution scalar fields (dirt, temperature) and shared `TileFieldMap`.
