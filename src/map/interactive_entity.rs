@@ -78,6 +78,7 @@ impl EntityCoordinates {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EntityType {
     Charger,
+    PartsDepot,
 }
 
 /// Shared interface every interactive entity exposes.
@@ -203,12 +204,72 @@ impl InteractiveEntityBehavior for ChargerEntity {
     }
 }
 
+/// A parts depot instance: the runtime, stateful counterpart of a
+/// [`CellType::PartsDepot`](crate::map::world_map::CellType) tile.
+/// Interaction is immediate (no queue or docking wait). Behavior is wired later.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PartsDepotEntity {
+    coordinates: EntityCoordinates,
+    /// Wall edge the depot backs onto (mirrors the tile's facing).
+    facing: ChargerFacing,
+    /// The special "in use" flag.
+    is_used: bool,
+    /// Free-form properties.
+    props: HashMap<String, String>,
+}
+
+impl PartsDepotEntity {
+    pub fn new(coordinates: EntityCoordinates, facing: ChargerFacing) -> Self {
+        Self {
+            coordinates,
+            facing,
+            is_used: false,
+            props: HashMap::new(),
+        }
+    }
+
+    pub fn facing(&self) -> ChargerFacing {
+        self.facing
+    }
+}
+
+impl InteractiveEntityBehavior for PartsDepotEntity {
+    fn entity_type(&self) -> EntityType {
+        EntityType::PartsDepot
+    }
+
+    fn coordinates(&self) -> EntityCoordinates {
+        self.coordinates
+    }
+
+    fn props(&self) -> HashMap<String, String> {
+        self.props.clone()
+    }
+
+    fn is_used(&self) -> bool {
+        self.is_used
+    }
+
+    fn set_used(&mut self, used: bool) {
+        self.is_used = used;
+    }
+
+    fn change_prop(&mut self, key: &str, value: &str) {
+        self.props.insert(key.to_string(), value.to_string());
+    }
+
+    fn get_prop(&self, key: &str) -> Option<String> {
+        self.props.get(key).cloned()
+    }
+}
+
 /// Serializable enum over every interactive entity kind. The
 /// [`InteractiveEntityBehavior`] impl dispatches to the active variant, so
 /// callers rarely need to match.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InteractiveEntity {
     Charger(ChargerEntity),
+    PartsDepot(PartsDepotEntity),
 }
 
 impl InteractiveEntity {
@@ -216,6 +277,7 @@ impl InteractiveEntity {
     pub fn as_charger(&self) -> Option<&ChargerEntity> {
         match self {
             InteractiveEntity::Charger(c) => Some(c),
+            _ => None,
         }
     }
 
@@ -223,6 +285,23 @@ impl InteractiveEntity {
     pub fn as_charger_mut(&mut self) -> Option<&mut ChargerEntity> {
         match self {
             InteractiveEntity::Charger(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Borrow as a [`PartsDepotEntity`] if that is the active kind.
+    pub fn as_parts_depot(&self) -> Option<&PartsDepotEntity> {
+        match self {
+            InteractiveEntity::PartsDepot(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// Mutably borrow as a [`PartsDepotEntity`] if that is the active kind.
+    pub fn as_parts_depot_mut(&mut self) -> Option<&mut PartsDepotEntity> {
+        match self {
+            InteractiveEntity::PartsDepot(d) => Some(d),
+            _ => None,
         }
     }
 }
@@ -231,42 +310,49 @@ impl InteractiveEntityBehavior for InteractiveEntity {
     fn entity_type(&self) -> EntityType {
         match self {
             InteractiveEntity::Charger(c) => c.entity_type(),
+            InteractiveEntity::PartsDepot(d) => d.entity_type(),
         }
     }
 
     fn coordinates(&self) -> EntityCoordinates {
         match self {
             InteractiveEntity::Charger(c) => c.coordinates(),
+            InteractiveEntity::PartsDepot(d) => d.coordinates(),
         }
     }
 
     fn props(&self) -> HashMap<String, String> {
         match self {
             InteractiveEntity::Charger(c) => c.props(),
+            InteractiveEntity::PartsDepot(d) => d.props(),
         }
     }
 
     fn is_used(&self) -> bool {
         match self {
             InteractiveEntity::Charger(c) => c.is_used(),
+            InteractiveEntity::PartsDepot(d) => d.is_used(),
         }
     }
 
     fn set_used(&mut self, used: bool) {
         match self {
             InteractiveEntity::Charger(c) => c.set_used(used),
+            InteractiveEntity::PartsDepot(d) => d.set_used(used),
         }
     }
 
     fn change_prop(&mut self, key: &str, value: &str) {
         match self {
             InteractiveEntity::Charger(c) => c.change_prop(key, value),
+            InteractiveEntity::PartsDepot(d) => d.change_prop(key, value),
         }
     }
 
     fn get_prop(&self, key: &str) -> Option<String> {
         match self {
             InteractiveEntity::Charger(c) => c.get_prop(key),
+            InteractiveEntity::PartsDepot(d) => d.get_prop(key),
         }
     }
 }
@@ -767,6 +853,56 @@ pub fn sync_chargers_for_chunks(
                         let wx = coord.x * HYPERMAP_CHUNK_SIZE + x;
                         let wy = coord.y * HYPERMAP_CHUNK_SIZE + y;
                         entities.insert(InteractiveEntity::Charger(ChargerEntity::new(
+                            EntityCoordinates::new(wx, wy, floor),
+                            facing,
+                        )));
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Rebuilds parts-depot entities for the given world chunks from authored cell data.
+///
+/// Mirrors [`sync_chargers_for_chunks`] but for [`EntityType::PartsDepot`].
+/// Wired by the behavior layer when it is added; no queues are managed.
+pub fn sync_parts_depots_for_chunks(
+    map: &Hypermap<CellType>,
+    entities: &mut InteractiveEntityMap,
+    chunks: impl IntoIterator<Item = ChunkCoord>,
+) {
+    let chunk_set: HashSet<ChunkCoord> = chunks.into_iter().collect();
+    if chunk_set.is_empty() {
+        return;
+    }
+
+    let stale: Vec<EntityCoordinates> = entities
+        .iter()
+        .filter(|entry| entry.entity_type == EntityType::PartsDepot)
+        .map(|entry| entry.coordinates)
+        .filter(|coords| {
+            let (chunk, _) = world_to_chunk_local(coords.x, coords.y);
+            chunk_set.contains(&chunk)
+        })
+        .collect();
+    for coords in stale {
+        entities.remove_of_type_at(coords, EntityType::PartsDepot);
+    }
+
+    for coord in chunk_set {
+        let _ = map.with_chunk_read(coord, |chunk| {
+            for floor in 0..HYPERMAP_FLOOR_COUNT as i32 {
+                for y in 0..HYPERMAP_CHUNK_SIZE {
+                    for x in 0..HYPERMAP_CHUNK_SIZE {
+                        let local = LocalCoord::new(x, y);
+                        let CellType::PartsDepot(facing) = *chunk.get_local_floor(local, floor)
+                        else {
+                            continue;
+                        };
+                        let wx = coord.x * HYPERMAP_CHUNK_SIZE + x;
+                        let wy = coord.y * HYPERMAP_CHUNK_SIZE + y;
+                        entities.insert(InteractiveEntity::PartsDepot(PartsDepotEntity::new(
                             EntityCoordinates::new(wx, wy, floor),
                             facing,
                         )));

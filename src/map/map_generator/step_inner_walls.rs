@@ -154,7 +154,7 @@ fn add_wall_bit(draft: &mut MapDraft, x: i32, z: i32, bit: u8) {
         DraftTile::Wall(bits) => draft.set(x, z, DraftTile::Wall(bits | bit)),
         // Concave union corner pillars, charging stations, and void cells stay
         // as-is; the inner wall simply has a gap at that cell.
-        DraftTile::Corner(_) | DraftTile::Charger(_) | DraftTile::Void => {}
+        DraftTile::Corner(_) | DraftTile::Charger(_) | DraftTile::PartsDepot(_) | DraftTile::Void => {}
     }
 }
 

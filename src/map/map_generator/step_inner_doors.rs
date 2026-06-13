@@ -133,7 +133,7 @@ fn edge_passable(
 /// `Open` and `Corner` carry no edge slabs; `Wall(bits)` floor carries the named slabs.
 fn cell_bits(draft: &MapDraft, x: i32, z: i32) -> Option<u8> {
     match draft.get(x, z) {
-        DraftTile::Open | DraftTile::Corner(_) | DraftTile::Charger(_) => Some(0),
+        DraftTile::Open | DraftTile::Corner(_) | DraftTile::Charger(_) | DraftTile::PartsDepot(_) => Some(0),
         DraftTile::Wall(bits) => Some(bits),
         DraftTile::Void => None,
     }

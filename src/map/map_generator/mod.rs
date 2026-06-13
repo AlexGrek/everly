@@ -10,6 +10,7 @@ pub mod grid_fill;
 mod house;
 mod step_carpet;
 mod step_charging_stations;
+mod step_parts_depot;
 mod step_place_lamps;
 mod step_corners;
 mod step_door;
@@ -82,6 +83,7 @@ impl MapDraft {
         self.step_place_inner_doors();
         self.step_home_crawlers();
         self.step_place_charging_stations();
+        self.step_place_parts_depots();
         self.step_place_lamps();
     }
 

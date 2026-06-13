@@ -746,7 +746,7 @@ fn build_circle_shadow(r: i32) -> &'static CircleShadow {
 #[inline]
 pub fn cell_subtile_flags(cell: CellType, local_x: usize, local_y: usize) -> u64 {
     match cell {
-        CellType::Road | CellType::Charger(_) => 0,
+        CellType::Road | CellType::Charger(_) | CellType::PartsDepot(_) => 0,
         CellType::Void => FLAG_VOID,
         CellType::Wall(mask) => {
             if wall_mask_blocks_subtile(mask, local_x, local_y) {

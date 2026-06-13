@@ -62,6 +62,8 @@ pub(crate) enum DraftTile {
     Corner(WallCorner),
     /// Walkable charging station backing onto the named wall (see [`ChargerFacing`]).
     Charger(ChargerFacing),
+    /// Walkable parts depot backing onto the named wall (see [`ChargerFacing`]).
+    PartsDepot(ChargerFacing),
 }
 
 /// Working map: all pipeline steps read and write this structure.
@@ -197,5 +199,6 @@ pub(crate) fn draft_tile_to_cell(tile: DraftTile) -> CellType {
         DraftTile::Wall(bits) => CellType::Wall(WallMask::from_bits(bits).expect("wall mask")),
         DraftTile::Corner(c) => CellType::Corner(c),
         DraftTile::Charger(facing) => CellType::Charger(facing),
+        DraftTile::PartsDepot(facing) => CellType::PartsDepot(facing),
     }
 }

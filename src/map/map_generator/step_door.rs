@@ -225,7 +225,7 @@ fn door_cell_allows_passage(
             let remaining = bits & !outward_edge;
             remaining.count_ones() == 0
         }
-        DraftTile::Open | DraftTile::Charger(_) => true,
+        DraftTile::Open | DraftTile::Charger(_) | DraftTile::PartsDepot(_) => true,
         DraftTile::Void => false,
     }
 }

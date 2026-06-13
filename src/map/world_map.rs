@@ -231,6 +231,9 @@ pub enum CellType {
     /// Walkable charging station: an elevated metal floor pad plus a glowing-blue
     /// cube mounted on the [`ChargerFacing`] wall. Passable like [`Road`](Self::Road).
     Charger(ChargerFacing),
+    /// Walkable parts depot: a wall-mounted storage cabinet with amber indicator.
+    /// Passable like [`Road`](Self::Road). Interaction is immediate (no queue).
+    PartsDepot(ChargerFacing),
 }
 
 /// Static (geometry-only) passability of a [`CellType`]: `1.0` for [`CellType::Road`],
@@ -239,7 +242,7 @@ pub enum CellType {
 #[inline]
 pub fn cell_passability(cell: CellType) -> f32 {
     match cell {
-        CellType::Road | CellType::Charger(_) => 1.0,
+        CellType::Road | CellType::Charger(_) | CellType::PartsDepot(_) => 1.0,
         CellType::Void | CellType::Wall(_) | CellType::Corner(_) => 0.0,
     }
 }
@@ -565,6 +568,10 @@ pub(crate) fn cell_to_token(cell: CellType) -> &'static str {
         CellType::Charger(ChargerFacing::South) => "cs",
         CellType::Charger(ChargerFacing::East) => "ce",
         CellType::Charger(ChargerFacing::West) => "cw",
+        CellType::PartsDepot(ChargerFacing::North) => "dn",
+        CellType::PartsDepot(ChargerFacing::South) => "ds",
+        CellType::PartsDepot(ChargerFacing::East) => "de",
+        CellType::PartsDepot(ChargerFacing::West) => "dw",
     }
 }
 
@@ -588,6 +595,10 @@ pub(crate) fn parse_cell_token(token: &str) -> Option<CellType> {
         "cs" | "CS" => Some(CellType::Charger(ChargerFacing::South)),
         "ce" | "CE" => Some(CellType::Charger(ChargerFacing::East)),
         "cw" | "CW" => Some(CellType::Charger(ChargerFacing::West)),
+        "dn" | "DN" => Some(CellType::PartsDepot(ChargerFacing::North)),
+        "ds" | "DS" => Some(CellType::PartsDepot(ChargerFacing::South)),
+        "de" | "DE" => Some(CellType::PartsDepot(ChargerFacing::East)),
+        "dw" | "DW" => Some(CellType::PartsDepot(ChargerFacing::West)),
         _ if bytes[0] == b'w' || bytes[0] == b'W' => {
             let v = ascii_hex_value(bytes[1])?;
             WallMask::from_bits(v).map(CellType::Wall)

@@ -63,6 +63,21 @@ const CHARGER_LIGHT_COLOR_ACTIVE: Color = Color::srgb(0.40, 1.0, 0.50);
 const CHARGER_LIGHT_INTENSITY_IDLE: f32 = 0.0;
 const CHARGER_LIGHT_INTENSITY_ACTIVE: f32 = 24_000.0;
 const CHARGER_LIGHT_RANGE: f32 = 4.0;
+/// Parts depot: wide industrial cabinet mounted on the backing wall.
+const DEPOT_CABINET_WIDTH: f32 = 0.66;
+const DEPOT_CABINET_HEIGHT: f32 = 1.2;
+const DEPOT_CABINET_DEPTH: f32 = 0.20;
+/// Vertical center of the depot cabinet above the storey floor.
+const DEPOT_CABINET_CENTER_Y: f32 = 0.78;
+/// Thin amber indicator strip on the cabinet front face.
+const DEPOT_INDICATOR_WIDTH: f32 = 0.52;
+const DEPOT_INDICATOR_HEIGHT: f32 = 0.06;
+const DEPOT_INDICATOR_DEPTH: f32 = 0.012;
+/// Vertical center of the indicator strip (positioned at mid-cabinet height).
+const DEPOT_INDICATOR_CENTER_Y: f32 = DEPOT_CABINET_CENTER_Y;
+/// Amber emissive for the indicator strip.
+const DEPOT_INDICATOR_BASE: Color = Color::srgb(0.30, 0.14, 0.02);
+const DEPOT_INDICATOR_EMISSIVE: LinearRgba = LinearRgba::rgb(3.8, 1.6, 0.15);
 /// Point light hangs this far above the metal docking pad top.
 const CHARGER_DOCK_LIGHT_CLEARANCE: f32 = 1.22;
 /// Connector: a chunky black "transformer" box, **larger** than the glowing cube,
@@ -140,6 +155,12 @@ struct RenderedChunkFloor0ChargerGlow;
 struct RenderedChunkFloor0ChargerConnector;
 
 #[derive(Component)]
+struct RenderedChunkFloor0DepotBody;
+
+#[derive(Component)]
+struct RenderedChunkFloor0DepotIndicator;
+
+#[derive(Component)]
 struct RenderedChunkChargerLight;
 
 /// Per-charger runtime visual (glow mesh + point light); keyed to [`InteractiveEntityMap`].
@@ -182,6 +203,12 @@ struct RenderedChunkUpperChargerGlow;
 #[derive(Component)]
 struct RenderedChunkUpperChargerConnector;
 
+#[derive(Component)]
+struct RenderedChunkUpperDepotBody;
+
+#[derive(Component)]
+struct RenderedChunkUpperDepotIndicator;
+
 /// Upper-layer mesh entities (refreshed when HUD floor changes). Floor 0 meshes stay on the chunk root.
 #[derive(Clone, Copy)]
 struct ChunkUpperMeshEntities {
@@ -195,6 +222,8 @@ struct ChunkUpperMeshEntities {
     charger_glow: Entity,
     charger_connector: Entity,
     charger_lights: Entity,
+    depot_body: Entity,
+    depot_indicator: Entity,
 }
 
 /// Chunks that must be re-baked after [`Hypermap`](crate::hypermap::Hypermap) cell edits (drained in [`render_chunks_30fps`]).
@@ -299,6 +328,8 @@ struct PreparedChunkRender {
     floor0_glass_cells: Vec<(i32, i32, CellType)>,
     // ── Floor-0 charging stations (metal pad + glowing cube) ─────────────────
     floor0_charger_cells: Vec<(i32, i32, CellType)>,
+    // ── Floor-0 parts depots (cabinet + indicator) ────────────────────────────
+    floor0_parts_depot_cells: Vec<(i32, i32, CellType)>,
     // ── Floor-0 lamp decorations ─────────────────────────────────────────────
     floor0_lamp_cells: Vec<(i32, i32, LampDecoration)>,
     // ── Upper floor meshes (active_floor at bake time) ───────────────────────
@@ -309,6 +340,7 @@ struct PreparedChunkRender {
     upper_road_pavement_cells: Vec<(i32, i32, i32, CellType)>,
     upper_road_marble_cells: Vec<(i32, i32, i32, CellType)>,
     upper_charger_cells: Vec<(i32, i32, i32, CellType)>,
+    upper_parts_depot_cells: Vec<(i32, i32, i32, CellType)>,
 }
 
 #[derive(Resource)]
@@ -337,6 +369,9 @@ struct HypermapRenderAssets {
     /// Template only — each live charger visual clones its own [`StandardMaterial`].
     charger_glow_idle_material: Handle<StandardMaterial>,
     charger_connector_material: Handle<StandardMaterial>,
+    // ── Parts-depot materials ──────────────────────────────────────────────────
+    depot_body_material: Handle<StandardMaterial>,
+    depot_indicator_material: Handle<StandardMaterial>,
     water_material: Handle<StandardWaterMaterial>,
 }
 
@@ -504,6 +539,23 @@ fn setup_hypermap_assets(
         cull_mode: None,
         ..default()
     });
+    // Parts depot: dark industrial metal cabinet.
+    let depot_body_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.12, 0.11, 0.09),
+        perceptual_roughness: 0.70,
+        metallic: 0.35,
+        cull_mode: None,
+        ..default()
+    });
+    // Amber emissive indicator strip on the cabinet front.
+    let depot_indicator_material = materials.add(StandardMaterial {
+        base_color: DEPOT_INDICATOR_BASE,
+        emissive: DEPOT_INDICATOR_EMISSIVE,
+        perceptual_roughness: 0.30,
+        metallic: 0.0,
+        cull_mode: None,
+        ..default()
+    });
     let normalized_dir = settings.wave_direction.normalize_or_zero();
     let coord_scale = Vec2::splat(chunk_size);
     let coord_offset = Vec2::splat(-chunk_size * 0.5);
@@ -543,6 +595,8 @@ fn setup_hypermap_assets(
         charger_metal_material,
         charger_glow_idle_material,
         charger_connector_material,
+        depot_body_material,
+        depot_indicator_material,
         water_material,
     });
     commands.insert_resource(MapSelectionRoadMaterial(road_material));
@@ -677,6 +731,17 @@ fn refresh_chunk_upper_layers_on_floor_change(
         if let Some(mesh_ids) = runtime.chunk_upper_meshes.get_mut(&coord) {
             mesh_ids.charger_lights = charger_lights;
         }
+
+        update_upper_charger_entity(
+            &mut commands, &mut meshes, mesh_ids.depot_body,
+            build_upper_depot_body_mesh(&prepared.upper_parts_depot_cells, ox, oy),
+            assets.depot_body_material.clone(), assets.empty_mesh.clone(),
+        );
+        update_upper_charger_entity(
+            &mut commands, &mut meshes, mesh_ids.depot_indicator,
+            build_upper_depot_indicator_mesh(&prepared.upper_parts_depot_cells, ox, oy),
+            assets.depot_indicator_material.clone(), assets.empty_mesh.clone(),
+        );
     }
 }
 
@@ -1412,6 +1477,49 @@ fn spawn_chunk_meshes(
         oy,
     );
 
+    // ── Floor 0: parts depots (cabinet body) ─────────────────────────────────
+    {
+        let (mesh3d, vis) =
+            if let Some(m) = build_floor0_depot_body_mesh(&prepared.floor0_parts_depot_cells, ox, oy) {
+                (Mesh3d(meshes.add(m)), Visibility::Inherited)
+            } else {
+                (Mesh3d(assets.empty_mesh.clone()), Visibility::Hidden)
+            };
+        let id = commands
+            .spawn((
+                Name::new(format!("Chunk floor0 depot body {},{}", ox, oy)),
+                RenderedChunkFloor0DepotBody,
+                mesh3d,
+                MeshMaterial3d(assets.depot_body_material.clone()),
+                Transform::default(),
+                vis,
+                Pickable::IGNORE,
+            ))
+            .id();
+        commands.entity(chunk_root).add_child(id);
+    }
+    // ── Floor 0: parts depots (amber indicator strip) ────────────────────────
+    {
+        let (mesh3d, vis) =
+            if let Some(m) = build_floor0_depot_indicator_mesh(&prepared.floor0_parts_depot_cells, ox, oy) {
+                (Mesh3d(meshes.add(m)), Visibility::Inherited)
+            } else {
+                (Mesh3d(assets.empty_mesh.clone()), Visibility::Hidden)
+            };
+        let id = commands
+            .spawn((
+                Name::new(format!("Chunk floor0 depot indicator {},{}", ox, oy)),
+                RenderedChunkFloor0DepotIndicator,
+                mesh3d,
+                MeshMaterial3d(assets.depot_indicator_material.clone()),
+                Transform::default(),
+                vis,
+                Pickable::IGNORE,
+            ))
+            .id();
+        commands.entity(chunk_root).add_child(id);
+    }
+
     // ── Floor 0: lamp decorations (cube mesh + point lights) ─────────────────
     {
         let (mesh3d, vis) =
@@ -1572,6 +1680,50 @@ fn spawn_chunk_meshes(
         oy,
     );
 
+    let upper_depot_body = {
+        let (mesh3d, vis) =
+            if let Some(m) = build_upper_depot_body_mesh(&prepared.upper_parts_depot_cells, ox, oy) {
+                (Mesh3d(meshes.add(m)), Visibility::Inherited)
+            } else {
+                (Mesh3d(assets.empty_mesh.clone()), Visibility::Hidden)
+            };
+        let id = commands
+            .spawn((
+                Name::new(format!("Chunk upper depot body {},{}", ox, oy)),
+                RenderedChunkUpperDepotBody,
+                mesh3d,
+                MeshMaterial3d(assets.depot_body_material.clone()),
+                Transform::default(),
+                vis,
+                Pickable::IGNORE,
+            ))
+            .id();
+        commands.entity(chunk_root).add_child(id);
+        id
+    };
+
+    let upper_depot_indicator = {
+        let (mesh3d, vis) =
+            if let Some(m) = build_upper_depot_indicator_mesh(&prepared.upper_parts_depot_cells, ox, oy) {
+                (Mesh3d(meshes.add(m)), Visibility::Inherited)
+            } else {
+                (Mesh3d(assets.empty_mesh.clone()), Visibility::Hidden)
+            };
+        let id = commands
+            .spawn((
+                Name::new(format!("Chunk upper depot indicator {},{}", ox, oy)),
+                RenderedChunkUpperDepotIndicator,
+                mesh3d,
+                MeshMaterial3d(assets.depot_indicator_material.clone()),
+                Transform::default(),
+                vis,
+                Pickable::IGNORE,
+            ))
+            .id();
+        commands.entity(chunk_root).add_child(id);
+        id
+    };
+
     ChunkUpperMeshEntities {
         road: upper_road,
         road_glass,
@@ -1583,6 +1735,8 @@ fn spawn_chunk_meshes(
         charger_glow: upper_charger_glow,
         charger_connector: upper_charger_connector,
         charger_lights: upper_charger_lights,
+        depot_body: upper_depot_body,
+        depot_indicator: upper_depot_indicator,
     }
 }
 
@@ -2308,6 +2462,164 @@ pub(crate) fn build_charger_preview_mesh(cell: CellType, ix: i32, iz: i32, y_bas
     finalize_mesh_from_buffers(positions, normals, uvs, indices)
 }
 
+/// Wall-mounted storage cabinet for a parts-depot cell.
+/// `(cx, cz)` is the tile center; the cabinet backs onto the `facing` wall.
+fn append_depot_cabinet(
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    uvs: &mut Vec<[f32; 2]>,
+    indices: &mut Vec<u32>,
+    cx: f32,
+    cz: f32,
+    y_base: f32,
+    facing: ChargerFacing,
+) {
+    let (dx, dz) = facing.wall_dir();
+    let edge = 0.5 - DEPOT_CABINET_DEPTH * 0.5;
+    let (sx, sz) = if dx != 0.0 {
+        (DEPOT_CABINET_DEPTH, DEPOT_CABINET_WIDTH)
+    } else {
+        (DEPOT_CABINET_WIDTH, DEPOT_CABINET_DEPTH)
+    };
+    append_box(
+        positions,
+        normals,
+        uvs,
+        indices,
+        cx + dx * edge,
+        y_base + DEPOT_CABINET_CENTER_Y,
+        cz + dz * edge,
+        sx,
+        DEPOT_CABINET_HEIGHT,
+        sz,
+    );
+}
+
+/// Thin amber indicator strip on the cabinet front face.
+fn append_depot_indicator(
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    uvs: &mut Vec<[f32; 2]>,
+    indices: &mut Vec<u32>,
+    cx: f32,
+    cz: f32,
+    y_base: f32,
+    facing: ChargerFacing,
+) {
+    let (dx, dz) = facing.wall_dir();
+    // Strip sits just in front of the cabinet face (cabinet edge − tiny protrusion).
+    let cabinet_front = 0.5 - DEPOT_CABINET_DEPTH;
+    let strip_edge = cabinet_front - DEPOT_INDICATOR_DEPTH * 0.5;
+    let (sx, sz) = if dx != 0.0 {
+        (DEPOT_INDICATOR_DEPTH, DEPOT_INDICATOR_WIDTH)
+    } else {
+        (DEPOT_INDICATOR_WIDTH, DEPOT_INDICATOR_DEPTH)
+    };
+    append_box(
+        positions,
+        normals,
+        uvs,
+        indices,
+        cx + dx * strip_edge,
+        y_base + DEPOT_INDICATOR_CENTER_Y,
+        cz + dz * strip_edge,
+        sx,
+        DEPOT_INDICATOR_HEIGHT,
+        sz,
+    );
+}
+
+pub(crate) fn build_floor0_depot_body_mesh(
+    cells: &[(i32, i32, CellType)],
+    origin_x: i32,
+    origin_y: i32,
+) -> Option<Mesh> {
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut uvs = Vec::new();
+    let mut indices = Vec::new();
+    for &(x, y, cell_type) in cells {
+        let CellType::PartsDepot(facing) = cell_type else { continue };
+        let cx = origin_x as f32 + x as f32 + 0.5;
+        let cz = origin_y as f32 + y as f32 + 0.5;
+        append_charger_metal(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, 0.0);
+        append_depot_cabinet(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, 0.0, facing);
+    }
+    finalize_mesh_from_buffers(positions, normals, uvs, indices)
+}
+
+pub(crate) fn build_floor0_depot_indicator_mesh(
+    cells: &[(i32, i32, CellType)],
+    origin_x: i32,
+    origin_y: i32,
+) -> Option<Mesh> {
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut uvs = Vec::new();
+    let mut indices = Vec::new();
+    for &(x, y, cell_type) in cells {
+        let CellType::PartsDepot(facing) = cell_type else { continue };
+        let cx = origin_x as f32 + x as f32 + 0.5;
+        let cz = origin_y as f32 + y as f32 + 0.5;
+        append_depot_indicator(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, 0.0, facing);
+    }
+    finalize_mesh_from_buffers(positions, normals, uvs, indices)
+}
+
+pub(crate) fn build_upper_depot_body_mesh(
+    cells: &[(i32, i32, i32, CellType)],
+    origin_x: i32,
+    origin_y: i32,
+) -> Option<Mesh> {
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut uvs = Vec::new();
+    let mut indices = Vec::new();
+    for &(x, y, floor, cell_type) in cells {
+        let CellType::PartsDepot(facing) = cell_type else { continue };
+        let cx = origin_x as f32 + x as f32 + 0.5;
+        let cz = origin_y as f32 + y as f32 + 0.5;
+        let y_base = floor as f32 * HYPERMAP_FLOOR_HEIGHT;
+        append_charger_metal(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, y_base);
+        append_depot_cabinet(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, y_base, facing);
+    }
+    finalize_mesh_from_buffers(positions, normals, uvs, indices)
+}
+
+pub(crate) fn build_upper_depot_indicator_mesh(
+    cells: &[(i32, i32, i32, CellType)],
+    origin_x: i32,
+    origin_y: i32,
+) -> Option<Mesh> {
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut uvs = Vec::new();
+    let mut indices = Vec::new();
+    for &(x, y, floor, cell_type) in cells {
+        let CellType::PartsDepot(facing) = cell_type else { continue };
+        let cx = origin_x as f32 + x as f32 + 0.5;
+        let cz = origin_y as f32 + y as f32 + 0.5;
+        let y_base = floor as f32 * HYPERMAP_FLOOR_HEIGHT;
+        append_depot_indicator(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, y_base, facing);
+    }
+    finalize_mesh_from_buffers(positions, normals, uvs, indices)
+}
+
+/// Combined pad + cabinet + indicator mesh for one parts-depot cell (map-editor preview).
+pub(crate) fn build_depot_preview_mesh(cell: CellType, ix: i32, iz: i32, y_base: f32) -> Option<Mesh> {
+    let CellType::PartsDepot(facing) = cell else { return None };
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut uvs = Vec::new();
+    let mut indices = Vec::new();
+    let cx = ix as f32 + 0.5;
+    let cz = iz as f32 + 0.5;
+    append_charger_metal(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, y_base);
+    append_depot_cabinet(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, y_base, facing);
+    append_depot_indicator(&mut positions, &mut normals, &mut uvs, &mut indices, cx, cz, y_base, facing);
+    finalize_mesh_from_buffers(positions, normals, uvs, indices)
+}
+
 fn finalize_mesh_from_buffers(
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
@@ -2511,6 +2823,7 @@ fn partition_chunk_cells_from_vec(
     let mut floor0_wall_cells = Vec::new();
     let mut floor0_glass_cells = Vec::new();
     let mut floor0_charger_cells = Vec::new();
+    let mut floor0_parts_depot_cells = Vec::new();
     let mut upper_cells = Vec::new();
     let mut upper_glass_cells = Vec::new();
     let mut upper_road_default_cells = Vec::new();
@@ -2518,6 +2831,7 @@ fn partition_chunk_cells_from_vec(
     let mut upper_road_pavement_cells = Vec::new();
     let mut upper_road_marble_cells = Vec::new();
     let mut upper_charger_cells = Vec::new();
+    let mut upper_parts_depot_cells = Vec::new();
     let w = WATER_MESH_EDGE_STRIP;
     let sz = HYPERMAP_CHUNK_SIZE;
     let mut i = 0usize;
@@ -2564,6 +2878,10 @@ fn partition_chunk_cells_from_vec(
                             if matches!(cell_type, CellType::Charger(_)) {
                                 floor0_charger_cells.push((x, y, cell_type));
                             }
+                            // Parts depots add their cabinet + indicator on top.
+                            if matches!(cell_type, CellType::PartsDepot(_)) {
+                                floor0_parts_depot_cells.push((x, y, cell_type));
+                            }
                         }
                     }
                 } else if floor == active_floor {
@@ -2594,6 +2912,9 @@ fn partition_chunk_cells_from_vec(
                             if matches!(cell_type, CellType::Charger(_)) {
                                 upper_charger_cells.push((x, y, floor, cell_type));
                             }
+                            if matches!(cell_type, CellType::PartsDepot(_)) {
+                                upper_parts_depot_cells.push((x, y, floor, cell_type));
+                            }
                         }
                     }
                 }
@@ -2609,6 +2930,7 @@ fn partition_chunk_cells_from_vec(
         floor0_wall_cells,
         floor0_glass_cells,
         floor0_charger_cells,
+        floor0_parts_depot_cells,
         upper_cells,
         upper_glass_cells,
         upper_road_default_cells,
@@ -2616,6 +2938,7 @@ fn partition_chunk_cells_from_vec(
         upper_road_pavement_cells,
         upper_road_marble_cells,
         upper_charger_cells,
+        upper_parts_depot_cells,
         floor0_lamp_cells: Vec::new(),
     }
 }
