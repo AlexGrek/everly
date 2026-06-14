@@ -230,13 +230,19 @@ pub struct Brain {
     pub tuning: FollowTuning,
     rng: StdRng,
     rng_seed: u64,
-    /// One-shot flag: when set, the next `WorldRoute` enqueued by any high-level
-    /// action will use `include_dynamic: true` so it routes around current bot
-    /// positions. Set after collision-pressure relocation; survives `reset()` so
-    /// it persists into the first post-reset planning tick; consumed by
-    /// `take_dynamic_repath`.
-    dynamic_repath: bool,
+    /// Countdown (frames remaining) for the dynamic-repath window. While > 0,
+    /// every `WorldRoute` enqueued by a high-level action uses
+    /// `include_dynamic: true` so it routes around current creature positions.
+    /// Set to [`DYNAMIC_REPATH_FRAMES`] on any genuine wedge frame (including
+    /// the collision-pressure relocation); ticks down by 1 each brain tick.
+    /// Survives `reset()` — the window must outlive the stuck-detection delay.
+    dynamic_repath: u32,
 }
+
+/// How many brain ticks (frames) the dynamic-repath window lasts after a
+/// collision. Must cover `FollowTuning::stuck_repath_secs` (~60 frames at
+/// 60 Hz) plus escape + retry overhead; 120 ≈ 2 s gives comfortable margin.
+const DYNAMIC_REPATH_FRAMES: u32 = 120;
 
 impl Brain {
     pub fn new(behaviors: Vec<Box<dyn Behavior>>, factory: HighLevelFactory, rng_seed: u64) -> Self {
@@ -249,7 +255,7 @@ impl Brain {
             tuning: FollowTuning::default(),
             rng: rng::seeded(rng_seed),
             rng_seed,
-            dynamic_repath: false,
+            dynamic_repath: 0,
         }
     }
 
@@ -272,19 +278,25 @@ impl Brain {
         self.priorities.clear();
     }
 
-    /// Arm the one-shot dynamic-repath flag. Call immediately after
-    /// [`reset`](Self::reset) when relocating a wedged bot so the first
-    /// re-planned `WorldRoute` routes around current creature positions.
+    /// (Re-)arm the dynamic-repath window. Call on every genuine wedge frame
+    /// (collision while not moving and not recovering) — including the
+    /// collision-pressure relocation. Each call resets the countdown to
+    /// [`DYNAMIC_REPATH_FRAMES`] so sustained wedging keeps the window alive.
     pub fn set_dynamic_repath(&mut self) {
-        self.dynamic_repath = true;
+        self.dynamic_repath = DYNAMIC_REPATH_FRAMES;
     }
 
-    /// Consume and return the dynamic-repath flag. Returns `true` exactly once
-    /// per [`set_dynamic_repath`](Self::set_dynamic_repath) call; subsequent
-    /// calls return `false`. Called by `black_bot_brain` when building
-    /// `BrainContext` so the flag is forwarded to the high-level action.
+    /// Tick the dynamic-repath countdown and return whether the window is
+    /// currently active. Called every frame by `black_bot_brain` when building
+    /// `BrainContext`; the countdown decrements by 1 so the window expires
+    /// automatically after [`DYNAMIC_REPATH_FRAMES`] ticks without a new wedge.
     pub fn take_dynamic_repath(&mut self) -> bool {
-        std::mem::replace(&mut self.dynamic_repath, false)
+        if self.dynamic_repath > 0 {
+            self.dynamic_repath -= 1;
+            true
+        } else {
+            false
+        }
     }
 
     /// Stop all motion this frame (used by the depleted / broken gate). Keeps the

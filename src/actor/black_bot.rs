@@ -104,6 +104,18 @@ const COLLISION_PRESSURE_RESET: u32 = 50;
 /// wall-slide or a brief bump the bot is still moving through). At max speed a
 /// bot covers ~0.02 tiles/frame, so this is comfortably below real motion.
 const COLLISION_PROGRESS_EPS_SQ: f32 = 1.0e-4;
+/// Squared tile distance a bot must travel from its stall reference to count as
+/// real net progress and reset the sustained-stall timer. Half a tile: enough to
+/// ignore jitter / in-place wiggling but far below a normal traversal step.
+const STALL_PROGRESS_RESET_SQ: f32 = 0.25;
+/// Seconds of **no net progress** — regardless of whether the bot is mid-recovery
+/// (step-aside / detour / escape / wait) — after which the bot is force-relocated
+/// and its plan recalculated with the dynamic passability map. This is the escape
+/// valve for open-space two-bot wedges that loop inside recovery maneuvers forever
+/// without ever building collision pressure (which is suspended while recovering).
+/// Set well above a single legitimate maneuver's budget (`stuck_repath_secs` ≈ 1 s
+/// plus escape) so it only fires once the normal machinery has demonstrably failed.
+const STALL_FORCE_RELOCATE_SECS: f32 = 4.0;
 /// Seconds for the yellow stuck flash to fade fully back to black.
 const STUCK_FLASH_FADE_SECS: f32 = 2.5;
 
@@ -1172,6 +1184,9 @@ fn track_black_bot_collision_pressure(
         let busy = brain.is_recovering() || brain.is_awaiting_path();
         let state = obj.inner.state();
         let collided = !moved && !busy && black_bot_frame_collided(state, brain.velocity());
+        if collided {
+            brain.set_dynamic_repath();
+        }
         let (next, should_reset) = tick_collision_pressure(vis.collision_pressure, collided);
         vis.collision_pressure = next;
 
