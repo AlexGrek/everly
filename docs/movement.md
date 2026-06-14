@@ -167,7 +167,12 @@ Still inside `arbitrate_actor_moves`, in entity order:
 - **Collided** (placed at `previous`): position holds; `last_movement_error =
   BlockedByOccupancy { conflict_cell }`. Reaction is owned by the existing
   brain machinery next frame (re-route, collision pressure, status flash) —
-  the pipeline itself never invents avoidance.
+  the pipeline itself never invents avoidance. A genuine head-on wedge that
+  cannot be resolved locally escalates, in the BlackBot brain, to a relocate
+  **and a full path recalculation against the dynamic passability map** (so the
+  new route avoids the tiles other bots currently occupy); this fires both on
+  collision-pressure saturation and on a sustained no-progress stall that loops
+  inside recovery maneuvers — see `docs/actor-brain.md`.
 - **Squeezed** (not placed): handled below.
 
 Every placed footprint is stamped into the dynamic passability **write**

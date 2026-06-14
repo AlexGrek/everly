@@ -133,6 +133,32 @@ and the log records `<name> reset (collision pressure)` (plus a detailed
 `wedged (...) → relocated` line for the selected bot). Pressure is zeroed.
 Depleted and broken bots do not accumulate pressure.
 
+**Total path recalculation against dynamic passability.** Relocating alone is not
+enough — the wiped plan would re-plan the *same* tile route straight back into the
+bot cluster it was just pulled out of. So every relocation also arms a
+**dynamic-repath window** (`Brain::set_dynamic_repath`, a ~2 s countdown read by
+`Brain::take_dynamic_repath` each tick into `BrainContext::dynamic_repath`). While
+the window is open, every `WorldRoute` a high-level action enqueues sets
+`include_dynamic: true`, so the background worker runs
+[`astar_shortest_world_path_dyn`](../src/map/hypermap_pathfind.rs) — the normal
+tile A\* plus a predicate that treats any tile whose **center subtile** carries a
+creature body (`FLAG_BLOCKED | FLAG_CREATURE`) as impassable. The new route
+therefore steers around the current crowd rather than through it. The window
+(rather than a one-shot flag) is needed because the actual re-plan often happens a
+second or two later, on the `stuck` rising edge, not on the relocation tick.
+
+**Sustained-stall escape valve.** Collision pressure is suspended while the bot
+`is_recovering` (detour / step-aside / escape / wait-in-place), so an **open-space
+two-bot wedge** that loops *inside* those maneuvers never builds pressure and would
+deadlock forever. A second, independent timer
+(`track_black_bot_collision_pressure`) measures how long the bot has failed to
+travel more than `STALL_PROGRESS_RESET_SQ` (1.5 tiles) from a slowly-updated
+anchor — regardless of recovery state. Once that exceeds
+`STALL_FORCE_RELOCATE_SECS` (**4 s**, far above any single legitimate maneuver)
+*and* the bot is still `is_recovering` (so charging / queued / idle bots are never
+yanked), it forces the **same** relocate + dynamic-repath as a pressure reset. The
+selected-bot log reads `wedged (stalled N.Ns in recovery) → relocated`.
+
 ### Proactive look-ahead avoidance
 
 Before a collision even happens, an actively-moving **on-screen** bot probes the

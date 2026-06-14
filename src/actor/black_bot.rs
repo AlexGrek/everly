@@ -104,10 +104,12 @@ const COLLISION_PRESSURE_RESET: u32 = 50;
 /// wall-slide or a brief bump the bot is still moving through). At max speed a
 /// bot covers ~0.02 tiles/frame, so this is comfortably below real motion.
 const COLLISION_PROGRESS_EPS_SQ: f32 = 1.0e-4;
-/// Squared tile distance a bot must travel from its stall reference to count as
-/// real net progress and reset the sustained-stall timer. Half a tile: enough to
-/// ignore jitter / in-place wiggling but far below a normal traversal step.
-const STALL_PROGRESS_RESET_SQ: f32 = 0.25;
+/// Squared tile distance a bot must travel from its stall anchor to count as real
+/// net progress and reset the sustained-stall timer. 1.5 tiles (sq 2.25): larger
+/// than a single futile step-aside excursion (a Moore-neighbour step is ≤ ~1.41
+/// tiles, so oscillating in and out of the wedge never resets the timer) yet well
+/// below a genuine multi-tile traversal, which does reset it.
+const STALL_PROGRESS_RESET_SQ: f32 = 2.25;
 /// Seconds of **no net progress** — regardless of whether the bot is mid-recovery
 /// (step-aside / detour / escape / wait) — after which the bot is force-relocated
 /// and its plan recalculated with the dynamic passability map. This is the escape
@@ -1141,7 +1143,17 @@ fn tick_collision_pressure(pressure: u32, collided: bool) -> (u32, bool) {
 /// bot is **teleported to the nearest free cell** ([`resolve_offscreen_collision`])
 /// before its plan is wiped — replanning in place would just re-wedge, which is
 /// the loop that left jammed bots resetting forever.
+/// Per-bot tracker for the sustained-stall escape valve: a slowly-updated
+/// position anchor plus how long the bot has stayed within
+/// [`STALL_PROGRESS_RESET_SQ`] of it.
+#[derive(Clone, Copy)]
+struct StallTrack {
+    anchor: Vec2,
+    elapsed: f32,
+}
+
 fn track_black_bot_collision_pressure(
+    time: Res<Time>,
     game_log: Res<GameLog>,
     hypermap: Res<HypermapRuntime>,
     dynamic: Res<DynamicPassabilityMap>,
@@ -1149,6 +1161,7 @@ fn track_black_bot_collision_pressure(
     mut interactive: ResMut<InteractiveEntityMap>,
     dispatch: Res<DispatchQueue>,
     mut prev_center: Local<HashMap<Entity, Vec2>>,
+    mut stall: Local<HashMap<Entity, StallTrack>>,
     mut query: Query<(
         Entity,
         &Name,
@@ -1161,6 +1174,7 @@ fn track_black_bot_collision_pressure(
         Option<&mut BotInventory>,
     )>,
 ) {
+    let dt = time.delta_secs();
     let static_cache = hypermap.static_subtile_cache.as_ref();
     for (entity, name, mut obj, mut brain, mut vis, force_logs, charge, breakable, mut inventory) in &mut query {
         let depleted = charge.is_some_and(|c| c.is_depleted());
@@ -1174,6 +1188,7 @@ fn track_black_bot_collision_pressure(
         prev_center.insert(entity, center);
         if depleted || broken {
             vis.collision_pressure = 0;
+            stall.insert(entity, StallTrack { anchor: center, elapsed: 0.0 });
             continue;
         }
 
@@ -1190,11 +1205,35 @@ fn track_black_bot_collision_pressure(
         let (next, should_reset) = tick_collision_pressure(vis.collision_pressure, collided);
         vis.collision_pressure = next;
 
-        if !should_reset {
+        // Sustained-stall escape valve. Collision pressure is suspended while the
+        // bot is mid-recovery, so an open-space two-bot wedge that loops inside
+        // step-aside / escape / wait maneuvers never builds pressure and would
+        // deadlock forever. Independently track how long the bot has failed to
+        // travel more than `STALL_PROGRESS_RESET_SQ` from a slow anchor; once that
+        // exceeds `STALL_FORCE_RELOCATE_SECS` *and* the bot is still in a recovery
+        // maneuver (so charging / queued / idle bots are never yanked), force the
+        // same relocate + dynamic replan. The threshold is far above any single
+        // legitimate maneuver, so it only fires when recovery has clearly failed.
+        let track = stall
+            .entry(entity)
+            .or_insert(StallTrack { anchor: center, elapsed: 0.0 });
+        if (center - track.anchor).length_squared() > STALL_PROGRESS_RESET_SQ {
+            track.anchor = center;
+            track.elapsed = 0.0;
+        } else {
+            track.elapsed += dt;
+        }
+        let stall_forced = track.elapsed >= STALL_FORCE_RELOCATE_SECS && brain.is_recovering();
+
+        if !should_reset && !stall_forced {
             continue;
         }
 
-        let reason = describe_movement_error(&state.last_movement_error);
+        let reason = if stall_forced && !should_reset {
+            format!("stalled {:.1}s in recovery", track.elapsed)
+        } else {
+            describe_movement_error(&state.last_movement_error)
+        };
         let tile = actor_main_tile(state.center);
         // Teleport out of the jam to a nearby free cell, then wipe the plan so
         // the bot replans from a position it can actually move from.
@@ -1205,7 +1244,9 @@ fn track_black_bot_collision_pressure(
         let state = obj.inner.state_mut();
         state.move_buffer = ActorMoveBuffer::default();
         state.next_waypoint_hint = None;
+        vis.collision_pressure = 0;
         prev_center.insert(entity, relocated);
+        stall.insert(entity, StallTrack { anchor: relocated, elapsed: 0.0 });
         interactive.evict_actor_everywhere(entity);
         release_fixer_work(entity, &dispatch, inventory.as_deref_mut());
         game_log.push_world(
@@ -1230,6 +1271,7 @@ fn track_black_bot_collision_pressure(
         }
     }
     prev_center.retain(|e, _| query.get(*e).is_ok());
+    stall.retain(|e, _| query.get(*e).is_ok());
 }
 
 /// One-line description of a movement error for the selected-bot trace.
