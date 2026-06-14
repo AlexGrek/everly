@@ -25,8 +25,8 @@ use futures_lite::future;
 use crate::hud::perf_timings::{PerfCounts, SystemTimings, TimedSystem};
 use crate::map::hypermap::{DoubleBufferedHypermap, Hypermap};
 use crate::map::hypermap_pathfind::{
-    astar_shortest_world_path, astar_subtile_detour, simplify_path_line_of_sight,
-    HypermapPathResult, HypermapSearchLimits,
+    astar_shortest_world_path, astar_shortest_world_path_dyn, astar_subtile_detour,
+    simplify_path_line_of_sight, HypermapPathResult, HypermapSearchLimits,
 };
 use crate::map::hypermap_world::HypermapRuntime;
 use crate::map::passability::{DynamicPassabilityMap, SubtilePassability};
@@ -51,12 +51,16 @@ pub struct RequestId(pub u64);
 #[derive(Clone, Debug)]
 pub enum PathKind {
     /// Tile-level world route from `start` to `goal`, simplified with the given
-    /// corner buffer.
+    /// corner buffer. When `include_dynamic` is `true` the search additionally
+    /// treats tiles whose center subtile holds a creature body as impassable,
+    /// routing around currently-wedged bot clusters (used after collision-pressure
+    /// relocation).
     WorldRoute {
         start: (i32, i32),
         goal: (i32, i32),
         max_expanded: usize,
         simplify_buffer: usize,
+        include_dynamic: bool,
     },
     /// Subtile-level local detour around other creatures (footprint-aware).
     SubtileDetour {
@@ -282,9 +286,14 @@ fn pathfind_dispatch(
             break;
         };
         let task = match kind {
-            PathKind::WorldRoute { .. } => {
+            PathKind::WorldRoute { include_dynamic, .. } => {
                 let passability = runtime.static_passability_map.clone();
-                pool.spawn(async move { compute_world_route(&passability, &kind) })
+                if include_dynamic {
+                    let dynamic_inner = dynamic.share_inner();
+                    pool.spawn(async move { compute_world_route_dynamic(&passability, &dynamic_inner, &kind) })
+                } else {
+                    pool.spawn(async move { compute_world_route(&passability, &kind) })
+                }
             }
             PathKind::SubtileDetour { .. } => {
                 let dynamic_inner = dynamic.share_inner();
@@ -322,14 +331,15 @@ fn pathfind_dispatch(
     }
 }
 
-/// Runs a [`PathKind::WorldRoute`] query against `passability`. Used by the
-/// dispatch task and by tests that fulfil requests synchronously.
+/// Runs a [`PathKind::WorldRoute`] query against static `passability` only.
+/// Used by the dispatch task and by tests that fulfil requests synchronously.
 fn compute_world_route(passability: &Hypermap<f32>, kind: &PathKind) -> PathOutcome {
     let PathKind::WorldRoute {
         start,
         goal,
         max_expanded,
         simplify_buffer,
+        ..
     } = *kind
     else {
         return PathOutcome::NoPath;
@@ -343,10 +353,42 @@ fn compute_world_route(passability: &Hypermap<f32>, kind: &PathKind) -> PathOutc
             } else {
                 path
             };
-            PathOutcome::Route {
-                path: simplified,
-                raw_len,
-            }
+            PathOutcome::Route { path: simplified, raw_len }
+        }
+        HypermapPathResult::NoPath { .. } => PathOutcome::NoPath,
+        HypermapPathResult::LimitExceeded { .. } => PathOutcome::LimitExceeded,
+    }
+}
+
+/// Like [`compute_world_route`] but additionally treats tiles whose center
+/// subtile carries a creature body as impassable, routing around current bot
+/// clusters. Simplification runs against static passability only.
+fn compute_world_route_dynamic(
+    passability: &Hypermap<f32>,
+    dynamic_inner: &Arc<DoubleBufferedHypermap<SubtilePassability>>,
+    kind: &PathKind,
+) -> PathOutcome {
+    let PathKind::WorldRoute {
+        start,
+        goal,
+        max_expanded,
+        simplify_buffer,
+        ..
+    } = *kind
+    else {
+        return PathOutcome::NoPath;
+    };
+    let dyn_map = DynamicPassabilityMap::from_inner(dynamic_inner.clone());
+    let dyn_read = dyn_map.inner().read_map();
+    match astar_shortest_world_path_dyn(passability, dyn_read, start, goal, HypermapSearchLimits { max_expanded }) {
+        HypermapPathResult::Found { path, .. } => {
+            let raw_len = path.len();
+            let simplified = if raw_len > 1 {
+                simplify_path_line_of_sight(passability, &path, simplify_buffer)
+            } else {
+                path
+            };
+            PathOutcome::Route { path: simplified, raw_len }
         }
         HypermapPathResult::NoPath { .. } => PathOutcome::NoPath,
         HypermapPathResult::LimitExceeded { .. } => PathOutcome::LimitExceeded,
@@ -401,12 +443,14 @@ mod tests {
             goal: (1, 1),
             max_expanded: 10,
             simplify_buffer: 1,
+            include_dynamic: false,
         }, Entity::PLACEHOLDER, PathfindReason::WanderNewGoal);
         let b = q.enqueue(PathKind::WorldRoute {
             start: (0, 0),
             goal: (2, 2),
             max_expanded: 10,
             simplify_buffer: 1,
+            include_dynamic: false,
         }, Entity::PLACEHOLDER, PathfindReason::WanderNewGoal);
         assert_eq!(a.0 + 1, b.0, "ids must be monotonic");
         assert_eq!(q.len(), 2);
@@ -440,6 +484,7 @@ mod tests {
             goal: (5, 0),
             max_expanded: 2000,
             simplify_buffer: 1,
+            include_dynamic: false,
         };
         let outcome = compute_world_route(&passability, &kind);
         let PathOutcome::Route { path, raw_len } = outcome else {
@@ -458,6 +503,7 @@ mod tests {
             goal: (3, 0),
             max_expanded: 2000,
             simplify_buffer: 1,
+            include_dynamic: false,
         };
         assert_eq!(compute_world_route(&passability, &kind), PathOutcome::NoPath);
     }
@@ -472,6 +518,7 @@ mod tests {
             goal,
             max_expanded: 10_000,
             simplify_buffer: 1,
+            include_dynamic: false,
         };
         let outcome = compute_world_route(&world.passability, &kind);
         assert!(
@@ -511,12 +558,14 @@ mod tests {
             goal: (1, 0),
             max_expanded: 10,
             simplify_buffer: 1,
+            include_dynamic: false,
         }, Entity::PLACEHOLDER, PathfindReason::WanderNewGoal);
         let b = q.enqueue(PathKind::WorldRoute {
             start: (0, 0),
             goal: (2, 0),
             max_expanded: 10,
             simplify_buffer: 1,
+            include_dynamic: false,
         }, Entity::PLACEHOLDER, PathfindReason::WanderNewGoal);
         let drained = q.drain_pending();
         assert_eq!(drained.len(), 2);

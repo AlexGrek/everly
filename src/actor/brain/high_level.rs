@@ -211,6 +211,7 @@ impl GoToRandomPoints {
                     goal,
                     max_expanded: WANDER_SEARCH_LIMIT,
                     simplify_buffer: PATH_CORNER_BUFFER,
+                    include_dynamic: ctx.dynamic_repath,
                 }, ctx.entity, reason);
                 self.awaiting = Some(id);
                 self.await_elapsed = 0.0;
@@ -350,6 +351,7 @@ impl GoToPatrol {
         low: &mut Box<dyn LowLevelAction>,
         entity: Entity,
         reason: PathfindReason,
+        include_dynamic: bool,
     ) {
         let len = loop_tiles.len();
         for _ in 0..len {
@@ -360,6 +362,7 @@ impl GoToPatrol {
                     goal: target,
                     max_expanded: WANDER_SEARCH_LIMIT,
                     simplify_buffer: PATH_CORNER_BUFFER,
+                    include_dynamic,
                 }, entity, reason);
                 self.awaiting = Some(id);
                 self.await_elapsed = 0.0;
@@ -444,12 +447,12 @@ impl HighLevelAction for GoToPatrol {
                             *low = Box::new(Wait::retry(RETRY_S));
                         } else {
                             cursor = (cursor + 1) % len;
-                            self.request_leg(pf, loop_tiles, here, &mut cursor, low, ctx.entity, PathfindReason::PatrolLegUnreachable);
+                            self.request_leg(pf, loop_tiles, here, &mut cursor, low, ctx.entity, PathfindReason::PatrolLegUnreachable, ctx.dynamic_repath);
                         }
                     }
                 }
             } else if self.await_elapsed >= PATH_WAIT_RETRY_S {
-                self.request_leg(pf, loop_tiles, here, &mut cursor, low, ctx.entity, PathfindReason::PatrolLegRetry);
+                self.request_leg(pf, loop_tiles, here, &mut cursor, low, ctx.entity, PathfindReason::PatrolLegRetry, ctx.dynamic_repath);
             }
             self.prev_low_stuck = low.is_stuck();
             self.prev_low_finished = low.is_finished();
@@ -465,7 +468,7 @@ impl HighLevelAction for GoToPatrol {
                 cursor = (cursor + 1) % len;
                 self.engaged = true;
                 self.legs_tried = 0;
-                self.request_leg(pf, loop_tiles, here, &mut cursor, low, ctx.entity, PathfindReason::PatrolLegTimedOut);
+                self.request_leg(pf, loop_tiles, here, &mut cursor, low, ctx.entity, PathfindReason::PatrolLegTimedOut, ctx.dynamic_repath);
                 self.prev_low_stuck = low.is_stuck();
                 self.prev_low_finished = low.is_finished();
                 self.cursor = Some(cursor);
@@ -484,7 +487,7 @@ impl HighLevelAction for GoToPatrol {
                 cursor = (cursor + 1) % len;
             }
             self.legs_tried = 0;
-            self.request_leg(pf, loop_tiles, here, &mut cursor, low, ctx.entity, PathfindReason::PatrolLeg);
+            self.request_leg(pf, loop_tiles, here, &mut cursor, low, ctx.entity, PathfindReason::PatrolLeg, ctx.dynamic_repath);
         }
 
         self.prev_low_stuck = low.is_stuck();
@@ -548,6 +551,7 @@ pub fn enqueue_patrol_candidates(
                 goal: tile,
                 max_expanded: WANDER_SEARCH_LIMIT,
                 simplify_buffer: PATH_CORNER_BUFFER,
+                include_dynamic: false,
             }, entity, PathfindReason::PatrolLoopGen);
             (id, tile)
         })
@@ -656,6 +660,7 @@ impl GoFixBots {
                 goal,
                 max_expanded: WANDER_SEARCH_LIMIT,
                 simplify_buffer: PATH_CORNER_BUFFER,
+                include_dynamic: ctx.dynamic_repath,
             },
             ctx.entity,
             reason,
@@ -1104,6 +1109,7 @@ impl GoToChargeStation {
                 goal: (coords.x, coords.y),
                 max_expanded: SEARCH_LIMIT,
                 simplify_buffer: PATH_CORNER_BUFFER,
+                include_dynamic: ctx.dynamic_repath,
             }, ctx.entity, PathfindReason::ChargerSeek);
             pending.push((coords, id));
         }
@@ -1353,6 +1359,7 @@ impl HighLevelAction for GoToChargeStation {
                             goal: (charger.x, charger.y),
                             max_expanded: SEARCH_LIMIT,
                             simplify_buffer: PATH_CORNER_BUFFER,
+                            include_dynamic: ctx.dynamic_repath,
                         }, ctx.entity, PathfindReason::ChargerDockApproach);
                         self.dock_route = Some(id);
                         self.dock_elapsed = 0.0;
@@ -1712,6 +1719,7 @@ mod tests {
             patrol_loop,
             pathfind: Some(pf),
             fixer: None,
+            dynamic_repath: false,
         }
     }
 

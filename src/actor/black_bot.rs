@@ -770,6 +770,7 @@ pub(crate) fn black_bot_brain(
         });
 
         let charge_level = charge.as_ref().map(|c| c.level).unwrap_or(1.0);
+        let dynamic_repath = brain.take_dynamic_repath();
         let effects = {
             let ctx = BrainContext {
                 entity,
@@ -797,6 +798,7 @@ pub(crate) fn black_bot_brain(
                     results: &pathfind_results,
                 }),
                 fixer: fixer_ctx,
+                dynamic_repath,
             };
             brain.tick(&ctx, state)
         };
@@ -1184,6 +1186,7 @@ fn track_black_bot_collision_pressure(
         resolve_offscreen_collision(obj.inner.as_mut(), &dynamic, static_cache);
         let relocated = obj.inner.state().center;
         brain.reset();
+        brain.set_dynamic_repath();
         let state = obj.inner.state_mut();
         state.move_buffer = ActorMoveBuffer::default();
         state.next_waypoint_hint = None;

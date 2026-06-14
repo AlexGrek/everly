@@ -1418,6 +1418,7 @@ mod tests {
             patrol_loop: None,
             pathfind: None,
             fixer: None,
+            dynamic_repath: false,
         };
         let mut rng = rng::seeded(1);
         fp.execute(&mut state, &ctx, &mut rng, &FollowTuning::default());
@@ -1484,6 +1485,7 @@ mod tests {
             patrol_loop: None,
             pathfind: None,
             fixer: None,
+            dynamic_repath: false,
         };
         let mut rng = rng::seeded(2);
         // No detour, so the bot steps aside. With every neighbour statically
@@ -1572,6 +1574,7 @@ mod tests {
                 results: &results,
             }),
             fixer: None,
+            dynamic_repath: false,
         };
         let mut rng = rng::seeded(5);
         let tuning = FollowTuning {
@@ -1626,6 +1629,7 @@ mod tests {
             patrol_loop: None,
             pathfind: None,
             fixer: None,
+            dynamic_repath: false,
         };
         let mut rng = rng::seeded(5);
         let original_len = fp.path.len();
@@ -1696,6 +1700,7 @@ mod tests {
             patrol_loop: None,
             pathfind: None,
             fixer: None,
+            dynamic_repath: false,
         }
     }
 
@@ -1939,6 +1944,7 @@ mod tests {
             patrol_loop: None,
             pathfind: None,
             fixer: None,
+            dynamic_repath: false,
         };
         let mut rng = rng::seeded(7);
 
@@ -1994,6 +2000,7 @@ mod tests {
                 patrol_loop: None,
             pathfind: None,
             fixer: None,
+            dynamic_repath: false,
             };
             fp.execute(&mut state, &ctx, &mut rng, &tuning);
             // Simulate being physically pinned: position never changes.
@@ -2048,6 +2055,7 @@ mod tests {
                 patrol_loop: None,
             pathfind: None,
             fixer: None,
+            dynamic_repath: false,
             };
             fp.execute(&mut state, &ctx, &mut rng, &tuning);
             state.move_buffer = ActorMoveBuffer::default();
@@ -2117,6 +2125,7 @@ mod tests {
             patrol_loop: None,
             pathfind: None,
             fixer: None,
+            dynamic_repath: false,
         };
 
         for _ in 0..4 {
@@ -2186,6 +2195,7 @@ mod tests {
                 patrol_loop: None,
             pathfind: None,
             fixer: None,
+            dynamic_repath: false,
             };
             wait.execute(&mut state, &ctx, &mut rng::seeded(1), &tuning);
         }

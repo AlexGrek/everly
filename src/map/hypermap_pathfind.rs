@@ -31,6 +31,7 @@ use bevy::math::IVec2;
 use pathfinding::directed::astar::astar;
 
 use crate::map::hypermap::Hypermap;
+use crate::map::passability::{FLAG_BLOCKED, FLAG_CREATURE, SubtilePassability};
 use crate::map::world_map::{CellType, MapParseError, WorldMapFloor};
 
 /// Stops expanding the open set after this many **pop** operations (tile expansions).
@@ -123,32 +124,16 @@ fn four_neighbors(wx: i32, wy: i32) -> [(i32, i32); 4] {
     ]
 }
 
-fn push_neighbor_if_walkable(
-    map: &Hypermap<f32>,
-    acc: &mut Vec<((i32, i32), u32)>,
-    n: (i32, i32),
-) {
-    if world_tile_walkable(map, n.0, n.1) {
-        acc.push((n, STEP_SCALE));
-    }
-}
-
-fn hypermap_successors(map: &Hypermap<f32>, pos: &(i32, i32)) -> Vec<((i32, i32), u32)> {
-    let mut out = Vec::with_capacity(4);
-    for n in four_neighbors(pos.0, pos.1) {
-        push_neighbor_if_walkable(map, &mut out, n);
-    }
-    out
-}
-
-/// A* shortest path on world tile coordinates. Honors [`HypermapSearchLimits::max_expanded`].
-pub fn astar_shortest_world_path(
-    map: &Hypermap<f32>,
+/// Generic inner A* over world tile coordinates, parameterised by a walkability
+/// predicate. Callers supply the predicate; this function owns the open-set
+/// bookkeeping and limit check.
+fn astar_world_path_pred<F: Fn(i32, i32) -> bool>(
+    walkable: F,
     start: (i32, i32),
     goal: (i32, i32),
     limits: HypermapSearchLimits,
 ) -> HypermapPathResult {
-    if !world_tile_walkable(map, start.0, start.1) || !world_tile_walkable(map, goal.0, goal.1) {
+    if !walkable(start.0, start.1) || !walkable(goal.0, goal.1) {
         return HypermapPathResult::NoPath { expansions: 0 };
     }
     if start == goal {
@@ -181,11 +166,7 @@ pub fn astar_shortest_world_path(
     let mut g_best: HashMap<(i32, i32), u32> = HashMap::new();
     let mut parent: HashMap<(i32, i32), (i32, i32)> = HashMap::new();
     let h0 = scaled_h(start, goal, start);
-    open.push(Node {
-        pos: start,
-        g: 0,
-        f: h0,
-    });
+    open.push(Node { pos: start, g: 0, f: h0 });
     g_best.insert(start, 0);
 
     let mut expansions = 0usize;
@@ -203,9 +184,7 @@ pub fn astar_shortest_world_path(
             let mut path = vec![goal];
             let mut cur = goal;
             while cur != start {
-                let Some(&p) = parent.get(&cur) else {
-                    break;
-                };
+                let Some(&p) = parent.get(&cur) else { break };
                 path.push(p);
                 cur = p;
             }
@@ -213,8 +192,11 @@ pub fn astar_shortest_world_path(
             return HypermapPathResult::Found { path, expansions };
         }
 
-        for (n, step) in hypermap_successors(map, &pos) {
-            let ng = g.saturating_add(step);
+        for n in four_neighbors(pos.0, pos.1) {
+            if !walkable(n.0, n.1) {
+                continue;
+            }
+            let ng = g.saturating_add(STEP_SCALE);
             let better = match g_best.get(&n) {
                 None => true,
                 Some(&old) => ng < old,
@@ -223,16 +205,52 @@ pub fn astar_shortest_world_path(
                 g_best.insert(n, ng);
                 parent.insert(n, pos);
                 let hn = scaled_h(n, goal, start);
-                open.push(Node {
-                    pos: n,
-                    g: ng,
-                    f: ng.saturating_add(hn),
-                });
+                open.push(Node { pos: n, g: ng, f: ng.saturating_add(hn) });
             }
         }
     }
 
     HypermapPathResult::NoPath { expansions }
+}
+
+/// A* shortest path on world tile coordinates. Honors [`HypermapSearchLimits::max_expanded`].
+pub fn astar_shortest_world_path(
+    map: &Hypermap<f32>,
+    start: (i32, i32),
+    goal: (i32, i32),
+    limits: HypermapSearchLimits,
+) -> HypermapPathResult {
+    astar_world_path_pred(|x, y| world_tile_walkable(map, x, y), start, goal, limits)
+}
+
+/// `true` when the center subtile (2, 2) of tile `(tx, ty)` carries a creature
+/// body flag. Used by the dynamic-aware world router to treat creature-occupied
+/// tiles as blocked during post-collision-pressure replanning.
+#[inline]
+fn tile_center_has_creature(dynamic: &Hypermap<SubtilePassability>, tx: i32, ty: i32) -> bool {
+    dynamic.get(tx, ty).flags_at(2, 2) & (FLAG_BLOCKED | FLAG_CREATURE) == FLAG_BLOCKED | FLAG_CREATURE
+}
+
+/// Like [`astar_shortest_world_path`] but additionally treats tiles whose
+/// **center subtile** holds a creature body (`FLAG_BLOCKED | FLAG_CREATURE`) as
+/// impassable. Used when replanning after collision-pressure relocation so the
+/// new route routes around currently-wedged bot clusters rather than through them.
+///
+/// Simplification still runs against static passability only; by the time the
+/// bot follows the simplified waypoints the dynamic picture will have shifted.
+pub fn astar_shortest_world_path_dyn(
+    map: &Hypermap<f32>,
+    dynamic: &Hypermap<SubtilePassability>,
+    start: (i32, i32),
+    goal: (i32, i32),
+    limits: HypermapSearchLimits,
+) -> HypermapPathResult {
+    astar_world_path_pred(
+        |x, y| world_tile_walkable(map, x, y) && !tile_center_has_creature(dynamic, x, y),
+        start,
+        goal,
+        limits,
+    )
 }
 
 /// Walks the integer Bresenham line from `a` to `b` and returns true iff every
@@ -526,8 +544,11 @@ pub fn explore_walkable_tiles_limited(
         }
         visited_order.push(pos);
 
-        for (n, step) in hypermap_successors(map, &pos) {
-            let ng = g.saturating_add(step);
+        for n in four_neighbors(pos.0, pos.1) {
+            if !world_tile_walkable(map, n.0, n.1) {
+                continue;
+            }
+            let ng = g.saturating_add(STEP_SCALE);
             let better = match g_best.get(&n) {
                 None => true,
                 Some(&old) => ng < old,

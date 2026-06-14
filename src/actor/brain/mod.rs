@@ -118,6 +118,10 @@ pub struct BrainContext<'a> {
     /// Fixer-only context (dispatch board, home depot, carried part). `Some` only
     /// for [`Fixer`](crate::actor::black_bot::BotSpecialization::Fixer) bots.
     pub fixer: Option<FixerContext<'a>>,
+    /// One-shot flag from [`Brain::take_dynamic_repath`]: when `true` the first
+    /// `WorldRoute` enqueued this tick must use `include_dynamic: true` so it
+    /// routes around current creature positions (post collision-pressure relocation).
+    pub dynamic_repath: bool,
 }
 
 impl BrainContext<'_> {
@@ -226,6 +230,12 @@ pub struct Brain {
     pub tuning: FollowTuning,
     rng: StdRng,
     rng_seed: u64,
+    /// One-shot flag: when set, the next `WorldRoute` enqueued by any high-level
+    /// action will use `include_dynamic: true` so it routes around current bot
+    /// positions. Set after collision-pressure relocation; survives `reset()` so
+    /// it persists into the first post-reset planning tick; consumed by
+    /// `take_dynamic_repath`.
+    dynamic_repath: bool,
 }
 
 impl Brain {
@@ -239,6 +249,7 @@ impl Brain {
             tuning: FollowTuning::default(),
             rng: rng::seeded(rng_seed),
             rng_seed,
+            dynamic_repath: false,
         }
     }
 
@@ -253,10 +264,27 @@ impl Brain {
     }
 
     /// Forget the current plan so the brain re-evaluates from scratch next tick.
+    /// Does NOT clear `dynamic_repath` — the flag is set after this call by the
+    /// collision-pressure handler and must survive into the next planning tick.
     pub fn reset(&mut self) {
         self.current = None;
         self.low_level = Box::new(Idle);
         self.priorities.clear();
+    }
+
+    /// Arm the one-shot dynamic-repath flag. Call immediately after
+    /// [`reset`](Self::reset) when relocating a wedged bot so the first
+    /// re-planned `WorldRoute` routes around current creature positions.
+    pub fn set_dynamic_repath(&mut self) {
+        self.dynamic_repath = true;
+    }
+
+    /// Consume and return the dynamic-repath flag. Returns `true` exactly once
+    /// per [`set_dynamic_repath`](Self::set_dynamic_repath) call; subsequent
+    /// calls return `false`. Called by `black_bot_brain` when building
+    /// `BrainContext` so the flag is forwarded to the high-level action.
+    pub fn take_dynamic_repath(&mut self) -> bool {
+        std::mem::replace(&mut self.dynamic_repath, false)
     }
 
     /// Stop all motion this frame (used by the depleted / broken gate). Keeps the
@@ -404,6 +432,7 @@ pub(crate) mod test_support {
             patrol_loop: None,
             pathfind: None,
             fixer: None,
+            dynamic_repath: false,
         }
     }
 
