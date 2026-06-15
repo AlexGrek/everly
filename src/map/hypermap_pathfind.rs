@@ -1105,6 +1105,40 @@ mod tests {
     }
 
     #[test]
+    fn subtile_detour_respects_footprint_radius() {
+        // A 1-subtile-wide gap in a wall row (y = 3, open only at x = 0). The
+        // subcell search is size-aware purely through its `is_free` predicate: a
+        // point (radius 0) threads the gap, but a radius-1 footprint cannot fit
+        // and — confined to the gap column (pad 0) — finds no route. This is the
+        // size rule "a subcell within the bot's radius of an occupied subcell is
+        // impassable" applied to the subcell pathfinder itself.
+        let wall = |p: IVec2| p.y == 3 && p.x != 0;
+        let free_for_radius = |r: i32| {
+            move |s: IVec2| {
+                for dx in -r..=r {
+                    for dy in -r..=r {
+                        if wall(s + IVec2::new(dx, dy)) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            }
+        };
+        let start = IVec2::new(0, 0);
+        let goal = IVec2::new(0, 6);
+
+        assert!(
+            astar_subtile_detour(start, goal, 6, 40, 8192, free_for_radius(0)).is_some(),
+            "a point-sized actor threads the 1-wide gap"
+        );
+        assert!(
+            astar_subtile_detour(start, goal, 0, 40, 8192, free_for_radius(1)).is_none(),
+            "a radius-1 footprint cannot fit the 1-wide gap — the search must reject it"
+        );
+    }
+
+    #[test]
     fn explore_respects_void_default() {
         let map: Hypermap<f32> = Hypermap::new(0.0);
         map.set(0, 0, 1.0);
