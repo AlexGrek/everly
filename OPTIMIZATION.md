@@ -612,3 +612,54 @@ and a divergence means pool coupling was re-introduced.
 Verified green: `cargo test -p everly` (252 passed, 0 failed, 2 ignored) and
 `cargo check -p everly --all-targets` warning-clean. Docs updated:
 `docs/movement.md`, `docs/actor.md`, `.claude/SKILLS/actor-engineer/SKILL.md`.
+
+### Movement collapsed to one sequential pass — no arbitrate split, no jam teleport (2026-06)
+
+Now that propose is sequential, the propose/arbitrate two-system split bought
+nothing: the proposal pass already runs on one thread, so collision detection can
+be done in the same sweep. Merged `propose_actor_moves` + `arbitrate_actor_moves`
+into a single `process_actor_moves`
+([`src/actor/movement.rs`](src/actor/movement.rs)) — think + static propose,
+owner-grid resolution, apply + commit, off-screen re-entry — and **deleted the
+back-off cascade, the depth cap, and the squeeze/teleport jam pool**.
+
+- **Why no jam teleport is needed (rule 8 — semantics simplified, not broken).**
+  The resolver (`arbitrate`) now **pre-stamps every actor's currently-occupied
+  footprint** before resolving, then each actor in entity order releases its own
+  origin and claims its proposed footprint or holds at origin. Two consequences:
+  a mover can never claim a cell another actor still holds (the occupant always
+  wins, independent of order), and every actor always has its own origin as a
+  guaranteed fall-back. So there is never a wedged actor with nowhere to go — the
+  entire recursive back-off + squeeze-pool machinery the old design needed to
+  rescue jams is gone. Precondition: `previous` footprints are pairwise disjoint
+  (last frame's accepted, overlap-free positions). The only residual teleport is
+  off-screen re-entry placement (`resolve_offscreen_collision`), which is unrelated
+  to jams and required because off-screen actors travel without collision.
+- **Allocation-free steady state (rule 4):** `OccupancyArbiter` keeps reusing its
+  owner grid + `records`/`entities`/`reentrants` vecs; `MoveRecord` shrank to
+  plain `Copy` `{ current, previous, radius, collided, conflict_cell }` (dropped
+  `placed`/`placed_previous`/`squeezed`). No per-actor/per-frame allocation.
+- **Brain deadlock breaker re-routes instead of teleporting**
+  ([`src/actor/black_bot.rs`](src/actor/black_bot.rs)): the sequential model
+  guarantees no two bots *overlap* but does not prevent a head-on *deadlock*
+  (both hold, each blocks the other). `track_black_bot_collision_pressure` no
+  longer teleports a wedged bot — it wipes the plan and forces a full re-path
+  against the **dynamic** passability map from the bot's current position
+  (`set_dynamic_repath`), so the new route steers around the occupied tiles. A bot
+  with no passable detour holds until the blocker clears (deliberate trade-off).
+- **Dead perf timers removed:** the nine movement HUD rows (`propose`,
+  `prop_par`, `prop_body`, `prop_think`, `prop_slide`, `prop_adv`, `arb_conflict`,
+  `arb_apply`, `arb_squeeze`) measured the now-gone phases and were deleted from
+  [`src/hud/perf_timings.rs`](src/hud/perf_timings.rs) (`TimedSystem::COUNT`
+  23 → 14), along with the `squeeze=` gauge / `squeezed_bots` counter. The
+  movement pass no longer does any `Instant` timing.
+
+The pure resolver is unit-tested in `movement.rs` (no-conflict advance, lower-index
+wins a contested cell, stationary occupant protected from a mover, follower takes a
+leader's freed cell same frame, follower-before-leader one-frame ripple, radius-1
+self-step does not self-collide). Docs updated: `docs/movement.md`, `docs/actor.md`,
+`docs/actor-brain.md`, `docs/charge.md`, `docs/field-interactions.md`, and the
+actor-engineer / field-interactions / bevy-engineer skills.
+
+Verified green: `cargo test -p everly` (272 passed, 0 failed, 2 ignored) and
+`cargo check -p everly --all-targets` warning-clean.

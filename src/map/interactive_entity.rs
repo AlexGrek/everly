@@ -470,6 +470,14 @@ pub struct InteractiveEntityMap {
     /// lookup instead of scanning every station's queues. Maintained only at the
     /// (cold) queue-mutation sites; an entry exists iff its count is `> 0`.
     queued_actors: HashMap<Entity, u32>,
+    /// Liveness watchdog: seconds since each queued actor last re-asserted its
+    /// membership. A pursuing bot refreshes this to `0` every brain tick
+    /// (`refresh_queue`); a despawned or no-longer-pursuing bot stops refreshing,
+    /// its idle time climbs, and `collect_stale_queued` evicts it once it crosses
+    /// the TTL — so a dead/abandoned bot can never block a charger's dock queue
+    /// forever. Keyed identically to `queued_actors` (an entry exists iff the
+    /// actor holds ≥ 1 membership).
+    queue_idle: HashMap<Entity, f32>,
 }
 
 impl InteractiveEntityMap {
@@ -552,6 +560,7 @@ impl InteractiveEntityMap {
         self.tiles.clear();
         self.queues.clear();
         self.queued_actors.clear();
+        self.queue_idle.clear();
     }
 
     /// Iterates every entity entry across all hypertiles. Order is unspecified.
@@ -644,17 +653,45 @@ impl InteractiveEntityMap {
             .collect()
     }
 
-    /// Records one new queue membership for `actor` in the reverse index.
+    /// Records one new queue membership for `actor` in the reverse index. Joining
+    /// a queue counts as a fresh liveness signal, so the idle timer resets.
     fn index_add(&mut self, actor: Entity) {
         *self.queued_actors.entry(actor).or_insert(0) += 1;
+        self.queue_idle.insert(actor, 0.0);
     }
 
-    /// Drops one queue membership for `actor`, removing the entry at zero.
+    /// Drops one queue membership for `actor`, removing the entry (and its idle
+    /// timer) at zero.
     fn index_remove(&mut self, actor: Entity) {
         if let Some(count) = self.queued_actors.get_mut(&actor) {
             *count -= 1;
             if *count == 0 {
                 self.queued_actors.remove(&actor);
+                self.queue_idle.remove(&actor);
+            }
+        }
+    }
+
+    /// Re-asserts that `actor` is still actively pursuing its queued station this
+    /// tick, resetting its liveness idle timer. No-op for an actor that holds no
+    /// membership. Called every brain tick while a charge action holds a slot.
+    pub fn refresh_queue(&mut self, actor: Entity) {
+        if self.queued_actors.contains_key(&actor) {
+            self.queue_idle.insert(actor, 0.0);
+        }
+    }
+
+    /// Ages every queued actor's idle timer by `dt` and appends to `out` the
+    /// actors that have not re-asserted their membership within `ttl` seconds.
+    /// The caller is expected to evict each (and reset its brain) — eviction drops
+    /// the idle entry, so a returned actor is reported once per stale episode.
+    /// `out` is caller-owned to keep the steady state allocation-free (it is empty
+    /// every frame in the common case).
+    pub fn collect_stale_queued(&mut self, dt: f32, ttl: f32, out: &mut Vec<Entity>) {
+        for (actor, idle) in self.queue_idle.iter_mut() {
+            *idle += dt;
+            if *idle >= ttl {
+                out.push(*actor);
             }
         }
     }
@@ -1251,6 +1288,41 @@ mod tests {
         assert!(map.is_in_any_queue(bot));
         map.evict_actor_everywhere(bot);
         assert!(!map.is_in_any_queue(bot), "eviction drops the index entry");
+    }
+
+    #[test]
+    fn stale_queue_membership_is_collected_after_ttl() {
+        let mut map = InteractiveEntityMap::new();
+        let station = EntityCoordinates::ground(4, 4);
+        let pursuing = Entity::from_bits(1);
+        let abandoned = Entity::from_bits(2);
+        let ttl = 2.0;
+
+        map.add_waiting(station, pursuing);
+        map.add_waiting(station, abandoned);
+
+        let mut stale = Vec::new();
+        // One bot keeps re-asserting its slot; the other goes silent.
+        for _ in 0..200 {
+            map.refresh_queue(pursuing);
+            stale.clear();
+            map.collect_stale_queued(0.016, ttl, &mut stale);
+            if !stale.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(stale, vec![abandoned], "only the silent bot ages out");
+
+        // Evicting the stale bot drops its idle timer; the pursuer survives.
+        map.evict_actor_everywhere(abandoned);
+        assert!(map.is_in_any_queue(pursuing));
+        assert!(!map.is_in_any_queue(abandoned));
+
+        // After eviction the pursuer (still refreshed) never goes stale.
+        let mut stale2 = Vec::new();
+        map.refresh_queue(pursuing);
+        map.collect_stale_queued(0.016, ttl, &mut stale2);
+        assert!(stale2.is_empty(), "refreshed survivor is not collected");
     }
 
     #[test]

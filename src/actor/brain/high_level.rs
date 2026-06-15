@@ -157,6 +157,14 @@ pub trait HighLevelAction: Send + Sync {
     fn preempt(&mut self, _ctx: &BrainContext) -> BrainEffects {
         BrainEffects::default()
     }
+
+    /// Station-queue coordinates this action is currently holding a slot in, if
+    /// any. Returned every tick so the liveness watchdog
+    /// ([`InteractiveEntityMap::refresh_queue`]) knows the bot is still pursuing
+    /// it. `None` (the default) means "not waiting on any station queue".
+    fn active_queue(&self) -> Option<EntityCoordinates> {
+        None
+    }
 }
 
 /// Default mapping from a priority kind to the action that serves it. A brain
@@ -1235,6 +1243,9 @@ impl HighLevelAction for GoToChargeStation {
         self.dock_route = None;
         self.phase = ChargePhase::Seeking;
         effects
+    }
+    fn active_queue(&self) -> Option<EntityCoordinates> {
+        self.queued_waiting.or(self.queued_wanting)
     }
     fn update(
         &mut self,

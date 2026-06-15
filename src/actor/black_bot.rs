@@ -118,6 +118,12 @@ const STALL_PROGRESS_RESET_SQ: f32 = 2.25;
 /// Set well above a single legitimate maneuver's budget (`stuck_repath_secs` ≈ 1 s
 /// plus escape) so it only fires once the normal machinery has demonstrably failed.
 const STALL_FORCE_RELOCATE_SECS: f32 = 4.0;
+/// Liveness TTL for a charger-queue membership: if a bot has not re-asserted its
+/// `wanting`/`waiting` slot (via the brain keepalive) within this many seconds —
+/// because it was despawned, or its plan abandoned the charger without cleanup —
+/// the queue watchdog evicts it so it can never block the dock queue forever. A
+/// genuinely pursuing bot refreshes every 60 Hz tick, so the margin is enormous.
+const QUEUE_STALE_SECS: f32 = 2.0;
 /// Seconds for the yellow stuck flash to fade fully back to black.
 const STUCK_FLASH_FADE_SECS: f32 = 2.5;
 
@@ -537,6 +543,7 @@ impl Plugin for BlackBotPlugin {
                     // after the fixed ticks of the same frame — no explicit
                     // ordering needed across schedules.
                     reconcile_charger_occupancy.after(black_bot_brain),
+                    reconcile_charger_queues.after(black_bot_brain),
                     track_black_bot_collision_pressure.after(process_actor_moves),
                 )
                     .run_if(in_state(GameState::InGame)),
@@ -1034,6 +1041,9 @@ fn apply_brain_effects(
         }
         interactive.remove_actor_from_queues(coords, entity);
     }
+    if effects.queue_keepalive.is_some() {
+        interactive.refresh_queue(entity);
+    }
     if effects.recharge > 0.0 {
         if let Some(c) = charge {
             c.level = (c.level + effects.recharge).min(1.0);
@@ -1076,6 +1086,36 @@ pub(crate) fn reconcile_charger_occupancy(
         let coords = entry.coordinates;
         if tile.x != coords.x || tile.y != coords.y {
             charger.set_occupant(None);
+        }
+    }
+}
+
+/// Liveness watchdog for charger queues: evicts any `wanting`/`waiting`
+/// membership a bot stopped re-asserting [`QUEUE_STALE_SECS`] ago. A bot keeps
+/// its slot alive by emitting `queue_keepalive` every brain tick while a charge
+/// action holds it ([`apply_brain_effects`] → [`InteractiveEntityMap::refresh_queue`]);
+/// a **despawned** bot (its brain never ticks again) or one whose plan abandoned
+/// the charger without going through `preempt`/`Done` stops refreshing, so its
+/// idle timer crosses the TTL and it is removed here — closing the leak where a
+/// dead bot stuck at the front of a `waiting` queue blocked everyone behind it.
+///
+/// A still-alive evicted bot also gets `Brain::reset` so its `GoToChargeStation`
+/// state cannot desync from the now-empty global queue (it re-seeks from scratch).
+pub(crate) fn reconcile_charger_queues(
+    time: Res<Time>,
+    mut interactive: ResMut<InteractiveEntityMap>,
+    mut stale: Local<Vec<Entity>>,
+    mut actors: Query<(&mut ActorObject, &mut Brain)>,
+) {
+    stale.clear();
+    interactive.collect_stale_queued(time.delta_secs(), QUEUE_STALE_SECS, &mut stale);
+    for &entity in stale.iter() {
+        interactive.evict_actor_everywhere(entity);
+        if let Ok((mut obj, mut brain)) = actors.get_mut(entity) {
+            brain.reset();
+            let s = obj.inner.state_mut();
+            s.move_buffer = ActorMoveBuffer::default();
+            s.next_waypoint_hint = None;
         }
     }
 }

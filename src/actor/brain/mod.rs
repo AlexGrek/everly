@@ -179,6 +179,12 @@ pub struct BrainEffects {
     pub repair_target: Option<(Entity, RepairPart)>,
     /// Optional in-game log line for this tick.
     pub log: Option<BrainLogEvent>,
+    /// Re-assert that this bot is still actively pursuing a station's queue this
+    /// tick (liveness keepalive read by [`InteractiveEntityMap::refresh_queue`]).
+    /// Set every tick by an action that holds a queue slot; a despawned or
+    /// abandoned bot stops emitting it, so the queue watchdog can evict its stale
+    /// membership. The coordinates are informational — refresh is keyed by entity.
+    pub queue_keepalive: Option<EntityCoordinates>,
 }
 
 fn merge_brain_effects(into: &mut BrainEffects, add: BrainEffects) {
@@ -214,6 +220,9 @@ fn merge_brain_effects(into: &mut BrainEffects, add: BrainEffects) {
     }
     if let Some(v) = add.log {
         into.log = Some(v);
+    }
+    if let Some(v) = add.queue_keepalive {
+        into.queue_keepalive = Some(v);
     }
 }
 
@@ -342,6 +351,14 @@ impl Brain {
             let outcome = action.update(ctx, &mut self.low_level, &mut self.rng);
             merge_brain_effects(&mut effects, outcome.effects);
             done = matches!(outcome.status, HighLevelStatus::Done);
+            // Keepalive: while an action still actively holds a station queue slot,
+            // re-assert it every tick so the liveness watchdog never evicts a bot
+            // that is genuinely pursuing the charger.
+            if !done {
+                if let Some(coords) = action.active_queue() {
+                    effects.queue_keepalive = Some(coords);
+                }
+            }
         }
         if done {
             self.current = None;
