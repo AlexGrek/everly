@@ -41,6 +41,23 @@ These queues are runtime coordination only (not persisted). They are cleared wit
 `InteractiveEntityMap::clear`, and charger sync drops queue state for rebuilt/removed
 charger tiles.
 
+### Liveness watchdog
+
+Because docking is gated on `is_waiting_front`, a single stale entry at the front of
+a `waiting` queue would block every bot behind it forever. Two paths could leak such
+an entry: a bot **despawned** while queued (its brain never ticks again to clean up),
+or a plan that abandons the charger without going through the action's `preempt`.
+
+To close that, each queued actor carries a liveness idle timer (`queue_idle`). A bot
+that is genuinely pursuing its charger re-asserts the slot **every brain tick** via
+`refresh_queue` (driven by the `GoToChargeStation` action returning `active_queue()`
+→ `BrainEffects::queue_keepalive`). The `reconcile_charger_queues` system
+(`black_bot.rs`, runs after `black_bot_brain`) ages every timer by `dt`,
+`collect_stale_queued` reports any that crossed `QUEUE_STALE_SECS` (2 s — a pursuing
+bot at 60 Hz never gets close), and each stale actor is `evict_actor_everywhere`'d.
+A still-alive evictee also gets `Brain::reset` so its action state cannot desync from
+the now-empty global queue (it re-seeks from scratch).
+
 ## Trait surface (`InteractiveEntityBehavior`)
 
 - `entity_type() -> EntityType`

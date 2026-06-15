@@ -1146,11 +1146,13 @@ fn sync_black_bot_transforms(
     }
 }
 
-/// `true` when this frame's movement step counts as a collision for BlackBot
-/// status (wall graze or head-on bot-on-bot bump; rear bumps ignored).
+/// `true` when this frame's movement step counts as a collision **for collision
+/// pressure** — i.e. a head-on bot-on-bot bump (rear bumps ignored). A wall graze
+/// (`BlockedByStatic`) is deliberately **not** counted: walls never build
+/// pressure and never make a bot "stuck"; they are answered by FollowPath's
+/// subtile re-route toward the next waypoint instead (see `docs/actor-brain.md`).
 fn black_bot_frame_collided(state: &ActorState, heading: Vec2) -> bool {
     match state.last_movement_error {
-        Some(ActorMovementError::BlockedByStatic { .. }) => true,
         Some(ActorMovementError::BlockedByOccupancy { world_subtile_x, world_subtile_y }) => {
             is_front_collision(state.center, heading, world_subtile_x, world_subtile_y)
         }

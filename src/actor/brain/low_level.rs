@@ -449,6 +449,12 @@ enum DetourPurpose {
     Avoidance,
     /// Stall splice-repair: on failure, escape to a free cell / abandon.
     Repair,
+    /// Wall re-route: a subtile subpath around static geometry toward the next
+    /// waypoint. On failure it never escalates to escape/abandon and never marks
+    /// the bot stuck — walls are answered only by re-routing, so it just resets
+    /// the stall state and keeps steering (the movement pipeline's wall-slide
+    /// still applies). Re-armable every stall, unlike one-shot [`Repair`].
+    WallRepair,
 }
 
 impl FollowPath {
@@ -923,6 +929,14 @@ impl LowLevelAction for FollowPath {
                         self.escape_or_abandon(state, ctx, t, dt);
                         return;
                     }
+                    DetourPurpose::WallRepair => {
+                        // A wall re-route could not be planned/landed: never escape
+                        // or abandon for a wall. Reset the stall state and keep
+                        // steering toward the waypoint (wall-slide still applies);
+                        // the bot re-routes again next stall if still wedged.
+                        self.stuck_timer = 0.0;
+                        self.stuck_reference_pos = Some(center);
+                    }
                 }
             }
         }
@@ -1144,21 +1158,33 @@ impl LowLevelAction for FollowPath {
         );
 
         if self.stuck_timer >= t.stuck_repath_secs {
-            // Improve recalculation: try one *local* splice-repair first — a
-            // footprint-aware subtile detour around the obstacle to a node a bit
-            // further along, spliced inline. Only when that can't be planned (no
-            // avoidance / pathfind data, or it later comes back empty) does the bot
-            // fall back to the relocate-and-abandon last resort.
-            if !self.repair_attempted && !self.on_sub_run() {
+            // A wall (static) wedge is treated differently from a bot wedge: it
+            // never builds collision pressure, never marks the bot stuck, and is
+            // **always** answered with a fresh subtile subpath toward the next
+            // waypoint (re-armable), never the escape/abandon last resort.
+            let wall_blocked = matches!(
+                state.last_movement_error,
+                Some(ActorMovementError::BlockedByStatic { .. })
+            );
+
+            // Improve recalculation: a *local* splice-repair — a footprint-aware
+            // subtile detour around the obstacle to a node a bit further along,
+            // spliced inline. For a bot stall it is one-shot (`repair_attempted`);
+            // for a wall it re-arms every stall so the bot keeps re-routing.
+            if !self.on_sub_run() && (wall_blocked || !self.repair_attempted) {
                 let goal_node = (self.index + 1).min(self.path.len() - 1);
                 if let Some(id) = self.enqueue_detour(state, ctx, goal_node) {
                     ctx.trace(format!(
-                        "stuck {:.1}s → local splice-repair toward node {goal_node}",
-                        self.stuck_timer
+                        "stuck {:.1}s ({}) → subtile re-route toward node {goal_node}",
+                        self.stuck_timer,
+                        if wall_blocked { "wall" } else { "bot" },
                     ));
-                    self.repair_attempted = true;
+                    if !wall_blocked {
+                        self.repair_attempted = true;
+                    }
                     self.detour_request = Some(id);
-                    self.detour_purpose = DetourPurpose::Repair;
+                    self.detour_purpose =
+                        if wall_blocked { DetourPurpose::WallRepair } else { DetourPurpose::Repair };
                     self.detour_goal = goal_node;
                     self.detour_wait_elapsed = 0.0;
                     self.detour_fallback = None;
@@ -1169,8 +1195,17 @@ impl LowLevelAction for FollowPath {
                     return;
                 }
             }
-            self.escape_or_abandon(state, ctx, t, dt);
-            return;
+            if wall_blocked {
+                // No subtile re-route available (no avoidance / pathfind data):
+                // a wall must still never abandon or mark the bot stuck. Reset and
+                // keep steering toward the waypoint; the movement pipeline's
+                // wall-slide carries the bot along the wall.
+                self.stuck_timer = 0.0;
+                self.stuck_reference_pos = Some(center);
+            } else {
+                self.escape_or_abandon(state, ctx, t, dt);
+                return;
+            }
         }
 
         // Braking profile: as we approach the waypoint, cap target speed to the
@@ -2469,5 +2504,91 @@ mod tests {
             pending.iter().any(|(_, k)| matches!(k, PathKind::SubtileDetour { .. })),
             "repair enqueues a subtile detour search"
         );
+    }
+
+    #[test]
+    fn wall_stall_reroutes_with_subtiles_and_never_abandons() {
+        // A bot wedged against a **wall** (BlockedByStatic) must re-route with a
+        // subtile subpath toward the next waypoint and **never** abandon / mark
+        // itself stuck — unlike a bot-on-bot wedge, which can escape/abandon.
+        use crate::actor::brain::{AvoidanceViews, PathfindAccess};
+        use crate::map::passability::{
+            DynamicPassabilityMap, SubtilePassability, FLAG_BLOCKED, FLAG_VOID,
+        };
+        use crate::map::pathfind_service::{PathfindQueue, PathfindResults};
+
+        let dynamic = DynamicPassabilityMap::new();
+        let static_subtiles: Hypermap<SubtilePassability> = Hypermap::new(SubtilePassability::EMPTY);
+        let queue = PathfindQueue::default();
+        let results = PathfindResults::default();
+        let passability = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let tuning = FollowTuning {
+            stuck_repath_secs: 0.3,
+            ..FollowTuning::default()
+        };
+
+        let mut fp = FollowPath::new(vec![(10, 0)]);
+        let mut state = ActorState {
+            center: Vec2::new(0.2, 0.2),
+            radius_subtiles: 2,
+            rotation: 0.0,
+            move_buffer: ActorMoveBuffer::default(),
+            last_movement_error: None,
+            last_accepted_center_subtile: Some(IVec2::new(1, 1)),
+            last_accepted_radius_subtiles: 2,
+            next_waypoint_hint: None,
+            field_main_tile: None,
+            dirtiness: 0.0,
+            shadow: crate::actor::ActorShadow::default(),
+        };
+        let mut rng = rng::seeded(31);
+
+        let make_ctx = |center: Vec2| BrainContext {
+            entity: Entity::PLACEHOLDER,
+            dt: 0.1,
+            center,
+            main_tile: IVec2::new(0, 0),
+            main_tile_changed: false,
+            floor: 0,
+            charge: 1.0,
+            missing_charge_pct: 0.0,
+            depleted: false,
+            broken: false,
+            passability: &passability,
+            interactive: &interactive,
+            on_screen: true,
+            trace: None,
+            avoidance: Some(AvoidanceViews {
+                dynamic: &dynamic,
+                static_subtiles: &static_subtiles,
+                blocked_flags: FLAG_BLOCKED | FLAG_VOID,
+            }),
+            patrol_loop: None,
+            pathfind: Some(PathfindAccess { queue: &queue, results: &results }),
+            fixer: None,
+            dynamic_repath: false,
+        };
+
+        for _ in 0..4 {
+            // The movement pipeline reports a wall block every tick.
+            state.last_movement_error = Some(ActorMovementError::BlockedByStatic {
+                world_subtile_x: 10,
+                world_subtile_y: 1,
+            });
+            let ctx = make_ctx(state.center);
+            fp.execute(&mut state, &ctx, &mut rng, &tuning);
+            state.move_buffer = ActorMoveBuffer::default();
+        }
+
+        assert!(fp.detour_request.is_some(), "wall stall must enqueue a subtile re-route");
+        assert_eq!(
+            fp.detour_purpose,
+            DetourPurpose::WallRepair,
+            "a wall wedge re-routes with the wall purpose, not the escape/abandon Repair"
+        );
+        assert!(!fp.abandoned, "a wall must never abandon");
+        assert!(!fp.is_stuck(), "a wall must never mark the bot stuck");
+        assert!(fp.escape_target.is_none(), "a wall never triggers the escape relocate");
     }
 }

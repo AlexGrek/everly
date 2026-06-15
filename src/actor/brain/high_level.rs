@@ -780,6 +780,18 @@ impl HighLevelAction for GoFixBots {
         let here = (ctx.main_tile.x, ctx.main_tile.y);
         let home_tile = (home.x, home.y);
 
+        // Safety net against an **orphaned `PendingPath`**. A route request that
+        // fails or times out clears `awaiting`, and several phase transitions hand
+        // the next phase a `PendingPath` that is no longer backed by an in-flight
+        // request. `PendingPath` never reports stuck or finished, so a phase's
+        // `low_level_needs_replan` gate can never fire to recover it — the bot
+        // coasts in `PendingPath` forever (observed on loitering fixers). If we
+        // hold one with nothing actually awaiting, drop to a short retry so the
+        // phase handler's replan logic runs next tick.
+        if self.awaiting.is_none() && low.kind() == LowLevelKind::PendingPath {
+            *low = Box::new(Wait::retry(RETRY_S));
+        }
+
         let outcome = match self.phase {
             FixPhase::Loiter => self.update_loiter(pf, fx, ctx, low, rng, here, home_tile),
             FixPhase::FetchPart => self.update_fetch(pf, fx, ctx, low, here, home_tile),
@@ -2458,6 +2470,31 @@ mod tests {
         assert!(
             dispatch.claim_of(Entity::PLACEHOLDER).is_none(),
             "pre-empt releases the claim back to the pool"
+        );
+    }
+
+    #[test]
+    fn fixer_recovers_from_orphaned_pending_path() {
+        // Regression: a fixer left holding a PendingPath with no in-flight request
+        // (e.g. a loiter route failed/timed out, or a phase transition handed the
+        // next phase a stale PendingPath) used to coast forever — PendingPath never
+        // reports stuck/finished, so the replan gate could never fire. The update
+        // safety net must swap it out so the bot recovers.
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let dispatch = DispatchQueue::default();
+        let pf = PathfindFixture::new();
+        let mut action = GoFixBots::new(); // starts in Loiter, nothing awaiting
+        let mut low: Box<dyn LowLevelAction> = Box::new(PendingPath::new());
+        let mut rng = rng::seeded(9);
+        let home = EntityCoordinates::ground(0, 0);
+
+        let c = fixer_ctx(&passability, &interactive, (0, 0), pf.access(), &dispatch, Some(home), None);
+        action.update(&c, &mut low, &mut rng);
+
+        assert!(
+            !is_pending(low.as_ref()),
+            "an orphaned PendingPath must be recovered, not coasted forever"
         );
     }
 }

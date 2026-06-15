@@ -135,7 +135,9 @@ BlackBots track a per-entity **collision pressure** counter (inspector:
 `track_black_bot_collision_pressure` decides whether the bot is genuinely
 **wedged** this frame — which requires *all* of:
 
-- a counted collision (wall graze or **head-on** bot-on-bot bump; rear bumps ignored), **and**
+- a counted collision — a **head-on** bot-on-bot bump (rear bumps ignored). A wall
+  hit (`BlockedByStatic`) is **not** counted: walls never build pressure and never
+  make a bot "stuck"; they are answered by FollowPath's subtile re-route (below), **and**
 - **no progress** — `center` barely moved (`COLLISION_PROGRESS_EPS_SQ`); a healthy
   wall-slide or a bump the bot is still moving through does **not** count, **and**
 - **not busy** — the bot is neither mid-recovery (`Brain::is_recovering`: detour,
@@ -228,8 +230,16 @@ route around other (moving) bots. When a step is rejected with
      reset (gated off while recovering), so two large bots pressed together with
      no free neighbour but open space around them would otherwise deadlock forever.
 
-This applies to bot-on-bot bumps only; a wall graze (`BlockedByStatic`) is left
-to the normal wall-slide / stuck-repath path.
+This applies to bot-on-bot bumps only. A **wall** hit (`BlockedByStatic`) is
+handled separately and never shares the bot machinery: it never builds collision
+pressure and never marks the bot stuck/abandoned. While a bot still makes progress
+it just **wall-slides** (the movement pipeline snaps the blocked axis and keeps the
+free one). If a wall actually wedges it (no progress for `stuck_repath_secs`),
+FollowPath **always re-routes with a subtile subpath toward the next waypoint** — a
+`SubtileDetour` with `DetourPurpose::WallRepair`, re-armable every stall, whose
+failure path simply resets and keeps steering (never escape/abandon). So walls are
+resolved purely by subcell re-routing; only bot-on-bot wedges can escalate to
+escape / relocate.
 
 ### Debugging a single bot (selected-bot trace)
 

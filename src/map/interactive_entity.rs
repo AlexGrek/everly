@@ -785,6 +785,7 @@ impl InteractiveEntityMap {
         });
         // The actor is gone from every queue, so drop its whole index entry.
         self.queued_actors.remove(&actor);
+        self.queue_idle.remove(&actor);
         for entry in self.iter_mut() {
             if let Some(charger) = entry.entity.as_charger_mut() {
                 if charger.occupant() == Some(actor) {
