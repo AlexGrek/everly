@@ -38,9 +38,9 @@ use crate::actor::dispatch::{
 };
 use crate::actor::snapshot::{BreakablePartSnap, BreakableSnap};
 use crate::actor::{
-    actor_main_tile, arbitrate_actor_moves, flush_actor_occupancy, is_front_collision, is_paused,
-    propose_actor_moves, resolve_offscreen_collision, Actor, ActorMoveBuffer, ActorMovementError,
-    ActorObject, ActorShadow, ActorState, OffScreenActor,
+    actor_main_tile, flush_actor_occupancy, is_front_collision, is_paused, process_actor_moves,
+    Actor, ActorMoveBuffer, ActorMovementError, ActorObject, ActorShadow, ActorState,
+    OffScreenActor,
 };
 use std::collections::HashMap;
 use crate::map::chunk_overlay::{ChunkOverlayState, OVERLAY_RES};
@@ -529,7 +529,7 @@ impl Plugin for BlackBotPlugin {
                 (
                     black_bot_brain
                         .after(flush_actor_occupancy)
-                        .before(propose_actor_moves)
+                        .before(process_actor_moves)
                         .after(PathfindSet::Collect)
                         .before(PathfindSet::Dispatch)
                         .run_if(not(is_paused)),
@@ -537,7 +537,7 @@ impl Plugin for BlackBotPlugin {
                     // after the fixed ticks of the same frame — no explicit
                     // ordering needed across schedules.
                     reconcile_charger_occupancy.after(black_bot_brain),
-                    track_black_bot_collision_pressure.after(arbitrate_actor_moves),
+                    track_black_bot_collision_pressure.after(process_actor_moves),
                 )
                     .run_if(in_state(GameState::InGame)),
             )
@@ -630,7 +630,8 @@ pub(crate) fn black_bot_brain(
         let tile_changed = vis.main_tile.map_or(false, |prev| prev != current_tile);
         vis.main_tile = Some(current_tile);
 
-        // A squeeze teleport last frame moved the bot non-locally; drop the stale
+        // A re-entry teleport last frame moved the bot non-locally (it returned
+        // from off-screen travel and was placed on a free cell); drop the stale
         // plan so it re-routes from where it actually landed.
         if state.shadow.teleported {
             brain.reset();
@@ -1132,17 +1133,20 @@ fn tick_collision_pressure(pressure: u32, collided: bool) -> (u32, bool) {
     }
 }
 
-/// Tracks per-frame collision pressure and **relocates** jammed bots once
+/// Tracks per-frame collision pressure and **re-routes** jammed bots once
 /// pressure reaches [`COLLISION_PRESSURE_RESET`]. Runs after
-/// `arbitrate_actor_moves` so `last_movement_error` reflects the current frame.
+/// `process_actor_moves` so `last_movement_error` reflects the current frame.
 ///
 /// Pressure only accumulates on a frame the bot **made no progress** (`center`
 /// barely moved) *and* its step was blocked — so a healthy wall-slide or a brief
 /// bump the bot is still moving through never builds toward a reset. Only a
 /// genuine wedge (two bots pressed together, or a corner trap) does. On reset the
-/// bot is **teleported to the nearest free cell** ([`resolve_offscreen_collision`])
-/// before its plan is wiped — replanning in place would just re-wedge, which is
-/// the loop that left jammed bots resetting forever.
+/// bot is **not** teleported: its plan is wiped and a **full re-path against the
+/// dynamic passability map** is forced from its current position
+/// (`set_dynamic_repath`), so the new route steers around the tiles other bots
+/// currently occupy. A bot with no passable detour (e.g. a true 1-wide corridor
+/// stand-off) holds in place until the other bot clears — the deliberate
+/// trade-off for removing all jam teleports from the movement pipeline.
 /// Per-bot tracker for the sustained-stall escape valve: a slowly-updated
 /// position anchor plus how long the bot has stayed within
 /// [`STALL_PROGRESS_RESET_SQ`] of it.
@@ -1155,8 +1159,6 @@ struct StallTrack {
 fn track_black_bot_collision_pressure(
     time: Res<Time>,
     game_log: Res<GameLog>,
-    hypermap: Res<HypermapRuntime>,
-    dynamic: Res<DynamicPassabilityMap>,
     selected: Res<SelectedActor>,
     mut interactive: ResMut<InteractiveEntityMap>,
     dispatch: Res<DispatchQueue>,
@@ -1175,7 +1177,6 @@ fn track_black_bot_collision_pressure(
     )>,
 ) {
     let dt = time.delta_secs();
-    let static_cache = hypermap.static_subtile_cache.as_ref();
     for (entity, name, mut obj, mut brain, mut vis, force_logs, charge, breakable, mut inventory) in &mut query {
         let depleted = charge.is_some_and(|c| c.is_depleted());
         let broken = breakable
@@ -1235,18 +1236,18 @@ fn track_black_bot_collision_pressure(
             describe_movement_error(&state.last_movement_error)
         };
         let tile = actor_main_tile(state.center);
-        // Teleport out of the jam to a nearby free cell, then wipe the plan so
-        // the bot replans from a position it can actually move from.
-        resolve_offscreen_collision(obj.inner.as_mut(), &dynamic, static_cache);
-        let relocated = obj.inner.state().center;
+        // Wipe the plan and force a re-path against the dynamic passability map
+        // from the bot's current position — no teleport. The new route routes
+        // around the tiles other bots occupy; if none is passable the bot simply
+        // holds until the blocker clears.
         brain.reset();
         brain.set_dynamic_repath();
         let state = obj.inner.state_mut();
         state.move_buffer = ActorMoveBuffer::default();
         state.next_waypoint_hint = None;
         vis.collision_pressure = 0;
-        prev_center.insert(entity, relocated);
-        stall.insert(entity, StallTrack { anchor: relocated, elapsed: 0.0 });
+        prev_center.insert(entity, center);
+        stall.insert(entity, StallTrack { anchor: center, elapsed: 0.0 });
         interactive.evict_actor_everywhere(entity);
         release_fixer_work(entity, &dispatch, inventory.as_deref_mut());
         game_log.push_world(
@@ -1261,10 +1262,7 @@ fn track_black_bot_collision_pressure(
                 tile.y,
                 LogEntry::Message {
                     level: LogLevel::Warn,
-                    text: format!(
-                        "wedged ({reason}) → relocated ({:.2},{:.2})→({:.2},{:.2})",
-                        center.x, center.y, relocated.x, relocated.y
-                    ),
+                    text: format!("wedged ({reason}) → re-routing from ({:.2},{:.2})", center.x, center.y),
                 },
                 true,
             );

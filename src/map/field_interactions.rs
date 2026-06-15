@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use bevy::prelude::*;
 
 use crate::hud::perf_timings::{SystemTimings, TimedSystem};
-use crate::actor::{actor_main_tile, arbitrate_actor_moves, ActorObject};
+use crate::actor::{actor_main_tile, process_actor_moves, ActorObject};
 use crate::map::dirt::{DirtMap, DIRT_TRACK_DEPOSIT};
 use crate::map::hypermap::Hypermap;
 use crate::map::hypermap_world::HypermapRuntime;
@@ -126,8 +126,8 @@ impl Plugin for FieldInteractionsPlugin {
             .add_systems(
                 FixedUpdate,
                 (
-                    dirt_actor_interaction.after(arbitrate_actor_moves),
-                    bot_occupancy_heat.after(arbitrate_actor_moves),
+                    dirt_actor_interaction.after(process_actor_moves),
+                    bot_occupancy_heat.after(process_actor_moves),
                 )
                     .run_if(in_state(GameState::InGame))
                     .run_if(not(crate::actor::is_paused)),

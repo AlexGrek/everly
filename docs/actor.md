@@ -24,20 +24,21 @@ order: [`level-persistence.md`](level-persistence.md).
 
 ## Per-frame lifecycle
 
-The movement pipeline runs in three phases (see `src/actor/movement.rs`):
+All movement runs in a **single sequential system**, `process_actor_moves`
+(see `src/actor/movement.rs`), preceded by the occupancy flush:
 
 1. `flush_actor_occupancy` — promote passability write→read, clear write.
-2. **Propose** (`propose_actor_moves`, sequential): for each actor,
-   clear `last_movement_error`, `think_low_level()`, `prepare_movement()`, then
-   `propose_move(static_cache)` — a **static-only** validated step recorded in the
-   actor's [`ActorShadow`]. Off-screen actors `advance_unchecked`; re-entrants are
-   queued. No dynamic-map writes, so this phase is fully parallel.
-3. **Arbitrate + apply + squeeze** (`arbitrate_actor_moves`, sequential): the
-   `OccupancyArbiter` resolves creature-on-creature conflicts over a per-frame
-   owner grid (entity-sorted, deterministic), applies each outcome, stamps
-   accepted footprints into the passability write buffer, and teleports squeezed
-   actors / re-entrants.
-4. Field interactions (e.g. dirt) — after movement; see `docs/field-interactions.md`.
+2. `process_actor_moves` (sequential), in four stages:
+   - **Think + propose**: for each actor, clear `last_movement_error`,
+     `think_low_level()`, `prepare_movement()`, then `propose_move(static_cache)`
+     — a **static-only** validated step recorded in the actor's [`ActorShadow`].
+     Off-screen actors `advance_unchecked`; re-entrants are queued.
+   - **Resolve**: creature-on-creature conflicts are resolved over a per-frame
+     owner grid (entity-sorted, deterministic).
+   - **Apply + commit**: each outcome is applied and every final footprint is
+     stamped into the passability write buffer.
+   - **Re-entry placement**: off-screen re-entrants are teleported to a free cell.
+3. Field interactions (e.g. dirt) — after movement; see `docs/field-interactions.md`.
 
 Movement for frame `N` writes occupancy into the passability write buffer, and
 that occupancy becomes visible from the read buffer after the flush at the start
@@ -98,14 +99,14 @@ Canonical API: [`actor_main_tile`](../src/actor/mod.rs) and [`ActorState::main_t
 
 Do **not** use `floor(center)` for main-tile or field logic — an actor spawned at tile center `(0.5, 0.5)` would be assigned the wrong tile. Subtile collision intentionally keeps `floor` so the footprint stays inside the subtile that contains the float position.
 
-After [`arbitrate_actor_moves`](../src/actor/movement.rs), [`dirt_actor_interaction`](../src/map/field_interactions.rs) updates `field_main_tile` and applies field rules to the tile the actor **left** when main tile changes. See `docs/field-interactions.md`.
+After [`process_actor_moves`](../src/actor/movement.rs), [`dirt_actor_interaction`](../src/map/field_interactions.rs) updates `field_main_tile` and applies field rules to the tile the actor **left** when main tile changes. See `docs/field-interactions.md`.
 
 ## Charge
 
 Every bot entity carries a [`Charge`](../src/actor/charge.rs) component — a
 battery `level` in `[0.0, 1.0]` that drains over time. A depleted bot is
 immobilized **in its think system** (zeroing `move_buffer`), not in
-`propose_actor_moves` — see [`charge.md`](charge.md) for the full system, including
+`process_actor_moves` — see [`charge.md`](charge.md) for the full system, including
 why the gate must live in `think`, the discharge rate, spawn ranges, inspector
 display, and persistence.
 
@@ -166,35 +167,40 @@ microseconds for the whole crowd, and keeping it off Bevy's global
 `par_iter_mut` version absorb unrelated compute work (see `docs/movement.md`
 and `OPTIMIZATION.md`).
 
-### Arbitration — `OccupancyArbiter`
+### Resolve — owner grid
 
-`arbitrate_actor_moves` (sequential, entity-sorted for determinism) stamps every
-proposal into a reused per-frame **owner grid** (a flat lock-free
-`HashMap<IVec2, u32>` from world-subtile to actor slot index — the arbiter is
-sequential, so no chunked/locked structure is needed). Footprints travel as
-compact `(center, radius)` circles end-to-end. For each actor in order:
+The resolve stage (entity-sorted for determinism) uses a reused per-frame
+**owner grid** (a flat lock-free `HashMap<IVec2, u32>` from world-subtile to
+actor slot index — the pass is sequential, so no chunked/locked structure is
+needed). Footprints travel as compact `(center, radius)` circles end-to-end. The
+pure resolver (`arbitrate`) first **pre-stamps every actor's currently-occupied
+footprint**, then for each actor in order:
 
+- it releases its own origin (so a small overlapping step never self-blocks);
 - if its proposed cells are all free, it takes them;
-- if a cell is owned by another actor, it is **backed off** to its previous
-  footprint and marked collided (`BlockedByOccupancy`). If the previous footprint
-  also conflicts, the *touched* actor is recursively backed off to **its**
-  previous footprint (depth-capped at 4); a still-wedged actor at the cap is
-  pushed to the squeeze pool.
+- if a cell is owned by another actor, it **holds at its origin** and is marked
+  collided (`BlockedByOccupancy`).
 
-This makes occupancy authoritative **within** the frame — two actors can never
-overlap, unlike the old read-snapshot model where both stepped into a free cell
-and resolved a frame late. Accepted footprints are then stamped into the dynamic
-**write** buffer (`commit_footprint`) so the brain's avoidance views and the async
-pathfinder read identical occupancy after the next flush.
+Pre-stamping makes the occupant of a cell unbeatable: a mover can never claim a
+cell another actor still holds, and every actor always has its own origin to fall
+back to. So occupancy is authoritative **within** the frame — two actors can
+never overlap — **and no jam ever needs a teleport**: there is no back-off
+cascade, no depth cap, and no squeeze pool (cf. the old two-system design). A
+follower processed before its leader holds for one frame (the *train ripple* in
+`docs/movement.md`), never overlapping.
 
-### Apply + squeeze
+Accepted footprints are then stamped into the dynamic **write** buffer
+(`commit_footprint`) so the brain's avoidance views and the async pathfinder read
+identical occupancy after the next flush.
+
+### Apply + re-entry
 
 In the same sequential system: placed actors advance (`center += proposed_delta`,
 `last_accepted_center_subtile = proposed_center`, rotation applied); collided
 actors hold position and surface `last_movement_error` for the brain to react to
-next frame; squeezed actors (and off-screen re-entrants) are teleported to a free
-cell by `resolve_offscreen_collision` (the only non-local move), logged as
-`BotSqueezedOut`.
+next frame; off-screen re-entrants are teleported to a free cell by
+`resolve_offscreen_collision` (the only non-local move) and flagged
+`shadow.teleported` so the brain re-routes from the landing spot.
 
 ### Grid position vs float center
 
@@ -255,15 +261,15 @@ collision cost proportional to the *visible* actor set, not the whole world.
 
 On the single frame an actor crosses **off-screen → on-screen**, it is placed
 back into a free cell by `resolve_offscreen_collision` (current cell →
-`next_waypoint_hint` → expanding tile ring r=1..5). This runs inside the
-sequential arbitration system, after every on-screen actor's new footprint has
-been stamped into the **write** buffer, over only the actors that re-entered this
-frame (collected during the parallel propose pass, sorted by entity). Each
+`next_waypoint_hint` → expanding tile ring r=1..5). This runs as the last stage
+of `process_actor_moves`, after every on-screen actor's footprint has been
+stamped into the **write** buffer, over only the actors that re-entered this
+frame (collected during the think + propose stage, sorted by entity). Each
 placement uses `DynamicPassabilityMap::try_claim_reentry_footprint`, which also
 probes the **write** buffer and commits its claim there — so a re-entrant avoids
 both the on-screen actors' new footprints and earlier re-entrants' just-claimed
-cells. Squeeze-pool actors (wedged past the back-off depth cap) are placed by the
-same routine and logged as `BotSqueezedOut`.
+cells. Re-entry is the **only** teleport left in the system (the old jam-recovery
+squeeze pool is gone — see `docs/movement.md` § *Why no teleport*).
 
 ### Per-actor static passability
 
@@ -361,7 +367,7 @@ impl Actor for Flier {
     }
 }
 
-// In a Bevy system (runs before `propose_actor_moves`):
+// In a Bevy system (runs before `process_actor_moves`):
 fn walker_think(time: Res<Time>, mut q: Query<(&mut ActorObject, &mut WalkerVisual)>) {
     let dt = time.delta_secs();
     let subtile_to_tile = 1.0 / SUBTILE_COUNT as f32;
@@ -420,13 +426,13 @@ Use this when introducing a new actor class:
   - [ ] `prepare_movement()` to fill `move_buffer`
   - [ ] **Decide static traversal rules** and override `blocked_flags()` if the actor is not a plain ground walker (fliers, swimmers, phasers, wall-runners…).
   - [ ] Override `propose_move()` if axis-decomposed wall-sliding or a special footprint shape is needed (default: axis-combined, no slide).
-- [ ] Do not mutate `center` directly in gameplay systems; `arbitrate_actor_moves` applies accepted motion.
+- [ ] Do not mutate `center` directly in gameplay systems; `process_actor_moves` applies accepted motion.
 - [ ] Write both channels every frame:
   - [ ] `tile_delta` — exact float displacement in tile-space (`direction * speed * dt / SUBTILE_COUNT`)
   - [ ] `subtile_shift` — integer steps from an accumulator (only non-zero on subtile boundary crossings)
 - [ ] Remember `1 tile = 5 subtiles`.
 - [ ] Spawn the actor as `ActorObject::new(Box::new(...))` and add a `Name`.
-- [ ] If the actor has a brain plugin, wire it `.before(propose_actor_moves)` and `.after(arbitrate_actor_moves)`.
+- [ ] If the actor has a brain plugin, wire it `.before(process_actor_moves)` and `.after(process_actor_moves)`.
 - [ ] Add/adjust unit tests for:
   - [ ] successful `propose_move` (`shadow.proposed_center` / `shadow.origin` match the expected centers)
   - [ ] dynamic-occupancy blocked path (`BlockedByOccupancy` after arbitration)

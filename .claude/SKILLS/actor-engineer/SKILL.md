@@ -25,14 +25,18 @@ paths:
 Use this skill for:
 
 - `Actor` trait design and default method behavior.
-- The 3-step arbitrated movement pipeline: `propose_actor_moves` (sequential —
-  off the global `ComputeTaskPool` on purpose), `arbitrate_actor_moves`
-  (sequential), and the squeeze/teleport tail.
+- The single-pass movement system `process_actor_moves` (sequential — off the
+  global `ComputeTaskPool` on purpose): think + propose, owner-grid resolution,
+  apply + commit, and the off-screen re-entry tail. Collision detection is merged
+  into the proposal pass; there is **no** separate arbitrate system, no back-off
+  cascade, and no squeeze/teleport jam pool (see `docs/movement.md`).
 - Movement/rotation buffers and per-frame error handling.
 - `ActorShadow` — per-actor shadow arrays (`current`/`previous` subtile coords)
   swapped each accepted frame; allocated once at spawn.
-- `OccupancyArbiter` — per-frame owner grid resource; deterministic conflict
-  resolution, bounded backoff (depth ≤ 4), squeeze-pool teleport fallback.
+- `OccupancyArbiter` — reused per-frame scratch (owner grid, move records, entity
+  list, re-entry list); deterministic entity-sorted conflict resolution. Pre-stamps
+  every actor's current footprint so an occupant always keeps its cell and every
+  actor can fall back to its own origin — no back-off cascade, no squeeze teleport.
 - Footprint-based collision and occupancy updates via `DynamicPassabilityMap`.
 - **Per-actor static traversal rules** via `Actor::blocked_flags()` — a bitmask
   of `SubtilePassability` flags the actor cannot enter (ground walkers block on

@@ -27,21 +27,6 @@ use crate::scene::camera::{spawn_camera, StrategyCameraRig};
 
 #[derive(Clone, Copy)]
 pub enum TimedSystem {
-    Propose,
-    /// Wall-clock of the `par_iter_mut` call alone. When this spikes while
-    /// `ProposeBody` stays flat, the time went to task-pool dispatch — the
-    /// waiting thread can pick up and run an unrelated queued task (e.g. a
-    /// chunk-mesh system), which bills that task's duration here.
-    ProposePar,
-    /// Aggregate CPU of the whole per-actor closure (superset of
-    /// think/slide/advance — any gap is per-actor work outside those three).
-    ProposeBody,
-    ProposeThink,
-    ProposeSlide,
-    ProposeAdvance,
-    ArbConflict,
-    ArbApply,
-    ArbSqueeze,
     /// `update_visible_hypermap_chunks` — chunk visibility / load queueing.
     ChunkVisibility,
     /// `render_chunks_30fps` — chunk mesh build + spawn/despawn.
@@ -73,17 +58,8 @@ pub enum TimedSystem {
 }
 
 impl TimedSystem {
-    pub const COUNT: usize = 23;
+    pub const COUNT: usize = 14;
     const LABELS: [&'static str; Self::COUNT] = [
-        "propose",
-        "prop_par",
-        "prop_body",
-        "prop_think",
-        "prop_slide",
-        "prop_adv",
-        "arb_conflict",
-        "arb_apply",
-        "arb_squeeze",
         "chunk_vis",
         "chunk_render",
         "chunk_floors",
@@ -113,10 +89,9 @@ pub struct PerfCounts {
     pub coasting_bots: AtomicU64,
     /// Bots ticked by the brain this frame.
     pub total_bots: AtomicU64,
-    /// Actors backed off to their previous footprint this frame (arbiter).
+    /// Actors that held at their previous footprint this frame (occupancy
+    /// conflict resolved by the movement pass).
     pub collided_bots: AtomicU64,
-    /// Actors teleported out of a jam this frame (arbiter squeeze pool).
-    pub squeezed_bots: AtomicU64,
 }
 
 #[derive(Resource)]
@@ -242,13 +217,12 @@ fn update_perf_timings(
         ));
     }
     out.push_str(&format!(
-        "pf q={} fly={} coast={}/{}\ncollide={} squeeze={}\n",
+        "pf q={} fly={} coast={}/{}\ncollide={}\n",
         counts.pf_pending.load(Ordering::Relaxed),
         counts.pf_in_flight.load(Ordering::Relaxed),
         counts.coasting_bots.load(Ordering::Relaxed),
         counts.total_bots.load(Ordering::Relaxed),
         counts.collided_bots.load(Ordering::Relaxed),
-        counts.squeezed_bots.load(Ordering::Relaxed),
     ));
     **text = out;
 }

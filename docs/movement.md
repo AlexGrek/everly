@@ -1,32 +1,39 @@
 # Bot movement
 
 How an actor's movement intent becomes a position change, end to end. This is
-the deep reference for the **arbitrated movement pipeline** in
+the deep reference for the **single-pass movement pipeline** in
 `src/actor/movement.rs`; the surrounding actor runtime (trait, state, spawning)
 is documented in `docs/actor.md`, and the planning layer that decides *where* a
 bot wants to go is in `docs/actor-brain.md` / `docs/pathfind-service.md`.
 
 ## Design summary
 
-Movement is split into three phases per frame:
+All movement for one frame happens in a **single sequential system**,
+`process_actor_moves`. Per frame, in four stages:
 
-1. **Propose** (sequential) — every on-screen actor computes one candidate
-   step, validated against **static** geometry only.
-2. **Arbitrate** (sequential, deterministic) — a single authority resolves all
-   actor-vs-actor occupancy conflicts within the frame.
-3. **Apply + squeeze** (inside the arbitrate system) — outcomes are written
-   back to the actors; hopelessly wedged bots are teleported out.
+1. **Think + propose** — every on-screen actor computes one candidate step,
+   validated against **static** geometry only, and records it compactly in its
+   `ActorShadow`. Off-screen actors `advance_unchecked` (no collision);
+   re-entrants are queued.
+2. **Resolve** (deterministic, entity-sorted) — actor-vs-actor occupancy is
+   resolved within the frame over a reused **owner grid**.
+3. **Apply + commit** — outcomes are written back to the actors and every final
+   footprint is stamped into the dynamic passability write buffer.
+4. **Re-entry placement** — actors returning from off-screen travel are placed
+   on a free cell.
 
-The split exists because propose is read-only against the static geometry
-(each actor touches only its own state) while arbitrate is the single authority
-over shared occupancy — two bots must never hold the same subtile in the same
-frame, so it is resolved by one thread in a deterministic order. The previous
-design (each actor checking last frame's occupancy snapshot and OR-stamping its
-footprint in parallel) let two actors claim the same free cell and overlap for
-a frame, and its contended parallel writes were the biggest per-frame hot spot
-(see `OPTIMIZATION.md`).
+This replaces the older "propose then arbitrate" two-system split. Because the
+propose step was already sequential (see below), there is no benefit to keeping
+collision detection in a separate pass — merging it lets the resolve stage
+commit each actor's footprint as it goes, which removes the back-off cascade and
+the squeeze/teleport jam-recovery logic entirely (see *Why no teleport*).
 
-> **Why propose is sequential, not `par_iter_mut`.** The per-bot work is a
+The old parallel design (each actor checking last frame's occupancy snapshot and
+OR-stamping its footprint in parallel) let two actors claim the same free cell
+and overlap for a frame, and its contended parallel writes were the biggest
+per-frame hot spot (see `OPTIMIZATION.md`).
+
+> **Why the pass is sequential, not `par_iter_mut`.** The per-bot work is a
 > single static slide probe — single-digit microseconds for the whole crowd.
 > Running it on Bevy's global `ComputeTaskPool` (via `par_iter_mut`) was a net
 > loss: that pool's `scope` ticks the *global* executor while waiting for its
@@ -34,7 +41,7 @@ a frame, and its contended parallel writes were the biggest per-frame hot spot
 > batching, etc.) and, at 60 Hz fixed catch-up ticks, compounded into
 > frame-rate-coupled stalls. Sequential execution on the main thread removes the
 > coupling for no measurable compute cost. A private thread pool would isolate
-> propose too, but only matters if per-bot work grows heavy (hundreds of bots);
+> the work too, but only matters if per-bot work grows heavy (hundreds of bots);
 > at this scale it adds `unsafe` query chunking and core contention for nothing.
 
 ## Tick lifecycle — fixed 60 Hz
@@ -42,7 +49,7 @@ a frame, and its contended parallel writes were the biggest per-frame hot spot
 The whole pipeline runs on Bevy's **`FixedUpdate` schedule at 60 Hz**
 (`Time::<Fixed>::from_hz(60.0)` in `GamePlugin`), decoupled from the render
 frame rate: a slow render frame runs extra fixed ticks to catch up, so bot
-pace never depends on fps. Inside `FixedUpdate`, `Res<Time>` yields the fixed`
+pace never depends on fps. Inside `FixedUpdate`, `Res<Time>` yields the fixed
 `dt` automatically.
 
 ```
@@ -55,9 +62,7 @@ FixedUpdate (×N per render frame, 60 Hz real-time)
     ↓
   pathfind_dispatch            spawn queued searches (≤10 in flight)
     ↓
-  propose_actor_moves          PHASE 1 (sequential)
-    ↓
-  arbitrate_actor_moves        PHASES 2 + 3 (sequential)
+  process_actor_moves          think + propose + resolve + apply + re-entry
     ↓
   dirt_actor_interaction, …    field deposits read final positions
 
@@ -88,26 +93,28 @@ computes the candidate grid cell as `last_accepted_center_subtile +
 subtile_shift` — never by re-quantizing the float center, which can round into
 a wall.
 
-## Phase 1 — propose (sequential)
+## Stage 1 — think + propose
 
-`propose_actor_moves` iterates all actors on the main thread. Per actor:
+`process_actor_moves` iterates all actors on the main thread. Per actor:
 
 1. Clear `last_movement_error` and the per-frame shadow flags.
 2. `think_low_level()` + `prepare_movement()` — light per-frame logic that
    fills `move_buffer` (heavy planning happened earlier in the brain system).
 3. Branch on visibility:
-   - **On-screen** → `Actor::propose_move(static_cache)`.
+   - **On-screen** → `Actor::propose_move(static_cache)`, then queued as a
+     resolution participant.
    - **Off-screen** → `advance_unchecked()` (move freely, no collision, no
      occupancy footprint) and tag with `OffScreenActor`.
    - **Re-entering** (was off-screen, now on a rendered chunk) → queued for
-     sequential placement in phase 3; no proposal this frame.
+     placement in stage 4; no proposal this frame.
+
+This stage touches only each actor's own state plus the read-only static cache,
+so it is order-independent (the order-sensitive work is stage 2).
 
 `propose_move` validates the candidate step against the **static subtile
 cache only** (`first_static_block`) — walls and void, filtered through the
 actor's `blocked_flags()` (ground walkers block on `FLAG_BLOCKED | FLAG_VOID`,
-flyers on `FLAG_BLOCKED` only). It never touches the dynamic occupancy map, so
-the whole phase takes no contended locks: static chunks are reached through
-the lock-free `ArcSwap` snapshot and read under uncontended per-chunk locks.
+flyers on `FLAG_BLOCKED` only). It never touches the dynamic occupancy map.
 
 The default `propose_move` tests the combined `(dx, dy)` footprint and cancels
 the whole step if blocked. `BlackBot` overrides it with an axis-decomposed
@@ -118,7 +125,7 @@ wall; the first blocked axis is reported as `BlockedByStatic`.
 The result is recorded compactly in the actor's `ActorShadow`:
 
 - `proposed_center: IVec2` — candidate footprint center (post-slide);
-- `origin: IVec2` — the last accepted center, i.e. the back-off target;
+- `origin: IVec2` — the last accepted center, i.e. the hold-in-place target;
 - `proposed_delta / proposed_rotation` — float motion to apply on success;
 - `static_block` — first statically blocked cell, if the slide clipped one;
 - `participates = true`.
@@ -128,46 +135,68 @@ circle of `radius_subtiles` around a center (`baked_circle_shadow`, `&'static`
 offsets), so `(center, radius)` is the entire representation — see
 `OPTIMIZATION.md` rule 4.
 
-## Phase 2 — arbitrate (sequential, deterministic)
+## Stage 2 — resolve (sequential, deterministic)
 
-`arbitrate_actor_moves` collects every participating actor, sorts by `Entity`
-(so the outcome is independent of phase-1 thread scheduling), and snapshots
-each one into a plain-`Copy` `MoveRecord { current, previous, radius, … }`.
-All scratch (`records`, `entities`, squeeze pool, owner grid) lives in the
-reused `OccupancyArbiter` resource — steady state allocates nothing.
+The participating actors are sorted by `Entity` (so the outcome is independent
+of any iteration order) and snapshotted into plain-`Copy`
+`MoveRecord { current, previous, radius, … }`. All scratch (`records`,
+`entities`, owner grid, re-entry list) lives in the reused `OccupancyArbiter`
+resource — steady state allocates nothing.
 
 Conflicts are resolved over the **owner grid**: a flat foldhash
 `HashMap<IVec2, u32>` mapping each claimed world-subtile to the dense record
-index that owns it (sequential pass → no locks needed). For each record in
-order:
+index that owns it (sequential pass → no locks needed). The pure resolver
+(`arbitrate`) works in two sweeps:
 
-- **No foreign cell in its proposed footprint** → stamp it; the actor advances.
-- **Conflict** → the actor is marked `collided` and backed off to its
-  `previous` footprint via `back_off`:
-  1. Unstamp anything the actor already placed.
-  2. Try to stamp its `previous` footprint.
-  3. If some other actor `j` occupies one of those cells, mark `j` collided
-     and recursively back `j` off to *its* previous footprint, then rescan.
-  4. Recursion is capped at `MAX_BACKOFF_DEPTH` (4). An actor touched at the
-     cap — or one that keeps re-landing on the same contested cell (cycle
-     guard) — is **unplaced and pushed to the squeeze pool** instead.
+1. **Pre-stamp** every actor's `previous` (currently-occupied) footprint into
+   the grid. The `previous` footprints are last frame's accepted positions, so
+   they are pairwise disjoint.
+2. **Resolve** each record in entity order:
+   - Release the actor's own `previous` footprint (so a small,
+     footprint-overlapping step never blocks on itself).
+   - **No foreign cell in its proposed footprint** → stamp `current`; the actor
+     advances.
+   - **Conflict** → stamp `previous` back; the actor is marked `collided` with
+     the conflicting cell and **holds in place**.
 
-Invariants: at most one owner per subtile at every step; a backed-off actor's
-old cells are always cleared before re-placement (no ghost ownership); the
-whole resolution is a pure function over `records` (unit-tested directly in
-`movement.rs`).
+### Why no teleport
 
-## Phase 3 — apply + squeeze
+Because every actor's currently-occupied footprint is pre-stamped:
 
-Still inside `arbitrate_actor_moves`, in entity order:
+- A mover can never claim a cell another actor still occupies — the **occupant
+  always keeps its spot**, regardless of entity order. (A mover that wants an
+  occupant's cell holds for that frame; if the occupant later vacates, the mover
+  advances next frame.)
+- Every actor always has its **own origin** to fall back to (it owns it, and
+  only releases it momentarily before re-claiming on a conflict), so there is
+  never a wedged actor with nowhere to go.
 
-- **Advanced** (placed at `current`): `center += proposed_delta`,
+That removes the entire jam-recovery machinery the old two-system design
+needed — no recursive back-off cascade, no depth cap, and **no squeeze/teleport
+pool**. The only remaining teleport is off-screen re-entry (stage 4), which is
+unrelated to jams.
+
+**Train ripple.** A line of bots all stepping the same direction flows
+smoothly, but a follower processed *before* its leader (lower `Entity`) sees the
+leader's not-yet-vacated cell as occupied and holds for a single frame; it
+advances the next frame once the leader has moved. This one-frame ripple is
+imperceptible at 60 Hz and is the price of the simpler, overlap-free model — it
+never produces an overlap.
+
+Invariants: at most one owner per subtile at every step; the resolution is a
+pure function over `records` (unit-tested directly in `movement.rs`).
+
+## Stage 3 — apply + commit
+
+In entity order, each outcome is written back to the actor:
+
+- **Advanced**: `center += proposed_delta`,
   `last_accepted_center_subtile = proposed_center`, rotation applied. If the
   slide clipped a wall, `last_movement_error = BlockedByStatic`.
-- **Collided** (placed at `previous`): position holds; `last_movement_error =
-  BlockedByOccupancy { conflict_cell }`. Reaction is owned by the existing
-  brain machinery next frame (re-route, collision pressure, status flash) —
-  the pipeline itself never invents avoidance. The brain's `FollowPath` follows a
+- **Collided**: position holds; `last_movement_error =
+  BlockedByOccupancy { conflict_cell }`. Reaction is owned by the existing brain
+  machinery next frame (re-route, collision pressure, status flash) — the
+  pipeline itself never invents avoidance. The brain's `FollowPath` follows a
   **single unified path of cell + subcell nodes** (`PathNode`); a bump first
   splices a local subtile detour inline, and a stall first tries a local
   splice-repair, before escalating. A genuine head-on wedge that cannot be
@@ -176,20 +205,24 @@ Still inside `arbitrate_actor_moves`, in entity order:
   avoids the tiles other bots currently occupy); this fires both on
   collision-pressure saturation and on a sustained no-progress stall that loops
   inside recovery maneuvers — see `docs/actor-brain.md`.
-- **Squeezed** (not placed): handled below.
 
-Every placed footprint is stamped into the dynamic passability **write**
-buffer via `commit_footprint` (`FLAG_BLOCKED | FLAG_CREATURE`), so after the
-next `flush` the brain's avoidance views and the async pathfinder see exactly
-the occupancy the arbiter decided.
+Every final footprint (the `current` cell on advance, the `previous` cell on a
+hold) is stamped into the dynamic passability **write** buffer via
+`commit_footprint` (`FLAG_BLOCKED | FLAG_CREATURE`), so after the next `flush`
+the brain's avoidance views and the async pathfinder see exactly the occupancy
+the movement pass decided.
 
-**Squeeze + re-entry:** squeeze-pool actors and off-screen re-entrants are
-placed sequentially (sorted by entity) by `resolve_offscreen_collision` — an
-expanding ring search for the nearest statically-and-dynamically free cell.
-This teleport is the only non-local move in the system and is the documented
-last resort for unresolvable jams; each squeeze emits a `BotSqueezedOut` game
-log entry and sets `shadow.teleported`, which the BlackBot brain uses to
-re-plan from the new position.
+## Stage 4 — re-entry placement
+
+Off-screen re-entrants (was off-screen, now on a rendered chunk) are placed
+sequentially (sorted by entity) by `resolve_offscreen_collision` — an expanding
+ring search for the nearest statically-and-dynamically free cell. The write
+buffer already holds this frame's footprints, so a re-entrant never lands on a
+placed actor. This teleport is the only non-local move in the system; it exists
+solely because off-screen actors travel **without collision detection against
+dynamic objects** and may re-enter sitting inside static geometry. Each placed
+re-entrant sets `shadow.teleported`, which the BlackBot brain uses to drop its
+stale plan and re-route from the new position.
 
 ## Occupancy storage
 
@@ -197,61 +230,25 @@ The dynamic occupancy map (`DynamicPassabilityMap`) is a double-buffered,
 single-floor subtile hypermap. Each frame `flush_actor_occupancy` promotes the
 write buffer to the read side; the write side starts clean and receives only
 this frame's accepted footprints. Reads during planning therefore see a
-consistent snapshot of *last* frame's occupancy, while the arbiter is the only
-within-frame authority. Flushed chunks are recycled through a pool with
+consistent snapshot of *last* frame's occupancy, while `process_actor_moves` is
+the only within-frame authority. Flushed chunks are recycled through a pool with
 dirty-cell spot-resetting, so the per-frame buffer cycle allocates nothing at
 steady state (see `OPTIMIZATION.md`, "Dynamic passability — single-floor
 chunks + recycled flush").
 
 ## Determinism
 
-- Phase 1 is sequential and each actor touches only its own state.
-- Phase 2/3 process in sorted-entity order, so results are reproducible.
+- Stage 1 each actor touches only its own state.
+- Stage 2/3 process in sorted-entity order, so results are reproducible.
 - Bot RNG lives in the sequential brain system and is seeded (`StdRng`).
 - The only non-determinism in the wider movement stack is the **arrival
   frame** of async pathfind results (`docs/pathfind-service.md`).
-
-## Performance instrumentation
-
-The HUD (`src/hud/perf_timings.rs`) shows per-stage timings under the FPS
-counter, `last ^peak` (peaks hold for 1 s):
-
-| Row | Meaning |
-|---|---|
-| `propose` | wall-clock of the whole propose system |
-| `prop_par` | wall-clock of the per-actor loop (≡ `prop_body` now propose is sequential) |
-| `prop_body` | total CPU of the per-actor loop body |
-| `prop_think` | `think_low_level` + `prepare_movement` |
-| `prop_slide` | `propose_move` static slides |
-| `prop_adv` | off-screen `advance_unchecked` |
-| `arb_conflict` | collect + sort + snapshot + owner-grid resolution |
-| `arb_apply` | outcome application + dynamic-buffer stamping |
-| `arb_squeeze` | squeeze/re-entry teleports |
-| `chunk_vis` | `update_visible_hypermap_chunks` (visibility / load queueing) |
-| `chunk_render` | `render_chunks_30fps` (chunk mesh build + spawn/despawn) |
-| `chunk_floors` | floor-switch remesh |
-| `brain` | `black_bot_brain` sequential planning tick |
-| `pf_dispatch` / `pf_collect` | async pathfind queue spawn / drain |
-| `f_dirt` / `f_heat` | per-bot field deposits |
-| `dirt_flush` / `temp_flush` | field double-buffer flushes |
-| `t_diffuse` | GPU temperature diffusion tick |
-| `ovl_*` | occupancy / generic overlay rebuilds |
-
-Plus two gauge lines: `pf q=… fly=… coast=…/…` (pathfind queue depth /
-in-flight / coasting bots) and `collide=… squeeze=…` (arbiter back-offs /
-teleports this tick).
-
-`prop_par` and `prop_body` should now track each other. A divergence means
-something re-introduced pool coupling into propose (e.g. switching it back to
-`par_iter_mut`): the loop would again tick the global `ComputeTaskPool`
-executor and bill unrelated queued compute (chunk meshing, render prep) to the
-propose pass — historically the cause of the frame-rate-coupled propose spike.
 
 ## Where things live
 
 | Concern | File |
 |---|---|
-| Pipeline systems, owner grid, arbitration core | `src/actor/movement.rs` |
+| Movement system, owner grid, resolution core | `src/actor/movement.rs` |
 | `Actor` trait, `ActorState`, default `propose_move`, off-screen advance | `src/actor/mod.rs` |
 | BlackBot slide override, brain integration | `src/actor/black_bot.rs` |
 | Static probe, dynamic buffer, footprint stamping, baked circles | `src/map/passability.rs` |

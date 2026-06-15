@@ -1,51 +1,50 @@
-//! Arbitrated movement pipeline shared by every actor.
+//! Single-pass sequential movement pipeline shared by every actor.
 //!
-//! Replaces the old per-actor `try_move` (each actor checked last frame's
-//! occupancy snapshot and OR-stamped its footprint in parallel, so two actors
-//! could step into the same free cell and overlap for a frame). The new model
-//! resolves occupancy **authoritatively within the frame** in three phases:
+//! Replaces the old two-system "propose then arbitrate" split. Because the
+//! propose step is already sequential (single-threaded — see the rationale in
+//! `docs/movement.md`), collision detection is merged into the same pass: every
+//! on-screen actor proposes its step and is placed against a within-frame owner
+//! grid in one deterministic, entity-sorted sweep.
 //!
-//! 1. [`propose_actor_moves`] (parallel) — each on-screen actor runs
-//!    `think_low_level` + `prepare_movement` + [`Actor::propose_move`], which
-//!    validates the step against **static** geometry only (read-only, lock-free)
-//!    and records its proposed footprint compactly in [`ActorShadow`]
-//!    (`proposed_center` / `origin` + radius — never explicit cell lists).
-//!    Off-screen actors `advance_unchecked`; re-entrants are queued.
-//! 2. [`arbitrate_actor_moves`] (sequential) — the [`OccupancyArbiter`] stamps
-//!    every proposal into an **owner grid** in a deterministic (entity-sorted)
-//!    order. A cell already owned by another actor is a conflict: the moving
-//!    actor is backed off to its previous footprint and marked collided; if the
-//!    previous footprint also conflicts, the *touched* actor is recursively
-//!    backed off (depth-capped at [`MAX_BACKOFF_DEPTH`]); a still-wedged actor at
-//!    the cap goes to the squeeze pool.
-//! 3. Apply + squeeze (still inside [`arbitrate_actor_moves`]) — placed actors
-//!    advance, collided actors hold and surface a movement error for the brain to
-//!    react to next frame, and squeezed actors / re-entrants are teleported to a
-//!    free cell ([`super::resolve_offscreen_collision`]).
+//! The pass works in four stages inside [`process_actor_moves`]:
 //!
-//! Accepted footprints are stamped into the [`DynamicPassabilityMap`] write
-//! buffer exactly as before, so the brain's avoidance views and the async
-//! pathfinder keep reading the same occupancy after the next `flush`.
+//! 1. **Think + propose** (any order) — each actor runs `think_low_level` +
+//!    `prepare_movement` + [`Actor::propose_move`], which validates the step
+//!    against **static** geometry only and records its proposed footprint
+//!    compactly in [`ActorShadow`] (`proposed_center` / `origin` + radius — never
+//!    explicit cell lists). Off-screen actors `advance_unchecked` (no collision);
+//!    re-entrants are queued.
+//! 2. **Resolve** (sequential, entity-sorted) — every participant's *current*
+//!    (last-accepted) footprint is pre-stamped into the [`OwnerGrid`], then each
+//!    actor in turn releases its own origin and tries to claim its proposed
+//!    footprint. If any cell is owned by another actor it **holds at its origin**
+//!    and is marked collided. Because origins are pre-stamped, a mover can never
+//!    steal a cell another actor still occupies, and every actor always has its
+//!    own origin to fall back to — so **no teleport/squeeze is ever needed** for
+//!    a jam (cf. the old back-off cascade + squeeze pool).
+//! 3. **Apply + commit** — placed actors advance; collided actors hold and
+//!    surface a `BlockedByOccupancy` error for the brain to react to next frame.
+//!    Every final footprint is stamped into the [`DynamicPassabilityMap`] write
+//!    buffer so the brain's avoidance views and the async pathfinder keep reading
+//!    the same occupancy after the next `flush`.
+//! 4. **Re-entry placement** — actors that just re-entered a rendered chunk from
+//!    off-screen travel are teleported to a free cell
+//!    ([`super::resolve_offscreen_collision`]). This is the only remaining
+//!    non-local move, and it exists solely because off-screen actors travel
+//!    without collision and may re-enter sitting inside static geometry.
 
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 use bevy::prelude::*;
 use bevy::platform::collections::HashMap;
 
-use crate::hud::game_log::{GameLog, LogEntry};
-use crate::hud::perf_timings::{PerfCounts, SystemTimings, TimedSystem};
+use crate::hud::perf_timings::PerfCounts;
 use crate::map::hypermap_world::HypermapRuntime;
 use crate::map::passability::{baked_circle_shadow, DynamicPassabilityMap};
 
 use super::{
     resolve_offscreen_collision, Actor, ActorMovementError, ActorObject, OffScreenActor,
 };
-
-/// Maximum depth of the back-off cascade. When resolving a conflict at this
-/// depth, the touched actor is squeezed (its footprint removed) instead of being
-/// backed off further. Matches the spec's "step 4" cap.
-pub const MAX_BACKOFF_DEPTH: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // Per-actor shadow + transient proposal state
@@ -56,29 +55,30 @@ pub const MAX_BACKOFF_DEPTH: u32 = 4;
 /// on construction and **not** serialized.
 ///
 /// Footprints are always baked circles, so they are stored compactly as a
-/// center (`origin` for the back-off target, `proposed_center` for this frame's
+/// center (`origin` for the fall-back target, `proposed_center` for this frame's
 /// candidate) plus the actor's `radius_subtiles` — never as explicit cell lists
 /// (OPTIMIZATION rule 4).
 #[derive(Debug, Clone, Default)]
 pub struct ActorShadow {
-    /// Grid center of the last accepted footprint — the fall-back target an
-    /// actor is backed off to on a dynamic conflict.
+    /// Grid center of the last accepted footprint — the cell an actor holds at
+    /// when its proposed step is blocked by another actor.
     pub origin: IVec2,
-    /// Float `center` one frame ago — momentum seed for a squeeze teleport.
+    /// Float `center` one frame ago — momentum seed for a re-entry teleport.
     pub world_previous: Vec2,
-    /// Proposed grid center this frame (Step 1 output, after the static slide).
+    /// Proposed grid center this frame (stage 1 output, after the static slide).
     pub proposed_center: IVec2,
     /// Float `center` delta applied if the proposal is accepted (after slide).
     pub proposed_delta: Vec2,
     /// Rotation delta to apply this frame.
     pub proposed_rotation: f32,
     /// `true` once a valid on-screen proposal was produced this frame, so the
-    /// actor participates in occupancy arbitration.
+    /// actor participates in occupancy resolution.
     pub participates: bool,
     /// First statically-blocked subtile found during the proposal, if any.
     pub static_block: Option<IVec2>,
-    /// Set by the squeeze pass when the actor was teleported out of a jam, so a
-    /// planner (e.g. the BlackBot brain) can re-plan from the new position.
+    /// Set by the re-entry pass when the actor was teleported to a free cell
+    /// after off-screen travel, so a planner (e.g. the BlackBot brain) can drop
+    /// its stale plan and re-route from the new position.
     pub teleported: bool,
 }
 
@@ -87,9 +87,9 @@ pub struct ActorShadow {
 // ---------------------------------------------------------------------------
 
 /// Flat map from absolute world-subtile to the actor slot index that owns it
-/// during one arbitration pass. Absent entries are free.
+/// during one resolution pass. Absent entries are free.
 ///
-/// The arbiter is entirely sequential so no locking is needed — all the
+/// The pass is entirely sequential so no locking is needed — all the
 /// `RwLock`/`Arc`/`ArcSwap` overhead of a `Hypermap`-backed grid is replaced
 /// by a plain foldhash `HashMap` (rule 1: SipHash is ~3× slower per op for
 /// 8-byte keys and buys nothing single-threaded). Footprints arrive compactly
@@ -150,142 +150,87 @@ impl OwnerGrid {
 }
 
 // ---------------------------------------------------------------------------
-// Pure arbitration core
+// Pure resolution core
 // ---------------------------------------------------------------------------
 
-/// One actor's footprint candidates and arbitration outcome for a frame.
+/// One actor's footprint candidates and resolution outcome for a frame.
 /// Footprints are compact `(center, radius)` circles (rule 4) — plain `Copy`
 /// data, no per-record buffers.
 #[derive(Default, Clone, Copy)]
 pub struct MoveRecord {
     /// Proposed footprint center this frame.
     pub current: IVec2,
-    /// Previous (last accepted) footprint center — the back-off target.
+    /// Previous (last accepted) footprint center — the hold-in-place target.
     pub previous: IVec2,
     /// Circle radius (subtiles) shared by both footprints.
     pub radius: i32,
-    /// `true` once a footprint was stamped into the owner grid.
-    pub placed: bool,
-    /// Which center is currently stamped (`true` = `previous`).
-    pub placed_previous: bool,
-    /// `true` if the actor failed to take its proposal (backed off or squeezed).
+    /// `true` if the actor could not take its proposal and held at `previous`.
     pub collided: bool,
-    /// `true` if no footprint could be placed at all (wedged past the depth cap).
-    pub squeezed: bool,
     /// First conflicting subtile, for the actor's `last_movement_error`.
     pub conflict_cell: Option<IVec2>,
 }
 
 impl MoveRecord {
     fn reset(&mut self) {
-        self.placed = false;
-        self.placed_previous = false;
         self.collided = false;
-        self.squeezed = false;
         self.conflict_cell = None;
     }
 }
 
-/// Runs the deterministic occupancy arbitration over `records` (already in the
-/// desired, e.g. entity-sorted, order). Clears and rebuilds `owners`; fills
-/// `squeeze` with the indices of actors that could not be placed.
-pub fn arbitrate(records: &mut [MoveRecord], owners: &mut OwnerGrid, squeeze: &mut Vec<usize>) {
+/// Runs the deterministic occupancy resolution over `records` (already in the
+/// desired, e.g. entity-sorted, order). Clears and rebuilds `owners`.
+///
+/// **Precondition:** the `previous` footprints are pairwise disjoint — they are
+/// last frame's accepted positions, which the previous pass guaranteed are
+/// non-overlapping (and re-entry placement keeps re-entrants disjoint too). This
+/// lets every actor's origin be pre-stamped as a guaranteed personal fall-back,
+/// which is why the pass needs no back-off cascade and no squeeze/teleport.
+pub fn arbitrate(records: &mut [MoveRecord], owners: &mut OwnerGrid) {
     owners.clear();
-    squeeze.clear();
     for r in records.iter_mut() {
         r.reset();
     }
+
+    // Pre-stamp every actor's currently-occupied footprint. A mover therefore
+    // sees a not-yet-processed occupant's cell as taken and cannot steal it;
+    // the occupant keeps its spot regardless of entity order.
+    for i in 0..records.len() {
+        owners.stamp(records[i].previous, records[i].radius, i as u32);
+    }
+
     for i in 0..records.len() {
         let r = records[i];
+        // Release our own origin so a footprint-overlapping small step does not
+        // conflict with ourselves.
+        owners.clear_cells(r.previous, r.radius, i as u32);
         match owners.first_foreign(r.current, r.radius, i as u32) {
             None => {
+                // Proposed footprint is clear — advance.
                 owners.stamp(r.current, r.radius, i as u32);
-                records[i].placed = true;
-                records[i].placed_previous = false;
             }
             Some((cell, _)) => {
+                // Occupied by another actor — hold at the (always-free) origin.
+                owners.stamp(r.previous, r.radius, i as u32);
                 records[i].collided = true;
                 records[i].conflict_cell = Some(cell);
-                back_off(records, owners, squeeze, i, 0);
             }
         }
     }
-}
-
-/// Places actor `i` at its **previous** footprint, recursively backing off any
-/// actor whose current placement touches it. Bounded by [`MAX_BACKOFF_DEPTH`].
-fn back_off(
-    records: &mut [MoveRecord],
-    owners: &mut OwnerGrid,
-    squeeze: &mut Vec<usize>,
-    i: usize,
-    depth: u32,
-) {
-    unplace(records, owners, i);
-    // Track the last j we tried to displace. If j appears a second time it means
-    // j's `previous` is the same cell as i's `previous` (j keeps landing back
-    // where i wants to go after being backed off). Squeeze j to break the cycle.
-    let mut last_j: Option<usize> = None;
-    loop {
-        let r = records[i];
-        match owners.first_foreign(r.previous, r.radius, i as u32) {
-            None => {
-                owners.stamp(r.previous, r.radius, i as u32);
-                records[i].placed = true;
-                records[i].placed_previous = true;
-                return;
-            }
-            Some((cell, j)) => {
-                let j = j as usize;
-                if records[j].conflict_cell.is_none() {
-                    records[j].conflict_cell = Some(cell);
-                }
-                records[j].collided = true;
-                if depth >= MAX_BACKOFF_DEPTH || Some(j) == last_j {
-                    // At depth cap, or j keeps re-landing on i's cell after being
-                    // backed off — squeeze j to free the cell unconditionally.
-                    unplace(records, owners, j);
-                    if !records[j].squeezed {
-                        records[j].squeezed = true;
-                        squeeze.push(j);
-                    }
-                } else {
-                    last_j = Some(j);
-                    back_off(records, owners, squeeze, j, depth + 1);
-                }
-                // The conflicting cell is now free (j moved or was squeezed);
-                // the outer loop re-scans to verify.
-            }
-        }
-    }
-}
-
-/// Removes actor `j`'s currently-stamped footprint from the owner grid.
-fn unplace(records: &mut [MoveRecord], owners: &mut OwnerGrid, j: usize) {
-    let r = records[j];
-    if !r.placed {
-        return;
-    }
-    let center = if r.placed_previous { r.previous } else { r.current };
-    owners.clear_cells(center, r.radius, j as u32);
-    records[j].placed = false;
 }
 
 // ---------------------------------------------------------------------------
 // OccupancyArbiter resource (reused scratch)
 // ---------------------------------------------------------------------------
 
-/// Reused per-frame scratch for the sequential arbitration pass. Holds the owner
-/// grid, the move records, and the squeeze / re-entry work lists so the steady
-/// state allocates nothing (rule 4).
+/// Reused per-frame scratch for the sequential resolution pass. Holds the owner
+/// grid, the move records, the entity-sorted participant list, and the re-entry
+/// work list so the steady state allocates nothing (rule 4).
 #[derive(Resource)]
 pub struct OccupancyArbiter {
     pub owners: OwnerGrid,
     pub records: Vec<MoveRecord>,
     pub entities: Vec<Entity>,
-    pub squeeze: Vec<usize>,
     pub reentrants: Vec<Entity>,
-    pub placements: Vec<(Entity, bool)>,
 }
 
 impl Default for OccupancyArbiter {
@@ -294,49 +239,43 @@ impl Default for OccupancyArbiter {
             owners: OwnerGrid::new(),
             records: Vec::new(),
             entities: Vec::new(),
-            squeeze: Vec::new(),
             reentrants: Vec::new(),
-            placements: Vec::new(),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Step 1 — sequential proposal
+// Merged movement system
 // ---------------------------------------------------------------------------
 
-/// Proposal pass. On-screen actors think, prepare, and propose a
-/// statically-validated footprint; off-screen actors advance without collision;
-/// re-entrants are queued for sequential placement. Touches only the read-only
-/// static cache.
+/// Single sequential movement pass: think, propose against static geometry,
+/// resolve actor-vs-actor occupancy over the owner grid, apply each outcome,
+/// stamp accepted footprints into the dynamic write buffer, and teleport
+/// off-screen re-entrants.
 ///
 /// **Deliberately sequential.** The per-bot work here is tiny (a static slide
-/// probe — single-digit microseconds for the whole crowd). The previous
-/// `par_iter_mut` ran on Bevy's global `ComputeTaskPool`, whose `scope` ticks
-/// the *global* executor while waiting for its batches: a propose tick would
-/// absorb unrelated queued compute work (render batching, etc.) and bill it
-/// here, and at 60 Hz fixed catch-up ticks this compounded into frame-rate-
-/// coupled stalls. Running on the main thread removes that coupling entirely
-/// for no measurable compute cost. See `docs/movement.md` and `OPTIMIZATION.md`.
-pub(crate) fn propose_actor_moves(
+/// probe — single-digit microseconds for the whole crowd). Running it on Bevy's
+/// global `ComputeTaskPool` (`par_iter_mut`) was a net loss: that pool's `scope`
+/// ticks the *global* executor while waiting for its own batches, absorbing
+/// unrelated queued compute (render batching, etc.) and, at 60 Hz fixed
+/// catch-up ticks, compounding into frame-rate-coupled stalls. Sequential
+/// execution removes that coupling entirely. See `docs/movement.md`.
+pub(crate) fn process_actor_moves(
     mut actors: Query<(Entity, &mut ActorObject, Option<&OffScreenActor>)>,
     hypermap: Res<HypermapRuntime>,
     mut arbiter: ResMut<OccupancyArbiter>,
+    dynamic: Res<DynamicPassabilityMap>,
     mut commands: Commands,
-    timings: Res<SystemTimings>,
+    counts: Res<PerfCounts>,
 ) {
-    let _t = timings.scope(TimedSystem::Propose);
     let static_cache = hypermap.static_subtile_cache.as_ref();
     let hypermap = &*hypermap;
 
     arbiter.reentrants.clear();
-    // `prop_par` now equals `prop_body` (sequential): a divergence would signal
-    // pool coupling was re-introduced. Kept as a regression sentinel.
-    let mut think_ns = 0u64;
-    let mut slide_ns = 0u64;
-    let mut advance_ns = 0u64;
+    arbiter.entities.clear();
 
-    let par = Instant::now();
+    // Stage 1: think, prepare, classify, and propose (static-only). Each actor
+    // touches only its own state, so this is order-independent.
     for (entity, mut actor_obj, off_screen) in actors.iter_mut() {
         let actor = actor_obj.inner.as_mut();
         {
@@ -346,10 +285,8 @@ pub(crate) fn propose_actor_moves(
             s.shadow.teleported = false;
         }
 
-        let t = Instant::now();
         actor.think_low_level();
         actor.prepare_movement();
-        think_ns += t.elapsed().as_nanos() as u64;
 
         let center = actor.state().center;
         let is_rendered =
@@ -361,131 +298,66 @@ pub(crate) fn propose_actor_moves(
                 commands.entity(entity).remove::<OffScreenActor>();
                 arbiter.reentrants.push(entity);
             } else {
-                let t = Instant::now();
                 actor.propose_move(static_cache);
-                slide_ns += t.elapsed().as_nanos() as u64;
+                arbiter.entities.push(entity);
             }
         } else {
             if !was_off_screen {
                 commands.entity(entity).insert(OffScreenActor);
             }
-            let t = Instant::now();
             actor.advance_unchecked();
-            advance_ns += t.elapsed().as_nanos() as u64;
         }
     }
-    let body_ns = par.elapsed().as_nanos() as u64;
-    timings.record(TimedSystem::ProposePar, body_ns);
 
-    timings.record(TimedSystem::ProposeBody, body_ns);
-    timings.record(TimedSystem::ProposeThink, think_ns);
-    timings.record(TimedSystem::ProposeSlide, slide_ns);
-    timings.record(TimedSystem::ProposeAdvance, advance_ns);
-}
-
-// ---------------------------------------------------------------------------
-// Step 2 + 3 — sequential arbitration, apply, and squeeze
-// ---------------------------------------------------------------------------
-
-/// Sequential arbitration: build entity-sorted records, resolve occupancy over
-/// the owner grid, apply each actor's outcome, stamp accepted footprints into
-/// the dynamic write buffer, and teleport squeezed actors / re-entrants.
-pub(crate) fn arbitrate_actor_moves(
-    mut actors: Query<(Entity, &mut ActorObject, Option<&Name>)>,
-    mut arbiter: ResMut<OccupancyArbiter>,
-    dynamic: Res<DynamicPassabilityMap>,
-    hypermap: Res<HypermapRuntime>,
-    game_log: Res<GameLog>,
-    timings: Res<SystemTimings>,
-    counts: Res<PerfCounts>,
-) {
-    let static_cache = hypermap.static_subtile_cache.as_ref();
-
-    // Stage: collect + snapshot + owner-grid conflict resolution.
-    let n;
+    // Stage 2: deterministic occupancy resolution over the owner grid.
+    arbiter.entities.sort_unstable();
+    let n = arbiter.entities.len();
+    while arbiter.records.len() < n {
+        arbiter.records.push(MoveRecord::default());
+    }
+    for k in 0..n {
+        let entity = arbiter.entities[k];
+        let Ok((_, actor_obj, _)) = actors.get(entity) else { continue };
+        let state = actor_obj.inner.state();
+        let rec = &mut arbiter.records[k];
+        rec.current = state.shadow.proposed_center;
+        rec.previous = state.shadow.origin;
+        rec.radius = state.radius_subtiles;
+    }
     {
-        let _t = timings.scope(TimedSystem::ArbConflict);
-
-        // Collect participating entities and sort for deterministic arbitration.
-        arbiter.entities.clear();
-        for (entity, actor_obj, _) in actors.iter() {
-            if actor_obj.inner.state().shadow.participates {
-                arbiter.entities.push(entity);
-            }
-        }
-        arbiter.entities.sort_unstable();
-        n = arbiter.entities.len();
-        while arbiter.records.len() < n {
-            arbiter.records.push(MoveRecord::default());
-        }
-
-        // Snapshot each actor's compact footprint into the records.
-        for k in 0..n {
-            let entity = arbiter.entities[k];
-            let Ok((_, actor_obj, _)) = actors.get(entity) else { continue };
-            let state = actor_obj.inner.state();
-            let rec = &mut arbiter.records[k];
-            rec.current = state.shadow.proposed_center;
-            rec.previous = state.shadow.origin;
-            rec.radius = state.radius_subtiles;
-        }
-
         let arb = &mut *arbiter;
-        arbitrate(&mut arb.records[..n], &mut arb.owners, &mut arb.squeeze);
+        arbitrate(&mut arb.records[..n], &mut arb.owners);
+    }
+    let collided = arbiter.records[..n].iter().filter(|r| r.collided).count() as u64;
+    counts.collided_bots.store(collided, Ordering::Relaxed);
 
-        let collided = arb.records[..n].iter().filter(|r| r.collided).count() as u64;
-        counts.collided_bots.store(collided, Ordering::Relaxed);
-        counts.squeezed_bots.store(arb.squeeze.len() as u64, Ordering::Relaxed);
+    // Stage 3: apply outcomes and stamp final footprints into the write buffer.
+    for k in 0..n {
+        let entity = arbiter.entities[k];
+        let rec = arbiter.records[k];
+        if let Ok((_, mut actor_obj, _)) = actors.get_mut(entity) {
+            apply_outcome(actor_obj.inner.as_mut(), &rec);
+        }
+        let center = if rec.collided { rec.previous } else { rec.current };
+        dynamic.commit_footprint(center, rec.radius);
     }
 
-    // Stage: apply outcomes and stamp accepted footprints into the dynamic write buffer.
-    {
-        let _t = timings.scope(TimedSystem::ArbApply);
-        for k in 0..n {
-            let entity = arbiter.entities[k];
-            if let Ok((_, mut actor_obj, _)) = actors.get_mut(entity) {
-                apply_outcome(actor_obj.inner.as_mut(), &arbiter.records[k]);
-            }
-            let rec = arbiter.records[k];
-            if rec.placed && !rec.squeezed {
-                let center = if rec.placed_previous { rec.previous } else { rec.current };
-                dynamic.commit_footprint(center, rec.radius);
-            }
-        }
-    }
-
-    // Stage: teleport squeezed actors and off-screen re-entrants.
-    {
-        let _t = timings.scope(TimedSystem::ArbSqueeze);
-        {
-            let arb = &mut *arbiter;
-            arb.placements.clear();
-            for &k in &arb.squeeze {
-                arb.placements.push((arb.entities[k], true));
-            }
-            for &entity in &arb.reentrants {
-                arb.placements.push((entity, false));
-            }
-            arb.placements.sort_unstable_by_key(|(e, _)| *e);
-        }
-
-        let placements = std::mem::take(&mut arbiter.placements);
-        for (entity, squeezed) in placements.iter().copied() {
-            let Ok((_, mut actor_obj, name)) = actors.get_mut(entity) else { continue };
+    // Stage 4: place off-screen re-entrants on a free cell (sorted for
+    // determinism). The write buffer already holds this frame's footprints, so a
+    // re-entrant never lands on a placed actor.
+    arbiter.reentrants.sort_unstable();
+    let reentrants = std::mem::take(&mut arbiter.reentrants);
+    for &entity in reentrants.iter() {
+        if let Ok((_, mut actor_obj, _)) = actors.get_mut(entity) {
             let actor = actor_obj.inner.as_mut();
             resolve_offscreen_collision(actor, &dynamic, static_cache);
-            if squeezed {
-                actor.state_mut().shadow.teleported = true;
-                let tile = crate::actor::actor_main_tile(actor.state().center);
-                let label = name.map(|n| n.to_string()).unwrap_or_default();
-                game_log.push_world(tile.x, tile.y, LogEntry::BotSqueezedOut { name: label }, false);
-            }
+            actor.state_mut().shadow.teleported = true;
         }
-        arbiter.placements = placements;
     }
+    arbiter.reentrants = reentrants;
 }
 
-/// Applies one arbitration outcome to an actor: advance on success, hold + error
+/// Applies one resolution outcome to an actor: advance on success, hold + error
 /// on a dynamic conflict, surface a static slide error, and always apply rotation.
 fn apply_outcome(actor: &mut dyn Actor, record: &MoveRecord) {
     let static_block = actor.state().shadow.static_block;
@@ -496,17 +368,6 @@ fn apply_outcome(actor: &mut dyn Actor, record: &MoveRecord) {
 
     let s = actor.state_mut();
     s.rotation += proposed_rotation;
-
-    if record.squeezed {
-        // Position handled by the squeeze pass; still report the jam.
-        if let Some(cell) = record.conflict_cell {
-            s.last_movement_error = Some(ActorMovementError::BlockedByOccupancy {
-                world_subtile_x: cell.x,
-                world_subtile_y: cell.y,
-            });
-        }
-        return;
-    }
 
     if record.collided {
         // Dynamic conflict: hold at the previous footprint, occupancy error wins.
@@ -546,89 +407,78 @@ mod tests {
     }
 
     #[test]
-    fn no_conflict_places_all_at_current() {
+    fn no_conflict_advances_all() {
         let mut owners = OwnerGrid::new();
-        let mut squeeze = Vec::new();
         let mut records = vec![rec(c(0, 0), c(-5, 0)), rec(c(10, 10), c(10, 9))];
-        arbitrate(&mut records, &mut owners, &mut squeeze);
-        assert!(records[0].placed && !records[0].placed_previous && !records[0].collided);
-        assert!(records[1].placed && !records[1].placed_previous && !records[1].collided);
-        assert!(squeeze.is_empty());
+        arbitrate(&mut records, &mut owners);
+        assert!(!records[0].collided);
+        assert!(!records[1].collided);
     }
 
     #[test]
     fn two_into_one_cell_lower_index_wins() {
         // Both propose into (0,0); record 0 is processed first and keeps it.
         let mut owners = OwnerGrid::new();
-        let mut squeeze = Vec::new();
         let mut records = vec![rec(c(0, 0), c(1, 0)), rec(c(0, 0), c(0, 5))];
-        arbitrate(&mut records, &mut owners, &mut squeeze);
-        assert!(records[0].placed && !records[0].collided, "first claim wins its proposal");
-        assert!(
-            records[1].placed && records[1].placed_previous && records[1].collided,
-            "second is backed off to its (disjoint) previous and marked collided"
-        );
+        arbitrate(&mut records, &mut owners);
+        assert!(!records[0].collided, "first claim wins its proposal");
+        assert!(records[1].collided, "second holds at its (disjoint) previous");
         assert_eq!(records[1].conflict_cell, Some(c(0, 0)));
-        assert!(squeeze.is_empty());
     }
 
     #[test]
-    fn occupant_priority_mover_yields_via_backoff() {
-        // record 0 (mover) steps onto record 1's stationary cell; record 1's
-        // previous == current == its cell. The mover must be bounced back.
+    fn stationary_occupant_is_protected_from_mover() {
+        // record 0 (mover) steps onto record 1's stationary cell; the occupant's
+        // pre-stamped footprint blocks the mover regardless of entity order.
         let mut owners = OwnerGrid::new();
-        let mut squeeze = Vec::new();
         let mut records = vec![
             rec(c(5, 5), c(4, 5)), // mover: was (4,5), wants (5,5)
             rec(c(5, 5), c(5, 5)), // stationary occupant of (5,5)
         ];
-        arbitrate(&mut records, &mut owners, &mut squeeze);
-        // Processing order: 0 takes (5,5); 1 conflicts, backs off to previous
-        // (5,5) which is owned by 0, so 0 is backed off to (4,5); 1 takes (5,5).
-        assert!(records[1].placed && records[1].placed_previous);
-        assert!(records[0].placed && records[0].placed_previous && records[0].collided);
-        assert!(squeeze.is_empty());
+        arbitrate(&mut records, &mut owners);
+        assert!(records[0].collided, "mover yields to the occupant");
+        assert_eq!(records[0].conflict_cell, Some(c(5, 5)));
+        assert!(!records[1].collided, "stationary occupant keeps its cell");
     }
 
     #[test]
-    fn deep_chain_squeezes_bot_at_depth_cap() {
-        // A chain of N bots each sitting where the next wants to go, all forced
-        // onto a single contested cell so the cascade exceeds the depth cap.
-        // Construct a worst case: every bot's current AND previous is the SAME
-        // cell (no escape), so back-off can never free it and the cap triggers.
+    fn follower_takes_leader_vacated_cell_same_frame() {
+        // Leader (index 0) advances and frees its origin; the follower (index 1,
+        // processed after) can move into that freed cell the same frame.
         let mut owners = OwnerGrid::new();
-        let mut squeeze = Vec::new();
-        let cell = c(3, 3);
-        let mut records: Vec<MoveRecord> =
-            (0..8).map(|_| rec(cell, cell)).collect();
-        arbitrate(&mut records, &mut owners, &mut squeeze);
-        // Exactly one bot holds the cell; the rest cannot be placed and at least
-        // one is squeezed once the back-off cap is hit.
-        let placed = records.iter().filter(|r| r.placed).count();
-        assert_eq!(placed, 1, "only one bot can own the single shared cell");
-        assert!(!squeeze.is_empty(), "wedged bots past the depth cap are squeezed");
-        for &k in &squeeze {
-            assert!(records[k].squeezed && !records[k].placed);
-        }
-    }
-
-    #[test]
-    fn backed_off_bot_leaves_no_ghost_owner() {
-        // After a bot is backed off its old current cells must be free for others.
-        let mut owners = OwnerGrid::new();
-        let mut squeeze = Vec::new();
-        // 0 moves (0,0)->(1,0); 1 sits at (1,0); 2 wants (0,0) (0's vacated cell).
         let mut records = vec![
-            rec(c(1, 0), c(0, 0)),
-            rec(c(1, 0), c(1, 0)),
-            rec(c(0, 0), c(-5, 0)),
+            rec(c(1, 0), c(0, 0)),  // leader: (0,0) -> (1,0)
+            rec(c(0, 0), c(-1, 0)), // follower: (-1,0) -> (0,0) (leader's old cell)
         ];
-        arbitrate(&mut records, &mut owners, &mut squeeze);
-        // 1 keeps (1,0); 0 backed off to (0,0); 2 then conflicts on (0,0) and is
-        // backed off to its previous (-5,0). No ghost ownership remains.
-        assert!(records[1].placed);
-        assert!(records[0].placed && records[0].placed_previous);
-        assert!(records[2].placed, "third bot still finds a home at its previous");
-        assert!(squeeze.is_empty());
+        arbitrate(&mut records, &mut owners);
+        assert!(!records[0].collided, "leader advances");
+        assert!(!records[1].collided, "follower takes the freed cell same frame");
+    }
+
+    #[test]
+    fn follower_before_leader_ripples_one_frame() {
+        // Same train as above but the follower has the lower index. It is
+        // processed before the leader has moved, so it sees the leader's origin
+        // still occupied and holds — a one-frame ripple, never an overlap.
+        let mut owners = OwnerGrid::new();
+        let mut records = vec![
+            rec(c(0, 0), c(-1, 0)), // follower (index 0): wants leader's cell (0,0)
+            rec(c(1, 0), c(0, 0)),  // leader (index 1): (0,0) -> (1,0)
+        ];
+        arbitrate(&mut records, &mut owners);
+        assert!(records[0].collided, "follower holds for one frame");
+        assert_eq!(records[0].conflict_cell, Some(c(0, 0)));
+        assert!(!records[1].collided, "leader still advances");
+    }
+
+    #[test]
+    fn small_step_does_not_self_collide() {
+        // A radius-1 actor stepping one subtile: its proposed footprint overlaps
+        // its origin, but releasing its own origin first means it never blocks
+        // on itself.
+        let mut owners = OwnerGrid::new();
+        let mut records = vec![MoveRecord { current: c(1, 0), previous: c(0, 0), radius: 1, ..Default::default() }];
+        arbitrate(&mut records, &mut owners);
+        assert!(!records[0].collided, "overlapping self-step must advance");
     }
 }

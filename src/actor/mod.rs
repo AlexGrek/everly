@@ -35,7 +35,7 @@ pub mod selection_overlay;
 pub mod snapshot;
 
 pub use movement::{ActorShadow, OccupancyArbiter};
-pub(crate) use movement::{arbitrate_actor_moves, propose_actor_moves};
+pub(crate) use movement::process_actor_moves;
 
 use bevy::prelude::*;
 
@@ -321,7 +321,8 @@ pub trait Actor: Send + Sync + 'static {
     /// Static geometry is read from the persistent `static_cache` (updated only
     /// on map edits); the actor's `blocked_flags()` decide which bits are
     /// impassable. Creature-on-creature conflicts are **not** checked here — the
-    /// sequential [`movement::arbitrate_actor_moves`] resolves those afterward.
+    /// sequential resolution stage of [`movement::process_actor_moves`] resolves
+    /// those afterward.
     ///
     /// The default tests the combined `(dx, dy)` footprint and cancels the whole
     /// step if any candidate cell is statically blocked. Classes that want
@@ -425,8 +426,7 @@ impl Plugin for ActorPlugin {
                 FixedUpdate,
                 (
                     flush_actor_occupancy,
-                    propose_actor_moves,
-                    arbitrate_actor_moves,
+                    process_actor_moves,
                 )
                     .chain()
                     .run_if(in_state(GameState::InGame))
