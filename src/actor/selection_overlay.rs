@@ -13,7 +13,7 @@
 use bevy::prelude::*;
 
 use crate::actor::black_bot::BlackBotVisual;
-use crate::actor::brain::Brain;
+use crate::actor::brain::{Brain, PathNode};
 use crate::actor::ActorObject;
 use crate::hud::actor_inspector::SelectedActor;
 use crate::menu::main_menu::GameState;
@@ -128,7 +128,7 @@ fn draw_selected_waypoints(
     let Ok((brain, obj)) = bots.get(selected) else {
         return;
     };
-    let Some((path, idx)) = brain.path() else {
+    let Some((path, idx)) = brain.route() else {
         return;
     };
     let remaining = path.get(idx..).unwrap_or(&[]);
@@ -138,7 +138,12 @@ fn draw_selected_waypoints(
 
     let center = obj.inner.state().center;
     let start = Vec3::new(center.x, WAYPOINT_Y, center.y);
-    let waypoint_pos = |&(tx, ty): &(i32, i32)| Vec3::new(tx as f32 + 0.5, WAYPOINT_Y, ty as f32 + 0.5);
+    // Works for both coarse cell legs and spliced subcell detours — read the
+    // node's tile-space center, never its grid kind.
+    let waypoint_pos = |node: &PathNode| {
+        let c = node.center();
+        Vec3::new(c.x, WAYPOINT_Y, c.y)
+    };
 
     gizmos.linestrip(
         std::iter::once(start).chain(remaining.iter().map(waypoint_pos)),
@@ -146,8 +151,8 @@ fn draw_selected_waypoints(
     );
 
     let last = remaining.len() - 1;
-    for (i, tile) in remaining.iter().enumerate() {
+    for (i, node) in remaining.iter().enumerate() {
         let radius = if i == last { WAYPOINT_TARGET_RADIUS } else { WAYPOINT_RADIUS };
-        gizmos.sphere(Isometry3d::from_translation(waypoint_pos(tile)), radius, WAYPOINT_COLOR);
+        gizmos.sphere(Isometry3d::from_translation(waypoint_pos(node)), radius, WAYPOINT_COLOR);
     }
 }

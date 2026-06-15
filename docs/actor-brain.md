@@ -48,8 +48,20 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
   `update`s the low-level action and may request [`BrainEffects`].
 - **[`LowLevelAction`](../src/actor/brain/low_level.rs)** — what the bot is
   physically doing this frame: `Idle`, `Wait(time)`, [`PendingPath`]
-  (waiting-for-path hold), or `FollowPath(path)`. `execute` writes
-  `move_buffer`. **All of BlackBot's movement feel lives in `FollowPath`**
+  (waiting-for-path hold), or `FollowPath(path)`. Each reports a typed
+  [`LowLevelKind`] (so callers branch on the kind instead of comparing `label`
+  strings). `execute` writes `move_buffer`.
+
+  **Unified path.** `FollowPath` follows a single `Vec<PathNode>` with one cursor.
+  A [`PathNode`](../src/actor/brain/path.rs) is either `Cell(IVec2)` (a coarse
+  tile waypoint from the world A\*) or `Sub(IVec2)` (a fine subtile waypoint from
+  a detour); both expose a tile-space `center()` the follower steers toward and a
+  `tile()` the overlays stamp. Detours are **spliced inline** as `Sub` nodes at
+  the cursor (replacing the segment up to the next `Cell`), so there is no
+  separate detour list — one steering loop handles both. The overlay / selection
+  accessor is `Brain::route() -> (&[PathNode], usize)`.
+
+  **All of BlackBot's movement feel lives in `FollowPath`**
   (mass/inertia, wall-momentum bleed, stuck-repath, and the head-on bot-on-bot
   response — elastic bounce then either a queued subtile detour or a
   step-aside-and-pause; rear bumps ignored — tuned by [`FollowTuning`]).
@@ -64,6 +76,16 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
   Charger-queue membership pauses the timer. [`Wait::retry`] uses the same stall
   rule so patrol/wander bots that cannot plan a route still recover instead of
   idling until depletion.
+
+  **Local splice-repair before relocating.** On the stall trigger the bot first
+  attempts **one** *local* repair: it enqueues a footprint-aware `SubtileDetour`
+  toward a `Cell` node a little further along and, when it lands, splices the
+  result inline as `Sub` nodes (so the route bends around the obstacle instead of
+  being thrown away). The attempt is latched once per stall episode (re-armed when
+  the bot next reaches a node) so a wedged bot can't spam repairs. Only when the
+  repair can't be planned — no avoidance/pathfind data, or it comes back
+  `NoPath`/times out — does the bot fall back to the relocate-and-abandon last
+  resort below.
 
   **Relocate before rescheduling.** A stalled bot does *not* immediately
   abandon (which would replan expensive A\* every cycle while it keeps wedging a
@@ -233,8 +255,13 @@ search is kept local: it is skipped past `DETOUR_MAX_SPAN_SUBTILES`, confined to
 the start/goal bounding box grown by `DETOUR_PAD_SUBTILES`, and capped at
 `DETOUR_MAX_EXPANDED` expansions. While `detour_request` is set the bot holds
 with inertial braking; on success the subtile staircase is collapsed to corners
-and followed (in tile-space float coordinates) until the bot reaches that next
-node, then the normal tile path resumes. A detour is dropped if a **fresh**
+and **spliced into the unified path as `Sub` nodes** at the cursor, so the bot
+threads them and then arrives at the next `Cell` and the coarse path resumes —
+one cursor, no parallel detour list. A spliced run is bounded by
+`stuck_repath_secs` (`drop_sub_run` rejoins the coarse cells if it stops making
+progress). The same machinery serves both the bot-on-bot avoidance detour and the
+stall splice-repair, distinguished by a `DetourPurpose` that picks the fallback
+(step-aside vs. escape/abandon). A detour is dropped if a **fresh**
 head-on bump invalidates it (a new blocker subtile, or contact after a frame with
 no occupancy error) or it runs longer than `stuck_repath_secs`. While two bots
 stay pressed together the movement error persists every frame, but the response
@@ -447,6 +474,8 @@ and add a `#[serde(default)]`-friendly variant — persistence is automatic.
 [`Brain`]: ../src/actor/brain/mod.rs
 [`BrainContext`]: ../src/actor/brain/mod.rs
 [`BrainEffects`]: ../src/actor/brain/mod.rs
+[`LowLevelKind`]: ../src/actor/brain/low_level.rs
+[`PathNode`]: ../src/actor/brain/path.rs
 [`Priorities`]: ../src/actor/brain/priority.rs
 [`FollowTuning`]: ../src/actor/brain/low_level.rs
 [`PendingPath`]: ../src/actor/brain/low_level.rs

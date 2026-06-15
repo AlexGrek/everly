@@ -16,7 +16,7 @@ use crate::map::hypermap_pathfind::{manhattan, world_tile_walkable};
 use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
 use crate::map::pathfind_service::{PathKind, PathOutcome, PathfindReason, RequestId};
 
-use super::low_level::{FollowPath, LowLevelAction, PendingPath, Wait};
+use super::low_level::{FollowPath, LowLevelAction, LowLevelKind, PendingPath, Wait};
 use super::priority::PriorityKind;
 use super::{BrainContext, BrainEffects, BrainLogEvent, FixerContext, PathfindAccess};
 
@@ -51,7 +51,7 @@ fn leg_timeout_secs(start: (i32, i32), goal: (i32, i32)) -> f32 {
 }
 
 fn is_follow_path(low: &dyn LowLevelAction) -> bool {
-    low.label() == "FollowPath"
+    low.kind() == LowLevelKind::FollowPath
 }
 
 /// Travel budget for the current wander/patrol leg (Manhattan start→goal × 3 s).
@@ -1561,6 +1561,9 @@ mod tests {
     struct VelocityFinished(Vec2);
 
     impl LowLevelAction for VelocityFinished {
+        fn kind(&self) -> LowLevelKind {
+            LowLevelKind::Idle
+        }
         fn execute(
             &mut self,
             _state: &mut crate::actor::ActorState,
@@ -1581,6 +1584,9 @@ mod tests {
     }
 
     impl LowLevelAction for StuckLowAction {
+        fn kind(&self) -> LowLevelKind {
+            LowLevelKind::Idle
+        }
         fn execute(
             &mut self,
             _state: &mut crate::actor::ActorState,
@@ -1737,6 +1743,9 @@ mod tests {
     struct FollowPathNeverDone;
 
     impl LowLevelAction for FollowPathNeverDone {
+        fn kind(&self) -> LowLevelKind {
+            LowLevelKind::FollowPath
+        }
         fn execute(
             &mut self,
             _state: &mut crate::actor::ActorState,
@@ -1754,7 +1763,7 @@ mod tests {
     }
 
     fn is_pending(low: &dyn LowLevelAction) -> bool {
-        low.label() == "PendingPath"
+        low.kind() == LowLevelKind::PendingPath
     }
 
     #[test]
@@ -1949,8 +1958,8 @@ mod tests {
 
         assert!(matches!(out.status, HighLevelStatus::Running));
         assert_eq!(out.effects.queue_want, Some(farther));
-        let (path, _) = low.path().expect("ranking should install a route after injected results");
-        assert_eq!(path.last().copied(), Some((6, 0)));
+        let (path, _) = low.route().expect("ranking should install a route after injected results");
+        assert_eq!(path.last().map(|n| n.tile()), Some((6, 0)));
     }
 
     #[test]
@@ -1993,8 +2002,8 @@ mod tests {
         );
 
         assert!(matches!(out.status, HighLevelStatus::Running));
-        let (path, _) = low.path().expect("ranked fallback should install a route");
-        assert_eq!(path.last().copied(), Some((4, 0)));
+        let (path, _) = low.route().expect("ranked fallback should install a route");
+        assert_eq!(path.last().map(|n| n.tile()), Some((4, 0)));
     }
 
     #[test]
@@ -2055,7 +2064,7 @@ mod tests {
             &mut low,
             &mut rng,
         );
-        assert!(low.path().is_some(), "seek should install a route after injected results");
+        assert!(low.route().is_some(), "seek should install a route after injected results");
 
         let out = action.update(
             &ctx(&passability, &interactive, 0.1, (7, 0), pf.access(), None),
@@ -2100,7 +2109,7 @@ mod tests {
             &mut low,
             &mut rng,
         );
-        assert!(low.path().is_some(), "approach route should be installed");
+        assert!(low.route().is_some(), "approach route should be installed");
 
         for tile in [(8, 0), (9, 0)] {
             let out = action.update(

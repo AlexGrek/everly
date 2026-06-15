@@ -56,6 +56,14 @@ unit tests that do not need routing pass `None`, or use test helpers on the queu
 
 Consumers **`take`** results (remove on read) so each id is single-use.
 
+The service stays decoupled from the brain's path representation: it returns
+`Route { path: Vec<(i32,i32)> }` and `Detour(Vec<IVec2>)` as the search
+algorithms naturally produce them. Conversion to the unified
+[`PathNode`](../src/actor/brain/path.rs) (`Route` → `Cell` nodes, `Detour` →
+spliced `Sub` nodes) happens **only at the install boundary** inside
+[`FollowPath`](../src/actor/brain/low_level.rs) / the high-level actions — the
+async layer never depends on `PathNode`.
+
 ## Frame schedule
 
 [`PathfindServicePlugin`] registers two systems in `Update` (gated on

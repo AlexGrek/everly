@@ -167,10 +167,13 @@ Still inside `arbitrate_actor_moves`, in entity order:
 - **Collided** (placed at `previous`): position holds; `last_movement_error =
   BlockedByOccupancy { conflict_cell }`. Reaction is owned by the existing
   brain machinery next frame (re-route, collision pressure, status flash) —
-  the pipeline itself never invents avoidance. A genuine head-on wedge that
-  cannot be resolved locally escalates, in the BlackBot brain, to a relocate
-  **and a full path recalculation against the dynamic passability map** (so the
-  new route avoids the tiles other bots currently occupy); this fires both on
+  the pipeline itself never invents avoidance. The brain's `FollowPath` follows a
+  **single unified path of cell + subcell nodes** (`PathNode`); a bump first
+  splices a local subtile detour inline, and a stall first tries a local
+  splice-repair, before escalating. A genuine head-on wedge that cannot be
+  resolved locally escalates, in the BlackBot brain, to a relocate **and a full
+  path recalculation against the dynamic passability map** (so the new route
+  avoids the tiles other bots currently occupy); this fires both on
   collision-pressure saturation and on a sustained no-progress stall that loops
   inside recovery maneuvers — see `docs/actor-brain.md`.
 - **Squeezed** (not placed): handled below.

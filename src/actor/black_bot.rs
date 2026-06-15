@@ -1465,8 +1465,9 @@ fn paint_black_bot_targets(
         if black_bot_offline(charge, breakable) {
             continue;
         }
-        if let Some((path, idx)) = brain.path() {
-            for &(tx, ty) in path.get(idx..).unwrap_or(&[]) {
+        if let Some((path, idx)) = brain.route() {
+            for node in path.get(idx..).unwrap_or(&[]) {
+                let (tx, ty) = node.tile();
                 if let Some(c) = stamp_tile(&overlay, &mut images, tx, ty, PATH_NODE_COLOR, 1) {
                     touched_chunks.insert(c);
                 }

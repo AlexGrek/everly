@@ -20,6 +20,7 @@
 pub mod behavior;
 pub mod high_level;
 pub mod low_level;
+pub mod path;
 pub mod priority;
 
 use bevy::prelude::*;
@@ -39,7 +40,8 @@ pub use high_level::{
     GoToChargeStation, GoToPatrol, GoToRandomPoints, HighLevelAction, HighLevelStatus,
     RECHARGE_PER_S,
 };
-pub use low_level::{FollowPath, FollowTuning, Idle, LowLevelAction, PendingPath, Wait};
+pub use low_level::{FollowPath, FollowTuning, Idle, LowLevelAction, LowLevelKind, PendingPath, Wait};
+pub use path::PathNode;
 pub use priority::{Priorities, Priority, PriorityKind};
 
 /// Read-only views the low-level subtile bot-on-bot detour needs: the actor's
@@ -382,8 +384,11 @@ impl Brain {
         self.low_level.target_tile()
     }
 
-    pub fn path(&self) -> Option<(&[(i32, i32)], usize)> {
-        self.low_level.path()
+    /// Remaining route as unified nodes plus the active cursor (overlay /
+    /// selection gizmos). Consumers read `node.center()` / `node.tile()` and
+    /// never branch on cell vs subcell.
+    pub fn route(&self) -> Option<(&[PathNode], usize)> {
+        self.low_level.route()
     }
 
     pub fn velocity(&self) -> Vec2 {
@@ -399,11 +404,11 @@ impl Brain {
     }
 
     pub fn has_target(&self) -> bool {
-        self.low_level.path().map(|(p, i)| i < p.len()).unwrap_or(false)
+        self.low_level.route().map(|(p, i)| i < p.len()).unwrap_or(false)
     }
 
     pub fn remaining_waypoints(&self) -> usize {
-        self.low_level.path().map(|(p, i)| p.len().saturating_sub(i)).unwrap_or(0)
+        self.low_level.route().map(|(p, i)| p.len().saturating_sub(i)).unwrap_or(0)
     }
 }
 

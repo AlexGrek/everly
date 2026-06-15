@@ -25,6 +25,7 @@ use crate::map::hypermap_pathfind::world_tile_walkable;
 use crate::map::passability::{DynamicPassabilityMap, SubtilePassabilityMap, FLAG_CREATURE, SUBTILE_COUNT};
 use crate::map::pathfind_service::{PathKind, PathOutcome, PathfindReason, RequestId};
 
+use super::path::PathNode;
 use super::BrainContext;
 
 /// Bounding-box margin (subtiles) added around the start/goal of a bot-on-bot
@@ -105,8 +106,22 @@ impl Default for FollowTuning {
     }
 }
 
+/// Discriminant for the concrete low-level action, so callers can branch on the
+/// kind without comparing [`LowLevelAction::label`] strings (`label` is for the
+/// inspector only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LowLevelKind {
+    Idle,
+    Wait,
+    PendingPath,
+    FollowPath,
+}
+
 /// The per-frame contract every low-level action implements.
 pub trait LowLevelAction: Send + Sync {
+    /// Which concrete action this is — typed, for control-flow branching.
+    fn kind(&self) -> LowLevelKind;
+
     /// Advance internal state and write this frame's movement intent into
     /// `state.move_buffer` / `state.next_waypoint_hint`.
     fn execute(
@@ -127,8 +142,9 @@ pub trait LowLevelAction: Send + Sync {
     /// Short label for the inspector.
     fn label(&self) -> String;
 
-    /// Active path + cursor, if this action follows one (overlay / inspector).
-    fn path(&self) -> Option<(&[(i32, i32)], usize)> {
+    /// Active route + cursor, if this action follows one (overlay / inspector).
+    /// Nodes are unified [`PathNode`]s — consumers read `center()` / `tile()`.
+    fn route(&self) -> Option<(&[PathNode], usize)> {
         None
     }
 
@@ -177,6 +193,9 @@ pub trait LowLevelAction: Send + Sync {
 pub struct Idle;
 
 impl LowLevelAction for Idle {
+    fn kind(&self) -> LowLevelKind {
+        LowLevelKind::Idle
+    }
     fn execute(&mut self, state: &mut ActorState, _ctx: &BrainContext, _rng: &mut StdRng, _t: &FollowTuning) {
         state.move_buffer = ActorMoveBuffer::default();
         state.next_waypoint_hint = None;
@@ -230,6 +249,9 @@ impl Wait {
 }
 
 impl LowLevelAction for Wait {
+    fn kind(&self) -> LowLevelKind {
+        LowLevelKind::Wait
+    }
     fn execute(&mut self, state: &mut ActorState, ctx: &BrainContext, _rng: &mut StdRng, t: &FollowTuning) {
         self.remaining_s -= ctx.dt;
         state.move_buffer = ActorMoveBuffer::default();
@@ -309,6 +331,9 @@ impl Default for PendingPath {
 }
 
 impl LowLevelAction for PendingPath {
+    fn kind(&self) -> LowLevelKind {
+        LowLevelKind::PendingPath
+    }
     fn execute(&mut self, state: &mut ActorState, ctx: &BrainContext, _rng: &mut StdRng, t: &FollowTuning) {
         let dt = ctx.dt;
         let center = state.center;
@@ -357,7 +382,10 @@ impl LowLevelAction for PendingPath {
 /// `is_finished() == true` when the path is exhausted or abandoned (stuck), at
 /// which point the owning high-level action re-plans.
 pub struct FollowPath {
-    pub path: Vec<(i32, i32)>,
+    /// Unified route: coarse [`PathNode::Cell`] waypoints from the tile A\*, with
+    /// fine [`PathNode::Sub`] detour waypoints spliced in at the cursor when the
+    /// bot routes around an obstacle. One list, one cursor.
+    pub path: Vec<PathNode>,
     pub index: usize,
     /// Unit heading toward `path[index]`; recomputed every moving frame.
     direction: Vec2,
@@ -378,36 +406,61 @@ pub struct FollowPath {
     /// A queued step-aside pause: `(target tile, seconds)`. The pause begins once
     /// the bot reaches `target`, so it retreats *then* waits. `None` = no pending wait.
     pending_wait: Option<((i32, i32), f32)>,
-    /// Active subtile-level detour: tile-space waypoint centers to thread around
-    /// a blocking bot before resuming the tile path. Empty = no detour.
-    detour: Vec<Vec2>,
-    detour_index: usize,
-    /// Time spent on the current detour; bounds it to `stuck_repath_secs`.
+    /// Time spent threading the current spliced `Sub` run; bounds it to
+    /// `stuck_repath_secs` so a detour that stops making progress is dropped.
     detour_timer: f32,
-    /// In-flight queued subtile-detour request id (set on a head-on bump that
-    /// chose to detour). While set, the bot holds and awaits the result.
+    /// In-flight queued subtile-detour request id (head-on bump that chose to
+    /// detour, or a stall splice-repair). While set, the bot holds and awaits it.
     detour_request: Option<RequestId>,
-    /// Seconds awaiting `detour_request` before falling back to a step-aside.
+    /// Whether the in-flight `detour_request` is avoidance (fall back to a
+    /// step-aside) or a stall repair (fall back to escape/abandon).
+    detour_purpose: DetourPurpose,
+    /// The path-node index the in-flight detour targets. On install the spliced
+    /// `Sub` run **replaces** `index..detour_goal`, so an avoidance detour
+    /// (`goal == index`) is a pure insert before the next node while a stall
+    /// repair (`goal > index`) drops the wedged cell(s) it routed around.
+    detour_goal: usize,
+    /// Seconds awaiting `detour_request` before falling back.
     detour_wait_elapsed: f32,
-    /// Step-aside tile to use if the awaited detour comes back `NoPath`/times out.
+    /// Step-aside tile used if an avoidance detour comes back `NoPath`/times out.
     detour_fallback: Option<(i32, i32)>,
     /// Blocker subtile of the last head-on occupancy bump we already reacted to.
     /// Suppresses re-bouncing / detour replanning every frame while two bots stay
     /// pressed together (mirrors the stuck-log rising edge in `black_bot_brain`).
     last_head_on_bump: Option<IVec2>,
-    /// Index in [`path`](Self::path) of a step-aside tile inserted by the bump
+    /// Index in [`path`](Self::path) of a step-aside cell inserted by the bump
     /// handler. Cleared once the bot reaches that cell or chooses a detour instead.
     step_aside_at: Option<usize>,
     /// When the stall timer fires, the bot first relocates to the center of the
     /// nearest free cell (`Some(tile)`) and only marks itself abandoned once it
     /// arrives — so it vacates a chokepoint before the high level reschedules.
     escape_target: Option<(i32, i32)>,
+    /// Latches a single local splice-repair attempt per stall episode; reset when
+    /// the bot makes progress (reaches a new node).
+    repair_attempted: bool,
     /// Set when the stuck timer fires; makes `is_finished` report `true`.
     abandoned: bool,
 }
 
+/// Why an in-flight subtile detour was requested, which decides its fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetourPurpose {
+    /// Bot-on-bot avoidance: on failure, step aside / wait.
+    Avoidance,
+    /// Stall splice-repair: on failure, escape to a free cell / abandon.
+    Repair,
+}
+
 impl FollowPath {
+    /// Builds a follower from a tile-level world route. The coarse cells become
+    /// [`PathNode::Cell`]s — this is the install boundary where `PathOutcome::Route`
+    /// is converted, so the async search layer never depends on [`PathNode`].
     pub fn new(path: Vec<(i32, i32)>) -> Self {
+        Self::from_nodes(path.into_iter().map(|(x, y)| PathNode::cell(x, y)).collect())
+    }
+
+    /// Builds a follower from already-unified nodes.
+    pub fn from_nodes(path: Vec<PathNode>) -> Self {
         Self {
             path,
             index: 0,
@@ -420,22 +473,36 @@ impl FollowPath {
             prev_tile: None,
             contact_wait_s: 0.0,
             pending_wait: None,
-            detour: Vec::new(),
-            detour_index: 0,
             detour_timer: 0.0,
             detour_request: None,
+            detour_purpose: DetourPurpose::Avoidance,
+            detour_goal: 0,
             detour_wait_elapsed: 0.0,
             detour_fallback: None,
             last_head_on_bump: None,
             step_aside_at: None,
             escape_target: None,
+            repair_attempted: false,
             abandoned: false,
         }
     }
 
-    fn clear_detour(&mut self) {
-        self.detour.clear();
-        self.detour_index = 0;
+    /// `true` while the cursor points at a spliced `Sub` node (threading a detour).
+    fn on_sub_run(&self) -> bool {
+        self.path.get(self.index).is_some_and(|n| !n.is_cell())
+    }
+
+    /// Drops the contiguous run of un-consumed `Sub` nodes at the cursor, so the
+    /// bot rejoins the coarse cell path. The unified-path equivalent of clearing
+    /// the old separate detour vec.
+    fn drop_sub_run(&mut self) {
+        let mut end = self.index;
+        while end < self.path.len() && !self.path[end].is_cell() {
+            end += 1;
+        }
+        if end > self.index {
+            self.path.drain(self.index..end);
+        }
         self.detour_timer = 0.0;
     }
 
@@ -455,25 +522,31 @@ impl FollowPath {
 
     fn clear_detour_request(&mut self) {
         self.detour_request = None;
+        self.detour_purpose = DetourPurpose::Avoidance;
         self.detour_wait_elapsed = 0.0;
         self.detour_fallback = None;
     }
 
-    /// Enqueues a short subtile-level detour search around a blocking bot toward
-    /// the next already-calculated path node. Returns the request id, or `None`
-    /// when avoidance data / a pathfind queue is unavailable or there is no next
-    /// node — in which case the caller steps aside instead.
-    fn enqueue_detour(&self, state: &ActorState, ctx: &BrainContext) -> Option<RequestId> {
+    /// Enqueues a short subtile-level detour search toward the node at
+    /// `goal_node`, footprint-aware around other creatures. Returns the request
+    /// id, or `None` when avoidance data / a pathfind queue is unavailable or
+    /// there is no such node — in which case the caller falls back.
+    fn enqueue_detour(
+        &self,
+        state: &ActorState,
+        ctx: &BrainContext,
+        goal_node: usize,
+    ) -> Option<RequestId> {
         let views = ctx.avoidance.as_ref()?;
         let pf = ctx.pathfind.as_ref()?;
-        let goal_tile = *self.path.get(self.index)?;
+        let (goal_tx, goal_ty) = self.path.get(goal_node)?.tile();
         let radius = state.radius_subtiles;
         let sc = SUBTILE_COUNT as i32;
         let start = state
             .last_accepted_center_subtile
             .unwrap_or_else(|| float_subtile(state.center));
         // Center subtile of the goal tile (`sc / 2` lands on the middle column).
-        let goal = IVec2::new(goal_tile.0 * sc + sc / 2, goal_tile.1 * sc + sc / 2);
+        let goal = IVec2::new(goal_tx * sc + sc / 2, goal_ty * sc + sc / 2);
         Some(pf.queue.enqueue(PathKind::SubtileDetour {
             start,
             goal,
@@ -485,14 +558,28 @@ impl FollowPath {
         }, ctx.entity, PathfindReason::SubtileDetour))
     }
 
-    /// Installs an arrived subtile detour (raw subtile path including the start):
-    /// collapse collinear runs, drop the start, and convert to tile-space centers.
+    /// Splices an arrived subtile detour (raw subtile path including the start)
+    /// into the unified path, **replacing** `index..detour_goal`: collapse
+    /// collinear runs, drop the start, convert to `Sub` nodes. For an avoidance
+    /// detour (`goal == index`) this is a pure insert before the next node; for a
+    /// stall repair (`goal > index`) it drops the wedged cell(s) it routed around.
+    /// A trailing `Sub` coincident with the goal node is dropped to avoid a
+    /// duplicate waypoint.
     fn install_detour(&mut self, subtiles: &[IVec2]) {
-        let collapsed = collapse_collinear_subtiles(subtiles);
-        self.detour = collapsed.into_iter().skip(1).map(subtile_center).collect();
-        self.detour_index = 0;
-        self.detour_timer = 0.0;
+        // Drop any unreached step-aside cell first so its stored index stays
+        // valid (the splice below shifts indices at/after the cursor).
         self.clear_step_aside_insertion();
+        let goal = self.detour_goal.clamp(self.index, self.path.len());
+        let collapsed = collapse_collinear_subtiles(subtiles);
+        let mut nodes: Vec<PathNode> =
+            collapsed.into_iter().skip(1).map(PathNode::Sub).collect();
+        if let (Some(last), Some(goal_node)) = (nodes.last(), self.path.get(goal)) {
+            if last.tile() == goal_node.tile() {
+                nodes.pop();
+            }
+        }
+        self.path.splice(self.index..goal, nodes);
+        self.detour_timer = 0.0;
     }
 
     /// Steps aside to `target` (insert a waypoint) and arms a post-step pause.
@@ -500,7 +587,7 @@ impl FollowPath {
     fn begin_step_aside(&mut self, target: Option<(i32, i32)>, rng: &mut StdRng) {
         if let Some(target) = target {
             let insert_idx = self.index.min(self.path.len());
-            self.path.insert(insert_idx, target);
+            self.path.insert(insert_idx, PathNode::cell(target.0, target.1));
             self.step_aside_at = Some(insert_idx);
             // Force heading recalculation toward the step-aside tile.
             self.stuck_timer = 0.0;
@@ -595,7 +682,7 @@ impl FollowPath {
     /// Center of the current path waypoint, used as the off-screen-resolution
     /// hint while the bot holds position.
     fn current_waypoint_hint(&self) -> Option<Vec2> {
-        self.path.get(self.index).copied().map(waypoint_center)
+        self.path.get(self.index).map(|n| n.center())
     }
 
     /// The nearest cell whose center the bot's whole footprint can occupy clear
@@ -699,7 +786,8 @@ impl FollowPath {
     fn finish_escape(&mut self, state: &mut ActorState) {
         self.escape_target = None;
         self.abandoned = true;
-        self.clear_detour();
+        self.drop_sub_run();
+        self.repair_attempted = false;
         self.last_head_on_bump = None;
         self.velocity = Vec2::ZERO;
         self.prev_center = None;
@@ -721,8 +809,41 @@ impl FollowPath {
     }
 
     fn advance_past_reached(&mut self, center: Vec2, eps: f32) {
-        while self.index < self.path.len() && reached_waypoint(center, self.path[self.index], eps) {
+        while self.index < self.path.len() && node_reached(center, self.path[self.index], eps) {
             self.index += 1;
+        }
+    }
+
+    /// Last-resort stall recovery, shared by the stuck tail and a failed
+    /// splice-repair: relocate to the nearest free cell (vacating the chokepoint
+    /// before rescheduling), or abandon in place when no free cell / avoidance
+    /// data is available (headless tests).
+    fn escape_or_abandon(&mut self, state: &mut ActorState, ctx: &BrainContext, t: &FollowTuning, dt: f32) {
+        let center = state.center;
+        if let Some(target) = self.find_escape_cell(state, ctx) {
+            ctx.trace(format!(
+                "stall → escape to tile {target:?} (center {:.2},{:.2}, main {:?})",
+                center.x, center.y, ctx.main_tile
+            ));
+            self.escape_target = Some(target);
+            self.drop_sub_run();
+            self.last_head_on_bump = None;
+            self.pending_wait = None;
+            self.stuck_timer = 0.0;
+            self.stuck_reference_pos = Some(center);
+            self.run_escape(state, ctx, t, dt);
+        } else {
+            ctx.trace(format!(
+                "stall, NO free escape cell → abandon in place (main {:?})",
+                ctx.main_tile
+            ));
+            self.abandoned = true;
+            self.drop_sub_run();
+            self.last_head_on_bump = None;
+            self.velocity = Vec2::ZERO;
+            self.prev_center = None;
+            state.move_buffer = ActorMoveBuffer::default();
+            state.next_waypoint_hint = None;
         }
     }
 
@@ -770,30 +891,36 @@ impl LowLevelAction for FollowPath {
         }
 
         // Awaiting a queued subtile detour: hold (inertial brake) until the result
-        // lands, then thread it; fall back to a step-aside on NoPath / timeout.
+        // lands, then splice it into the path; on NoPath / timeout fall back per
+        // purpose — avoidance steps aside, a stall repair escapes / abandons.
         if let Some(id) = self.detour_request {
             let outcome = ctx.pathfind.as_ref().and_then(|pf| pf.results.take(id));
-            match outcome {
+            let failed = match outcome {
                 Some(PathOutcome::Detour(subtiles)) => {
                     self.clear_detour_request();
                     self.install_detour(&subtiles);
+                    false
                 }
-                Some(_) => {
-                    // NoPath / unexpected kind: step aside with the saved fallback,
-                    // or wait in place if it was already taken.
-                    let fallback = self.detour_fallback;
-                    self.clear_detour_request();
-                    self.step_aside_or_wait(fallback, rng);
-                }
+                Some(_) => true,
                 None => {
                     self.detour_wait_elapsed += dt;
                     if self.detour_wait_elapsed >= DETOUR_WAIT_S {
-                        let fallback = self.detour_fallback;
-                        self.clear_detour_request();
-                        self.step_aside_or_wait(fallback, rng);
+                        true
                     } else {
                         self.drive(state, center, Vec2::ZERO, t.decel, dt);
                         state.next_waypoint_hint = self.current_waypoint_hint();
+                        return;
+                    }
+                }
+            };
+            if failed {
+                let purpose = self.detour_purpose;
+                let fallback = self.detour_fallback;
+                self.clear_detour_request();
+                match purpose {
+                    DetourPurpose::Avoidance => self.step_aside_or_wait(fallback, rng),
+                    DetourPurpose::Repair => {
+                        self.escape_or_abandon(state, ctx, t, dt);
                         return;
                     }
                 }
@@ -824,7 +951,7 @@ impl LowLevelAction for FollowPath {
         // without occupancy, so this is skipped for them. One subtile read per
         // moving bot per tick — no footprint scan.
         if ctx.on_screen
-            && self.detour.is_empty()
+            && !self.on_sub_run()
             && self.detour_request.is_none()
             && self.pending_wait.is_none()
             && self.step_aside_at.is_none()
@@ -843,9 +970,11 @@ impl LowLevelAction for FollowPath {
                         (self.direction.y * reach).round() as i32,
                     );
                 if probe != start && subtile_has_creature(views.dynamic, probe) {
-                    if let Some(id) = self.enqueue_detour(state, ctx) {
+                    if let Some(id) = self.enqueue_detour(state, ctx, self.index) {
                         ctx.trace(format!("look-ahead: creature at subtile {probe:?} → detour"));
                         self.detour_request = Some(id);
+                        self.detour_purpose = DetourPurpose::Avoidance;
+                        self.detour_goal = self.index;
                         self.detour_wait_elapsed = 0.0;
                         self.detour_fallback = self.step_target(state, ctx, self.direction, rng);
                         self.drive(state, center, Vec2::ZERO, t.decel, dt);
@@ -891,7 +1020,7 @@ impl LowLevelAction for FollowPath {
 
                     // A fresh bump invalidates any in-progress detour, pending pause,
                     // unreached step-aside insertion, or awaited detour before re-deciding.
-                    self.clear_detour();
+                    self.drop_sub_run();
                     self.clear_detour_request();
                     self.pending_wait = None;
                     self.clear_step_aside_insertion();
@@ -904,12 +1033,14 @@ impl LowLevelAction for FollowPath {
                     // A detour is planned off-thread: enqueue the request and hold;
                     // when it lands the bot threads it, otherwise it steps aside / waits.
                     let enqueued = want_detour
-                        .then(|| self.enqueue_detour(state, ctx))
+                        .then(|| self.enqueue_detour(state, ctx, self.index))
                         .flatten();
                     match enqueued {
                         Some(id) => {
                             ctx.trace(format!("bump at {blocker:?} → detour (fallback {step:?})"));
                             self.detour_request = Some(id);
+                            self.detour_purpose = DetourPurpose::Avoidance;
+                            self.detour_goal = self.index;
                             self.detour_wait_elapsed = 0.0;
                             self.detour_fallback = step;
                         }
@@ -933,7 +1064,7 @@ impl LowLevelAction for FollowPath {
                                         "bump at {blocker:?} → neighbours taken, escape to {target:?}"
                                     ));
                                     self.escape_target = Some(target);
-                                    self.clear_detour();
+                                    self.drop_sub_run();
                                     self.last_head_on_bump = None;
                                     self.pending_wait = None;
                                     self.stuck_timer = 0.0;
@@ -952,40 +1083,24 @@ impl LowLevelAction for FollowPath {
             }
         }
 
-        // Follow an active subtile detour around a bot before resuming the tile
-        // path. Bounded by `stuck_repath_secs` so a detour that stops making
-        // progress is dropped and normal stuck handling can take over.
-        if !self.detour.is_empty() {
+        // Bound a spliced `Sub` run: while threading detour subcells, accumulate a
+        // timer and drop the remaining run once it stops making progress, so the
+        // bot rejoins its coarse cells and normal stuck handling can take over.
+        if self.on_sub_run() {
             self.detour_timer += dt;
-            while self.detour_index < self.detour.len()
-                && (self.detour[self.detour_index] - center).length_squared()
-                    <= t.waypoint_eps * t.waypoint_eps
-            {
-                self.detour_index += 1;
+            if self.detour_timer > t.stuck_repath_secs {
+                self.drop_sub_run();
             }
-            if self.detour_index < self.detour.len() && self.detour_timer <= t.stuck_repath_secs {
-                let wp = self.detour[self.detour_index];
-                let to_wp = wp - center;
-                if to_wp.length_squared() > 1e-12 {
-                    self.direction = to_wp.normalize();
-                }
-                let dist = to_wp.length();
-                let brake_limited_speed = (2.0 * t.decel * dist).sqrt();
-                let desired_speed = t.max_speed.min(brake_limited_speed);
-                let desired = self.direction * desired_speed;
-                let steer_rate = if self.velocity.length() > desired_speed {
-                    t.decel
-                } else {
-                    t.accel
-                };
-                self.drive(state, center, desired, steer_rate, dt);
-                state.next_waypoint_hint = Some(wp);
-                return;
-            }
-            self.clear_detour();
+        } else {
+            self.detour_timer = 0.0;
         }
 
+        let prev_index = self.index;
         self.advance_past_reached(center, t.waypoint_eps);
+        // Reaching a new node is progress — re-arm the one-shot stall repair.
+        if self.index != prev_index {
+            self.repair_attempted = false;
+        }
 
         // Arm the post-step-aside pause once the bot has reached the cell it
         // retreated/strafed into; decelerate with mass/inertia before the timer
@@ -1008,7 +1123,7 @@ impl LowLevelAction for FollowPath {
             return;
         }
 
-        let wp = waypoint_center(self.path[self.index]);
+        let wp = self.path[self.index].center();
         let to_wp = wp - center;
         if to_wp.length_squared() > 1e-12 {
             self.direction = to_wp.normalize();
@@ -1029,35 +1144,32 @@ impl LowLevelAction for FollowPath {
         );
 
         if self.stuck_timer >= t.stuck_repath_secs {
-            // Before rescheduling, relocate to the center of the nearest free cell
-            // so the bot stops wedging a chokepoint and replans from a clean spot.
-            // Falls back to abandoning in place when no avoidance data / free cell
-            // is available (e.g. headless tests).
-            if let Some(target) = self.find_escape_cell(state, ctx) {
-                ctx.trace(format!(
-                    "stuck {:.1}s → escape to tile {:?} (center {:.2},{:.2}, main {:?})",
-                    self.stuck_timer, target, center.x, center.y, ctx.main_tile
-                ));
-                self.escape_target = Some(target);
-                self.clear_detour();
-                self.last_head_on_bump = None;
-                self.pending_wait = None;
-                self.stuck_timer = 0.0;
-                self.stuck_reference_pos = Some(center);
-                self.run_escape(state, ctx, t, dt);
-            } else {
-                ctx.trace(format!(
-                    "stuck {:.1}s, NO free escape cell → abandon in place (main {:?})",
-                    self.stuck_timer, ctx.main_tile
-                ));
-                self.abandoned = true;
-                self.clear_detour();
-                self.last_head_on_bump = None;
-                self.velocity = Vec2::ZERO;
-                self.prev_center = None;
-                state.move_buffer = ActorMoveBuffer::default();
-                state.next_waypoint_hint = None;
+            // Improve recalculation: try one *local* splice-repair first — a
+            // footprint-aware subtile detour around the obstacle to a node a bit
+            // further along, spliced inline. Only when that can't be planned (no
+            // avoidance / pathfind data, or it later comes back empty) does the bot
+            // fall back to the relocate-and-abandon last resort.
+            if !self.repair_attempted && !self.on_sub_run() {
+                let goal_node = (self.index + 1).min(self.path.len() - 1);
+                if let Some(id) = self.enqueue_detour(state, ctx, goal_node) {
+                    ctx.trace(format!(
+                        "stuck {:.1}s → local splice-repair toward node {goal_node}",
+                        self.stuck_timer
+                    ));
+                    self.repair_attempted = true;
+                    self.detour_request = Some(id);
+                    self.detour_purpose = DetourPurpose::Repair;
+                    self.detour_goal = goal_node;
+                    self.detour_wait_elapsed = 0.0;
+                    self.detour_fallback = None;
+                    self.stuck_timer = 0.0;
+                    self.stuck_reference_pos = Some(center);
+                    self.drive(state, center, Vec2::ZERO, t.decel, dt);
+                    state.next_waypoint_hint = self.current_waypoint_hint();
+                    return;
+                }
             }
+            self.escape_or_abandon(state, ctx, t, dt);
             return;
         }
 
@@ -1076,6 +1188,10 @@ impl LowLevelAction for FollowPath {
         state.next_waypoint_hint = Some(wp);
     }
 
+    fn kind(&self) -> LowLevelKind {
+        LowLevelKind::FollowPath
+    }
+
     fn is_finished(&self) -> bool {
         self.abandoned || self.index >= self.path.len()
     }
@@ -1086,7 +1202,8 @@ impl LowLevelAction for FollowPath {
         self.contact_wait_s = 0.0;
         self.pending_wait = None;
         self.escape_target = None;
-        self.clear_detour();
+        self.drop_sub_run();
+        self.repair_attempted = false;
         self.clear_detour_request();
         self.last_head_on_bump = None;
     }
@@ -1096,14 +1213,14 @@ impl LowLevelAction for FollowPath {
             "FollowPath (escaping)".to_string()
         } else if self.detour_request.is_some() {
             "FollowPath (awaiting detour)".to_string()
-        } else if self.detour.is_empty() {
-            "FollowPath".to_string()
-        } else {
+        } else if self.on_sub_run() {
             "FollowPath (detour)".to_string()
+        } else {
+            "FollowPath".to_string()
         }
     }
 
-    fn path(&self) -> Option<(&[(i32, i32)], usize)> {
+    fn route(&self) -> Option<(&[PathNode], usize)> {
         Some((&self.path, self.index))
     }
 
@@ -1121,7 +1238,13 @@ impl LowLevelAction for FollowPath {
     }
 
     fn target_tile(&self) -> Option<(i32, i32)> {
-        self.path.last().copied()
+        // The final *cell* destination; trailing spliced subcells don't change it.
+        self.path
+            .iter()
+            .rev()
+            .find(|n| n.is_cell())
+            .or_else(|| self.path.last())
+            .map(|n| n.tile())
     }
 
     fn is_awaiting_path(&self) -> bool {
@@ -1131,10 +1254,10 @@ impl LowLevelAction for FollowPath {
     }
 
     fn is_recovering(&self) -> bool {
-        // Any active collision-recovery maneuver: detour (awaited or threading),
-        // step-aside (pending move or post-step pause), or jam escape.
+        // Any active collision-recovery maneuver: detour (awaited or threading a
+        // spliced sub-run), step-aside (pending move or post-step pause), or escape.
         self.detour_request.is_some()
-            || !self.detour.is_empty()
+            || self.on_sub_run()
             || self.contact_wait_s > 0.0
             || self.pending_wait.is_some()
             || self.step_aside_at.is_some()
@@ -1156,6 +1279,13 @@ pub fn waypoint_center(tile: (i32, i32)) -> Vec2 {
 #[inline]
 pub fn reached_waypoint(center: Vec2, tile: (i32, i32), eps: f32) -> bool {
     (waypoint_center(tile) - center).length_squared() <= eps * eps
+}
+
+/// `true` when `center` is within `eps` tiles of a path node's center (works for
+/// both cell and subcell nodes).
+#[inline]
+fn node_reached(center: Vec2, node: PathNode, eps: f32) -> bool {
+    (node.center() - center).length_squared() <= eps * eps
 }
 
 /// `true` when another creature occupies the world-subtile `sub` in the dynamic
@@ -1229,14 +1359,6 @@ fn min_dist2_to_chebyshev_ring(center: Vec2, here: IVec2, ring: i32) -> f32 {
 pub fn float_subtile(pos: Vec2) -> IVec2 {
     let sc = SUBTILE_COUNT as f32;
     IVec2::new((pos.x * sc).floor() as i32, (pos.y * sc).floor() as i32)
-}
-
-/// Tile-space center of world subtile `sub` (inverse of [`float_subtile`] at the
-/// subtile midpoint): `(sub + 0.5) / SUBTILE_COUNT`.
-#[inline]
-fn subtile_center(sub: IVec2) -> Vec2 {
-    let sc = SUBTILE_COUNT as f32;
-    Vec2::new((sub.x as f32 + 0.5) / sc, (sub.y as f32 + 0.5) / sc)
 }
 
 /// Drops interior subtiles that lie on a straight run, keeping only the
@@ -1502,7 +1624,7 @@ mod tests {
             fp.path.len() > original_len,
             "bot bump should insert a step-aside waypoint"
         );
-        let stepped = fp.path[fp.index];
+        let stepped = fp.path[fp.index].tile();
         assert_eq!(stepped.0, 6, "front-preferred step is ahead (+X) of (5,5), got {stepped:?}");
         assert!((4..=6).contains(&stepped.1), "step stays an immediate neighbour, got {stepped:?}");
     }
@@ -1591,7 +1713,7 @@ mod tests {
         let pending = queue.drain_pending();
         assert_eq!(pending.len(), 1);
         assert!(matches!(pending[0].1, PathKind::SubtileDetour { .. }));
-        assert!(fp.detour.is_empty(), "detour path must not be installed synchronously");
+        assert!(!fp.on_sub_run(), "detour subcells must not be spliced synchronously");
     }
 
     #[test]
@@ -1641,9 +1763,9 @@ mod tests {
 
         fp.execute(&mut state, &ctx, &mut rng, &tuning);
 
-        assert!(fp.detour.is_empty(), "zero-chance bump must not detour");
+        assert!(!fp.on_sub_run(), "zero-chance bump must not detour");
         assert!(fp.path.len() > original_len, "zero-chance bump must step aside");
-        let stepped = fp.path[fp.index];
+        let stepped = fp.path[fp.index].tile();
         let cur = (5, 5);
         assert!(
             (stepped.0 - cur.0).abs() <= 1 && (stepped.1 - cur.1).abs() <= 1 && stepped != cur,
@@ -1722,7 +1844,7 @@ mod tests {
         fp.execute(&mut state, &ctx, &mut rng, &FollowTuning::default());
 
         assert_eq!(fp.path.len(), original_len, "rear bump must not insert a step");
-        assert!(fp.detour.is_empty(), "rear bump must not detour");
+        assert!(!fp.on_sub_run(), "rear bump must not detour");
         assert!(fp.velocity.x > 0.0, "rear bump must not reflect forward velocity");
     }
 
@@ -1784,7 +1906,7 @@ mod tests {
         // End-to-end: the bump then waits in place (no waypoint, no detour).
         fp.execute(&mut state, &ctx, &mut rng, &tuning);
         assert_eq!(fp.path.len(), original_len, "all-taken bump inserts no step waypoint");
-        assert!(fp.detour.is_empty(), "no pathfind handle → no detour");
+        assert!(!fp.on_sub_run(), "no pathfind handle → no detour");
         assert!(
             fp.contact_wait_s > 0.0,
             "fully boxed in → bot waits in place, got {}",
@@ -1866,7 +1988,7 @@ mod tests {
         let ctx = bump_ctx(&state, &passability, &interactive);
         fp.execute(&mut state, &ctx, &mut rng, &tuning);
         assert!(fp.contact_wait_s <= 0.0, "pause must not start before arrival");
-        let cell = fp.path[fp.index];
+        let cell = fp.path[fp.index].tile();
 
         // Arrive at the chosen step-aside cell: the pause arms but the bot coasts
         // down with decel before the timer runs.
@@ -2224,4 +2346,128 @@ mod tests {
         }
     }
 
+    #[test]
+    fn install_detour_splices_subcell_nodes_at_cursor() {
+        // A bending subtile staircase (corner at (25,30)) splices `Sub` nodes into
+        // the unified path *before* the current cell, so the cursor now threads
+        // subcells and then arrives at the preserved coarse cell.
+        let mut fp = FollowPath::new(vec![(5, 5), (8, 5)]);
+        fp.index = 1; // next coarse cell is (8, 5)
+        let subs = vec![IVec2::new(25, 25), IVec2::new(25, 30), IVec2::new(40, 30)];
+
+        let before = fp.path.len();
+        fp.install_detour(&subs);
+
+        assert!(fp.path.len() > before, "detour subcells must be spliced in");
+        assert!(fp.on_sub_run(), "cursor now points at a spliced Sub node");
+        assert!(matches!(fp.path[fp.index], PathNode::Sub(_)));
+        assert!(
+            fp.path.iter().any(|n| *n == PathNode::cell(8, 5)),
+            "the coarse cell after the detour is preserved"
+        );
+    }
+
+    #[test]
+    fn install_detour_repair_replaces_wedged_cell() {
+        // A stall repair targets the node *after* the wedged cell. Installing it
+        // must replace `index..goal` — dropping the wedged cell — so the bot
+        // doesn't thread the detour and then U-turn back into the obstacle.
+        let mut fp = FollowPath::new(vec![(5, 5), (6, 5), (9, 5)]);
+        fp.index = 1; // wedged trying to reach (6, 5)
+        fp.detour_goal = 2; // route around it to (9, 5)
+        let subs = vec![IVec2::new(27, 25), IVec2::new(27, 30), IVec2::new(47, 30)];
+
+        fp.install_detour(&subs);
+
+        assert!(
+            !fp.path.contains(&PathNode::cell(6, 5)),
+            "the wedged cell must be dropped, not left behind the detour"
+        );
+        assert!(
+            fp.path.contains(&PathNode::cell(9, 5)),
+            "the repair goal cell is preserved"
+        );
+        assert!(matches!(fp.path[fp.index], PathNode::Sub(_)), "cursor now threads subcells");
+    }
+
+    #[test]
+    fn stall_attempts_local_repair_before_escape() {
+        // A pinned bot with avoidance + a pathfind handle must first enqueue a
+        // local splice-repair `SubtileDetour` (purpose Repair) — not jump straight
+        // to relocate/abandon.
+        use crate::actor::brain::{AvoidanceViews, PathfindAccess};
+        use crate::map::passability::{
+            DynamicPassabilityMap, SubtilePassability, FLAG_BLOCKED, FLAG_VOID,
+        };
+        use crate::map::pathfind_service::{PathfindQueue, PathfindResults};
+
+        let dynamic = DynamicPassabilityMap::new();
+        let static_subtiles: Hypermap<SubtilePassability> = Hypermap::new(SubtilePassability::EMPTY);
+        let queue = PathfindQueue::default();
+        let results = PathfindResults::default();
+        let passability = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let tuning = FollowTuning {
+            stuck_repath_secs: 0.3,
+            ..FollowTuning::default()
+        };
+
+        let mut fp = FollowPath::new(vec![(10, 0)]);
+        let mut state = ActorState {
+            center: Vec2::new(0.2, 0.2),
+            radius_subtiles: 2,
+            rotation: 0.0,
+            move_buffer: ActorMoveBuffer::default(),
+            last_movement_error: None,
+            last_accepted_center_subtile: Some(IVec2::new(1, 1)),
+            last_accepted_radius_subtiles: 2,
+            next_waypoint_hint: None,
+            field_main_tile: None,
+            dirtiness: 0.0,
+            shadow: crate::actor::ActorShadow::default(),
+        };
+        let mut rng = rng::seeded(31);
+
+        let make_ctx = |center: Vec2| BrainContext {
+            entity: Entity::PLACEHOLDER,
+            dt: 0.1,
+            center,
+            main_tile: IVec2::new(0, 0),
+            main_tile_changed: false,
+            floor: 0,
+            charge: 1.0,
+            missing_charge_pct: 0.0,
+            depleted: false,
+            broken: false,
+            passability: &passability,
+            interactive: &interactive,
+            on_screen: true,
+            trace: None,
+            avoidance: Some(AvoidanceViews {
+                dynamic: &dynamic,
+                static_subtiles: &static_subtiles,
+                blocked_flags: FLAG_BLOCKED | FLAG_VOID,
+            }),
+            patrol_loop: None,
+            pathfind: Some(PathfindAccess { queue: &queue, results: &results }),
+            fixer: None,
+            dynamic_repath: false,
+        };
+
+        for _ in 0..4 {
+            let ctx = make_ctx(state.center);
+            fp.execute(&mut state, &ctx, &mut rng, &tuning);
+            state.move_buffer = ActorMoveBuffer::default();
+        }
+
+        assert!(fp.detour_request.is_some(), "stall must enqueue a local splice-repair first");
+        assert_eq!(fp.detour_purpose, DetourPurpose::Repair);
+        assert!(!fp.abandoned, "repair must be tried before abandoning");
+        assert!(fp.escape_target.is_none(), "repair is tried before the escape relocate");
+        let pending = queue.drain_pending();
+        assert!(
+            pending.iter().any(|(_, k)| matches!(k, PathKind::SubtileDetour { .. })),
+            "repair enqueues a subtile detour search"
+        );
+    }
 }
