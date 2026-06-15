@@ -22,7 +22,7 @@ use crate::actor::{
     ActorMovementError, ActorState,
 };
 use crate::map::hypermap_pathfind::world_tile_walkable;
-use crate::map::passability::{DynamicPassabilityMap, SubtilePassabilityMap, FLAG_CREATURE, SUBTILE_COUNT};
+use crate::map::passability::{FLAG_CREATURE, SUBTILE_COUNT};
 use crate::map::pathfind_service::{PathKind, PathOutcome, PathfindReason, RequestId};
 
 use super::path::PathNode;
@@ -958,12 +958,15 @@ impl LowLevelAction for FollowPath {
         }
 
         // Proactive look-ahead avoidance (on-screen only). Before a collision
-        // even happens, probe the single subtile just beyond the bot's leading
-        // edge along its heading; if another creature occupies it, route a
-        // subtile detour toward the next path node and hold — so the bot steers
-        // around instead of pressing into the jam. Off-screen bots advance
-        // without occupancy, so this is skipped for them. One subtile read per
-        // moving bot per tick — no footprint scan.
+        // even happens, advance the bot's **whole footprint** one subtile along
+        // its heading and test it for another creature: a subcell within the
+        // bot's radius of an occupied subcell is in fact impassable, so a wide
+        // bot must probe its leading arc, not a single cell. The bot's own
+        // current footprint is exempted (`previous`), so only the newly-entered
+        // leading crescent is checked. If a creature sits there, route a subtile
+        // detour toward the next path node and hold — steering around instead of
+        // pressing into the jam. Off-screen bots advance without occupancy, so
+        // this is skipped for them.
         if ctx.on_screen
             && !self.on_sub_run()
             && self.detour_request.is_none()
@@ -972,20 +975,34 @@ impl LowLevelAction for FollowPath {
             && self.velocity.length_squared() > LOOKAHEAD_MIN_SPEED_SQ
         {
             if let Some(views) = ctx.avoidance.as_ref() {
+                let radius = state.radius_subtiles;
                 let start = state
                     .last_accepted_center_subtile
                     .unwrap_or_else(|| float_subtile(center));
-                // One cell beyond the leading edge: radius + 1 along the heading
-                // (reuse the maintained unit `direction` — no per-tick sqrt).
-                let reach = state.radius_subtiles as f32 + 1.0;
-                let probe = start
-                    + IVec2::new(
-                        (self.direction.x * reach).round() as i32,
-                        (self.direction.y * reach).round() as i32,
-                    );
-                if probe != start && subtile_has_creature(views.dynamic, probe) {
+                // One subtile forward along the heading (reuse the maintained unit
+                // `direction` — no per-tick sqrt).
+                let lead = IVec2::new(
+                    self.direction.x.round() as i32,
+                    self.direction.y.round() as i32,
+                );
+                let advanced = start + lead;
+                // Footprint-aware creature test: `FLAG_CREATURE` never appears in
+                // static geometry, so this trips only on another bot's body in the
+                // leading footprint, leaving walls to the slide / `WallRepair` path.
+                let creature_ahead = lead != IVec2::ZERO
+                    && views
+                        .dynamic
+                        .probe_footprint(
+                            advanced,
+                            radius,
+                            Some((start, radius)),
+                            FLAG_CREATURE,
+                            views.static_subtiles,
+                        )
+                        .is_err();
+                if creature_ahead {
                     if let Some(id) = self.enqueue_detour(state, ctx, self.index) {
-                        ctx.trace(format!("look-ahead: creature at subtile {probe:?} → detour"));
+                        ctx.trace(format!("look-ahead: creature in leading footprint at {advanced:?} → detour"));
                         self.detour_request = Some(id);
                         self.detour_purpose = DetourPurpose::Avoidance;
                         self.detour_goal = self.index;
@@ -1321,14 +1338,6 @@ pub fn reached_waypoint(center: Vec2, tile: (i32, i32), eps: f32) -> bool {
 #[inline]
 fn node_reached(center: Vec2, node: PathNode, eps: f32) -> bool {
     (node.center() - center).length_squared() <= eps * eps
-}
-
-/// `true` when another creature occupies the world-subtile `sub` in the dynamic
-/// **read** buffer. Single-cell read — the cheap probe used by proactive
-/// look-ahead avoidance.
-#[inline]
-fn subtile_has_creature(dynamic: &DynamicPassabilityMap, sub: IVec2) -> bool {
-    SubtilePassabilityMap::new(dynamic).flags_xy(0, 0, sub.x, sub.y) & FLAG_CREATURE != 0
 }
 
 /// Advance a no-progress timer; reset when `center` moves past `progress_eps` or
@@ -1890,7 +1899,7 @@ mod tests {
         // handle → no step cell, no escape, no detour: the bot must just wait in
         // place (arm contact_wait_s, insert no waypoint).
         use crate::actor::brain::AvoidanceViews;
-        use crate::map::passability::{SubtilePassability, FLAG_BLOCKED};
+        use crate::map::passability::{DynamicPassabilityMap, SubtilePassability, FLAG_BLOCKED};
 
         let mut fp = FollowPath::new(vec![(8, 5)]);
         fp.velocity = Vec2::new(1.0, 0.0);
@@ -1958,7 +1967,7 @@ mod tests {
         // and the collision-pressure relocate and deadlock two bots — the bot must
         // begin an escape to the nearest free cell.
         use crate::actor::brain::AvoidanceViews;
-        use crate::map::passability::{SubtilePassability, FLAG_BLOCKED};
+        use crate::map::passability::{DynamicPassabilityMap, SubtilePassability, FLAG_BLOCKED};
 
         let mut fp = FollowPath::new(vec![(8, 5)]);
         fp.velocity = Vec2::new(1.0, 0.0);
@@ -2590,5 +2599,84 @@ mod tests {
         assert!(!fp.abandoned, "a wall must never abandon");
         assert!(!fp.is_stuck(), "a wall must never mark the bot stuck");
         assert!(fp.escape_target.is_none(), "a wall never triggers the escape relocate");
+    }
+
+    #[test]
+    fn lookahead_is_footprint_aware_not_single_cell() {
+        // A creature offset to the **side** of the heading — within the bot's
+        // radius of its leading footprint, but not on the center axis — must
+        // trigger a look-ahead detour. The old single-cell probe (straight ahead)
+        // would have missed it; a size-aware footprint probe catches it.
+        use crate::actor::brain::{AvoidanceViews, PathfindAccess};
+        use crate::map::passability::{
+            DynamicPassabilityMap, SubtilePassability, FLAG_BLOCKED, FLAG_VOID,
+        };
+        use crate::map::pathfind_service::{PathfindQueue, PathfindResults};
+
+        let dynamic = DynamicPassabilityMap::new();
+        // Creature in the leading footprint after advancing +X by one subtile
+        // (advanced center (26,25), radius 2): (26,27) is in that circle but NOT
+        // in the bot's current footprint at (25,25), and is off the +X center
+        // axis the old single-cell probe checked.
+        dynamic.write_footprint(&[IVec2::new(26, 27)]);
+        dynamic.flush();
+        let static_subtiles: Hypermap<SubtilePassability> = Hypermap::new(SubtilePassability::EMPTY);
+        let queue = PathfindQueue::default();
+        let results = PathfindResults::default();
+        let passability = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+
+        let mut fp = FollowPath::new(vec![(8, 5)]);
+        fp.velocity = Vec2::new(1.0, 0.0);
+        fp.direction = Vec2::new(1.0, 0.0);
+        let mut state = ActorState {
+            center: Vec2::new(5.0, 5.0),
+            radius_subtiles: 2,
+            rotation: 0.0,
+            move_buffer: ActorMoveBuffer::default(),
+            last_movement_error: None,
+            last_accepted_center_subtile: Some(IVec2::new(25, 25)),
+            last_accepted_radius_subtiles: 2,
+            next_waypoint_hint: None,
+            field_main_tile: None,
+            dirtiness: 0.0,
+            shadow: crate::actor::ActorShadow::default(),
+        };
+        let ctx = BrainContext {
+            entity: Entity::PLACEHOLDER,
+            dt: 0.1,
+            center: state.center,
+            main_tile: IVec2::new(5, 5),
+            main_tile_changed: false,
+            floor: 0,
+            charge: 1.0,
+            missing_charge_pct: 0.0,
+            depleted: false,
+            broken: false,
+            passability: &passability,
+            interactive: &interactive,
+            on_screen: true,
+            trace: None,
+            avoidance: Some(AvoidanceViews {
+                dynamic: &dynamic,
+                static_subtiles: &static_subtiles,
+                blocked_flags: FLAG_BLOCKED | FLAG_VOID,
+            }),
+            patrol_loop: None,
+            pathfind: Some(PathfindAccess { queue: &queue, results: &results }),
+            fixer: None,
+            dynamic_repath: false,
+        };
+        let mut rng = rng::seeded(41);
+
+        fp.execute(&mut state, &ctx, &mut rng, &FollowTuning::default());
+
+        assert!(
+            fp.detour_request.is_some(),
+            "an off-axis creature inside the leading footprint must trigger a look-ahead detour"
+        );
+        assert_eq!(fp.detour_purpose, DetourPurpose::Avoidance);
+        let pending = queue.drain_pending();
+        assert!(pending.iter().any(|(_, k)| matches!(k, PathKind::SubtileDetour { .. })));
     }
 }

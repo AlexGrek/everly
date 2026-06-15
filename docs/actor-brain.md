@@ -185,14 +185,17 @@ selected-bot log reads `wedged (stalled N.Ns in recovery) → re-routing from (x
 
 ### Proactive look-ahead avoidance
 
-Before a collision even happens, an actively-moving **on-screen** bot probes the
-**single subtile just beyond its leading edge** along its heading
-(`radius_subtiles + 1` subtiles ahead, reusing the maintained unit `direction`
-so there's no per-tick `sqrt`). If that one cell holds another creature
-(`FLAG_CREATURE` in the dynamic read buffer — `subtile_has_creature`), the bot
+Before a collision even happens, an actively-moving **on-screen** bot advances
+its **whole footprint** one subtile along its heading (reusing the maintained
+unit `direction` so there's no per-tick `sqrt`) and tests that leading footprint
+for another creature — a subcell within the bot's `radius_subtiles` of an
+occupied subcell is in fact impassable, so a wide bot must probe its leading
+**arc**, not a single cell. The bot's own current footprint is exempted
+(`probe_footprint`'s `previous`), so only the newly-entered leading crescent is
+checked, and the test trips only on `FLAG_CREATURE` (static walls carry no
+creature bit, so they're left to the slide / `WallRepair` path). On a hit the bot
 **enqueues a subtile detour** toward its next path node and holds, steering
-around the obstacle instead of pressing into it. It's one subtile read per
-moving bot per tick — no footprint scan. Gated by `BrainContext::on_screen`
+around the obstacle instead of pressing into it. Gated by `BrainContext::on_screen`
 (off-screen bots advance without occupancy, so probing is pointless) and skipped
 while already detouring / stepping / waiting, or below `LOOKAHEAD_MIN_SPEED_SQ`.
 
