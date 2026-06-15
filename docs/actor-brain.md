@@ -2,7 +2,7 @@
 
 The **brain** is the OOP high-level decision layer for smart actors, in
 [`src/actor/brain/`](../src/actor/brain/). It sits *above* the deterministic
-low-level movement pipeline (`Actor::propose_move`, `arbitrate_actor_moves`) described in
+low-level movement pipeline (`Actor::propose_move`, `process_actor_moves`) described in
 [`actor.md`](actor.md). BlackBot is its first consumer.
 
 ## Concepts
@@ -17,7 +17,7 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
                      Low-level action   (Wait / PendingPath / FollowPath)
                               │ execute()
                               ▼
-                     ActorState.move_buffer  ──▶ propose_actor_moves → arbitrate_actor_moves
+                     ActorState.move_buffer  ──▶ process_actor_moves
                               ▲
                      PathfindQueue ──▶ AsyncComputeTaskPool ──▶ PathfindResults
                      (enqueue)         (≤10 in flight)         (take by RequestId)
@@ -116,7 +116,7 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
 
 ### BlackBot status colors
 
-`sync_black_bot_status_visual` (in `black_bot.rs`, runs `.after(arbitrate_actor_moves)`)
+`sync_black_bot_status_visual` (in `black_bot.rs`, runs after `process_actor_moves`)
 recolors the sphere by priority: **white** when the control plane breaks, a
 **yellow stuck flash** when `Brain::is_stuck` (relit to full yellow, then
 fading back over `STUCK_FLASH_FADE_SECS`), otherwise a **collision flash** — a
@@ -131,7 +131,7 @@ the displayed color changes, so a settled bot costs no per-frame asset writes.
 ### Collision pressure reset
 
 BlackBots track a per-entity **collision pressure** counter (inspector:
-`collision_pressure`). Each frame after [`arbitrate_actor_moves`](../src/actor/movement.rs),
+`collision_pressure`). Each frame after [`process_actor_moves`](../src/actor/movement.rs),
 `track_black_bot_collision_pressure` decides whether the bot is genuinely
 **wedged** this frame — which requires *all* of:
 
@@ -146,18 +146,18 @@ BlackBots track a per-entity **collision pressure** counter (inspector:
   maneuver is in flight lets it finish.
 
 Wedged frame → **+5**; otherwise → **−1** floored at **0**. When pressure reaches
-**50**, the bot is **relocated to the nearest free cell**
-([`resolve_offscreen_collision`](../src/actor/mod.rs)) — replanning *in place*
-would just re-wedge — then [`Brain::reset`](../src/actor/brain/mod.rs) wipes the
-plan, charger slots are released via
+**50**, the bot is **re-routed in place** — it is **not** teleported (the movement
+pipeline no longer has any jam teleport; see `docs/movement.md` § *Why no
+teleport*). [`Brain::reset`](../src/actor/brain/mod.rs) wipes the plan, charger
+slots are released via
 [`InteractiveEntityMap::evict_actor_everywhere`](../src/map/interactive_entity.rs),
 and the log records `<name> reset (collision pressure)` (plus a detailed
-`wedged (...) → relocated` line for the selected bot). Pressure is zeroed.
-Depleted and broken bots do not accumulate pressure.
+`wedged (...) → re-routing from (x,y)` line for the selected bot). Pressure is
+zeroed. Depleted and broken bots do not accumulate pressure.
 
-**Total path recalculation against dynamic passability.** Relocating alone is not
-enough — the wiped plan would re-plan the *same* tile route straight back into the
-bot cluster it was just pulled out of. So every relocation also arms a
+**Total path recalculation against dynamic passability.** Wiping the plan alone is
+not enough — it would re-plan the *same* tile route straight back into the bot
+cluster. So every reset also arms a
 **dynamic-repath window** (`Brain::set_dynamic_repath`, a ~2 s countdown read by
 `Brain::take_dynamic_repath` each tick into `BrainContext::dynamic_repath`). While
 the window is open, every `WorldRoute` a high-level action enqueues sets
@@ -167,7 +167,7 @@ tile A\* plus a predicate that treats any tile whose **center subtile** carries 
 creature body (`FLAG_BLOCKED | FLAG_CREATURE`) as impassable. The new route
 therefore steers around the current crowd rather than through it. The window
 (rather than a one-shot flag) is needed because the actual re-plan often happens a
-second or two later, on the `stuck` rising edge, not on the relocation tick.
+second or two later, on the `stuck` rising edge, not on the reset tick.
 
 **Sustained-stall escape valve.** Collision pressure is suspended while the bot
 `is_recovering` (detour / step-aside / escape / wait-in-place), so an **open-space
@@ -178,8 +178,8 @@ travel more than `STALL_PROGRESS_RESET_SQ` (1.5 tiles) from a slowly-updated
 anchor — regardless of recovery state. Once that exceeds
 `STALL_FORCE_RELOCATE_SECS` (**4 s**, far above any single legitimate maneuver)
 *and* the bot is still `is_recovering` (so charging / queued / idle bots are never
-yanked), it forces the **same** relocate + dynamic-repath as a pressure reset. The
-selected-bot log reads `wedged (stalled N.Ns in recovery) → relocated`.
+yanked), it forces the **same** re-route + dynamic-repath as a pressure reset. The
+selected-bot log reads `wedged (stalled N.Ns in recovery) → re-routing from (x,y)`.
 
 ### Proactive look-ahead avoidance
 
@@ -225,7 +225,7 @@ route around other (moving) bots. When a step is rejected with
      brake for 0.5–1.5 s. **This is what breaks open-space two-bot wedges:** a bare
      wait-in-place reports `is_recovering`, which suspends *both* the stuck-timer
      escape (skipped by the wait's early return) and the collision-pressure
-     relocate (gated off while recovering), so two large bots pressed together with
+     reset (gated off while recovering), so two large bots pressed together with
      no free neighbour but open space around them would otherwise deadlock forever.
 
 This applies to bot-on-bot bumps only; a wall graze (`BlockedByStatic`) is left
@@ -330,11 +330,11 @@ The specialization is **persisted** (see [Persistence](#persistence)); the patro
   [specialization](#specializations) (`BotSpecialization::build_brain`), the
   default `make_high_level` factory, and a seeded `StdRng`.
 - `black_bot_brain` (runs
-  `.after(flush_actor_occupancy).after(PathfindSet::Collect).before(PathfindSet::Dispatch).before(propose_actor_moves)`,
+  `.after(flush_actor_occupancy).after(PathfindSet::Collect).before(PathfindSet::Dispatch).before(process_actor_moves)`,
   sequential) ticks each brain, gates depleted/broken bots (`brain.reset` — wipes
   the plan and clears movement intent), ticks wear/break, and applies effects via
   `apply_brain_effects`. It runs after the occupancy flush so the bot-on-bot
-  subtile detour reads the same dynamic passability snapshot `propose_actor_moves` will
+  subtile detour reads the same dynamic passability snapshot `process_actor_moves` will
   use this frame, and between pathfind collect/dispatch so bots can enqueue and
   consume route results in the same frame cadence.
   - **Offline eviction:** when a bot first becomes non-operational

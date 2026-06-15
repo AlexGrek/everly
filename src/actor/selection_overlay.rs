@@ -9,10 +9,13 @@
 //!   marker at each. Unlike the global path overlay (`paint_black_bot_targets`,
 //!   gated on `PathOverlayEnabled`), this is always shown for the selection and
 //!   independent of the overlay toggle.
+//! - for a `PATROL` bot, the bot's full fixed patrol loop — every patrol point,
+//!   drawn as a closed polyline with a marker at each — in a distinct color so it
+//!   reads separately from the green active route above.
 
 use bevy::prelude::*;
 
-use crate::actor::black_bot::BlackBotVisual;
+use crate::actor::black_bot::{BlackBotVisual, Patrol};
 use crate::actor::brain::{Brain, PathNode};
 use crate::actor::ActorObject;
 use crate::hud::actor_inspector::SelectedActor;
@@ -43,6 +46,14 @@ const WAYPOINT_COLOR: Color = Color::srgb(0.35, 1.0, 0.55);
 const WAYPOINT_RADIUS: f32 = 0.12;
 const WAYPOINT_TARGET_RADIUS: f32 = 0.22;
 
+/// Height above floor 0 at which the patrol loop is drawn. Slightly higher than
+/// the active route so the two overlays don't z-fight where they overlap.
+const PATROL_Y: f32 = 0.18;
+/// Patrol-loop color — a cool cyan, distinct from the green active route.
+const PATROL_COLOR: Color = Color::srgb(0.30, 0.75, 1.0);
+/// Gizmo sphere radius at each patrol point.
+const PATROL_POINT_RADIUS: f32 = 0.16;
+
 /// Marks the singleton glowing selection cube.
 #[derive(Component)]
 struct SelectionMarker;
@@ -53,7 +64,11 @@ impl Plugin for SelectionOverlayPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             Update,
-            (sync_selection_marker, draw_selected_waypoints)
+            (
+                sync_selection_marker,
+                draw_selected_patrol_loop,
+                draw_selected_waypoints,
+            )
                 .run_if(in_state(GameState::InGame)),
         );
     }
@@ -154,5 +169,43 @@ fn draw_selected_waypoints(
     for (i, node) in remaining.iter().enumerate() {
         let radius = if i == last { WAYPOINT_TARGET_RADIUS } else { WAYPOINT_RADIUS };
         gizmos.sphere(Isometry3d::from_translation(waypoint_pos(node)), radius, WAYPOINT_COLOR);
+    }
+}
+
+/// Draws the full fixed patrol loop of the selected `PATROL` bot: every patrol
+/// point as a marker, joined by a closed polyline (the loop wraps back to its
+/// first point, matching how `GoToPatrol` cycles the tiles forever). Shown only
+/// when the selected bot carries a [`Patrol`] with a generated loop; other
+/// specializations have no `Patrol` component and draw nothing here. Tile
+/// `(tx, ty)` maps to world center `(tx + 0.5, ty + 0.5)` on floor 0.
+fn draw_selected_patrol_loop(
+    selection: Res<SelectedActor>,
+    bots: Query<&Patrol, With<BlackBotVisual>>,
+    mut gizmos: Gizmos,
+) {
+    let Some(selected) = selection.entity else {
+        return;
+    };
+    let Ok(patrol) = bots.get(selected) else {
+        return;
+    };
+    if patrol.loop_tiles.is_empty() {
+        return;
+    }
+
+    let point = |&(tx, ty): &(i32, i32)| Vec3::new(tx as f32 + 0.5, PATROL_Y, ty as f32 + 0.5);
+
+    // Closed loop: walk every point and wrap back to the first.
+    gizmos.linestrip(
+        patrol
+            .loop_tiles
+            .iter()
+            .map(point)
+            .chain(patrol.loop_tiles.first().map(point)),
+        PATROL_COLOR,
+    );
+
+    for tile in &patrol.loop_tiles {
+        gizmos.sphere(Isometry3d::from_translation(point(tile)), PATROL_POINT_RADIUS, PATROL_COLOR);
     }
 }

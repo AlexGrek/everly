@@ -50,14 +50,14 @@ pipeline. Already-depleted bots are skipped (no work, no underflow).
 ### Depletion disables movement
 
 A depleted bot (`is_depleted()`) is stopped **in its think system**, not in
-[`propose_actor_moves`](../src/actor/movement.rs):
+[`process_actor_moves`](../src/actor/movement.rs):
 
 - [`black_bot_brain`](../src/actor/black_bot.rs) detects depletion at the top of
   its per-bot loop, zeros the [`move_buffer`](../src/actor/mod.rs), and
   `continue` — skipping pathing logic entirely.
 
-Because the buffer is empty, `propose_actor_moves` records the held footprint (`proposed_center == origin`) in
-place (no delta), and `arbitrate_actor_moves` re-stamps the bot's existing
+Because the buffer is empty, `process_actor_moves` records the held footprint
+(`proposed_center == origin`) in place (no delta) and re-stamps the bot's existing
 footprint: it holds position and keeps its dynamic-occupancy cell. Recharge is
 handled by BlackBot brain logic (`GoToChargeStation`) which seeks accessible
 chargers from `InteractiveEntityMap`, docks, and applies `RECHARGE_PER_S`

@@ -156,7 +156,7 @@ Full docs: **`docs/pathfind-service.md`**. Brain integration: **`docs/actor-brai
 
 Trait-based actor system. Each actor type implements `Actor` (state accessors, optional `think_low_level`, `blocked_flags` for traversal). Wrapped in `ActorObject` (a `Component` holding `Box<dyn Actor>`).
 
-Per-frame pipeline: `propose_actor_moves` (parallel, static-only checks) → `arbitrate_actor_moves` (sequential, owner grid conflict resolution, squeeze teleport) → field interactions → flush passability.
+Per-frame pipeline: `process_actor_moves` (sequential single pass — think + static-only propose, owner-grid conflict resolution, apply, off-screen re-entry placement) → field interactions → flush passability.
 
 Movement uses **dual channels**: `tile_delta` (float, smooth rendering) and `subtile_shift` (integer, collision grid). Accumulate float displacement across frames; emit integer steps only on subtile boundary crossings. `1 tile = 5 subtiles`.
 
