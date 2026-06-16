@@ -17,7 +17,10 @@ use crate::actor::actor_pick::{ActorInspectable, ActorPickMesh};
 use crate::actor::black_bot::{BlackBotVisual, BotSpecialization, Breakable};
 use crate::actor::brain::Brain;
 use crate::actor::charge::Charge;
-use crate::actor::inspect::{debug_rows, display_actor_name, route_rows, status_rows, systems_rows};
+use crate::actor::dispatch::BotInventory;
+use crate::actor::inspect::{
+    debug_rows, display_actor_name, inventory_rows, route_rows, status_rows, systems_rows,
+};
 use crate::actor::ActorObject;
 use crate::edit::actor_spawn::{ActorSpawnState, ActorTool};
 use crate::menu::main_menu::GameState;
@@ -55,6 +58,7 @@ pub enum InspectorTab {
     Status,
     Systems,
     Route,
+    Inventory,
     Debug,
 }
 
@@ -392,17 +396,20 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                     BackgroundColor(ACCENT.with_alpha(0.45)),
                 ));
 
-                // Tab bar: Status | Systems | Route | Debug
+                // Tab bar: Status | Systems | Route | Inventory | Debug
                 card.spawn(Node {
                     width: Val::Percent(100.0),
                     flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
                     column_gap: Val::Px(6.0),
+                    row_gap: Val::Px(4.0),
                     ..default()
                 })
                 .with_children(|tabs| {
                     spawn_tab_button(tabs, "Status", InspectorTab::Status, true);
                     spawn_tab_button(tabs, "Systems", InspectorTab::Systems, false);
                     spawn_tab_button(tabs, "Route", InspectorTab::Route, false);
+                    spawn_tab_button(tabs, "Inventory", InspectorTab::Inventory, false);
                     spawn_tab_button(tabs, "Debug", InspectorTab::Debug, false);
                 });
 
@@ -874,7 +881,7 @@ fn sync_actor_inspector_panel(
     existing_actions: Query<Entity, With<ActorInspectorActionBtn>>,
     actor_data: Query<(&ActorObject, Option<&Name>), With<ActorInspectable>>,
     black: Query<(&Brain, &BlackBotVisual, Option<&BotSpecialization>)>,
-    actor_extras: Query<(Option<&Charge>, Option<&Breakable>)>,
+    actor_extras: Query<(Option<&Charge>, Option<&Breakable>, Option<&BotInventory>)>,
     force_logs: Query<&ActorForceLogs>,
     mut state: Local<PanelBuildState>,
 ) {
@@ -915,10 +922,10 @@ fn sync_actor_inspector_panel(
         return;
     };
 
-    let (charge, breakable) = actor_extras
+    let (charge, breakable, inventory) = actor_extras
         .get(actor)
-        .map(|(c, b)| (c.map(|c| c.level), b))
-        .unwrap_or((None, None));
+        .map(|(c, b, i)| (c.map(|c| c.level), b, i))
+        .unwrap_or((None, None, None));
     let is_black_bot = black.get(actor).is_ok();
 
     let force_logs_on = force_logs.get(actor).map(|f| f.0).unwrap_or(false);
@@ -940,6 +947,9 @@ fn sync_actor_inspector_panel(
             ),
             InspectorTab::Systems => breakable.map(|b| systems_rows(b)).unwrap_or_default(),
             InspectorTab::Route => route_rows(brain),
+            InspectorTab::Inventory => {
+                inventory_rows(inventory.and_then(|inv| inv.carried))
+            }
             InspectorTab::Debug => debug_rows(force_logs_on),
         };
     } else {

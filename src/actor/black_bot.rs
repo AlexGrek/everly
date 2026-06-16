@@ -633,9 +633,10 @@ pub(crate) fn black_bot_brain(
         // A re-entry teleport last frame moved the bot non-locally (it returned
         // from off-screen travel and was placed on a free cell); drop the stale
         // plan so it re-routes from where it actually landed.
+        // Fixer claim and inventory are kept — GoFixBots recovers the claim via
+        // claim_of and re-routes to the target from the new position.
         if state.shadow.teleported {
             brain.reset();
-            release_fixer_work(entity, &dispatch, inventory.as_deref_mut());
             state.move_buffer = ActorMoveBuffer::default();
             state.next_waypoint_hint = None;
         }
@@ -690,9 +691,11 @@ pub(crate) fn black_bot_brain(
         // Depleted or broken bots are immobilized: wipe the plan (routes/targets),
         // cancel movement, and release every charger queue slot / occupancy they
         // hold (once, on the offline transition) so they stop blocking working bots.
+        // The fixer's dispatch claim IS released so another fixer can cover the
+        // stranded bot while this one is offline. Inventory is kept (permanent).
         if depleted || broken {
             brain.reset();
-            release_fixer_work(entity, &dispatch, inventory.as_deref_mut());
+            release_fixer_claim(entity, &dispatch);
             state.move_buffer = ActorMoveBuffer::default();
             state.next_waypoint_hint = None;
             if !vis.offline_released {
@@ -965,18 +968,13 @@ pub(crate) fn black_bot_brain(
     }
 }
 
-/// Releases any dispatch claim held by `entity` and drops its carried part. Used
-/// wherever a fixer's brain is force-reset (teleport, offline, collision) so a
-/// claimed repair task doesn't stay orphaned on the board.
-fn release_fixer_work(
-    entity: Entity,
-    dispatch: &DispatchQueue,
-    inventory: Option<&mut BotInventory>,
-) {
+/// Releases any dispatch claim held by `entity`. Called only when the fixer goes
+/// genuinely offline (depleted or broken) so the stranded bot's request is freed
+/// for another fixer. Navigation resets (teleport, collision re-route) do NOT
+/// call this — the fixer resumes its claim automatically via `claim_of` in
+/// `GoFixBots::update`. Inventory is never cleared here; it is permanent state.
+fn release_fixer_claim(entity: Entity, dispatch: &DispatchQueue) {
     dispatch.release(entity);
-    if let Some(inv) = inventory {
-        inv.carried = None;
-    }
 }
 
 /// Closest reachable [`CellType::PartsDepot`](crate::map::world_map::CellType)
@@ -1227,7 +1225,6 @@ fn track_black_bot_collision_pressure(
     game_log: Res<GameLog>,
     selected: Res<SelectedActor>,
     mut interactive: ResMut<InteractiveEntityMap>,
-    dispatch: Res<DispatchQueue>,
     mut prev_center: Local<HashMap<Entity, Vec2>>,
     mut stall: Local<HashMap<Entity, StallTrack>>,
     mut query: Query<(
@@ -1239,11 +1236,10 @@ fn track_black_bot_collision_pressure(
         &ActorForceLogs,
         Option<&Charge>,
         Option<&Breakable>,
-        Option<&mut BotInventory>,
     )>,
 ) {
     let dt = time.delta_secs();
-    for (entity, name, mut obj, mut brain, mut vis, force_logs, charge, breakable, mut inventory) in &mut query {
+    for (entity, name, mut obj, mut brain, mut vis, force_logs, charge, breakable) in &mut query {
         let depleted = charge.is_some_and(|c| c.is_depleted());
         let broken = breakable
             .as_ref()
@@ -1315,7 +1311,8 @@ fn track_black_bot_collision_pressure(
         prev_center.insert(entity, center);
         stall.insert(entity, StallTrack { anchor: center, elapsed: 0.0 });
         interactive.evict_actor_everywhere(entity);
-        release_fixer_work(entity, &dispatch, inventory.as_deref_mut());
+        // Fixer claim and inventory are kept — GoFixBots recovers the claim via
+        // claim_of and re-routes to the target after the repath.
         game_log.push_world_for_bot(
             tile.x,
             tile.y,

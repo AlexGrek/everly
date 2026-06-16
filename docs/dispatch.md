@@ -53,11 +53,18 @@ claim / release / complete through a shared `&` — the same pattern as
 | `complete(bot)` | Remove a request (repaired / gone). |
 | `maintain(broken, alive)` | Drop requests for non-stranded bots; free claims of dead fixers. |
 
-**Claim hygiene.** A claim must never outlive the fixer that holds it. Releases
-happen on: `GoFixBots::preempt` (recharge), every forced `brain.reset()` site in
-`black_bot.rs` (`release_fixer_work`: squeeze-teleport, offline gate, collision
-reset), and `maintain` (despawned claimer). Without this a reset fixer would
-orphan its task forever.
+**Claim hygiene.** Releases happen on: the offline gate (`depleted || broken`) in
+`black_bot.rs` (`release_fixer_claim`) so another fixer can cover while this one
+is incapacitated; and `maintain` (despawned claimer). Navigation resets
+(squeeze-teleport, collision repath) and recharge pre-emptions do **not** release
+the claim — `GoFixBots::update` recovers it from `dispatch.claim_of(entity)` when
+`Fixing` becomes the dominant priority again and the new action starts in Loiter.
+
+**Inventory is permanent.** `BotInventory::carried` is never cleared by brain
+resets, pre-emptions, or the offline gate. It is overwritten on the next
+`pickup_part` (a new delivery cycle) and cleared only on successful delivery
+(`clear_inventory` effect). A fixer that carries a part through a recharge
+detour or a navigation reset resumes delivering from where it left off.
 
 ## `BotInventory` + marker
 

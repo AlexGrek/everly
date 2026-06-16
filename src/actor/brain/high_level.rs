@@ -735,13 +735,13 @@ impl GoFixBots {
         }
     }
 
-    /// Drops the current claim (back to the pool) and clears carried inventory —
-    /// used on give-up and pre-emption so a stuck task frees up for another fixer.
-    fn abandon_claim(&mut self, fx: FixerContext, entity: Entity, effects: &mut BrainEffects) {
+    /// Drops the current claim back to the pool — used when the fixer cannot
+    /// reach the stranded bot and must give up the task. Inventory is not cleared;
+    /// the carried part persists until the next successful delivery overwrites it.
+    fn abandon_claim(&mut self, fx: FixerContext, entity: Entity) {
         if self.claim.take().is_some() {
             fx.dispatch.release(entity);
         }
-        effects.clear_inventory = true;
     }
 }
 
@@ -763,15 +763,14 @@ impl HighLevelAction for GoFixBots {
             FixPhase::ReturnHome => "GoFixBots (return)".to_string(),
         }
     }
-    fn preempt(&mut self, ctx: &BrainContext) -> BrainEffects {
-        let mut effects = BrainEffects::default();
-        if let Some(fx) = ctx.fixer {
-            self.abandon_claim(fx, ctx.entity, &mut effects);
-        }
+    fn preempt(&mut self, _ctx: &BrainContext) -> BrainEffects {
+        // Keep the dispatch claim and inventory — the fixer resumes its assigned
+        // task after recharging. GoFixBots::update recovers the claim via claim_of
+        // when Fixing becomes dominant again.
         self.phase = FixPhase::Loiter;
         self.awaiting = None;
         self.leg = None;
-        effects
+        BrainEffects::default()
     }
     fn update(
         &mut self,
@@ -800,6 +799,35 @@ impl HighLevelAction for GoFixBots {
         // phase handler's replan logic runs next tick.
         if self.awaiting.is_none() && low.kind() == LowLevelKind::PendingPath {
             *low = Box::new(Wait::retry(RETRY_S));
+        }
+
+        // Claim recovery after brain reset or recharge pre-emption. When the
+        // brain is wiped, GoFixBots is re-created in Loiter with no local claim.
+        // But the dispatch board may still hold a claim for this fixer entity —
+        // re-attach it and resume the appropriate phase without re-fetching the
+        // part if inventory is already loaded.
+        if self.phase == FixPhase::Loiter && self.claim.is_none() {
+            if let Some(req) = fx.dispatch.claim_of(ctx.entity) {
+                self.claim = Some(req);
+                self.leg = None;
+                low.halt();
+                if fx.carried.is_some() {
+                    self.phase = FixPhase::Deliver;
+                    self.start_route(
+                        pf,
+                        ctx,
+                        low,
+                        (req.location.x, req.location.y),
+                        PathfindReason::FixerDeliver,
+                    );
+                } else {
+                    self.phase = FixPhase::FetchPart;
+                    self.start_route(pf, ctx, low, home_tile, PathfindReason::FixerFetchPart);
+                }
+                self.prev_low_stuck = low.is_stuck();
+                self.prev_low_finished = low.is_finished();
+                return HighLevelOutcome::running();
+            }
         }
 
         let outcome = match self.phase {
@@ -994,14 +1022,13 @@ impl GoFixBots {
                     return HighLevelOutcome::running();
                 }
                 // Can't reach the bot's tile (it's occupied / boxed in): give up,
-                // drop the part, return home so the task frees for another fixer.
+                // return home so the task frees for another fixer. Inventory kept.
                 RoutePoll::AtGoal | RoutePoll::Failed => {
-                    let mut effects = BrainEffects::default();
-                    self.abandon_claim(fx, ctx.entity, &mut effects);
+                    self.abandon_claim(fx, ctx.entity);
                     self.phase = FixPhase::ReturnHome;
                     self.leg = None;
                     self.start_route(pf, ctx, low, home_tile, PathfindReason::FixerReturnHome);
-                    return HighLevelOutcome::running_with(effects);
+                    return HighLevelOutcome::running();
                 }
             }
         }

@@ -4,6 +4,7 @@ use bevy::math::IVec2;
 
 use crate::actor::black_bot::{BotSpecialization, Breakable, BreakablePartState};
 use crate::actor::brain::Brain;
+use crate::actor::dispatch::RepairPart;
 use crate::actor::{actor_main_tile, ActorObject};
 
 /// One label/value row in the inspector modal.
@@ -122,6 +123,15 @@ pub fn systems_rows(b: &Breakable) -> Vec<InspectRow> {
         InspectRow { label: "CONTROL_PLANE", value: format_part(&b.control_plane) },
         InspectRow { label: "SENSORY_SYSTEM", value: format_part(&b.sensory_system) },
     ]
+}
+
+/// Inventory-tab rows: what the bot is currently carrying (fixer bots).
+pub fn inventory_rows(carried: Option<RepairPart>) -> Vec<InspectRow> {
+    let value = match carried {
+        Some(part) => part.label().to_string(),
+        None => "(empty)".to_string(),
+    };
+    vec![InspectRow { label: "carried", value }]
 }
 
 pub fn display_actor_name(name: &str) -> String {
