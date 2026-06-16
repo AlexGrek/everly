@@ -2469,6 +2469,52 @@ mod tests {
     }
 
     #[test]
+    fn fixer_full_flow_delivers_battery_and_recharges_on_contact() {
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let dispatch = DispatchQueue::default();
+        let discharged = Entity::from_bits(0xBA77);
+        dispatch.post(discharged, RepairPart::Battery, IVec2::new(3, 3));
+
+        let pf = PathfindFixture::new();
+        let mut action = GoFixBots::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = rng::seeded(3);
+        let home = EntityCoordinates::ground(0, 0);
+
+        // Tick 1 (loiter @ home): claim + route to depot.
+        let c = fixer_ctx(&passability, &interactive, (0, 0), pf.access(), &dispatch, Some(home), None);
+        action.update(&c, &mut low, &mut rng);
+        pf.resolve_all_routes(vec![(0, 0)], 1); // already on the depot tile
+
+        // Tick 2 (fetch): poll resolves AtGoal → pick up the battery, route to the bot.
+        let c = fixer_ctx(&passability, &interactive, (0, 0), pf.access(), &dispatch, Some(home), None);
+        let out = action.update(&c, &mut low, &mut rng);
+        assert_eq!(out.effects.pickup_part, Some(RepairPart::Battery), "battery picked up at depot");
+
+        // Tick 3 (deliver): standing next to the discharged bot → recharge on proximity.
+        let c = fixer_ctx(
+            &passability,
+            &interactive,
+            (3, 3),
+            pf.access(),
+            &dispatch,
+            Some(home),
+            Some(RepairPart::Battery),
+        );
+        let out = action.update(&c, &mut low, &mut rng);
+        assert!(out.effects.repair_target.is_none(), "a battery is not a part repair");
+        let (target, level) = out.effects.recharge_target.expect("recharges the discharged bot");
+        assert_eq!(target, discharged);
+        assert!(
+            (BATTERY_RECHARGE_MIN..=BATTERY_RECHARGE_MAX).contains(&level),
+            "recharge level {level} within [{BATTERY_RECHARGE_MIN}, {BATTERY_RECHARGE_MAX}]"
+        );
+        assert!(out.effects.clear_inventory, "carried battery is consumed");
+        assert!(dispatch.is_empty(), "completed request leaves the board");
+    }
+
+    #[test]
     fn fixer_preempt_releases_claim_and_drops_part() {
         let passability: Hypermap<f32> = Hypermap::new(1.0);
         let interactive = InteractiveEntityMap::new();

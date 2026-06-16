@@ -21,8 +21,10 @@ pub use crate::map::tile_field::TILE_FIELD_OVERLAY_RES as DIRT_OVERLAY_RES;
 
 const DIRT_CLAMP_MAX: f32 = 1.0;
 
-/// Dirt added to a tile when an actor leaves it (see `field_interactions`).
-pub const DIRT_TRACK_DEPOSIT: f32 = 0.01;
+/// Dirt-field ↔ actor coupling rate, per main-tile crossing (see `field_interactions`):
+/// fraction of the actor's dirtiness wiped onto a cleaner floor, and fraction of a
+/// dirtier floor's dirt picked up by the actor.
+pub const DIRT_TRACK_DEPOSIT: f32 = 0.05;
 
 /// Tile-resolution dirt hypermap (double-buffered).
 #[derive(Resource)]

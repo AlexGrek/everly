@@ -413,10 +413,12 @@ shared routine wish value lives in `behavior_utils.rs`.
     `pickup_part` (the bot's [`BotInventory`] now carries the part, rendered as a
     floating marker) and head to the stranded bot.
   - **Deliver:** route to the stranded bot's location; the moment the fixer is
-    within **1.5 tiles** (`FIX_REACH_SQ`, *near but not colliding*), emit
-    `repair_target` (reset that part's wear + clear its broken flag on the target
-    bot) and `clear_inventory`, `complete` the request, and return home. If the
-    bot's tile is unreachable, drop the claim and return so another fixer can try.
+    within **1.5 tiles** (`FIX_REACH_SQ`, *near but not colliding*), service it,
+    `clear_inventory`, `complete` the request, and return home. A repair part
+    emits `repair_target` (reset that part's wear + clear its broken flag); a
+    `Battery` emits `recharge_target` instead, restoring the discharged bot to a
+    random **50–70%** (rolled from the brain RNG). If the bot's tile is
+    unreachable, drop the claim and return so another fixer can try.
   - **ReturnHome:** route back to the depot, then `Loiter` again.
   The home depot lives on the bot's `Fixer` component (closest *reachable* depot,
   located lazily at spawn via `find_accessible_within`); the claim lives on the

@@ -50,12 +50,12 @@ Every actor carries its own [`ActorState::dirtiness`](../src/actor/mod.rs) in `0
 and **spawns clean** (`0.0`; not serialized, so a loaded actor starts clean again). On
 each main-tile transition the actor **exchanges** dirt with the tile it just **left**
 ([`dirt_exchange`](../src/map/field_interactions.rs), rate
-[`DIRT_TRACK_DEPOSIT`](../src/map/dirt.rs) = `0.01` = 1%):
+[`DIRT_TRACK_DEPOSIT`](../src/map/dirt.rs) = `0.05` = 5%):
 
 | Floor vs actor | Effect |
 |----------------|--------|
-| Floor **cleaner** than actor | Actor wipes `1%` of its dirtiness onto the tile (capped so it never goes below `0.0`); the tile gains exactly what the actor lost (conserved). |
-| Floor **dirtier** than actor | Actor picks up `1%` *of the floor's* dirtiness (clamped to `1.0`); the tile is unchanged. |
+| Floor **cleaner** than actor | Actor wipes `5%` of its dirtiness onto the tile (capped so it never goes below `0.0`); the tile gains exactly what the actor lost (conserved). |
+| Floor **dirtier** than actor | Actor picks up `5%` *of the floor's* dirtiness (clamped to `1.0`); the tile is unchanged. |
 | Equal, or **Void** tile | No-op. |
 
 Dirt is stored in a **tile-only** [`DoubleBufferedHypermap<f32>`](../src/map/tile_field.rs)

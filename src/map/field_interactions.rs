@@ -59,11 +59,11 @@ pub fn collect_main_tile_transitions(actors: &mut Query<&mut ActorObject>) -> Ve
 /// Pure dirt-exchange rule between a `floor` value and an `actor` dirtiness.
 ///
 /// Returns `(new_actor_dirtiness, floor_delta)`:
-/// - Floor cleaner than the actor: the actor wipes [`DIRT_TRACK_DEPOSIT`] (1%) of
+/// - Floor cleaner than the actor: the actor wipes [`DIRT_TRACK_DEPOSIT`] of
 ///   itself onto the tile (capped so it never goes below `0.0`); `floor_delta`
 ///   equals what the actor lost (conserved).
-/// - Floor dirtier than the actor: the actor picks up `1%` *of the floor's*
-///   dirtiness (clamped to `1.0`); `floor_delta` is `0.0`.
+/// - Floor dirtier than the actor: the actor picks up [`DIRT_TRACK_DEPOSIT`] *of the
+///   floor's* dirtiness (clamped to `1.0`); `floor_delta` is `0.0`.
 /// - Equal: no change.
 #[inline]
 pub fn dirt_exchange(floor: f32, actor: f32) -> (f32, f32) {
@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn dirt_exchange_actor_wipes_onto_cleaner_floor() {
         let (actor, floor_delta) = dirt_exchange(0.2, 0.5);
-        assert!((actor - 0.49).abs() < 1e-6, "actor loses 1%");
+        assert!((actor - (0.5 - DIRT_TRACK_DEPOSIT)).abs() < 1e-6, "actor wipes the deposit fraction");
         assert!((floor_delta - DIRT_TRACK_DEPOSIT).abs() < 1e-6, "floor gains what actor lost");
     }
 

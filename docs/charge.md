@@ -63,6 +63,15 @@ handled by BlackBot brain logic (`GoToChargeStation`) which seeks accessible
 chargers from `InteractiveEntityMap`, docks, and applies `RECHARGE_PER_S`
 while charging.
 
+### Rescue of a fully-discharged bot
+
+A bot that hits 0% can no longer reach a charger on its own. Like a *broken*
+bot, it **asks for help**: `maintain_dispatch_queue` posts a `Battery`
+[`RepairRequest`](dispatch.md) for it. A **fixer** bot fetches a battery from the
+parts depot and delivers it, recharging the discharged bot to a random **50–70%**
+(`recharge_target` effect). That partial top-up lets the bot move again and seek a
+charger for the rest. See [`dispatch.md`](dispatch.md).
+
 ## Inspector display
 
 The HUD actor inspector ([`src/hud/actor_inspector.rs`](../src/hud/actor_inspector.rs))
