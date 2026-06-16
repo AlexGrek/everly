@@ -419,6 +419,7 @@ impl BlackBot {
                 center,
                 radius_subtiles: BLACK_RADIUS_SUBTILES,
                 rotation: 0.0,
+                heading: Vec2::ZERO,
                 move_buffer: ActorMoveBuffer::default(),
                 last_movement_error: None,
                 last_accepted_center_subtile: Some(initial_sub),
@@ -821,6 +822,16 @@ pub(crate) fn black_bot_brain(
             };
             brain.tick(&ctx, state)
         };
+
+        // Publish this tick's movement direction so other bots can read where
+        // this one is heading (`ActorState::heading`). Sticky: a frame with no
+        // direction (idle / waiting / braked to rest) keeps the last heading, so
+        // a paused bot still "faces" the way it last moved — heading doubles as
+        // the (not-yet-rendered) rotation.
+        let heading = brain.heading();
+        if heading != Vec2::ZERO {
+            state.heading = heading;
+        }
 
         // Fixer inventory: pick up a part at the depot / clear it on delivery.
         if let Some(inv) = inventory.as_deref_mut() {

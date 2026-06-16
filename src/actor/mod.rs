@@ -127,6 +127,14 @@ pub struct ActorState {
     pub radius_subtiles: i32,
     /// Actor yaw/rotation in radians.
     pub rotation: f32,
+    /// Current movement direction as a unit vector (`Vec2::ZERO` = unknown).
+    /// Published each frame by the bot's think system so **other** bots can read
+    /// where it is going: the velocity direction while moving, or the heading
+    /// toward the next path node while stalled (a wedged bot has zero velocity
+    /// but still intends a direction — so velocity alone is insufficient). It
+    /// also doubles as the bot's facing/rotation, which is not yet rendered (bots
+    /// are spheres). Transient — recomputed from the plan each tick, not serialized.
+    pub heading: Vec2,
     /// Per-frame movement intent written by [`Actor::prepare_movement`].
     pub move_buffer: ActorMoveBuffer,
     /// Cleared at the beginning of each low-level processing step.
@@ -249,6 +257,73 @@ impl ActorState {
             (self.center.x * scale).floor() as i32,
             (self.center.y * scale).floor() as i32,
         )
+    }
+
+    // --- Movement direction (heading) --------------------------------------
+    //
+    // Relative-motion helpers built on [`heading`](Self::heading). Read another
+    // bot's `ActorState` (e.g. via [`CellOccupancy`](crate::map::cell_occupancy))
+    // and compare to reason about traffic: same-way following, head-on closing,
+    // who is heading at whom.
+
+    /// `true` when this bot has a known movement direction (`heading != ZERO`).
+    #[inline]
+    pub fn is_moving(&self) -> bool {
+        self.heading != Vec2::ZERO
+    }
+
+    /// Facing as an angle in radians (`atan2(y, x)`), or `None` with no known
+    /// direction. The yaw a renderer would use once actor rotation is
+    /// implemented; today purely informational (bots are spheres).
+    #[inline]
+    pub fn heading_angle(&self) -> Option<f32> {
+        self.is_moving().then(|| self.heading.y.atan2(self.heading.x))
+    }
+
+    /// `true` when this bot is heading toward `point` — its direction has a
+    /// positive component toward it. Always `false` if it has no direction.
+    #[inline]
+    pub fn is_moving_toward(&self, point: Vec2) -> bool {
+        self.is_moving() && self.heading.dot(point - self.center) > 0.0
+    }
+
+    /// `true` when this bot is closing on `other` (heading toward its position).
+    #[inline]
+    pub fn is_moving_toward_actor(&self, other: &ActorState) -> bool {
+        self.is_moving_toward(other.center)
+    }
+
+    /// Alignment of the two bots' directions in `-1..=1` (`heading · other`):
+    /// `1` same way, `0` perpendicular / either directionless, `-1` opposed.
+    /// Building block for the relative helpers below.
+    #[inline]
+    pub fn heading_alignment(&self, other: &ActorState) -> f32 {
+        self.heading.dot(other.heading)
+    }
+
+    /// `true` when this bot moves in the **same general direction** as `other`
+    /// (`heading · other.heading > 0`) — e.g. following another down a corridor.
+    /// `false` if either bot is directionless.
+    #[inline]
+    pub fn is_moving_forward_relative_to(&self, other: &ActorState) -> bool {
+        self.is_moving() && other.is_moving() && self.heading_alignment(other) > 0.0
+    }
+
+    /// `true` when this bot moves in the **opposite general direction** to
+    /// `other` (`heading · other.heading < 0`). Directional counterpart to
+    /// [`is_moving_forward_relative_to`](Self::is_moving_forward_relative_to).
+    #[inline]
+    pub fn is_moving_opposite_to(&self, other: &ActorState) -> bool {
+        self.is_moving() && other.is_moving() && self.heading_alignment(other) < 0.0
+    }
+
+    /// `true` when the two bots are closing on **each other** — each heading
+    /// toward the other's position. The head-on case needing the strongest
+    /// avoidance, distinct from merely opposed headings (two bots can have
+    /// opposite headings yet be moving apart).
+    #[inline]
+    pub fn is_head_on_with(&self, other: &ActorState) -> bool {
+        self.is_moving_toward_actor(other) && other.is_moving_toward_actor(self)
     }
 }
 
@@ -591,6 +666,7 @@ mod tests {
                     center,
                     radius_subtiles,
                     rotation: 0.0,
+                    heading: Vec2::ZERO,
                     move_buffer: ActorMoveBuffer::default(),
                     last_movement_error: None,
                     last_accepted_center_subtile: None,
@@ -625,6 +701,7 @@ mod tests {
                 center,
                 radius_subtiles,
                 rotation: 0.0,
+                heading: Vec2::ZERO,
                 move_buffer: ActorMoveBuffer::default(),
                 last_movement_error: None,
                 last_accepted_center_subtile: None,
@@ -723,6 +800,71 @@ mod tests {
         let bounced = reflect_velocity(v, n);
         assert!((bounced.x + 1.0).abs() < 1e-6);
         assert!(bounced.y.abs() < 1e-6);
+    }
+
+    // --- Movement direction (heading) helpers ---
+
+    /// A bot at `center` heading along the unit `heading`.
+    fn heading_actor(center: Vec2, heading: Vec2) -> DummyActor {
+        let mut a = DummyActor::new(center, 0);
+        a.state.heading = heading.normalize_or_zero();
+        a
+    }
+
+    #[test]
+    fn directionless_bot_reports_no_motion() {
+        let a = DummyActor::new(Vec2::ZERO, 0);
+        assert!(!a.state.is_moving());
+        assert_eq!(a.state.heading_angle(), None);
+        // Every relative test is false against a directionless bot.
+        let b = heading_actor(Vec2::new(1.0, 1.0), Vec2::X);
+        assert!(!a.state.is_moving_toward(Vec2::new(5.0, 0.0)));
+        assert!(!a.state.is_moving_forward_relative_to(&b.state));
+        assert!(!b.state.is_moving_forward_relative_to(&a.state));
+    }
+
+    #[test]
+    fn is_moving_toward_uses_relative_position() {
+        let a = heading_actor(Vec2::new(0.0, 0.0), Vec2::X);
+        assert!(a.state.is_moving_toward(Vec2::new(5.0, 0.0)), "ahead along +X");
+        assert!(!a.state.is_moving_toward(Vec2::new(-5.0, 0.0)), "behind on -X");
+        assert!(!a.state.is_moving_toward(Vec2::new(0.0, 5.0)), "perpendicular");
+    }
+
+    #[test]
+    fn forward_vs_opposite_relative_to_other() {
+        let east = heading_actor(Vec2::ZERO, Vec2::X);
+        let also_east = heading_actor(Vec2::new(3.0, 0.0), Vec2::X);
+        let west = heading_actor(Vec2::new(3.0, 0.0), Vec2::NEG_X);
+
+        assert!(east.state.is_moving_forward_relative_to(&also_east.state));
+        assert!(!east.state.is_moving_opposite_to(&also_east.state));
+
+        assert!(east.state.is_moving_opposite_to(&west.state));
+        assert!(!east.state.is_moving_forward_relative_to(&west.state));
+    }
+
+    #[test]
+    fn head_on_requires_both_closing() {
+        // Two bots facing each other across the X axis: each heads at the other.
+        let left = heading_actor(Vec2::new(0.0, 0.0), Vec2::X);
+        let right = heading_actor(Vec2::new(4.0, 0.0), Vec2::NEG_X);
+        assert!(left.state.is_head_on_with(&right.state));
+        assert!(right.state.is_head_on_with(&left.state));
+
+        // Opposite headings but moving *apart* (each away from the other) is not
+        // head-on, even though `is_moving_opposite_to` holds.
+        let a = heading_actor(Vec2::new(0.0, 0.0), Vec2::NEG_X);
+        let b = heading_actor(Vec2::new(4.0, 0.0), Vec2::X);
+        assert!(a.state.is_moving_opposite_to(&b.state));
+        assert!(!a.state.is_head_on_with(&b.state), "headings oppose but bots diverge");
+    }
+
+    #[test]
+    fn heading_angle_matches_atan2() {
+        let north = heading_actor(Vec2::ZERO, Vec2::Y);
+        let angle = north.state.heading_angle().expect("has direction");
+        assert!((angle - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
     }
 
     // --- Off-screen actor optimization ---

@@ -34,8 +34,8 @@ use super::BrainContext;
 const DETOUR_PAD_SUBTILES: i32 = 6;
 /// Maximum Manhattan span (subtiles) between the actor and the next path node
 /// for which a subtile detour is attempted — keeps it a *short* local maneuver
-/// (`40 subtiles = 8 tiles`).
-const DETOUR_MAX_SPAN_SUBTILES: i32 = 40;
+/// (`140 subtiles = 28 tiles`).
+const DETOUR_MAX_SPAN_SUBTILES: i32 = 140;
 /// Hard cap on subtile A\* node expansions for a detour (safety bound).
 const DETOUR_MAX_EXPANDED: usize = 1024;
 /// Seconds [`FollowPath`] coasts/holds awaiting a queued subtile-detour result
@@ -150,6 +150,15 @@ pub trait LowLevelAction: Send + Sync {
 
     /// Current velocity (inspector). Default zero.
     fn velocity(&self) -> Vec2 {
+        Vec2::ZERO
+    }
+
+    /// The bot's intended **movement direction** as a unit vector, published to
+    /// [`ActorState::heading`] so other bots can read its facing. Distinct from
+    /// [`velocity`](Self::velocity): when the bot is wedged or braking its
+    /// velocity is ~zero, but it still *intends* to head toward its next path
+    /// node — that intent is the heading. Default `Vec2::ZERO` (no direction).
+    fn heading(&self) -> Vec2 {
         Vec2::ZERO
     }
 
@@ -368,6 +377,10 @@ impl LowLevelAction for PendingPath {
     }
     fn velocity(&self) -> Vec2 {
         self.velocity
+    }
+    fn heading(&self) -> Vec2 {
+        // No route yet — the best available direction is the coasting velocity.
+        self.velocity.normalize_or_zero()
     }
     fn is_awaiting_path(&self) -> bool {
         true
@@ -1280,6 +1293,17 @@ impl LowLevelAction for FollowPath {
         self.velocity
     }
 
+    fn heading(&self) -> Vec2 {
+        // Moving: the actual velocity direction. Stalled / braking (velocity ~0
+        // against a blocker): the maintained unit `direction` toward the next
+        // node — so a wedged bot still reports the way it is *trying* to go.
+        if self.velocity.length_squared() > 1e-8 {
+            self.velocity.normalize()
+        } else {
+            self.direction.normalize_or_zero()
+        }
+    }
+
     fn stuck_timer(&self) -> f32 {
         self.stuck_timer
     }
@@ -1551,6 +1575,7 @@ mod tests {
             center: Vec2::new(5.0, 5.0),
             radius_subtiles: 2,
             rotation: 0.0,
+            heading: Vec2::ZERO,
             move_buffer: ActorMoveBuffer::default(),
             last_movement_error: Some(ActorMovementError::BlockedByOccupancy {
                 world_subtile_x: 26,
@@ -1597,6 +1622,22 @@ mod tests {
     }
 
     #[test]
+    fn follow_path_heading_prefers_velocity_then_falls_back_to_direction() {
+        let mut fp = FollowPath::new(vec![(8, 5)]);
+        // Moving: heading is the (normalized) velocity direction.
+        fp.velocity = Vec2::new(2.0, 0.0);
+        fp.direction = Vec2::new(0.0, 1.0);
+        assert!((fp.heading() - Vec2::X).length() < 1e-6, "moving → velocity dir");
+
+        // Wedged: zero velocity, but still intends to head toward the next node.
+        fp.velocity = Vec2::ZERO;
+        assert!(
+            (fp.heading() - Vec2::Y).length() < 1e-6,
+            "stalled → maintained `direction` toward next node, not zero",
+        );
+    }
+
+    #[test]
     fn track_tiles_remembers_previous_distinct_cell() {
         let mut fp = FollowPath::new(vec![(9, 5)]);
         fp.track_tiles(IVec2::new(4, 5));
@@ -1619,6 +1660,7 @@ mod tests {
             center: Vec2::new(5.0, 5.0),
             radius_subtiles: 2,
             rotation: 0.0,
+            heading: Vec2::ZERO,
             move_buffer: ActorMoveBuffer::default(),
             last_movement_error: Some(ActorMovementError::BlockedByOccupancy {
                 world_subtile_x: 26,
@@ -1831,6 +1873,7 @@ mod tests {
             center: Vec2::new(5.0, 5.0),
             radius_subtiles: 2,
             rotation: 0.0,
+            heading: Vec2::ZERO,
             move_buffer: ActorMoveBuffer::default(),
             last_movement_error: Some(ActorMovementError::BlockedByOccupancy {
                 world_subtile_x: blocker_subtile.x,
@@ -2085,6 +2128,7 @@ mod tests {
             center: Vec2::new(1.45, 0.5), // within braking zone of waypoint center (1.5, 0.5)
             radius_subtiles: 2,
             rotation: 0.0,
+            heading: Vec2::ZERO,
             move_buffer: ActorMoveBuffer::default(),
             last_movement_error: None,
             last_accepted_center_subtile: Some(IVec2::new(6, 2)),
@@ -2135,6 +2179,7 @@ mod tests {
             center: Vec2::new(0.5, 0.5),
             radius_subtiles: 2,
             rotation: 0.0,
+            heading: Vec2::ZERO,
             move_buffer: ActorMoveBuffer::default(),
             last_movement_error: None,
             last_accepted_center_subtile: Some(IVec2::new(2, 2)),
@@ -2191,6 +2236,7 @@ mod tests {
             center: Vec2::new(0.55, 0.5),
             radius_subtiles: 2,
             rotation: 0.0,
+            heading: Vec2::ZERO,
             move_buffer: ActorMoveBuffer::default(),
             last_movement_error: None,
             last_accepted_center_subtile: Some(IVec2::new(2, 2)),
@@ -2265,6 +2311,7 @@ mod tests {
             center: Vec2::new(0.2, 0.2),
             radius_subtiles: 2,
             rotation: 0.0,
+            heading: Vec2::ZERO,
             move_buffer: ActorMoveBuffer::default(),
             last_movement_error: None,
             last_accepted_center_subtile: Some(IVec2::new(1, 1)),
@@ -2334,6 +2381,7 @@ mod tests {
             center: Vec2::new(3.2, 4.1),
             radius_subtiles: 2,
             rotation: 0.0,
+            heading: Vec2::ZERO,
             move_buffer: ActorMoveBuffer::default(),
             last_movement_error: None,
             last_accepted_center_subtile: Some(IVec2::new(16, 20)),
@@ -2386,6 +2434,7 @@ mod tests {
             center: Vec2::new(5.0, 5.0),
             radius_subtiles: 2,
             rotation: 0.0,
+            heading: Vec2::ZERO,
             move_buffer: ActorMoveBuffer::default(),
             last_movement_error: Some(ActorMovementError::BlockedByOccupancy {
                 world_subtile_x: blocker_subtile.x,
@@ -2471,6 +2520,7 @@ mod tests {
             center: Vec2::new(0.2, 0.2),
             radius_subtiles: 2,
             rotation: 0.0,
+            heading: Vec2::ZERO,
             move_buffer: ActorMoveBuffer::default(),
             last_movement_error: None,
             last_accepted_center_subtile: Some(IVec2::new(1, 1)),
@@ -2553,6 +2603,7 @@ mod tests {
             center: Vec2::new(0.2, 0.2),
             radius_subtiles: 2,
             rotation: 0.0,
+            heading: Vec2::ZERO,
             move_buffer: ActorMoveBuffer::default(),
             last_movement_error: None,
             last_accepted_center_subtile: Some(IVec2::new(1, 1)),
@@ -2645,6 +2696,7 @@ mod tests {
             center: Vec2::new(5.0, 5.0),
             radius_subtiles: 2,
             rotation: 0.0,
+            heading: Vec2::ZERO,
             move_buffer: ActorMoveBuffer::default(),
             last_movement_error: None,
             last_accepted_center_subtile: Some(IVec2::new(25, 25)),

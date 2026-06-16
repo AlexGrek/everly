@@ -460,6 +460,13 @@ impl Brain {
         self.low_level.velocity()
     }
 
+    /// The bot's intended movement direction this tick as a unit vector
+    /// (`Vec2::ZERO` when it has none). Published to [`ActorState::heading`] by
+    /// the owning think system; see [`LowLevelAction::heading`].
+    pub fn heading(&self) -> Vec2 {
+        self.low_level.heading()
+    }
+
     pub fn stuck_timer(&self) -> f32 {
         self.low_level.stuck_timer()
     }
@@ -524,6 +531,7 @@ pub(crate) mod test_support {
             center: Vec2::new(0.5, 0.5),
             radius_subtiles: 2,
             rotation: 0.0,
+            heading: Vec2::ZERO,
             move_buffer: ActorMoveBuffer::default(),
             last_movement_error: None,
             last_accepted_center_subtile: None,

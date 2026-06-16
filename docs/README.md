@@ -12,6 +12,7 @@ Current behavior docs:
 - `docs/map-generator.md` — procedural chunk geometry (`src/map/map_generator/`).
 - `docs/add_new_tile.md` — end-to-end checklist for adding a new `CellType` (encoding, passability, generation, editor, rendering).
 - `docs/interactive-entities.md` — sparse per-tile store of stateful reference-type objects (chargers), the `InteractiveEntity` trait/enum, and the `InteractiveEntityMap` resource.
+- `docs/cell-occupancy.md` — sparse per-cell **actor occupancy** (`CellOccupancy`): which entities stand on each tile, updated on every main-cell change.
 - `docs/corners.md` — inner `c*` corner pillars (concave union elbows, detection algorithm).
 - `docs/actor.md` — actor trait runtime loop, movement buffer, footprint collision flow, **main tile** (`round(center)`), and usage examples.
 - `docs/actor-brain.md` — BlackBot brain: behaviors, priorities, high/low-level actions, stuck/escape, async routing integration.

@@ -80,6 +80,7 @@ impl Plugin for GamePlugin {
             .add_plugins(hud::overlays::OverlaysPlugin)
             .add_plugins(hud::perf_timings::PerfTimingsPlugin)
             .add_plugins(map::pathfind_service::PathfindServicePlugin)
+            .add_plugins(map::cell_occupancy::CellOccupancyPlugin)
             .add_plugins(actor::dispatch::DispatchPlugin)
             .add_systems(
                 OnEnter(menu::main_menu::GameState::InGame),

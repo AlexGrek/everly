@@ -175,6 +175,7 @@ impl From<ActorStateSnap> for ActorState {
             center: s.center.into(),
             radius_subtiles: s.radius_subtiles,
             rotation: s.rotation,
+            heading: Vec2::ZERO,
             move_buffer: s.move_buffer.into(),
             last_movement_error: s.last_movement_error.map(Into::into),
             last_accepted_center_subtile: s.last_accepted_center_subtile.map(Into::into),
@@ -418,6 +419,7 @@ mod tests {
             center: Vec2::new(10.5, 20.25),
             radius_subtiles: 2,
             rotation: 1.5,
+            heading: Vec2::ZERO,
             move_buffer: ActorMoveBuffer {
                 tile_delta: Vec2::new(0.1, 0.0),
                 subtile_shift: IVec2::new(1, 0),
