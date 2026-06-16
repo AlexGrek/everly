@@ -1904,6 +1904,7 @@ mod tests {
             pathfind: Some(pf),
             fixer: None,
             dynamic_repath: false,
+            neighbors: None,
         }
     }
 

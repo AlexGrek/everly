@@ -43,6 +43,7 @@ use crate::actor::{
     OffScreenActor,
 };
 use std::collections::HashMap;
+use crate::map::cell_occupancy::CellOccupancy;
 use crate::map::chunk_overlay::{ChunkOverlayState, OVERLAY_RES};
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap};
 use crate::map::hypermap_world::{HypermapChunkRemeshQueue, HypermapRuntime};
@@ -585,6 +586,7 @@ pub(crate) fn black_bot_brain(
     mut interactive: ResMut<InteractiveEntityMap>,
     dispatch: Res<DispatchQueue>,
     game_log: Res<GameLog>,
+    occupancy: Res<CellOccupancy>,
     mut indexed: Local<IndexedChargerChunks>,
     mut query: Query<(
         Entity,
@@ -819,6 +821,7 @@ pub(crate) fn black_bot_brain(
                 }),
                 fixer: fixer_ctx,
                 dynamic_repath,
+                neighbors: Some(&occupancy),
             };
             brain.tick(&ctx, state)
         };

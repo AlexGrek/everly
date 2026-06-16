@@ -47,6 +47,17 @@ const DETOUR_WAIT_S: f32 = 0.5;
 /// a head-on bot-on-bot bump.
 const STEP_BACK_WAIT_MIN_SECS: f32 = 0.5;
 const STEP_BACK_WAIT_MAX_SECS: f32 = 1.5;
+
+/// Inclusive bounds (seconds, both `< 1`) of the brief hold after **rear-ending**
+/// another bot heading the same way — long enough for the bot ahead to pull away.
+const REAR_END_WAIT_MIN_SECS: f32 = 0.2;
+const REAR_END_WAIT_MAX_SECS: f32 = 0.9;
+/// Probability that a rear-end (hitting another bot's back) abandons the route for
+/// a dynamic re-path instead of just waiting it out.
+const REAR_END_REROUTE_CHANCE: f32 = 0.1;
+/// Probability that **being hit from behind** (blocker behind our heading)
+/// triggers a dynamic re-path; otherwise the bot ignores it and continues.
+const REAR_HIT_REROUTE_CHANCE: f32 = 0.05;
 /// Speed (tiles/s) below which a post-step-aside hold counts as "stopped".
 const CONTACT_WAIT_STOP_SPEED: f32 = 0.08;
 /// Half-width (tiles) of the square scanned for a free cell when a stalled bot
@@ -176,6 +187,16 @@ pub trait LowLevelAction: Send + Sync {
     /// route — coasting on a pending async path, braked awaiting a detour, or
     /// paused after a step-aside (perf HUD `coast` gauge). Default `false`.
     fn is_awaiting_path(&self) -> bool {
+        false
+    }
+
+    /// Take (and clear) a pending request to re-path against the **dynamic**
+    /// passability map. A low-level action raises this when it decides — without
+    /// access to `Brain` — that the current route should be recomputed around
+    /// current creature positions (e.g. [`FollowPath`] after a rear bot collision).
+    /// [`Brain::tick`](super::Brain::tick) checks it after `execute` and arms the
+    /// dynamic-repath window. Default `false`.
+    fn take_dynamic_repath_request(&mut self) -> bool {
         false
     }
 
@@ -453,6 +474,13 @@ pub struct FollowPath {
     repair_attempted: bool,
     /// Set when the stuck timer fires; makes `is_finished` report `true`.
     abandoned: bool,
+    /// `true` when `abandoned` was set **deliberately** for a dynamic re-route
+    /// (rear-collision response), not because the bot is stuck. Keeps `is_stuck`
+    /// (and the yellow stuck flash / log) from firing on an intentional reroute.
+    abandoned_for_reroute: bool,
+    /// Pending request for [`Brain`](super::Brain) to arm a dynamic re-path; taken
+    /// (and cleared) via [`take_dynamic_repath_request`](LowLevelAction::take_dynamic_repath_request).
+    dynamic_repath_request: bool,
 }
 
 /// Why an in-flight subtile detour was requested, which decides its fallback.
@@ -503,6 +531,8 @@ impl FollowPath {
             escape_target: None,
             repair_attempted: false,
             abandoned: false,
+            abandoned_for_reroute: false,
+            dynamic_repath_request: false,
         }
     }
 
@@ -814,6 +844,28 @@ impl FollowPath {
         state.next_waypoint_hint = None;
     }
 
+    /// Abandons the current route and asks [`Brain`](super::Brain) to re-path
+    /// against the **dynamic** passability map (around current creature positions).
+    /// Used by the rear-collision responses (rear-end / got-hit-from-behind) on
+    /// their small-probability "recalculate" branch. Unlike the stall path this is
+    /// **deliberate**, so `abandoned_for_reroute` suppresses the stuck flash/log;
+    /// the owning high-level action replans next tick (route is `is_finished`).
+    fn request_dynamic_reroute(&mut self, state: &mut ActorState) {
+        self.dynamic_repath_request = true;
+        self.abandoned = true;
+        self.abandoned_for_reroute = true;
+        self.drop_sub_run();
+        self.clear_detour_request();
+        self.clear_step_aside_insertion();
+        self.pending_wait = None;
+        self.contact_wait_s = 0.0;
+        self.last_head_on_bump = None;
+        self.velocity = Vec2::ZERO;
+        self.prev_center = None;
+        state.move_buffer = ActorMoveBuffer::default();
+        state.next_waypoint_hint = None;
+    }
+
     /// Records the bot's current main tile, shifting the previous one into
     /// [`prev_tile`](Self::prev_tile) whenever it crosses a tile boundary.
     fn track_tiles(&mut self, main_tile: IVec2) {
@@ -1029,11 +1081,14 @@ impl LowLevelAction for FollowPath {
             }
         }
 
-        // Bot-on-bot bump response. Only **head-on** (front/side) contacts
-        // provoke a reaction — a rear bump (blocker behind the heading) is
-        // ignored, no bounce/step/detour. On a head-on bump the bot bounces, then
-        // either routes a subtile detour (`bot_detour_chance`) or steps aside
-        // into a free neighbour (front-preferred), or waits if all are taken.
+        // Bot-on-bot bump response — identity-aware. Resolve *which* bot the
+        // contact is with (via `CellOccupancy`) and react by where it hit:
+        //  - I hit another bot's FRONT (it heads toward me) → head-to-head: bounce
+        //    then detour (`bot_detour_chance`) / step-aside / escape / wait.
+        //  - I hit another bot's BACK (it heads my way) → rear-ended it: no bounce,
+        //    a brief wait (< 1 s) so it pulls away, or rarely a dynamic re-route.
+        //  - I GOT hit from behind (blocker behind my heading) → don't react, keep
+        //    going; rarely a dynamic re-route.
         if let Some(ActorMovementError::BlockedByOccupancy {
             world_subtile_x,
             world_subtile_y,
@@ -1045,85 +1100,138 @@ impl LowLevelAction for FollowPath {
                 self.direction
             };
             let blocker = IVec2::new(world_subtile_x, world_subtile_y);
-            if is_front_collision(center, heading, world_subtile_x, world_subtile_y) {
-                // Rising edge only: while two bots stay pressed together the
-                // movement error persists every frame, but we must not bounce or
-                // replan a detour on each one — finish the maneuver in flight.
+            let i_hit_them = is_front_collision(center, heading, world_subtile_x, world_subtile_y);
+
+            if i_hit_them {
+                // Rising edge only: while two bots stay pressed together the error
+                // persists every frame, but we react once and finish in flight.
                 if self.last_head_on_bump != Some(blocker) {
                     self.last_head_on_bump = Some(blocker);
 
-                    let normal = occupancy_collision_normal(center, world_subtile_x, world_subtile_y);
-                    self.velocity = reflect_velocity(self.velocity, normal);
-                    if self.velocity.length_squared() > 1e-8 {
-                        self.direction = self.velocity.normalize();
-                    } else {
-                        self.direction = -self.direction;
-                    }
-                    // Skip achieved-vs-planned clamping this frame so reflection is preserved.
-                    self.prev_center = None;
+                    // Who did we run into, and did we strike its front (it is moving
+                    // toward us → head-to-head) or its back (it is moving our way →
+                    // we rear-ended it)? A stationary or unidentified blocker is
+                    // treated as head-on so we detour around it rather than wait.
+                    let other = ctx.neighbors.and_then(|n| n.resolve_blocker(blocker, ctx.entity));
+                    let hit_their_front = match other {
+                        Some((_, o)) if o.is_moving() => o.heading.dot(center - o.center) > 0.0,
+                        _ => true,
+                    };
 
-                    // A fresh bump invalidates any in-progress detour, pending pause,
-                    // unreached step-aside insertion, or awaited detour before re-deciding.
-                    self.drop_sub_run();
-                    self.clear_detour_request();
-                    self.pending_wait = None;
-                    self.clear_step_aside_insertion();
-
-                    // Pick the step-aside cell (front-preferred free neighbour;
-                    // `None` = every neighbour taken → wait). Roll the detour vs
-                    // step-aside response with the unchanged `bot_detour_chance`.
-                    let step = self.step_target(state, ctx, heading, rng);
-                    let want_detour = rng::chance(rng, t.bot_detour_chance);
-                    // A detour is planned off-thread: enqueue the request and hold;
-                    // when it lands the bot threads it, otherwise it steps aside / waits.
-                    let enqueued = want_detour
-                        .then(|| self.enqueue_detour(state, ctx, self.index))
-                        .flatten();
-                    match enqueued {
-                        Some(id) => {
-                            ctx.trace(format!("bump at {blocker:?} → detour (fallback {step:?})"));
-                            self.detour_request = Some(id);
-                            self.detour_purpose = DetourPurpose::Avoidance;
-                            self.detour_goal = self.index;
-                            self.detour_wait_elapsed = 0.0;
-                            self.detour_fallback = step;
+                    if hit_their_front {
+                        if let Some((who, _)) = other {
+                            ctx.trace(format!("hit {who:?}'s front at {blocker:?} → head-on"));
                         }
-                        None => match step {
-                            Some(c) => {
-                                ctx.trace(format!("bump at {blocker:?} → step aside to {c:?}"));
-                                self.begin_step_aside(step, rng);
+                        // HEAD-TO-HEAD: elastic bounce, then detour / step-aside / wait.
+                        let normal = occupancy_collision_normal(center, world_subtile_x, world_subtile_y);
+                        self.velocity = reflect_velocity(self.velocity, normal);
+                        if self.velocity.length_squared() > 1e-8 {
+                            self.direction = self.velocity.normalize();
+                        } else {
+                            self.direction = -self.direction;
+                        }
+                        // Skip achieved-vs-planned clamping this frame so reflection is preserved.
+                        self.prev_center = None;
+
+                        // A fresh bump invalidates any in-progress detour, pending pause,
+                        // unreached step-aside insertion, or awaited detour before re-deciding.
+                        self.drop_sub_run();
+                        self.clear_detour_request();
+                        self.pending_wait = None;
+                        self.clear_step_aside_insertion();
+
+                        // Pick the step-aside cell (front-preferred free neighbour;
+                        // `None` = every neighbour taken → wait). Roll the detour vs
+                        // step-aside response with the unchanged `bot_detour_chance`.
+                        let step = self.step_target(state, ctx, heading, rng);
+                        let want_detour = rng::chance(rng, t.bot_detour_chance);
+                        // A detour is planned off-thread: enqueue the request and hold;
+                        // when it lands the bot threads it, otherwise it steps aside / waits.
+                        let enqueued = want_detour
+                            .then(|| self.enqueue_detour(state, ctx, self.index))
+                            .flatten();
+                        match enqueued {
+                            Some(id) => {
+                                ctx.trace(format!("bump at {blocker:?} → detour (fallback {step:?})"));
+                                self.detour_request = Some(id);
+                                self.detour_purpose = DetourPurpose::Avoidance;
+                                self.detour_goal = self.index;
+                                self.detour_wait_elapsed = 0.0;
+                                self.detour_fallback = step;
                             }
-                            // Genuine wedge: no free immediate neighbour. A bare
-                            // wait-in-place here would suspend BOTH the stuck-timer
-                            // escape (skipped by the early return) and the
-                            // collision-pressure relocate (gated off while
-                            // `is_recovering`), so two big bots pressed together in
-                            // open space deadlock forever. Try the wider escape
-                            // search (nearest fully-free cell, radius
-                            // `ESCAPE_SEARCH_TILES`) first; only wait if even that
-                            // finds nothing (genuinely boxed in / no avoidance data).
-                            None => {
-                                if let Some(target) = self.find_escape_cell(state, ctx) {
-                                    ctx.trace(format!(
-                                        "bump at {blocker:?} → neighbours taken, escape to {target:?}"
-                                    ));
-                                    self.escape_target = Some(target);
-                                    self.drop_sub_run();
-                                    self.last_head_on_bump = None;
-                                    self.pending_wait = None;
-                                    self.stuck_timer = 0.0;
-                                    self.stuck_reference_pos = Some(center);
-                                    self.run_escape(state, ctx, t, dt);
-                                    return;
+                            None => match step {
+                                Some(c) => {
+                                    ctx.trace(format!("bump at {blocker:?} → step aside to {c:?}"));
+                                    self.begin_step_aside(step, rng);
                                 }
-                                ctx.trace(format!(
-                                    "bump at {blocker:?} → neighbours taken, no escape → wait"
-                                ));
-                                self.begin_wait_in_place(rng);
+                                // Genuine wedge: no free immediate neighbour. A bare
+                                // wait-in-place here would suspend BOTH the stuck-timer
+                                // escape (skipped by the early return) and the
+                                // collision-pressure relocate (gated off while
+                                // `is_recovering`), so two big bots pressed together in
+                                // open space deadlock forever. Try the wider escape
+                                // search (nearest fully-free cell, radius
+                                // `ESCAPE_SEARCH_TILES`) first; only wait if even that
+                                // finds nothing (genuinely boxed in / no avoidance data).
+                                None => {
+                                    if let Some(target) = self.find_escape_cell(state, ctx) {
+                                        ctx.trace(format!(
+                                            "bump at {blocker:?} → neighbours taken, escape to {target:?}"
+                                        ));
+                                        self.escape_target = Some(target);
+                                        self.drop_sub_run();
+                                        self.last_head_on_bump = None;
+                                        self.pending_wait = None;
+                                        self.stuck_timer = 0.0;
+                                        self.stuck_reference_pos = Some(center);
+                                        self.run_escape(state, ctx, t, dt);
+                                        return;
+                                    }
+                                    ctx.trace(format!(
+                                        "bump at {blocker:?} → neighbours taken, no escape → wait"
+                                    ));
+                                    self.begin_wait_in_place(rng);
+                                }
+                            },
+                        }
+                    } else {
+                        // REAR-ENDED a bot heading our way: don't fight it. Clear any
+                        // in-flight maneuver, then either re-route (rarely) or brake
+                        // and wait briefly (< 1 s) so it pulls ahead. No bounce.
+                        self.drop_sub_run();
+                        self.clear_detour_request();
+                        self.pending_wait = None;
+                        self.clear_step_aside_insertion();
+                        if rng::chance(rng, REAR_END_REROUTE_CHANCE) {
+                            if let Some((who, _)) = other {
+                                ctx.trace(format!("rear-ended {who:?} at {blocker:?} → dynamic reroute"));
                             }
-                        },
+                            self.request_dynamic_reroute(state);
+                            return;
+                        }
+                        if let Some((who, _)) = other {
+                            ctx.trace(format!("rear-ended {who:?} at {blocker:?} → brief wait"));
+                        }
+                        self.contact_wait_s =
+                            rng::range(rng, REAR_END_WAIT_MIN_SECS..=REAR_END_WAIT_MAX_SECS);
+                        self.drive(state, center, Vec2::ZERO, t.decel, dt);
+                        state.next_waypoint_hint = self.current_waypoint_hint();
+                        return;
                     }
                 }
+            } else {
+                // GOT HIT FROM BEHIND (blocker behind our heading). Don't react —
+                // keep going — but rarely re-route dynamically. Rising edge so the
+                // dice roll happens once per distinct rear contact, not every frame.
+                if self.last_head_on_bump != Some(blocker) {
+                    self.last_head_on_bump = Some(blocker);
+                    if rng::chance(rng, REAR_HIT_REROUTE_CHANCE) {
+                        ctx.trace(format!("hit from behind at {blocker:?} → dynamic reroute"));
+                        self.request_dynamic_reroute(state);
+                        return;
+                    }
+                }
+                // Otherwise fall through and keep steering toward the waypoint.
             }
         }
 
@@ -1271,6 +1379,7 @@ impl LowLevelAction for FollowPath {
         self.repair_attempted = false;
         self.clear_detour_request();
         self.last_head_on_bump = None;
+        self.dynamic_repath_request = false;
     }
 
     fn label(&self) -> String {
@@ -1309,8 +1418,13 @@ impl LowLevelAction for FollowPath {
     }
 
     fn is_stuck(&self) -> bool {
-        // "Stuck" means we abandoned an unfinished route because progress stalled.
-        self.abandoned && self.index < self.path.len()
+        // "Stuck" means we abandoned an unfinished route because progress stalled —
+        // not a deliberate dynamic re-route (which also abandons the route).
+        self.abandoned && !self.abandoned_for_reroute && self.index < self.path.len()
+    }
+
+    fn take_dynamic_repath_request(&mut self) -> bool {
+        std::mem::take(&mut self.dynamic_repath_request)
     }
 
     fn target_tile(&self) -> Option<(i32, i32)> {
@@ -1611,6 +1725,7 @@ mod tests {
             pathfind: None,
             fixer: None,
             dynamic_repath: false,
+            neighbors: None,
         };
         let mut rng = rng::seeded(1);
         fp.execute(&mut state, &ctx, &mut rng, &FollowTuning::default());
@@ -1696,6 +1811,7 @@ mod tests {
             pathfind: None,
             fixer: None,
             dynamic_repath: false,
+            neighbors: None,
         };
         let mut rng = rng::seeded(2);
         // No detour, so the bot steps aside. With every neighbour statically
@@ -1786,6 +1902,7 @@ mod tests {
             }),
             fixer: None,
             dynamic_repath: false,
+            neighbors: None,
         };
         let mut rng = rng::seeded(5);
         let tuning = FollowTuning {
@@ -1842,6 +1959,7 @@ mod tests {
             pathfind: None,
             fixer: None,
             dynamic_repath: false,
+            neighbors: None,
         };
         let mut rng = rng::seeded(5);
         let original_len = fp.path.len();
@@ -1915,6 +2033,7 @@ mod tests {
             pathfind: None,
             fixer: None,
             dynamic_repath: false,
+            neighbors: None,
         }
     }
 
@@ -2161,6 +2280,7 @@ mod tests {
             pathfind: None,
             fixer: None,
             dynamic_repath: false,
+            neighbors: None,
         };
         let mut rng = rng::seeded(7);
 
@@ -2219,6 +2339,7 @@ mod tests {
             pathfind: None,
             fixer: None,
             dynamic_repath: false,
+            neighbors: None,
             };
             fp.execute(&mut state, &ctx, &mut rng, &tuning);
             // Simulate being physically pinned: position never changes.
@@ -2276,6 +2397,7 @@ mod tests {
             pathfind: None,
             fixer: None,
             dynamic_repath: false,
+            neighbors: None,
             };
             fp.execute(&mut state, &ctx, &mut rng, &tuning);
             state.move_buffer = ActorMoveBuffer::default();
@@ -2348,6 +2470,7 @@ mod tests {
             pathfind: None,
             fixer: None,
             dynamic_repath: false,
+            neighbors: None,
         };
 
         for _ in 0..4 {
@@ -2420,6 +2543,7 @@ mod tests {
             pathfind: None,
             fixer: None,
             dynamic_repath: false,
+            neighbors: None,
             };
             wait.execute(&mut state, &ctx, &mut rng::seeded(1), &tuning);
         }
@@ -2557,6 +2681,7 @@ mod tests {
             pathfind: Some(PathfindAccess { queue: &queue, results: &results }),
             fixer: None,
             dynamic_repath: false,
+            neighbors: None,
         };
 
         for _ in 0..4 {
@@ -2640,6 +2765,7 @@ mod tests {
             pathfind: Some(PathfindAccess { queue: &queue, results: &results }),
             fixer: None,
             dynamic_repath: false,
+            neighbors: None,
         };
 
         for _ in 0..4 {
@@ -2731,6 +2857,7 @@ mod tests {
             pathfind: Some(PathfindAccess { queue: &queue, results: &results }),
             fixer: None,
             dynamic_repath: false,
+            neighbors: None,
         };
         let mut rng = rng::seeded(41);
 

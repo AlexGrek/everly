@@ -30,6 +30,7 @@ use crate::rng::{self, StdRng};
 use crate::actor::dispatch::{DispatchQueue, RepairPart};
 use crate::actor::{ActorMoveBuffer, ActorState};
 use crate::hud::game_log::{GameLog, LogEntry, LogLevel};
+use crate::map::cell_occupancy::CellOccupancy;
 use crate::map::hypermap::Hypermap;
 use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
 use crate::map::passability::{DynamicPassabilityMap, SubtilePassability};
@@ -132,6 +133,11 @@ pub struct BrainContext<'a> {
     /// `WorldRoute` enqueued this tick must use `include_dynamic: true` so it
     /// routes around current creature positions (post collision-pressure relocation).
     pub dynamic_repath: bool,
+    /// Per-tile actor occupancy + kinematics, so the bot-on-bot collision response
+    /// can resolve **which** bot it hit and read that bot's heading (front vs back
+    /// of the other). `None` disables identity-aware classification — the responder
+    /// then treats every front collision as head-on (most tests pass `None`).
+    pub neighbors: Option<&'a CellOccupancy>,
 }
 
 impl BrainContext<'_> {
@@ -413,6 +419,13 @@ impl Brain {
         }
 
         self.low_level.execute(state, ctx, &mut self.rng, &self.tuning);
+        // A low-level action (e.g. FollowPath after a rear collision) can ask for a
+        // dynamic re-path; it can't reach `Brain` itself, so it raises a request and
+        // we arm the window here. The next planning tick then enqueues an
+        // `include_dynamic` route (consumed via `take_dynamic_repath`).
+        if self.low_level.take_dynamic_repath_request() {
+            self.set_dynamic_repath();
+        }
         effects
     }
 
@@ -523,6 +536,7 @@ pub(crate) mod test_support {
             pathfind: None,
             fixer: None,
             dynamic_repath: false,
+            neighbors: None,
         }
     }
 
