@@ -1,20 +1,26 @@
-//! Lock-free sub-section timers for the actor movement pipeline and the chunk
-//! streaming systems, shown beneath the FPS counter.
+//! Lock-free perf-instrumentation framework, shown beneath the FPS counter.
 //!
-//! Rows come in two flavors (see [`TimedSystem`] for the full list):
+//! The framework is intentionally kept in place with **no active counters** —
+//! re-add instrumentation when needed rather than re-deriving the plumbing.
 //!
-//! - **Wall-clock scopes** (`propose`, `prop_par`, `arb_*`, `chunk_*`) — RAII
-//!   [`TimingScope`]s around a system or section. Note `prop_par` wraps a
-//!   `par_iter_mut`: while its scope waits for batches, the thread can execute
-//!   an unrelated queued task, so a `prop_par` spike with a flat `prop_body`
-//!   means *stolen* time (look at the `chunk_*` rows), not actor work.
-//! - **Parallel aggregates** (`prop_body`, `prop_think`, `prop_slide`,
-//!   `prop_adv`) — CPU time summed across all worker threads via per-frame
-//!   `AtomicU64` accumulators; they show budget, not latency.
+//! Two flavors are supported:
+//!
+//! - **Wall-clock scopes** — RAII [`TimingScope`]s around a system or section,
+//!   created via `timings.scope(TimedSystem::Foo)`. Each adds one variant to
+//!   [`TimedSystem`] (and a label in [`TimedSystem::LABELS`]).
+//! - **Live gauges** — relaxed atomic counters on [`PerfCounts`], stored each
+//!   frame by the owning system and printed under the timing rows.
 //!
 //! Storage is pairs of atomics; `timings.scope()` is a lock-free RAII record
 //! (one relaxed store + one `fetch_max` on drop), `timings.record()` stores an
 //! already-measured aggregate.
+//!
+//! To add a counter:
+//! 1. add a variant to [`TimedSystem`] and a matching string to
+//!    [`TimedSystem::LABELS`], bumping [`TimedSystem::COUNT`]; wrap the section
+//!    with `let _t = timings.scope(TimedSystem::Foo);`, **or**
+//! 2. add an `AtomicU64` field to [`PerfCounts`], store into it from the owning
+//!    system, and print it in [`update_perf_timings`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -25,74 +31,21 @@ use bevy::prelude::*;
 use crate::menu::main_menu::GameState;
 use crate::scene::camera::{spawn_camera, StrategyCameraRig};
 
+/// Wall-clock timing slots. Add one variant per instrumented section and a
+/// matching label below; the framework currently ships with none.
 #[derive(Clone, Copy)]
-pub enum TimedSystem {
-    /// `update_visible_hypermap_chunks` — chunk visibility / load queueing.
-    ChunkVisibility,
-    /// `render_chunks_30fps` — chunk mesh build + spawn/despawn.
-    ChunkRender,
-    /// `refresh_chunk_upper_layers_on_floor_change` — floor-switch remesh.
-    ChunkFloors,
-    /// `black_bot_brain` — sequential planning tick over all bots.
-    Brain,
-    /// `pathfind_dispatch` — spawning queued searches onto the async pool.
-    PfDispatch,
-    /// `pathfind_collect` — draining finished route outcomes.
-    PfCollect,
-    /// `dirt_actor_interaction` — per-bot dirt deposits.
-    FieldDirt,
-    /// `bot_occupancy_heat` — per-bot heat deposits.
-    FieldHeat,
-    /// `flush_dirt_map` — dirt double-buffer flush.
-    DirtFlush,
-    /// `flush_temperature_map` — temperature double-buffer flush.
-    TempFlush,
-    /// `diffusion_tick` — GPU temperature diffusion pack/upload/apply.
-    TempDiffusion,
-    /// `sync_generic_overlays` — generic RGBA overlay plane rebuilds.
-    OverlayGeneric,
-    /// `sync_occupancy_overlays` — occupancy overlay plane sync.
-    OverlayOccupancy,
-    /// `update_occupancy_overlay_textures` — occupancy texture re-upload.
-    OverlayTextures,
-}
+pub enum TimedSystem {}
 
 impl TimedSystem {
-    pub const COUNT: usize = 14;
-    const LABELS: [&'static str; Self::COUNT] = [
-        "chunk_vis",
-        "chunk_render",
-        "chunk_floors",
-        "brain",
-        "pf_dispatch",
-        "pf_collect",
-        "f_dirt",
-        "f_heat",
-        "dirt_flush",
-        "temp_flush",
-        "t_diffuse",
-        "ovl_gen",
-        "ovl_occ",
-        "ovl_tex",
-    ];
+    pub const COUNT: usize = 0;
+    const LABELS: [&'static str; Self::COUNT] = [];
 }
 
 /// Live gauge counters shown beneath the timers — set each frame by the
-/// systems that own the values (relaxed atomic stores; lock-free).
+/// systems that own the values (relaxed atomic stores; lock-free). Add fields
+/// here as needed; the framework currently ships with none.
 #[derive(Resource, Default)]
-pub struct PerfCounts {
-    /// Pathfind requests waiting in the queue (not yet dispatched).
-    pub pf_pending: AtomicU64,
-    /// Pathfind searches currently running on the async pool.
-    pub pf_in_flight: AtomicU64,
-    /// Bots coasting on `PendingPath` (waiting for an async route).
-    pub coasting_bots: AtomicU64,
-    /// Bots ticked by the brain this frame.
-    pub total_bots: AtomicU64,
-    /// Actors that held at their previous footprint this frame (occupancy
-    /// conflict resolved by the movement pass).
-    pub collided_bots: AtomicU64,
-}
+pub struct PerfCounts {}
 
 #[derive(Resource)]
 pub struct SystemTimings {
@@ -180,7 +133,7 @@ fn spawn_perf_timings(mut commands: Commands, camera: Query<Entity, With<Strateg
 fn update_perf_timings(
     time: Res<Time>,
     timings: Res<SystemTimings>,
-    counts: Res<PerfCounts>,
+    _counts: Res<PerfCounts>,
     mut refresh_acc: Local<f32>,
     mut held_peak_ms: Local<[f64; TimedSystem::COUNT]>,
     mut held_age_s: Local<[f32; TimedSystem::COUNT]>,
@@ -216,13 +169,5 @@ fn update_perf_timings(
             TimedSystem::LABELS[i], last_ms, held_peak_ms[i],
         ));
     }
-    out.push_str(&format!(
-        "pf q={} fly={} coast={}/{}\ncollide={}\n",
-        counts.pf_pending.load(Ordering::Relaxed),
-        counts.pf_in_flight.load(Ordering::Relaxed),
-        counts.coasting_bots.load(Ordering::Relaxed),
-        counts.total_bots.load(Ordering::Relaxed),
-        counts.collided_bots.load(Ordering::Relaxed),
-    ));
     **text = out;
 }

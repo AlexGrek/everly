@@ -163,10 +163,16 @@ cluster. So every reset also arms a
 **dynamic-repath window** (`Brain::set_dynamic_repath`, a ~2 s countdown read by
 `Brain::take_dynamic_repath` each tick into `BrainContext::dynamic_repath`). While
 the window is open, every `WorldRoute` a high-level action enqueues sets
-`include_dynamic: true`, so the background worker runs
+`include_dynamic: true` (and carries the bot's `radius` from
+`BrainContext::radius_subtiles`), so the background worker runs
 [`astar_shortest_world_path_dyn`](../src/map/hypermap_pathfind.rs) — the normal
-tile A\* plus a predicate that treats any tile whose **center subtile** carries a
-creature body (`FLAG_BLOCKED | FLAG_CREATURE`) as impassable. The new route
+tile A\* plus a **footprint-aware** predicate that treats a tile as impassable
+when a creature body (`FLAG_BLOCKED | FLAG_CREATURE`) overlaps the bot's whole
+footprint (`radius` subtiles) centered on it, not merely its center subtile
+(`passability::footprint_has_all_flags`). So a wide bot also avoids tiles whose
+*edges* a cluster occupies — the same "occupied subcell within radius ⇒
+impassable" size rule the subcell router uses. The bot's own start tile is
+exempted so its footprint there never blocks its departure. The new route
 therefore steers around the current crowd rather than through it. The window
 (rather than a one-shot flag) is needed because the actual re-plan often happens a
 second or two later, on the `stuck` rising edge, not on the reset tick.

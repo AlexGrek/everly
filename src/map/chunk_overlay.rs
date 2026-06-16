@@ -77,7 +77,6 @@ use bevy::mesh::PlaneMeshBuilder;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
-use crate::hud::perf_timings::{SystemTimings, TimedSystem};
 use crate::map::hypermap::{ChunkCoord, LocalCoord, HYPERMAP_CHUNK_SIZE};
 use crate::map::hypermap_world::HypermapRuntime;
 use crate::map::passability::{
@@ -296,8 +295,7 @@ fn sync_generic_overlays(
     assets: Res<ChunkOverlayAssets>,
     mut state: ResMut<ChunkOverlayState>,
     planes: Query<Entity, With<GenericOverlayPlane>>,
- timings: Res<SystemTimings>) {
-    let _t = timings.scope(TimedSystem::OverlayGeneric);
+) {
     let desired: std::collections::HashSet<ChunkCoord> = if enabled.0 {
         runtime.desired_chunk_coords().into_iter().collect()
     } else {
@@ -368,8 +366,7 @@ fn sync_occupancy_overlays(
     assets: Res<ChunkOverlayAssets>,
     mut occ: ResMut<OccupancyOverlayState>,
     planes: Query<Entity, With<OccupancyOverlayPlane>>,
- timings: Res<SystemTimings>) {
-    let _t = timings.scope(TimedSystem::OverlayOccupancy);
+) {
     let desired: std::collections::HashSet<ChunkCoord> = if enabled.0 {
         runtime.desired_chunk_coords().into_iter().collect()
     } else {
@@ -416,8 +413,7 @@ fn update_occupancy_overlay_textures(
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut occ: ResMut<OccupancyOverlayState>,
- timings: Res<SystemTimings>) {
-    let _t = timings.scope(TimedSystem::OverlayTextures);
+) {
     if !enabled.0 {
         return;
     }

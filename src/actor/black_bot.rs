@@ -59,7 +59,6 @@ use crate::map::pathfind_service::{
 };
 use crate::hud::actor_inspector::SelectedActor;
 use crate::hud::game_log::{BreakableSystem, GameLog, LogEntry, LogLevel};
-use crate::hud::perf_timings::{PerfCounts, SystemTimings, TimedSystem};
 use crate::menu::main_menu::GameState;
 
 /// Epsilon kept inside the passable subtile when snapping the float center to
@@ -600,11 +599,8 @@ pub(crate) fn black_bot_brain(
         Option<&mut BotInventory>,
         Option<&OffScreenActor>,
     )>,
-    timings: Res<SystemTimings>,
-    counts: Res<PerfCounts>,
     selected: Res<SelectedActor>,
 ) {
-    let _t = timings.scope(TimedSystem::Brain);
     let dt = time.delta_secs();
     let passability = &*hypermap.static_passability_map;
     let static_subtiles = &*hypermap.static_subtile_cache;
@@ -620,15 +616,9 @@ pub(crate) fn black_bot_brain(
     // (they mutate a *different* bot's `Breakable` than the one being iterated).
     let mut repairs: Vec<(Entity, RepairPart)> = Vec::new();
 
-    let mut coasting: u64 = 0;
-    let mut total: u64 = 0;
     for (entity, name, mut obj, mut brain, mut vis, force_logs, mut charge, mut breakable, mut patrol, mut fixer, mut inventory, off_screen) in
         &mut query
     {
-        total += 1;
-        if brain.is_awaiting_path() {
-            coasting += 1;
-        }
         let force = force_logs.0;
         let blocked_flags = obj.inner.blocked_flags();
         let state = obj.inner.state_mut();
@@ -937,9 +927,6 @@ pub(crate) fn black_bot_brain(
             force_logs.0,
         );
     }
-
-    counts.coasting_bots.store(coasting, std::sync::atomic::Ordering::Relaxed);
-    counts.total_bots.store(total, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Releases any dispatch claim held by `entity` and drops its carried part. Used

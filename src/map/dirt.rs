@@ -6,7 +6,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
 use bevy::prelude::*;
-use crate::hud::perf_timings::{SystemTimings, TimedSystem};
 use crate::rng;
 
 use crate::map::hypermap::{random_rng_seed, ChunkCoord, Hypermap, LocalCoord, HYPERMAP_CHUNK_SIZE};
@@ -217,8 +216,7 @@ impl Plugin for DirtMapPlugin {
     }
 }
 
-pub(crate) fn flush_dirt_map(dirt: Res<DirtMap>, timings: Res<SystemTimings>) {
-    let _t = timings.scope(TimedSystem::DirtFlush);
+pub(crate) fn flush_dirt_map(dirt: Res<DirtMap>) {
     dirt.field.flush_if_pending();
 }
 

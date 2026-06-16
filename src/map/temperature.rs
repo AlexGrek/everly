@@ -4,7 +4,6 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 use bevy::prelude::*;
-use crate::hud::perf_timings::{SystemTimings, TimedSystem};
 use crate::rng;
 
 use crate::map::hypermap::{random_rng_seed, ChunkCoord, Hypermap, LocalCoord, HYPERMAP_CHUNK_SIZE};
@@ -213,8 +212,7 @@ impl Plugin for TemperatureMapPlugin {
     }
 }
 
-pub(crate) fn flush_temperature_map(temperature: Res<TemperatureMap>, timings: Res<SystemTimings>) {
-    let _t = timings.scope(TimedSystem::TempFlush);
+pub(crate) fn flush_temperature_map(temperature: Res<TemperatureMap>) {
     temperature.field.flush_if_pending();
 }
 

@@ -34,7 +34,6 @@ use bevy::render::{
     Render, RenderApp, RenderStartup, RenderSystems,
 };
 
-use crate::hud::perf_timings::{SystemTimings, TimedSystem};
 use crate::map::hypermap::{ChunkCoord, LocalCoord, HYPERMAP_CHUNK_SIZE};
 use crate::map::hypermap_world::HypermapRuntime;
 use crate::map::temperature::{TemperatureMap, TEMP_MAX_C, TEMP_MIN_C, TEMP_ZERO_C};
@@ -248,8 +247,7 @@ fn diffusion_tick(
     mut window: ResMut<DiffusionWindow>,
     mut scratch: ResMut<DiffusionScratch>,
     mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
- timings: Res<SystemTimings>) {
-    let _t = timings.scope(TimedSystem::TempDiffusion);
+) {
     let coords = runtime.desired_chunk_coords();
     let Some((origin_chunk, chunks_w, chunks_h)) = window_chunk_bounds(&coords) else {
         gpu.active = false;

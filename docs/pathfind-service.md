@@ -40,7 +40,10 @@ unit tests that do not need routing pass `None`, or use test helpers on the queu
   `Hypermap<f32>` static passability, then line-of-sight simplification
   (`simplify_buffer` corner padding). Used by wander, patrol legs, charger
   candidate scans, dock-approach routes, and patrol-loop generation reachability
-  checks.
+  checks. When `include_dynamic` is set it also rejects tiles whose creature
+  occupancy overlaps the bot's **footprint** (`radius` subtiles) — a size-aware
+  test (`footprint_has_all_flags`), not a single center-subtile read — so a
+  post-relocation reroute steers a wide bot around clusters its body would clip.
 - **`SubtileDetour`** — bounded 4-neighbour A\* on the subtile grid around a
   head-on bot bump, footprint-tested via `DynamicPassabilityMap::probe_footprint`
   + static subtile cache. Used only by [`FollowPath`](../src/actor/brain/low_level.rs).

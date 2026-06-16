@@ -7,7 +7,6 @@ use std::collections::HashSet;
 
 use bevy::prelude::*;
 
-use crate::hud::perf_timings::{SystemTimings, TimedSystem};
 use crate::actor::{actor_main_tile, process_actor_moves, ActorObject};
 use crate::map::dirt::{DirtMap, DIRT_TRACK_DEPOSIT};
 use crate::map::hypermap::Hypermap;
@@ -142,8 +141,7 @@ pub(crate) fn dirt_actor_interaction(
     mut actors: Query<&mut ActorObject>,
     dirt: Res<DirtMap>,
     hypermap: Res<HypermapRuntime>,
- timings: Res<SystemTimings>) {
-    let _t = timings.scope(TimedSystem::FieldDirt);
+) {
     let world = hypermap.map.as_ref();
     for mut actor_obj in actors.iter_mut() {
         let state = actor_obj.inner.state_mut();
@@ -184,8 +182,7 @@ fn bot_occupancy_heat(
     actors: Query<&ActorObject>,
     temperature: Res<TemperatureMap>,
     hypermap: Res<HypermapRuntime>,
- timings: Res<SystemTimings>) {
-    let _t = timings.scope(TimedSystem::FieldHeat);
+) {
     timer.0.tick(time.delta());
     if !timer.0.just_finished() {
         return;

@@ -30,7 +30,6 @@ use crate::menu::main_menu::GameState;
 use crate::map::dirt::DirtMap;
 use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
 use crate::map::passability::{cell_subtile_flags, SubtilePassability, SUBTILE_COUNT};
-use crate::hud::perf_timings::{SystemTimings, TimedSystem};
 use crate::map::chunk_metadata::{try_load_chunk_metadata, ChunkGeneratorMetadata};
 use crate::map::map_generator::{fill_procedural_chunk, CHUNK_VOID_MARGIN};
 use crate::map::temperature::TemperatureMap;
@@ -610,9 +609,7 @@ fn refresh_chunk_upper_layers_on_floor_change(
     mut materials: ResMut<Assets<StandardMaterial>>,
     assets: Res<HypermapRenderAssets>,
     mut commands: Commands,
-    timings: Res<SystemTimings>,
 ) {
-    let _t = timings.scope(TimedSystem::ChunkFloors);
     let current = floor.0;
     if prev_floor.as_ref() == Some(&current) {
         return;
@@ -802,9 +799,7 @@ fn update_visible_hypermap_chunks(
     cameras: Query<&StrategyCamera>,
     active_floor: Res<ActiveFloorLevel>,
     level: Res<LevelName>,
-    timings: Res<SystemTimings>,
 ) {
-    let _t = timings.scope(TimedSystem::ChunkVisibility);
     let Ok(camera) = cameras.single() else {
         return;
     };
@@ -885,9 +880,7 @@ fn render_chunks_30fps(
     level: Res<LevelName>,
     roots: Query<Entity, With<RenderedChunkRoot>>,
     waters: Query<Entity, With<RenderedChunkWater>>,
-    timings: Res<SystemTimings>,
 ) {
-    let _t = timings.scope(TimedSystem::ChunkRender);
     let remesh_coords: Vec<ChunkCoord> = remesh.0.drain().collect();
     for coord in remesh_coords {
         if !runtime.desired_chunks.contains(&coord) {

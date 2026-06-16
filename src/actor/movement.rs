@@ -33,12 +33,9 @@
 //!    non-local move, and it exists solely because off-screen actors travel
 //!    without collision and may re-enter sitting inside static geometry.
 
-use std::sync::atomic::Ordering;
-
 use bevy::prelude::*;
 use bevy::platform::collections::HashMap;
 
-use crate::hud::perf_timings::PerfCounts;
 use crate::map::hypermap_world::HypermapRuntime;
 use crate::map::passability::{baked_circle_shadow, DynamicPassabilityMap};
 
@@ -266,7 +263,6 @@ pub(crate) fn process_actor_moves(
     mut arbiter: ResMut<OccupancyArbiter>,
     dynamic: Res<DynamicPassabilityMap>,
     mut commands: Commands,
-    counts: Res<PerfCounts>,
 ) {
     let static_cache = hypermap.static_subtile_cache.as_ref();
     let hypermap = &*hypermap;
@@ -328,9 +324,6 @@ pub(crate) fn process_actor_moves(
         let arb = &mut *arbiter;
         arbitrate(&mut arb.records[..n], &mut arb.owners);
     }
-    let collided = arbiter.records[..n].iter().filter(|r| r.collided).count() as u64;
-    counts.collided_bots.store(collided, Ordering::Relaxed);
-
     // Stage 3: apply outcomes and stamp final footprints into the write buffer.
     for k in 0..n {
         let entity = arbiter.entities[k];

@@ -1159,6 +1159,40 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_world_route_is_footprint_aware() {
+        // A 1-tile-tall corridor (y = 0) from (0,0) to (4,0); a creature sits in
+        // tile (2,0) off its center subtile but within a radius-2 footprint. The
+        // center-only router (radius 0) walks straight through the clear center
+        // subtile; a radius-2 bot is blocked at (2,0) and — boxed in the corridor —
+        // finds no route. Proves the tile-level dynamic router honors bot size.
+        let map: Hypermap<f32> = Hypermap::new(0.0);
+        for x in 0..=4 {
+            map.set(x, 0, 1.0);
+        }
+        let dynamic: Hypermap<SubtilePassability> = Hypermap::new(SubtilePassability::EMPTY);
+        let mut blocker = SubtilePassability::EMPTY;
+        // Subtile (12,4) of tile (2,0): local (row 4, col 2) — not the center (2,2).
+        blocker.or_flags(4, 2, FLAG_BLOCKED | FLAG_CREATURE);
+        dynamic.set(2, 0, blocker);
+
+        let r0 = astar_shortest_world_path_dyn(
+            &map, &dynamic, (0, 0), (4, 0), 0, HypermapSearchLimits { max_expanded: 10_000 },
+        );
+        assert!(
+            matches!(r0, HypermapPathResult::Found { .. }),
+            "center-only (radius 0) passes the clear center subtile, got {r0:?}"
+        );
+
+        let r2 = astar_shortest_world_path_dyn(
+            &map, &dynamic, (0, 0), (4, 0), 2, HypermapSearchLimits { max_expanded: 10_000 },
+        );
+        assert!(
+            matches!(r2, HypermapPathResult::NoPath { .. }),
+            "radius-2 footprint overlaps the creature at (2,0) → corridor blocked, got {r2:?}"
+        );
+    }
+
+    #[test]
     fn explore_respects_void_default() {
         let map: Hypermap<f32> = Hypermap::new(0.0);
         map.set(0, 0, 1.0);
