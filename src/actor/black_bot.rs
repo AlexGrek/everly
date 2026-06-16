@@ -612,14 +612,17 @@ pub(crate) fn black_bot_brain(
         &remesh,
     );
 
-    // Repairs requested by fixers this tick, applied in a second pass below
-    // (they mutate a *different* bot's `Breakable` than the one being iterated).
+    // Repairs / recharges requested by fixers this tick, applied in a second pass
+    // below (they mutate a *different* bot's `Breakable` / `Charge` than the one
+    // being iterated).
     let mut repairs: Vec<(Entity, RepairPart)> = Vec::new();
+    let mut recharges: Vec<(Entity, f32)> = Vec::new();
 
     for (entity, name, mut obj, mut brain, mut vis, force_logs, mut charge, mut breakable, mut patrol, mut fixer, mut inventory, off_screen) in
         &mut query
     {
         let force = force_logs.0;
+        let is_selected = selected.entity == Some(entity);
         let blocked_flags = obj.inner.blocked_flags();
         let state = obj.inner.state_mut();
 
@@ -825,9 +828,13 @@ pub(crate) fn black_bot_brain(
                 inv.carried = None;
             }
         }
-        // A delivered repair targets a *different* bot; collect for the 2nd pass.
+        // A delivered repair / recharge targets a *different* bot; collect for
+        // the 2nd pass.
         if let Some((target, part)) = effects.repair_target {
             repairs.push((target, part));
+        }
+        if let Some((target, level)) = effects.recharge_target {
+            recharges.push((target, level));
         }
 
         // MOVEMENT_ENGINE wears only while actually moving this frame.
@@ -850,11 +857,12 @@ pub(crate) fn black_bot_brain(
         if brain.is_stuck() {
             if !vis.stuck_logged {
                 vis.stuck_logged = true;
-                game_log.push_world(
+                game_log.push_world_for_bot(
                     current_tile.x,
                     current_tile.y,
                     LogEntry::BotStuck { name: name.to_string() },
                     force,
+                    is_selected,
                 );
             }
         } else {
@@ -864,19 +872,21 @@ pub(crate) fn black_bot_brain(
         // Charging lifecycle events. `dock`/`undock` are one-shot phase
         // transitions (entering `Charging` / reaching full), so each logs once.
         if effects.dock.is_some() {
-            game_log.push_world(
+            game_log.push_world_for_bot(
                 current_tile.x,
                 current_tile.y,
                 LogEntry::ChargingStarted { name: name.to_string() },
                 force,
+                is_selected,
             );
         }
         if effects.undock.is_some() {
-            game_log.push_world(
+            game_log.push_world_for_bot(
                 current_tile.x,
                 current_tile.y,
                 LogEntry::ChargingDone { name: name.to_string() },
                 force,
+                is_selected,
             );
         }
         if let Some(log) = effects.log {
@@ -894,7 +904,7 @@ pub(crate) fn black_bot_brain(
                     waypoint_y: waypoint.1,
                 },
             };
-            game_log.push_world(current_tile.x, current_tile.y, entry, force);
+            game_log.push_world_for_bot(current_tile.x, current_tile.y, entry, force, is_selected);
         }
 
         apply_brain_effects(entity, &effects, &mut interactive, charge.as_deref_mut());
@@ -913,11 +923,13 @@ pub(crate) fn black_bot_brain(
             RepairPart::MovementEngine => &mut b.movement_engine,
             RepairPart::ControlPlane => &mut b.control_plane,
             RepairPart::SensorySystem => &mut b.sensory_system,
+            // A battery is delivered via `recharge_target`, never `repair_target`.
+            RepairPart::Battery => continue,
         };
         p.wear = 0.0;
         p.broken = false;
         let tile = actor_main_tile(obj.inner.state().center);
-        game_log.push_world(
+        game_log.push_world_for_bot(
             tile.x,
             tile.y,
             LogEntry::Message {
@@ -925,6 +937,30 @@ pub(crate) fn black_bot_brain(
                 text: format!("{} {} repaired", name.as_str(), part.label()),
             },
             force_logs.0,
+            selected.entity == Some(target),
+        );
+    }
+
+    // Second pass: apply fixer-delivered battery recharges to the *target* bots
+    // (same cross-bot borrow constraint as repairs above). Lifts a discharged bot
+    // straight to the delivered level, waking it from the depleted gate next tick.
+    for (target, level) in recharges.drain(..) {
+        let Ok((_, name, obj, _, _, force_logs, mut charge, _, _, _, _, _)) = query.get_mut(target)
+        else {
+            continue;
+        };
+        let Some(c) = charge.as_mut() else { continue };
+        **c = Charge::new(level);
+        let tile = actor_main_tile(obj.inner.state().center);
+        game_log.push_world_for_bot(
+            tile.x,
+            tile.y,
+            LogEntry::Message {
+                level: LogLevel::Success,
+                text: format!("{} recharged to {}%", name.as_str(), (c.level * 100.0).round() as i32),
+            },
+            force_logs.0,
+            selected.entity == Some(target),
         );
     }
 }
@@ -1280,11 +1316,12 @@ fn track_black_bot_collision_pressure(
         stall.insert(entity, StallTrack { anchor: center, elapsed: 0.0 });
         interactive.evict_actor_everywhere(entity);
         release_fixer_work(entity, &dispatch, inventory.as_deref_mut());
-        game_log.push_world(
+        game_log.push_world_for_bot(
             tile.x,
             tile.y,
             LogEntry::BotCollisionReset { name: name.to_string() },
             force_logs.0,
+            selected.entity == Some(entity),
         );
         if selected.entity == Some(entity) {
             game_log.push_world(

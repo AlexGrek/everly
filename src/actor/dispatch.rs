@@ -32,14 +32,18 @@ const INVENTORY_MARKER_Y: f32 = 1.35;
 /// Side length of the carried-part marker cube.
 const INVENTORY_MARKER_SIZE: f32 = 0.22;
 
-/// A repairable sub-component a fixer can carry and deliver. Mirrors the
-/// immobilizing parts of [`Breakable`]; kept as its own small enum so dispatch /
-/// inventory code never depends on the full breakable struct.
+/// Something a fixer can carry from the parts depot and deliver to a stranded
+/// bot. The three breakable kinds mirror the immobilizing parts of
+/// [`Breakable`]; [`Battery`](RepairPart::Battery) is delivered to a *depleted*
+/// bot and recharges it instead of repairing a part. Kept as its own small enum
+/// so dispatch / inventory code never depends on the full breakable struct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepairPart {
     MovementEngine,
     ControlPlane,
     SensorySystem,
+    /// A fresh battery for a discharged bot (recharge on delivery, no part fix).
+    Battery,
 }
 
 impl RepairPart {
@@ -49,15 +53,18 @@ impl RepairPart {
             RepairPart::MovementEngine => "movement engine",
             RepairPart::ControlPlane => "control plane",
             RepairPart::SensorySystem => "sensory system",
+            RepairPart::Battery => "battery",
         }
     }
 
-    /// The matching [`BreakableSystem`] for logging.
-    pub fn breakable_system(self) -> BreakableSystem {
+    /// The matching [`BreakableSystem`] for logging, or `None` for a
+    /// [`Battery`](RepairPart::Battery) (which is not a breakable sub-component).
+    pub fn breakable_system(self) -> Option<BreakableSystem> {
         match self {
-            RepairPart::MovementEngine => BreakableSystem::MovementEngine,
-            RepairPart::ControlPlane => BreakableSystem::ControlPlane,
-            RepairPart::SensorySystem => BreakableSystem::SensorySystem,
+            RepairPart::MovementEngine => Some(BreakableSystem::MovementEngine),
+            RepairPart::ControlPlane => Some(BreakableSystem::ControlPlane),
+            RepairPart::SensorySystem => Some(BreakableSystem::SensorySystem),
+            RepairPart::Battery => None,
         }
     }
 
@@ -67,6 +74,7 @@ impl RepairPart {
             RepairPart::MovementEngine => Color::srgb(1.0, 0.55, 0.10),
             RepairPart::ControlPlane => Color::srgb(0.20, 0.75, 1.0),
             RepairPart::SensorySystem => Color::srgb(0.85, 0.30, 1.0),
+            RepairPart::Battery => Color::srgb(0.30, 1.0, 0.45),
         }
     }
 
@@ -270,9 +278,12 @@ fn sync_inventory_markers(
     }
 }
 
-/// Refreshes the [`DispatchQueue`] from the world each frame: stranded (broken,
-/// non-depleted) bots (re)post a request for the part they need; requests for
-/// bots no longer stranded are dropped and claims by vanished fixers released.
+/// Refreshes the [`DispatchQueue`] from the world each frame: stranded bots
+/// (re)post a request for what they need — a [`Battery`](RepairPart::Battery)
+/// when discharged, otherwise their most-critical broken part. A discharged bot
+/// can't move regardless of repairs, so charge comes first; once recharged it
+/// re-posts for any remaining break. Requests for bots no longer stranded are
+/// dropped and claims by vanished fixers released.
 ///
 /// Runs `.before` the brain tick so loitering fixers see an up-to-date board.
 fn maintain_dispatch_queue(
@@ -280,23 +291,28 @@ fn maintain_dispatch_queue(
     bots: Query<(Entity, &ActorObject, Option<&Breakable>, Option<&Charge>), With<BlackBotVisual>>,
 ) {
     use std::collections::HashSet;
-    let mut broken: HashSet<Entity> = HashSet::new();
+    let mut stranded_bots: HashSet<Entity> = HashSet::new();
     let mut alive: HashSet<Entity> = HashSet::new();
     for (entity, obj, breakable, charge) in &bots {
         alive.insert(entity);
         let depleted = charge.is_some_and(Charge::is_depleted);
-        let Some(b) = breakable else { continue };
-        // Only the immobilizing breaks strand a bot and warrant a rescue.
-        let stranded = !depleted && (b.movement_engine.broken || b.control_plane.broken);
-        if !stranded {
-            continue;
-        }
-        let Some(part) = RepairPart::most_critical_broken(b) else { continue };
+        // What does this bot need? A battery if discharged; else its most
+        // critical immobilizing break (only those warrant a rescue).
+        let part = if depleted {
+            Some(RepairPart::Battery)
+        } else {
+            breakable.and_then(|b| {
+                (b.movement_engine.broken || b.control_plane.broken)
+                    .then(|| RepairPart::most_critical_broken(b))
+                    .flatten()
+            })
+        };
+        let Some(part) = part else { continue };
         let tile = actor_main_tile(obj.inner.state().center);
         dispatch.post(entity, part, tile);
-        broken.insert(entity);
+        stranded_bots.insert(entity);
     }
-    dispatch.maintain(&broken, &alive);
+    dispatch.maintain(&stranded_bots, &alive);
 }
 
 /// Registers the [`DispatchQueue`] resource and its maintenance / marker systems.

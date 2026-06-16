@@ -282,6 +282,24 @@ impl GameLog {
         self.push(coord, entry, force);
     }
 
+    /// Like [`push_world`](Self::push_world), but for **per-bot** events: the
+    /// entry is dropped unless the producing bot is currently `selected` or the
+    /// event is an [`LogLevel::Err`]. Errors are always recorded; informational,
+    /// warning, success and unexpected lines reach the log only for the selected
+    /// bot, keeping the overlay readable when many bots are active.
+    pub fn push_world_for_bot(
+        &self,
+        world_x: i32,
+        world_y: i32,
+        entry: LogEntry,
+        force: bool,
+        selected: bool,
+    ) {
+        if selected || entry.level() == LogLevel::Err {
+            self.push_world(world_x, world_y, entry, force);
+        }
+    }
+
     /// Records `entry` in the given hypertile's queue, holding each lock only
     /// for the push itself.
     pub fn push(&self, coord: ChunkCoord, entry: LogEntry, force: bool) {
@@ -557,6 +575,29 @@ mod tests {
         let (elsewhere, _) = world_to_chunk_local(1000, 1000);
         assert_eq!(log.render_lines(elsewhere, true, LogDisplayFilter::All), Some(Vec::new()));
         assert!(log.render_lines(elsewhere, false, LogDisplayFilter::All).is_none());
+    }
+
+    #[test]
+    fn push_world_for_bot_filters_non_errors_for_unselected() {
+        let log = GameLog::default();
+        let (here, _) = world_to_chunk_local(5, 5);
+
+        // Unselected bot: errors recorded, everything else dropped.
+        log.push_world_for_bot(5, 5, LogEntry::ChargeDepleted { name: "Err".into() }, false, false);
+        log.push_world_for_bot(5, 5, LogEntry::BotStuck { name: "Warn".into() }, false, false);
+        log.push_world_for_bot(
+            5,
+            5,
+            LogEntry::Message { level: LogLevel::Info, text: "Info".into() },
+            false,
+            false,
+        );
+        // Selected bot: non-error recorded too.
+        log.push_world_for_bot(5, 5, LogEntry::BotStuck { name: "Warn2".into() }, false, true);
+
+        let lines = log.render_lines(here, true, LogDisplayFilter::All).unwrap();
+        let texts: Vec<&str> = lines.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(texts, ["Warn2 stuck", "Err charge depleted"]);
     }
 
     #[test]

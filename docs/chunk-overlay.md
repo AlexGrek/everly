@@ -48,6 +48,8 @@ Shared layout via [`tile_field`](../src/map/tile_field.rs) — **one texel per w
 
 `DirtOverlayPlugin` + `DirtMapPlugin` — black RGB, alpha = dirt × 255. Seeding ~6% of non-void tiles at `0.1..=0.3`; actors add [`DIRT_TRACK_DEPOSIT`](../src/map/dirt.rs) on tiles they leave (`docs/field-interactions.md`).
 
+**Visual upsampling.** The dirt **data** stays one scalar per world tile, but the dirt overlay texture is rendered at `DIRT_OVERLAY_SUPERSAMPLE` (= 4) texels per tile edge — `512 × 512` per chunk — and filled by **bilinear interpolation** between the four nearest tile samples (taps reach one tile into neighbouring chunks via a padded border, so stains stay seamless across chunk edges and fade smoothly instead of showing 1 m blocks). This is purely a rendering change; deposits, persistence (`dirt.bin`), and gameplay still operate at tile resolution.
+
 ### Temperature (heatmap)
 
 `TemperatureOverlayPlugin` + `TemperatureMapPlugin` — values in **°C** on [−30, +30]. Colormap: **blue** (cold) → **white** (0) → **yellow** → **red** (hot). Off by default; open **Overlays** panel from HUD (or press **F5**). Seeding: ~4% cold patches (−26..−6 °C), ~4% warm (6..26 °C), rest 0 °C.

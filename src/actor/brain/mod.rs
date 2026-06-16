@@ -181,6 +181,9 @@ pub struct BrainEffects {
     /// Repair `part` on the target bot (reset its wear and clear the broken flag):
     /// a fixer delivering a part to a stranded bot.
     pub repair_target: Option<(Entity, RepairPart)>,
+    /// Recharge the target bot to this charge level (`0.0..=1.0`): a fixer
+    /// delivering a [`Battery`](RepairPart::Battery) to a discharged bot.
+    pub recharge_target: Option<(Entity, f32)>,
     /// Optional in-game log line for this tick.
     pub log: Option<BrainLogEvent>,
     /// Re-assert that this bot is still actively pursuing a station's queue this
@@ -221,6 +224,9 @@ fn merge_brain_effects(into: &mut BrainEffects, add: BrainEffects) {
     }
     if let Some(v) = add.repair_target {
         into.repair_target = Some(v);
+    }
+    if let Some(v) = add.recharge_target {
+        into.recharge_target = Some(v);
     }
     if let Some(v) = add.log {
         into.log = Some(v);

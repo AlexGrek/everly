@@ -10,10 +10,18 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
 use crate::map::chunk_overlay::DIRT_OVERLAY_Y;
 use crate::map::dirt::DirtMap;
-use crate::map::hypermap::{ChunkCoord, HYPERMAP_CHUNK_SIZE};
+use crate::map::hypermap::{ChunkCoord, LocalCoord, HYPERMAP_CHUNK_SIZE};
 use crate::map::hypermap_world::HypermapRuntime;
-use crate::map::tile_field::{TileFieldMap, TILE_FIELD_OVERLAY_RES};
+use crate::map::tile_field::TILE_FIELD_OVERLAY_RES;
 use crate::menu::main_menu::GameState;
+
+/// Dirt-overlay texels per world-tile edge. The dirt **field** is one scalar per
+/// tile; this only upsamples the *rendered* texture so stains read as smooth fades
+/// rather than 1 m blocks (see [`paint_dirt_chunk_supersampled`]). Purely visual.
+const DIRT_OVERLAY_SUPERSAMPLE: u32 = 4;
+
+/// Dirt overlay texture size per chunk edge (`TILE_FIELD_OVERLAY_RES × supersample`).
+const DIRT_OVERLAY_TEXELS: u32 = TILE_FIELD_OVERLAY_RES * DIRT_OVERLAY_SUPERSAMPLE;
 
 #[derive(Resource, Default)]
 pub struct DirtOverlayState {
@@ -61,7 +69,7 @@ fn setup_dirt_overlay(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) 
 }
 
 fn new_tile_field_image() -> Image {
-    let size = TILE_FIELD_OVERLAY_RES;
+    let size = DIRT_OVERLAY_TEXELS;
     Image::new(
         Extent3d { width: size, height: size, depth_or_array_layers: 1 },
         TextureDimension::D2,
@@ -113,6 +121,64 @@ fn dirt_to_rgba(dirt: f32) -> [u8; 4] {
     }
     let a = (dirt.clamp(0.0, 1.0) * 255.0).round() as u8;
     [0, 0, 0, a]
+}
+
+/// Bilinearly upsamples one chunk's tile-resolution dirt into a
+/// `DIRT_OVERLAY_TEXELS²` RGBA image. Tile sample `(lx, ly)` is treated as living at
+/// its tile centre; each output texel blends the four nearest tile samples. A 1-tile
+/// padded border (read from `dirt` so it spans neighbouring chunks) keeps stains
+/// seamless across chunk edges. Visual only — the dirt field stays per-tile.
+fn paint_dirt_chunk_supersampled(data: &mut [u8], dirt: &DirtMap, coord: ChunkCoord) {
+    let n = HYPERMAP_CHUNK_SIZE as usize;
+    let stride = n + 2;
+    let origin_x = coord.x * HYPERMAP_CHUNK_SIZE;
+    let origin_y = coord.y * HYPERMAP_CHUNK_SIZE;
+
+    // Padded tile grid: `pad[(ly+1) * stride + (lx+1)]` for lx, ly in 0..n, plus a
+    // one-tile ring so bilinear taps at the chunk border read real neighbour values.
+    let mut pad = vec![0.0f32; stride * stride];
+    dirt.read_map().with_chunk_read(coord, |chunk| {
+        for ly in 0..n {
+            for lx in 0..n {
+                let v = *chunk.get_local(LocalCoord::new(lx as i32, ly as i32));
+                pad[(ly + 1) * stride + (lx + 1)] = v;
+            }
+        }
+    });
+    for p in 0..stride as i32 {
+        let wx = origin_x + p - 1;
+        pad[p as usize] = dirt.get_tile(wx, origin_y - 1);
+        pad[(stride - 1) * stride + p as usize] = dirt.get_tile(wx, origin_y + n as i32);
+        let wy = origin_y + p - 1;
+        pad[p as usize * stride] = dirt.get_tile(origin_x - 1, wy);
+        pad[p as usize * stride + (stride - 1)] = dirt.get_tile(origin_x + n as i32, wy);
+    }
+
+    let s = DIRT_OVERLAY_SUPERSAMPLE as f32;
+    let res = DIRT_OVERLAY_TEXELS as usize;
+    for py in 0..res {
+        let fy = (py as f32 + 0.5) / s - 0.5;
+        let ly0 = fy.floor();
+        let ty = fy - ly0;
+        let row0 = (ly0 as i32 + 1) as usize;
+        let row1 = row0 + 1;
+        for px in 0..res {
+            let fx = (px as f32 + 0.5) / s - 0.5;
+            let lx0 = fx.floor();
+            let tx = fx - lx0;
+            let col0 = (lx0 as i32 + 1) as usize;
+            let col1 = col0 + 1;
+            let v00 = pad[row0 * stride + col0];
+            let v10 = pad[row0 * stride + col1];
+            let v01 = pad[row1 * stride + col0];
+            let v11 = pad[row1 * stride + col1];
+            let top = v00 + (v10 - v00) * tx;
+            let bot = v01 + (v11 - v01) * tx;
+            let v = top + (bot - top) * ty;
+            let idx = (py * res + px) * 4;
+            data[idx..idx + 4].copy_from_slice(&dirt_to_rgba(v));
+        }
+    }
 }
 
 fn sync_dirt_overlays(
@@ -184,11 +250,10 @@ fn update_dirt_overlay_textures(
         let Some(image) = images.get_mut(&img_handle) else { continue; };
         let Some(data) = image.data.as_mut() else { continue; };
 
-        let chunk_existed = dirt.read_map().with_chunk_read(coord, |chunk| {
-            TileFieldMap::paint_chunk_to_rgba(data, chunk, dirt_to_rgba);
-        }).is_some();
-
-        if !chunk_existed {
+        if dirt.read_map().has_chunk(coord) {
+            paint_dirt_chunk_supersampled(data, &dirt, coord);
+        } else {
+            // No chunk ever materialized → all-transparent.
             data.fill(0);
         }
         materials.get_mut(&mat_handle);

@@ -10,7 +10,7 @@ use bevy::ecs::entity::Entity;
 use bevy::math::Vec2;
 use crate::rng::{self, StdRng};
 
-use crate::actor::dispatch::RepairRequest;
+use crate::actor::dispatch::{RepairPart, RepairRequest};
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap, HYPERMAP_CHUNK_SIZE};
 use crate::map::hypermap_pathfind::{manhattan, world_tile_walkable};
 use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
@@ -596,6 +596,11 @@ const FIXER_LOITER_RADIUS: i32 = 10;
 /// Squared tile distance at which a fixer is "close enough" to a stranded bot to
 /// repair it — near but not touching (avoids a collision with the target).
 const FIX_REACH_SQ: f32 = 2.25; // 1.5 tiles
+/// Inclusive charge level a delivered [`Battery`](RepairPart::Battery) restores a
+/// discharged bot to — a partial top-up (it must still seek a charger for the
+/// rest), rolled per delivery from the fixer's seeded RNG.
+const BATTERY_RECHARGE_MIN: f32 = 0.5;
+const BATTERY_RECHARGE_MAX: f32 = 0.7;
 
 /// Phase of the perpetual fixer routine.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -800,7 +805,7 @@ impl HighLevelAction for GoFixBots {
         let outcome = match self.phase {
             FixPhase::Loiter => self.update_loiter(pf, fx, ctx, low, rng, here, home_tile),
             FixPhase::FetchPart => self.update_fetch(pf, fx, ctx, low, here, home_tile),
-            FixPhase::Deliver => self.update_deliver(pf, fx, ctx, low, here, home_tile),
+            FixPhase::Deliver => self.update_deliver(pf, fx, ctx, low, here, home_tile, rng),
             FixPhase::ReturnHome => self.update_return(pf, ctx, low, here, home_tile),
         };
         self.prev_low_stuck = low.is_stuck();
@@ -948,13 +953,14 @@ impl GoFixBots {
         low: &mut Box<dyn LowLevelAction>,
         _here: (i32, i32),
         home_tile: (i32, i32),
+        rng: &mut StdRng,
     ) -> HighLevelOutcome {
         let Some(req) = self.claim else {
             self.phase = FixPhase::ReturnHome;
             return HighLevelOutcome::running();
         };
 
-        // Close enough to repair? Fix on proximity, before colliding with the bot.
+        // Close enough to service? Act on proximity, before colliding with the bot.
         let target_center = Vec2::new(req.location.x as f32 + 0.5, req.location.y as f32 + 0.5);
         if (ctx.center - target_center).length_squared() <= FIX_REACH_SQ {
             low.halt();
@@ -963,11 +969,18 @@ impl GoFixBots {
             self.phase = FixPhase::ReturnHome;
             self.leg = None;
             self.start_route(pf, ctx, low, home_tile, PathfindReason::FixerReturnHome);
-            return HighLevelOutcome::running_with(BrainEffects {
-                repair_target: Some((req.broken_bot, req.part)),
+            // A battery recharges the discharged bot; any other part is a repair.
+            let mut effects = BrainEffects {
                 clear_inventory: true,
                 ..BrainEffects::default()
-            });
+            };
+            if req.part == RepairPart::Battery {
+                let level = rng::range(rng, BATTERY_RECHARGE_MIN..=BATTERY_RECHARGE_MAX);
+                effects.recharge_target = Some((req.broken_bot, level));
+            } else {
+                effects.repair_target = Some((req.broken_bot, req.part));
+            }
+            return HighLevelOutcome::running_with(effects);
         }
 
         if self.awaiting.is_some() {
