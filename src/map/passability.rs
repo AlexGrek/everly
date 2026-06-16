@@ -432,6 +432,29 @@ pub fn first_static_block(
     None
 }
 
+/// `true` when **all** of `flags` are set on any subtile of the circular
+/// footprint of `radius_subtiles` centered on `center` in `map`.
+///
+/// The size-aware read counterpart of a single-subtile flag test: a subcell
+/// within the bot's radius of an occupied subcell makes the center impassable.
+/// Chunk-local (one cursor for the whole circle), so it is cheap enough for the
+/// async tile-level router to call per candidate tile.
+pub fn footprint_has_all_flags(
+    map: &Hypermap<SubtilePassability>,
+    center: IVec2,
+    radius_subtiles: i32,
+    flags: u64,
+) -> bool {
+    let shadow = baked_circle_shadow(radius_subtiles.max(0));
+    let mut cursor = SubtileReadCursor::new(map);
+    for offset in shadow.offsets {
+        if cursor.flags(center + *offset) & flags == flags {
+            return true;
+        }
+    }
+    false
+}
+
 /// ORs `FLAG_BLOCKED | FLAG_CREATURE` for every subtile in `shadow` centered at
 /// `center` into the given write-side map. Used to stamp actor footprints.
 /// Chunk-local: the cursor resolves each chunk at most once for the whole circle.

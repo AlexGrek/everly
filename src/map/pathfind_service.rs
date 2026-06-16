@@ -61,6 +61,10 @@ pub enum PathKind {
         max_expanded: usize,
         simplify_buffer: usize,
         include_dynamic: bool,
+        /// Bot footprint radius (subtiles), used only when `include_dynamic` is
+        /// `true` so the dynamic creature test is size-aware (a tile is blocked
+        /// when a creature overlaps the footprint, not just the center subtile).
+        radius: i32,
     },
     /// Subtile-level local detour around other creatures (footprint-aware).
     SubtileDetour {
@@ -373,6 +377,7 @@ fn compute_world_route_dynamic(
         goal,
         max_expanded,
         simplify_buffer,
+        radius,
         ..
     } = *kind
     else {
@@ -380,7 +385,7 @@ fn compute_world_route_dynamic(
     };
     let dyn_map = DynamicPassabilityMap::from_inner(dynamic_inner.clone());
     let dyn_read = dyn_map.inner().read_map();
-    match astar_shortest_world_path_dyn(passability, dyn_read, start, goal, HypermapSearchLimits { max_expanded }) {
+    match astar_shortest_world_path_dyn(passability, dyn_read, start, goal, radius, HypermapSearchLimits { max_expanded }) {
         HypermapPathResult::Found { path, .. } => {
             let raw_len = path.len();
             let simplified = if raw_len > 1 {
@@ -444,6 +449,7 @@ mod tests {
             max_expanded: 10,
             simplify_buffer: 1,
             include_dynamic: false,
+            radius: 0,
         }, Entity::PLACEHOLDER, PathfindReason::WanderNewGoal);
         let b = q.enqueue(PathKind::WorldRoute {
             start: (0, 0),
@@ -451,6 +457,7 @@ mod tests {
             max_expanded: 10,
             simplify_buffer: 1,
             include_dynamic: false,
+            radius: 0,
         }, Entity::PLACEHOLDER, PathfindReason::WanderNewGoal);
         assert_eq!(a.0 + 1, b.0, "ids must be monotonic");
         assert_eq!(q.len(), 2);
@@ -485,6 +492,7 @@ mod tests {
             max_expanded: 2000,
             simplify_buffer: 1,
             include_dynamic: false,
+            radius: 0,
         };
         let outcome = compute_world_route(&passability, &kind);
         let PathOutcome::Route { path, raw_len } = outcome else {
@@ -504,6 +512,7 @@ mod tests {
             max_expanded: 2000,
             simplify_buffer: 1,
             include_dynamic: false,
+            radius: 0,
         };
         assert_eq!(compute_world_route(&passability, &kind), PathOutcome::NoPath);
     }
@@ -519,6 +528,7 @@ mod tests {
             max_expanded: 10_000,
             simplify_buffer: 1,
             include_dynamic: false,
+            radius: 0,
         };
         let outcome = compute_world_route(&world.passability, &kind);
         assert!(
@@ -559,6 +569,7 @@ mod tests {
             max_expanded: 10,
             simplify_buffer: 1,
             include_dynamic: false,
+            radius: 0,
         }, Entity::PLACEHOLDER, PathfindReason::WanderNewGoal);
         let b = q.enqueue(PathKind::WorldRoute {
             start: (0, 0),
@@ -566,6 +577,7 @@ mod tests {
             max_expanded: 10,
             simplify_buffer: 1,
             include_dynamic: false,
+            radius: 0,
         }, Entity::PLACEHOLDER, PathfindReason::WanderNewGoal);
         let drained = q.drain_pending();
         assert_eq!(drained.len(), 2);

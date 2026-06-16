@@ -31,7 +31,9 @@ use bevy::math::IVec2;
 use pathfinding::directed::astar::astar;
 
 use crate::map::hypermap::Hypermap;
-use crate::map::passability::{FLAG_BLOCKED, FLAG_CREATURE, SubtilePassability};
+use crate::map::passability::{
+    footprint_has_all_flags, FLAG_BLOCKED, FLAG_CREATURE, SubtilePassability, SUBTILE_COUNT,
+};
 use crate::map::world_map::{CellType, MapParseError, WorldMapFloor};
 
 /// Stops expanding the open set after this many **pop** operations (tile expansions).
@@ -223,18 +225,29 @@ pub fn astar_shortest_world_path(
     astar_world_path_pred(|x, y| world_tile_walkable(map, x, y), start, goal, limits)
 }
 
-/// `true` when the center subtile (2, 2) of tile `(tx, ty)` carries a creature
-/// body flag. Used by the dynamic-aware world router to treat creature-occupied
-/// tiles as blocked during post-collision-pressure replanning.
+/// `true` when a creature body (`FLAG_BLOCKED | FLAG_CREATURE`) sits anywhere in
+/// the bot's **footprint** (circle of `radius` subtiles) centered on tile
+/// `(tx, ty)`'s center subtile. Size-aware: a large bot is blocked from a tile
+/// whose center is clear but whose edges a neighbouring cluster occupies — the
+/// same "occupied subcell within radius ⇒ impassable" rule the subcell router uses.
 #[inline]
-fn tile_center_has_creature(dynamic: &Hypermap<SubtilePassability>, tx: i32, ty: i32) -> bool {
-    dynamic.get(tx, ty).flags_at(2, 2) & (FLAG_BLOCKED | FLAG_CREATURE) == FLAG_BLOCKED | FLAG_CREATURE
+fn tile_footprint_has_creature(
+    dynamic: &Hypermap<SubtilePassability>,
+    tx: i32,
+    ty: i32,
+    radius: i32,
+) -> bool {
+    let sc = SUBTILE_COUNT as i32;
+    let center = IVec2::new(tx * sc + sc / 2, ty * sc + sc / 2);
+    footprint_has_all_flags(dynamic, center, radius, FLAG_BLOCKED | FLAG_CREATURE)
 }
 
-/// Like [`astar_shortest_world_path`] but additionally treats tiles whose
-/// **center subtile** holds a creature body (`FLAG_BLOCKED | FLAG_CREATURE`) as
-/// impassable. Used when replanning after collision-pressure relocation so the
-/// new route routes around currently-wedged bot clusters rather than through them.
+/// Like [`astar_shortest_world_path`] but additionally treats a tile as
+/// impassable when a creature body (`FLAG_BLOCKED | FLAG_CREATURE`) overlaps the
+/// bot's **footprint** (`radius` subtiles) centered on it. Used when replanning
+/// after collision-pressure relocation so the new route steers around
+/// currently-wedged bot clusters — size-aware, so a wide bot also avoids tiles
+/// whose edges (not just center) a cluster occupies.
 ///
 /// Simplification still runs against static passability only; by the time the
 /// bot follows the simplified waypoints the dynamic picture will have shifted.
@@ -243,10 +256,17 @@ pub fn astar_shortest_world_path_dyn(
     dynamic: &Hypermap<SubtilePassability>,
     start: (i32, i32),
     goal: (i32, i32),
+    radius: i32,
     limits: HypermapSearchLimits,
 ) -> HypermapPathResult {
     astar_world_path_pred(
-        |x, y| world_tile_walkable(map, x, y) && !tile_center_has_creature(dynamic, x, y),
+        // The bot stands on `start`, so its own footprint there must never gate
+        // it — exempt the start tile from the dynamic creature test (static
+        // walkability still applies), as the subtile router exempts its start.
+        |x, y| {
+            world_tile_walkable(map, x, y)
+                && ((x, y) == start || !tile_footprint_has_creature(dynamic, x, y, radius))
+        },
         start,
         goal,
         limits,

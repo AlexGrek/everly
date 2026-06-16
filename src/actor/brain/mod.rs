@@ -89,6 +89,10 @@ pub struct BrainContext<'a> {
     pub entity: Entity,
     pub dt: f32,
     pub center: Vec2,
+    /// Bot footprint radius in subtiles. Plumbed to `WorldRoute` enqueues so a
+    /// size-aware dynamic repath routes around clusters the bot's whole body
+    /// (not just its center) would clip.
+    pub radius_subtiles: i32,
     pub main_tile: IVec2,
     pub main_tile_changed: bool,
     pub floor: i32,
@@ -451,6 +455,7 @@ pub(crate) mod test_support {
             entity: Entity::PLACEHOLDER,
             dt: 1.0 / 60.0,
             center: Vec2::ZERO,
+            radius_subtiles: 2,
             main_tile: IVec2::ZERO,
             main_tile_changed: true,
             floor: 0,

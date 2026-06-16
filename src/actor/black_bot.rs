@@ -798,6 +798,7 @@ pub(crate) fn black_bot_brain(
                 entity,
                 dt,
                 center: state.center,
+                radius_subtiles: state.radius_subtiles,
                 main_tile: current_tile,
                 main_tile_changed: tile_changed,
                 floor: 0,
