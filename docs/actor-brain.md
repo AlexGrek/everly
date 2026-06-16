@@ -459,6 +459,38 @@ collected and applied in a **second pass** over the bot query (it resets a
 claims/releases are not effects — fixers mutate the interior-mutable
 [`DispatchQueue`] through `&` during the tick. See [`dispatch.md`](dispatch.md).
 
+`integer_memory_write: Option<(IntegerMemoryId, i64)>` is the **memory write
+channel**: a high-level action returns it to set one of its *own* bot's integer
+memory slots this tick (actions don't get `&mut Brain`). `black_bot_brain` applies
+it via `brain.set_integer_memory`. See [Memory](#memory).
+
+## Memory
+
+Every [`Brain`] carries a `BotMemory` ([`memory.rs`](../src/actor/brain/memory.rs)):
+four fixed `[T; 256]` storages addressed by `#[repr(u8)]` enum IDs, so a slot is a
+stable named byte address.
+
+| Storage | Element | ID enum |
+|---|---|---|
+| `IntegerMemory` | `i64` | `IntegerMemoryId` |
+| `FloatMemory` | `f32` | `FloatMemoryId` *(reserved)* |
+| `CoordinatesMemory` | `IVec2` | `CoordinatesMemoryId` *(reserved)* |
+| `FreeformMemory` | `Option<Box<dyn MemoryRecord>>` | `FreeformMemoryId` *(reserved)* |
+
+**Memory survives `Brain::reset()`.** A reset wipes only the *plan* (current
+high-level action, low-level action, priorities); memory is persistent runtime
+state. It is **not** serialized — a loaded bot starts with fresh (zero) memory.
+
+Reads/writes go two ways: code holding `&mut Brain` (e.g. the collision-pressure
+system) calls `integer_memory` / `set_integer_memory` / `bump_integer_memory`
+directly; a high-level action writes through `BrainEffects::integer_memory_write`.
+
+**`HELP_FAILURES_COUNT`** (first integer function) bounds how many times a fixer
+re-attempts the *same* help task after getting wedged: reset to `0` on a fresh
+claim or a successful delivery, `+= 1` on each collision/stall reset while holding
+the task, and once it exceeds 4 the fixer gives the task up (releases the claim,
+returns the part to a depot). Full lifecycle: [`dispatch.md`](dispatch.md).
+
 ## Persistence
 
 A saved BlackBot stores its brain's `rng_seed` **and its `specialization`** (so a

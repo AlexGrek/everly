@@ -3,6 +3,7 @@
 use bevy::math::IVec2;
 
 use crate::actor::black_bot::{BotSpecialization, Breakable, BreakablePartState};
+use crate::actor::brain::memory::{BotMemory, IntegerMemoryId};
 use crate::actor::brain::Brain;
 use crate::actor::dispatch::RepairPart;
 use crate::actor::{actor_main_tile, ActorObject};
@@ -123,6 +124,15 @@ pub fn systems_rows(b: &Breakable) -> Vec<InspectRow> {
         InspectRow { label: "CONTROL_PLANE", value: format_part(&b.control_plane) },
         InspectRow { label: "SENSORY_SYSTEM", value: format_part(&b.sensory_system) },
     ]
+}
+
+/// Memory-tab rows: the bot's persistent memory slots (see `brain::memory`).
+/// Lists the named integer slots; extend as more storages gain functions.
+pub fn memory_rows(memory: &BotMemory) -> Vec<InspectRow> {
+    vec![InspectRow {
+        label: "HELP_FAILURES_COUNT",
+        value: memory.integer(IntegerMemoryId::HelpFailuresCount).to_string(),
+    }]
 }
 
 /// Inventory-tab rows: what the bot is currently carrying (fixer bots).

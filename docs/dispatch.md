@@ -38,6 +38,26 @@ same board:
 A bot that is *both* discharged and broken is rescued in two stages: the battery
 request comes first; once it wakes it re-posts for the remaining break.
 
+### Giving up a hopeless task (`HELP_FAILURES_COUNT`)
+
+A fixer keeps its claim + inventory across navigation resets (collision repath,
+squeeze-teleport) and recharge detours, so it normally just resumes. But a target
+boxed into an unreachable spot would make it retry forever. The brain's
+`IntegerMemory[HELP_FAILURES_COUNT]` (see
+[`actor-brain.md` § Memory](actor-brain.md#memory)) bounds this:
+
+- `= 0` when the fixer claims a fresh task or completes a delivery;
+- `+= 1` on every collision/stall reset while it holds a claim
+  (`track_black_bot_collision_pressure`);
+- once it exceeds **4**, that reset **gives the task up**: the claim is
+  `release`d (posting the request back to the queue for another fixer) and the
+  counter is cleared. The part is **kept**, not deleted.
+
+With a part but no claim, `GoFixBots` enters `FixPhase::DropPart`: it routes to the
+**nearest reachable depot** (`nearest_reachable_depot`, falling back to the home
+depot) and drops the part there (`clear_inventory`) before resuming its routine.
+The same path also returns a part the deliver phase abandoned as unreachable.
+
 ## `DispatchQueue` (resource)
 
 Interior-mutable (`Mutex<Vec<RepairRequest>>`) so the sequential brain tick can

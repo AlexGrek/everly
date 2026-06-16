@@ -19,7 +19,8 @@ use crate::actor::brain::Brain;
 use crate::actor::charge::Charge;
 use crate::actor::dispatch::BotInventory;
 use crate::actor::inspect::{
-    debug_rows, display_actor_name, inventory_rows, route_rows, status_rows, systems_rows,
+    debug_rows, display_actor_name, inventory_rows, memory_rows, route_rows, status_rows,
+    systems_rows,
 };
 use crate::actor::ActorObject;
 use crate::edit::actor_spawn::{ActorSpawnState, ActorTool};
@@ -59,6 +60,7 @@ pub enum InspectorTab {
     Systems,
     Route,
     Inventory,
+    Memory,
     Debug,
 }
 
@@ -396,7 +398,7 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                     BackgroundColor(ACCENT.with_alpha(0.45)),
                 ));
 
-                // Tab bar: Status | Systems | Route | Inventory | Debug
+                // Tab bar: Status | Systems | Route | Inventory | Memory | Debug
                 card.spawn(Node {
                     width: Val::Percent(100.0),
                     flex_direction: FlexDirection::Row,
@@ -410,6 +412,7 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                     spawn_tab_button(tabs, "Systems", InspectorTab::Systems, false);
                     spawn_tab_button(tabs, "Route", InspectorTab::Route, false);
                     spawn_tab_button(tabs, "Inventory", InspectorTab::Inventory, false);
+                    spawn_tab_button(tabs, "Memory", InspectorTab::Memory, false);
                     spawn_tab_button(tabs, "Debug", InspectorTab::Debug, false);
                 });
 
@@ -950,6 +953,7 @@ fn sync_actor_inspector_panel(
             InspectorTab::Inventory => {
                 inventory_rows(inventory.and_then(|inv| inv.carried))
             }
+            InspectorTab::Memory => memory_rows(brain.memory()),
             InspectorTab::Debug => debug_rows(force_logs_on),
         };
     } else {

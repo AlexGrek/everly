@@ -95,6 +95,7 @@ pub enum PathfindReason {
     FixerFetchPart,
     FixerDeliver,
     FixerReturnHome,
+    FixerDropPart,
     SubtileDetour,
 }
 

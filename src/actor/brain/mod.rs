@@ -20,6 +20,7 @@
 pub mod behavior;
 pub mod high_level;
 pub mod low_level;
+pub mod memory;
 pub mod path;
 pub mod priority;
 
@@ -41,6 +42,9 @@ pub use high_level::{
     RECHARGE_PER_S,
 };
 pub use low_level::{FollowPath, FollowTuning, Idle, LowLevelAction, LowLevelKind, PendingPath, Wait};
+pub use memory::{
+    BotMemory, CoordinatesMemoryId, FloatMemoryId, FreeformMemoryId, IntegerMemoryId, MemoryRecord,
+};
 pub use path::PathNode;
 pub use priority::{Priorities, Priority, PriorityKind};
 
@@ -184,6 +188,10 @@ pub struct BrainEffects {
     /// Recharge the target bot to this charge level (`0.0..=1.0`): a fixer
     /// delivering a [`Battery`](RepairPart::Battery) to a discharged bot.
     pub recharge_target: Option<(Entity, f32)>,
+    /// Write `value` into the bot's own [`IntegerMemory`](memory::BotMemory) slot
+    /// `id` this tick. Used by high-level actions to update memory through the
+    /// effects channel (they don't get `&mut Brain`). Applied by `black_bot_brain`.
+    pub integer_memory_write: Option<(IntegerMemoryId, i64)>,
     /// Optional in-game log line for this tick.
     pub log: Option<BrainLogEvent>,
     /// Re-assert that this bot is still actively pursuing a station's queue this
@@ -228,6 +236,9 @@ fn merge_brain_effects(into: &mut BrainEffects, add: BrainEffects) {
     if let Some(v) = add.recharge_target {
         into.recharge_target = Some(v);
     }
+    if let Some(v) = add.integer_memory_write {
+        into.integer_memory_write = Some(v);
+    }
     if let Some(v) = add.log {
         into.log = Some(v);
     }
@@ -258,6 +269,9 @@ pub struct Brain {
     /// the collision-pressure relocation); ticks down by 1 each brain tick.
     /// Survives `reset()` — the window must outlive the stuck-detection delay.
     dynamic_repath: u32,
+    /// Persistent per-bot memory (see [`memory`]). **Survives `reset()`** — only
+    /// the plan is wiped on reset, never the memory.
+    memory: BotMemory,
 }
 
 /// How many brain ticks (frames) the dynamic-repath window lasts after a
@@ -277,7 +291,28 @@ impl Brain {
             rng: rng::seeded(rng_seed),
             rng_seed,
             dynamic_repath: 0,
+            memory: BotMemory::default(),
         }
+    }
+
+    // --- Memory (persistent; survives `reset()`) ---------------------------
+
+    /// Read-only view of this bot's memory (inspector / read-side helpers).
+    pub fn memory(&self) -> &BotMemory {
+        &self.memory
+    }
+
+    pub fn integer_memory(&self, id: IntegerMemoryId) -> i64 {
+        self.memory.integer(id)
+    }
+
+    pub fn set_integer_memory(&mut self, id: IntegerMemoryId, value: i64) {
+        self.memory.set_integer(id, value);
+    }
+
+    /// Adds `delta` to an integer slot and returns the new value.
+    pub fn bump_integer_memory(&mut self, id: IntegerMemoryId, delta: i64) -> i64 {
+        self.memory.bump_integer(id, delta)
     }
 
     pub fn rng_seed(&self) -> u64 {
@@ -293,6 +328,9 @@ impl Brain {
     /// Forget the current plan so the brain re-evaluates from scratch next tick.
     /// Does NOT clear `dynamic_repath` — the flag is set after this call by the
     /// collision-pressure handler and must survive into the next planning tick.
+    /// Does NOT clear `memory` — memory is persistent runtime state and several
+    /// counters (e.g. [`HelpFailuresCount`](IntegerMemoryId::HelpFailuresCount))
+    /// exist precisely to span the resets they count.
     pub fn reset(&mut self) {
         self.current = None;
         self.low_level = Box::new(Idle);
@@ -552,5 +590,17 @@ mod tests {
         assert!(brain.current_kind().is_some());
         brain.reset();
         assert!(brain.current_kind().is_none());
+    }
+
+    #[test]
+    fn memory_survives_reset() {
+        let mut brain = black_bot_brain(5);
+        brain.set_integer_memory(IntegerMemoryId::HelpFailuresCount, 3);
+        brain.reset();
+        assert_eq!(
+            brain.integer_memory(IntegerMemoryId::HelpFailuresCount),
+            3,
+            "memory must persist across a plan reset",
+        );
     }
 }

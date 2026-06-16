@@ -10,6 +10,8 @@ use bevy::ecs::entity::Entity;
 use bevy::math::Vec2;
 use crate::rng::{self, StdRng};
 
+use crate::actor::black_bot::nearest_reachable_depot;
+use crate::actor::brain::memory::IntegerMemoryId;
 use crate::actor::dispatch::{RepairPart, RepairRequest};
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap, HYPERMAP_CHUNK_SIZE};
 use crate::map::hypermap_pathfind::{manhattan, world_tile_walkable};
@@ -613,6 +615,9 @@ enum FixPhase {
     Deliver,
     /// Delivered: travel back to the home depot, then loiter.
     ReturnHome,
+    /// Carrying a part with no active claim (gave up / abandoned the task):
+    /// travel to the nearest depot and drop the part there, then loiter.
+    DropPart,
 }
 
 /// Outcome of polling an in-flight fixer route.
@@ -761,6 +766,7 @@ impl HighLevelAction for GoFixBots {
             FixPhase::FetchPart => "GoFixBots (fetch part)".to_string(),
             FixPhase::Deliver => "GoFixBots (deliver)".to_string(),
             FixPhase::ReturnHome => "GoFixBots (return)".to_string(),
+            FixPhase::DropPart => "GoFixBots (drop part)".to_string(),
         }
     }
     fn preempt(&mut self, _ctx: &BrainContext) -> BrainEffects {
@@ -801,13 +807,13 @@ impl HighLevelAction for GoFixBots {
             *low = Box::new(Wait::retry(RETRY_S));
         }
 
-        // Claim recovery after brain reset or recharge pre-emption. When the
-        // brain is wiped, GoFixBots is re-created in Loiter with no local claim.
-        // But the dispatch board may still hold a claim for this fixer entity —
-        // re-attach it and resume the appropriate phase without re-fetching the
-        // part if inventory is already loaded.
+        // Claim recovery / part return after a brain reset or recharge
+        // pre-emption. When the brain is wiped, GoFixBots is re-created in Loiter
+        // with no local claim.
         if self.phase == FixPhase::Loiter && self.claim.is_none() {
             if let Some(req) = fx.dispatch.claim_of(ctx.entity) {
+                // The dispatch board still holds this fixer's claim — re-attach it
+                // and resume, skipping the fetch if inventory is already loaded.
                 self.claim = Some(req);
                 self.leg = None;
                 low.halt();
@@ -827,6 +833,18 @@ impl HighLevelAction for GoFixBots {
                 self.prev_low_stuck = low.is_stuck();
                 self.prev_low_finished = low.is_finished();
                 return HighLevelOutcome::running();
+            } else if fx.carried.is_some() {
+                // No claim but still carrying a part (gave up after too many help
+                // failures, or abandoned an unreachable target): return the part
+                // to the nearest depot instead of hauling it around forever.
+                self.phase = FixPhase::DropPart;
+                self.leg = None;
+                low.halt();
+                let depot = drop_off_depot(ctx, fx).unwrap_or(home_tile);
+                self.start_route(pf, ctx, low, depot, PathfindReason::FixerDropPart);
+                self.prev_low_stuck = low.is_stuck();
+                self.prev_low_finished = low.is_finished();
+                return HighLevelOutcome::running();
             }
         }
 
@@ -835,6 +853,7 @@ impl HighLevelAction for GoFixBots {
             FixPhase::FetchPart => self.update_fetch(pf, fx, ctx, low, here, home_tile),
             FixPhase::Deliver => self.update_deliver(pf, fx, ctx, low, here, home_tile, rng),
             FixPhase::ReturnHome => self.update_return(pf, ctx, low, here, home_tile),
+            FixPhase::DropPart => self.update_drop_part(pf, fx, ctx, low),
         };
         self.prev_low_stuck = low.is_stuck();
         self.prev_low_finished = low.is_finished();
@@ -876,7 +895,11 @@ impl GoFixBots {
                 self.leg = None;
                 low.halt();
                 self.start_route(pf, ctx, low, home_tile, PathfindReason::FixerFetchPart);
-                return HighLevelOutcome::running();
+                // Fresh task: clear the per-task help-failure counter.
+                return HighLevelOutcome::running_with(BrainEffects {
+                    integer_memory_write: Some((IntegerMemoryId::HelpFailuresCount, 0)),
+                    ..BrainEffects::default()
+                });
             }
         }
 
@@ -998,8 +1021,10 @@ impl GoFixBots {
             self.leg = None;
             self.start_route(pf, ctx, low, home_tile, PathfindReason::FixerReturnHome);
             // A battery recharges the discharged bot; any other part is a repair.
+            // Task succeeded: clear the per-task help-failure counter.
             let mut effects = BrainEffects {
                 clear_inventory: true,
+                integer_memory_write: Some((IntegerMemoryId::HelpFailuresCount, 0)),
                 ..BrainEffects::default()
             };
             if req.part == RepairPart::Battery {
@@ -1095,6 +1120,88 @@ impl GoFixBots {
         }
         HighLevelOutcome::running()
     }
+
+    /// Carrying a part with no claim: travel to the nearest reachable depot and
+    /// drop the part there (`clear_inventory`), then resume loitering. Reached
+    /// when the give-up logic released the claim but kept the part.
+    fn update_drop_part(
+        &mut self,
+        pf: PathfindAccess,
+        fx: FixerContext,
+        ctx: &BrainContext,
+        low: &mut Box<dyn LowLevelAction>,
+    ) -> HighLevelOutcome {
+        let here = (ctx.main_tile.x, ctx.main_tile.y);
+        let Some(depot) = drop_off_depot(ctx, fx) else {
+            // No depot reachable at all: drop in place rather than stall forever.
+            self.phase = FixPhase::Loiter;
+            self.leg = None;
+            return HighLevelOutcome::running_with(BrainEffects {
+                clear_inventory: true,
+                ..BrainEffects::default()
+            });
+        };
+
+        // Standing on the depot: drop the part and resume loitering.
+        if here == depot {
+            self.phase = FixPhase::Loiter;
+            self.leg = None;
+            low.halt();
+            return HighLevelOutcome::running_with(BrainEffects {
+                clear_inventory: true,
+                ..BrainEffects::default()
+            });
+        }
+
+        if self.awaiting.is_some() {
+            match self.poll_route(pf, ctx.dt) {
+                RoutePoll::Waiting => return HighLevelOutcome::running(),
+                RoutePoll::Route(path) => {
+                    if let Some(leg) = &mut self.leg {
+                        leg.reset_elapsed();
+                    }
+                    *low = Box::new(FollowPath::new(path));
+                    return HighLevelOutcome::running();
+                }
+                RoutePoll::AtGoal => {
+                    self.phase = FixPhase::Loiter;
+                    self.leg = None;
+                    low.halt();
+                    return HighLevelOutcome::running_with(BrainEffects {
+                        clear_inventory: true,
+                        ..BrainEffects::default()
+                    });
+                }
+                RoutePoll::Failed => {
+                    *low = Box::new(Wait::retry(RETRY_S));
+                    return HighLevelOutcome::running();
+                }
+            }
+        }
+
+        let leg_expired = self
+            .leg
+            .as_mut()
+            .map(|leg| is_follow_path(low.as_ref()) && !low.is_finished() && leg.tick(ctx.dt))
+            .unwrap_or(false);
+        if leg_expired
+            || low_level_needs_replan(low.as_ref(), self.prev_low_stuck, self.prev_low_finished)
+        {
+            self.leg = None;
+            low.halt();
+            self.start_route(pf, ctx, low, depot, PathfindReason::FixerDropPart);
+        }
+        HighLevelOutcome::running()
+    }
+}
+
+/// Nearest reachable parts depot to drop a carried part at: the closest one to
+/// the bot's current tile, falling back to its home depot. `None` only when the
+/// fixer has neither (it then drops in place).
+fn drop_off_depot(ctx: &BrainContext, fx: FixerContext) -> Option<(i32, i32)> {
+    nearest_reachable_depot(ctx.interactive, ctx.passability, ctx.main_tile)
+        .or(fx.home_depot)
+        .map(|c| (c.x, c.y))
 }
 
 // ---------------------------------------------------------------------------
@@ -2492,6 +2599,11 @@ mod tests {
             "repairs the stranded bot's part"
         );
         assert!(out.effects.clear_inventory, "carried part is consumed");
+        assert_eq!(
+            out.effects.integer_memory_write,
+            Some((IntegerMemoryId::HelpFailuresCount, 0)),
+            "a successful delivery clears the help-failure counter"
+        );
         assert!(dispatch.is_empty(), "completed request leaves the board");
     }
 
@@ -2542,7 +2654,10 @@ mod tests {
     }
 
     #[test]
-    fn fixer_preempt_releases_claim_and_drops_part() {
+    fn fixer_preempt_keeps_claim_and_inventory() {
+        // A recharge pre-emption must NOT abandon the task: the claim and any
+        // carried part survive so the fixer resumes after topping up. The claim is
+        // recovered on the next tick via `claim_of`.
         let passability: Hypermap<f32> = Hypermap::new(1.0);
         let interactive = InteractiveEntityMap::new();
         let dispatch = DispatchQueue::default();
@@ -2560,11 +2675,79 @@ mod tests {
         assert!(dispatch.claim_of(Entity::PLACEHOLDER).is_some(), "claimed before pre-empt");
 
         let effects = action.preempt(&c);
-        assert!(effects.clear_inventory, "pre-empt drops any carried part");
+        assert!(!effects.clear_inventory, "pre-empt keeps the carried part (permanent)");
         assert!(
-            dispatch.claim_of(Entity::PLACEHOLDER).is_none(),
-            "pre-empt releases the claim back to the pool"
+            dispatch.claim_of(Entity::PLACEHOLDER).is_some(),
+            "pre-empt keeps the claim so the fixer resumes the task after recharging"
         );
+    }
+
+    #[test]
+    fn fixer_clears_help_failures_on_fresh_claim() {
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let dispatch = DispatchQueue::default();
+        dispatch.post(Entity::from_bits(0xC0), RepairPart::MovementEngine, IVec2::new(3, 4));
+
+        let pf = PathfindFixture::new();
+        let mut action = GoFixBots::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = rng::seeded(7);
+        let home = EntityCoordinates::ground(0, 0);
+
+        let c = fixer_ctx(&passability, &interactive, (0, 0), pf.access(), &dispatch, Some(home), None);
+        let out = action.update(&c, &mut low, &mut rng);
+        assert_eq!(
+            out.effects.integer_memory_write,
+            Some((IntegerMemoryId::HelpFailuresCount, 0)),
+            "claiming a fresh task clears the per-task help-failure counter"
+        );
+    }
+
+    #[test]
+    fn fixer_returns_carried_part_to_depot_when_unclaimed() {
+        // No claim but still carrying a part (gave up after too many help
+        // failures, or abandoned an unreachable target): route to the depot and
+        // drop it there rather than haul it around forever.
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let dispatch = DispatchQueue::default();
+        let pf = PathfindFixture::new();
+        let mut action = GoFixBots::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = rng::seeded(11);
+        let home = EntityCoordinates::ground(0, 0);
+
+        // Tick 1 @ (5,5): enter DropPart, route toward the (home) depot.
+        let c = fixer_ctx(
+            &passability,
+            &interactive,
+            (5, 5),
+            pf.access(),
+            &dispatch,
+            Some(home),
+            Some(RepairPart::MovementEngine),
+        );
+        action.update(&c, &mut low, &mut rng);
+        assert_eq!(action.label(), "GoFixBots (drop part)");
+        assert_eq!(
+            pf.drain_world_routes(),
+            vec![((5, 5), (0, 0))],
+            "routes to the depot to drop the part",
+        );
+
+        // Tick 2 @ (0,0): standing on the depot → drop the part.
+        let c = fixer_ctx(
+            &passability,
+            &interactive,
+            (0, 0),
+            pf.access(),
+            &dispatch,
+            Some(home),
+            Some(RepairPart::MovementEngine),
+        );
+        let out = action.update(&c, &mut low, &mut rng);
+        assert!(out.effects.clear_inventory, "the carried part is returned to the depot");
     }
 
     #[test]

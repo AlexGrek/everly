@@ -30,7 +30,7 @@ use crate::actor::actor_pick::{ActorForceLogs, ActorInspectable, ActorPickMesh};
 use crate::actor::brain::{
     assemble_patrol_loop, enqueue_patrol_candidates, make_high_level, AvoidanceViews, Behavior,
     Brain, BrainContext, BrainEffects, BrainLogEvent, ChargeSelfKeeper, FixerContext, FixerDuty,
-    PathfindAccess, Patroller, RandomWalker,
+    IntegerMemoryId, PathfindAccess, Patroller, RandomWalker,
 };
 use crate::actor::charge::Charge;
 use crate::actor::dispatch::{
@@ -831,6 +831,11 @@ pub(crate) fn black_bot_brain(
                 inv.carried = None;
             }
         }
+        // Memory writes requested by the high-level action this tick (e.g. a fixer
+        // clearing HELP_FAILURES_COUNT on a fresh claim / successful delivery).
+        if let Some((id, value)) = effects.integer_memory_write {
+            brain.set_integer_memory(id, value);
+        }
         // A delivered repair / recharge targets a *different* bot; collect for
         // the 2nd pass.
         if let Some((target, part)) = effects.repair_target {
@@ -980,8 +985,9 @@ fn release_fixer_claim(entity: Entity, dispatch: &DispatchQueue) {
 /// Closest reachable [`CellType::PartsDepot`](crate::map::world_map::CellType)
 /// (4-neighbour BFS over static passability, bounded by [`FIXER_DEPOT_SEARCH_STEPS`])
 /// to `from` on the ground floor, picked by Manhattan distance. `None` when no
-/// depot is reachable.
-fn nearest_reachable_depot(
+/// depot is reachable. Also used by [`GoFixBots`](crate::actor::brain::GoFixBots)
+/// to pick a drop-off depot for a returned part.
+pub fn nearest_reachable_depot(
     interactive: &InteractiveEntityMap,
     passability: &Hypermap<f32>,
     from: IVec2,
@@ -1225,6 +1231,7 @@ fn track_black_bot_collision_pressure(
     game_log: Res<GameLog>,
     selected: Res<SelectedActor>,
     mut interactive: ResMut<InteractiveEntityMap>,
+    dispatch: Res<DispatchQueue>,
     mut prev_center: Local<HashMap<Entity, Vec2>>,
     mut stall: Local<HashMap<Entity, StallTrack>>,
     mut query: Query<(
@@ -1304,6 +1311,20 @@ fn track_black_bot_collision_pressure(
         // holds until the blocker clears.
         brain.reset();
         brain.set_dynamic_repath();
+        // Count this reset against the fixer's current help task, if any. Most
+        // resets keep the claim + inventory (GoFixBots recovers the claim via
+        // claim_of and re-routes after the repath). But once a fixer has failed
+        // this many times on one task it is hopeless for this fixer: post the task
+        // back to the queue (release the claim) and clear the counter. The bot
+        // keeps the carried part; with no claim, GoFixBots routes to a depot and
+        // drops it (FixPhase::DropPart).
+        if dispatch.claim_of(entity).is_some() {
+            let failures = brain.bump_integer_memory(IntegerMemoryId::HelpFailuresCount, 1);
+            if failures > 4 {
+                dispatch.release(entity);
+                brain.set_integer_memory(IntegerMemoryId::HelpFailuresCount, 0);
+            }
+        }
         let state = obj.inner.state_mut();
         state.move_buffer = ActorMoveBuffer::default();
         state.next_waypoint_hint = None;
@@ -1311,8 +1332,6 @@ fn track_black_bot_collision_pressure(
         prev_center.insert(entity, center);
         stall.insert(entity, StallTrack { anchor: center, elapsed: 0.0 });
         interactive.evict_actor_everywhere(entity);
-        // Fixer claim and inventory are kept — GoFixBots recovers the claim via
-        // claim_of and re-routes to the target after the repath.
         game_log.push_world_for_bot(
             tile.x,
             tile.y,
