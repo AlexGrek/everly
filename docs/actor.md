@@ -51,6 +51,7 @@ of frame `N+1`.
 - `center: Vec2` — actor center in tile-space floats. Updated by the exact float `tile_delta` every frame — never quantized.
 - `radius_subtiles: i32` — circular occupancy radius in subtiles.
 - `rotation: f32` — actor orientation.
+- `heading: Vec2` — current **movement direction** as a unit vector (`Vec2::ZERO` = unknown); see [Movement direction](#movement-direction-heading). Published each frame by the think system so other bots can read where this one is going. Transient — recomputed from the plan each tick, not serialized.
 - `move_buffer: ActorMoveBuffer` — relative motion for this frame (two displacement channels):
   - `tile_delta: Vec2` — exact float displacement in tile-space, applied to `center` every frame for smooth rendering.
   - `subtile_shift: IVec2` — integer subtile steps for the passability collision grid; typically `(0, 0)` on most frames, non-zero only when accumulated float motion crosses a subtile boundary.
@@ -100,6 +101,48 @@ Canonical API: [`actor_main_tile`](../src/actor/mod.rs) and [`ActorState::main_t
 Do **not** use `floor(center)` for main-tile or field logic — an actor spawned at tile center `(0.5, 0.5)` would be assigned the wrong tile. Subtile collision intentionally keeps `floor` so the footprint stays inside the subtile that contains the float position.
 
 After [`process_actor_moves`](../src/actor/movement.rs), [`dirt_actor_interaction`](../src/map/field_interactions.rs) updates `field_main_tile` and applies field rules to the tile the actor **left** when main tile changes. See `docs/field-interactions.md`.
+
+## Movement direction (heading)
+
+`ActorState.heading` is the actor's current movement direction as a **unit
+vector** (`Vec2::ZERO` when it has none — e.g. a bot that has never moved). It is
+published every frame by the bot's think system so **other** bots can read where
+it is going (combine with [`CellOccupancy`](../src/map/cell_occupancy.rs) to find
+who is on a nearby tile, then read their `heading`). It also doubles as the bot's
+facing/rotation, which is **not yet rendered** (bots are spheres), so `rotation`
+stays unused for now.
+
+Heading is **not** the same as velocity. A bot wedged against another or braking
+has ~zero velocity but still *intends* to move toward its next path node — so
+velocity alone cannot tell you where a stalled bot is trying to go. The
+derivation (in [`FollowPath::heading`](../src/actor/brain/low_level.rs), surfaced
+through [`Brain::heading`](../src/actor/brain/mod.rs) and written in
+[`black_bot_brain`](../src/actor/black_bot.rs)) is:
+
+1. **moving** → the normalized velocity direction;
+2. **stalled / braking** (velocity ≈ 0) → the maintained unit `direction` toward
+   the next path node;
+3. otherwise → `Vec2::ZERO`.
+
+The write is **sticky**: a frame that yields no direction (idle, waiting, braked
+to rest) keeps the last heading, so a paused bot still faces the way it last
+moved.
+
+Relative-motion helpers on `ActorState` (read another bot's state and compare):
+
+| Method | Meaning |
+|--------|---------|
+| `is_moving()` | has a known direction (`heading != 0`) |
+| `heading_angle() -> Option<f32>` | facing as `atan2(y, x)` radians (the future yaw) |
+| `is_moving_toward(point)` | direction points toward a world point |
+| `is_moving_toward_actor(other)` | closing on the other bot's position |
+| `heading_alignment(other) -> f32` | `heading · other.heading` in `-1..=1` |
+| `is_moving_forward_relative_to(other)` | same general direction (alignment `> 0`) — convoy/following |
+| `is_moving_opposite_to(other)` | opposite general direction (alignment `< 0`) |
+| `is_head_on_with(other)` | **both** closing on each other — the case needing strongest avoidance |
+
+`is_moving_*` is always `false` for a directionless bot, so callers never need to
+guard the zero case.
 
 ## Charge
 
@@ -326,6 +369,7 @@ impl Walker {
                 center,
                 radius_subtiles,
                 rotation: 0.0,
+                heading: Vec2::ZERO,
                 move_buffer: ActorMoveBuffer::default(),
                 last_movement_error: None,
                 last_accepted_center_subtile: None,
@@ -412,6 +456,7 @@ Use this when introducing a new actor class:
   - [ ] `center` in tile-space (`Vec2`)
   - [ ] `radius_subtiles`
   - [ ] `rotation`
+  - [ ] `heading: Vec2::ZERO` (published each frame by the think system; see [Movement direction](#movement-direction-heading))
   - [ ] `move_buffer: ActorMoveBuffer::default()`
   - [ ] `last_movement_error: None`
   - [ ] `last_accepted_center_subtile: None`

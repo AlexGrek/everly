@@ -61,6 +61,14 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
   separate detour list — one steering loop handles both. The overlay / selection
   accessor is `Brain::route() -> (&[PathNode], usize)`.
 
+  **Heading.** `Brain::heading()` (→ `LowLevelAction::heading`) reports the bot's
+  intended movement direction as a unit vector: the velocity direction while
+  moving, or — crucially — `FollowPath`'s maintained `direction` toward the next
+  node while the bot is wedged/braking (so it is non-zero even at zero velocity).
+  `black_bot_brain` publishes it to `ActorState.heading` each tick so other bots
+  can read this bot's facing. See [Movement direction](actor.md#movement-direction-heading)
+  for the field, the relative-motion helpers, and the sticky-write rule.
+
   **All of BlackBot's movement feel lives in `FollowPath`**
   (mass/inertia, wall-momentum bleed, stuck-repath, and the head-on bot-on-bot
   response — elastic bounce then either a queued subtile detour or a
