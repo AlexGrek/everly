@@ -58,6 +58,26 @@ With a part but no claim, `GoFixBots` enters `FixPhase::DropPart`: it routes to 
 depot) and drops the part there (`clear_inventory`) before resuming its routine.
 The same path also returns a part the deliver phase abandoned as unreachable.
 
+### Give-up cooldown (no instant re-claim)
+
+Giving a task up must not let the same — or another — loitering fixer **re-claim it
+on the very next tick**, or the fixer would camp the depot endlessly fetching a part,
+failing to deliver, dropping it, and re-fetching (the "stuck on the depot,
+pickup/dropping parts" loop). So a give-up uses `release_with_cooldown(fixer,
+FIXER_TASK_COOLDOWN_S)` (6 s) instead of a plain `release`: the request returns to
+the pool but is **invisible to `claim_nearest` / `has_open_within`** until its
+`cooldown` ticks to zero (`tick_cooldowns`, once per frame in
+`maintain_dispatch_queue`). A re-post by the still-stranded bot preserves an active
+cooldown. Both give-up paths use it: the deliver-phase `abandon_claim` (target
+unreachable) and the collision-pressure give-up (`HELP_FAILURES_COUNT > 4`). The
+**offline gate** (`release_fixer_claim`, depleted/broken fixer) keeps the plain,
+cooldown-free `release` so another fixer can cover an incapacitated one at once.
+
+The effect: a transiently-blocked target is retried after the cooldown; a
+permanently-unreachable one is retried only ~once per cooldown (not every tick), and
+between attempts the fixer loiter-wanders away from the depot instead of flickering
+pickup/drop on it.
+
 ## `DispatchQueue` (resource)
 
 Interior-mutable (`Mutex<Vec<RepairRequest>>`) so the sequential brain tick can
@@ -68,17 +88,23 @@ claim / release / complete through a shared `&` — the same pattern as
 |--------|------|
 | `post(bot, part, loc)` | Upsert a request by bot (preserves its `claimed_by`). |
 | `claim_nearest(fixer, from)` | Claim the nearest **unclaimed** request; mark it. |
-| `has_open_within(from, r)` | Is there an unclaimed request within `r` tiles? |
-| `release(fixer)` | Return a fixer's claim to the pool. |
+| `has_open_within(from, r)` | Is there an unclaimed, off-cooldown request within `r` tiles? |
+| `release(fixer)` | Return a fixer's claim to the pool (immediately re-claimable). |
+| `release_with_cooldown(fixer, s)` | Release **and** bar re-claim for `s` seconds (give-up). |
+| `tick_cooldowns(dt)` | Age out give-up cooldowns (once per frame). |
 | `complete(bot)` | Remove a request (repaired / gone). |
 | `maintain(broken, alive)` | Drop requests for non-stranded bots; free claims of dead fixers. |
 
 **Claim hygiene.** Releases happen on: the offline gate (`depleted || broken`) in
-`black_bot.rs` (`release_fixer_claim`) so another fixer can cover while this one
-is incapacitated; and `maintain` (despawned claimer). Navigation resets
-(squeeze-teleport, collision repath) and recharge pre-emptions do **not** release
-the claim — `GoFixBots::update` recovers it from `dispatch.claim_of(entity)` when
-`Fixing` becomes the dominant priority again and the new action starts in Loiter.
+`black_bot.rs` (`release_fixer_claim`, plain `release`) so another fixer can cover
+while this one is incapacitated; `maintain` (despawned claimer); and **giving a task
+up** — the deliver-phase `abandon_claim` (unreachable target) and the
+collision-pressure give-up (`HELP_FAILURES_COUNT > 4`), both via
+`release_with_cooldown` (see [Give-up cooldown](#give-up-cooldown-no-instant-re-claim)).
+Navigation resets (squeeze-teleport, collision repath) and recharge pre-emptions do
+**not** release the claim — `GoFixBots::update` recovers it from
+`dispatch.claim_of(entity)` when `Fixing` becomes the dominant priority again and the
+new action starts in Loiter.
 
 **Inventory is permanent.** `BotInventory::carried` is never cleared by brain
 resets, pre-emptions, or the offline gate. It is overwritten on the next
