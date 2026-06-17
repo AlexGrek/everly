@@ -198,8 +198,9 @@ In entity order, each outcome is written back to the actor:
   machinery next frame (re-route, collision pressure, status flash) — the
   pipeline itself never invents avoidance. The brain's `FollowPath` follows a
   **single unified path of cell + subcell nodes** (`PathNode`); a bump first
-  splices a local subtile detour inline, and a stall first tries a local
-  splice-repair, before escalating. A genuine head-on wedge that cannot be
+  **recenters the float center on the occupied subtile** and then routes a local
+  subtile detour from there (so the grid-aligned detour starts grid-aligned), and
+  a stall first tries a local splice-repair, before escalating. A genuine head-on wedge that cannot be
   resolved locally escalates, in the BlackBot brain, to a relocate **and a full
   path recalculation against the dynamic passability map** (so the new route
   avoids the tiles other bots currently occupy); this fires both on

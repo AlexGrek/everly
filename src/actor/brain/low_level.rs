@@ -12,7 +12,10 @@
 //!   accel/decel velocity steering), wall-momentum bleed, a stuck-repath safety
 //!   net, and the bot-on-bot response — a deterministic elastic bounce + step
 //!   back to the previously occupied cell, with a subtile detour as fallback —
-//!   see [`FollowTuning`].
+//!   see [`FollowTuning`]. Detours triggered *before* the bot has crossed into
+//!   the obstacle (the look-ahead probe and the head-on bounce) first **recenter**
+//!   the float center on the occupied subtile, so the grid-aligned detour is
+//!   followed from a grid-aligned start (`recenter_target`).
 
 use bevy::prelude::*;
 use crate::rng::{self, StdRng};
@@ -42,6 +45,17 @@ const DETOUR_MAX_EXPANDED: usize = 1024;
 /// before falling back to a step-aside. The detour is a local avoidance hint, so
 /// it must resolve quickly or be abandoned.
 const DETOUR_WAIT_S: f32 = 0.5;
+
+/// Arrival threshold (tiles) for the pre-detour recenter. Before launching an
+/// avoidance detour (look-ahead probe hit or a head-on bounce), the bot first
+/// parks its real float center on the center of the subtile it occupies, so the
+/// grid-aligned detour — which starts from that subtile — is followed from a
+/// grid-aligned position. A subtile is `0.2` tiles, so this is a fraction of one.
+const RECENTER_EPS: f32 = 0.03;
+/// Safety cap (seconds) on the recenter approach: if the bot cannot reach its
+/// subtile center (e.g. pressed by another bot), launch the detour anyway rather
+/// than hold forever.
+const RECENTER_MAX_S: f32 = 0.5;
 
 /// Inclusive bounds (seconds) of the pause a bot holds after stepping aside from
 /// a head-on bot-on-bot bump.
@@ -481,6 +495,15 @@ pub struct FollowPath {
     /// Pending request for [`Brain`](super::Brain) to arm a dynamic re-path; taken
     /// (and cleared) via [`take_dynamic_repath_request`](LowLevelAction::take_dynamic_repath_request).
     dynamic_repath_request: bool,
+    /// World position the bot is steering to **before** launching a deferred
+    /// avoidance detour: the center of the subtile it occupies. Set by a
+    /// look-ahead probe hit or a head-on bounce; while `Some`, the bot approaches
+    /// this point and only then enqueues the detour (`detour_goal` / `detour_purpose`
+    /// / `detour_fallback` carry the deferred request). `None` = not recentering.
+    recenter_target: Option<Vec2>,
+    /// Seconds spent approaching [`recenter_target`](Self::recenter_target); bounded
+    /// by [`RECENTER_MAX_S`] so a wedged bot still launches its detour.
+    recenter_elapsed: f32,
 }
 
 /// Why an in-flight subtile detour was requested, which decides its fallback.
@@ -533,6 +556,8 @@ impl FollowPath {
             abandoned: false,
             abandoned_for_reroute: false,
             dynamic_repath_request: false,
+            recenter_target: None,
+            recenter_elapsed: 0.0,
         }
     }
 
@@ -574,6 +599,38 @@ impl FollowPath {
         self.detour_purpose = DetourPurpose::Avoidance;
         self.detour_wait_elapsed = 0.0;
         self.detour_fallback = None;
+        self.recenter_target = None;
+        self.recenter_elapsed = 0.0;
+    }
+
+    /// Arms a *recenter-then-detour* maneuver: park the real center on the current
+    /// subtile's center first, then launch the deferred detour from there. Stores
+    /// the detour parameters; the recenter block in [`execute`](Self::execute)
+    /// enqueues the search once the center arrives (or [`RECENTER_MAX_S`] elapses).
+    ///
+    /// Used for the two cases the bot detects an obstacle without already having
+    /// crossed into it: a **look-ahead probe** hit and a **head-on bounce**. The
+    /// detour A\* starts from `last_accepted_center_subtile`, so aligning the float
+    /// center to that subtile makes the bot follow the grid-aligned route from a
+    /// grid-aligned start instead of from wherever the center happened to drift.
+    fn begin_recenter_detour(
+        &mut self,
+        state: &ActorState,
+        goal: usize,
+        purpose: DetourPurpose,
+        fallback: Option<(i32, i32)>,
+    ) {
+        let sub = state
+            .last_accepted_center_subtile
+            .unwrap_or_else(|| float_subtile(state.center));
+        self.recenter_target = Some(subtile_center(sub));
+        self.recenter_elapsed = 0.0;
+        // Carry the deferred detour request; do not enqueue until centered.
+        self.detour_request = None;
+        self.detour_goal = goal;
+        self.detour_purpose = purpose;
+        self.detour_fallback = fallback;
+        self.detour_wait_elapsed = 0.0;
     }
 
     /// Enqueues a short subtile-level detour search toward the node at
@@ -1022,6 +1079,64 @@ impl LowLevelAction for FollowPath {
             return;
         }
 
+        // Recenter-before-detour: a look-ahead probe hit or a head-on bounce parks
+        // the bot on its current subtile's center first, then launches the deferred
+        // detour *from there* (the detour A* starts from that subtile). Takes over
+        // the whole tick while active so the bot is not re-deciding mid-approach.
+        if let Some(target) = self.recenter_target {
+            self.recenter_elapsed += dt;
+            let to = target - center;
+            let arrived = to.length_squared() <= RECENTER_EPS * RECENTER_EPS;
+            if arrived || self.recenter_elapsed >= RECENTER_MAX_S {
+                self.recenter_target = None;
+                self.recenter_elapsed = 0.0;
+                // Centered (or timed out): launch the deferred detour from here.
+                match self.enqueue_detour(state, ctx, self.detour_goal) {
+                    Some(id) => {
+                        ctx.trace(format!("recentered → detour toward node {}", self.detour_goal));
+                        self.detour_request = Some(id);
+                        self.detour_wait_elapsed = 0.0;
+                    }
+                    None => {
+                        // No pathfind/avoidance data: fall back per the stored purpose.
+                        let purpose = self.detour_purpose;
+                        let fallback = self.detour_fallback;
+                        match purpose {
+                            DetourPurpose::Avoidance => self.step_aside_or_wait(fallback, rng),
+                            DetourPurpose::Repair => {
+                                self.escape_or_abandon(state, ctx, t, dt);
+                                return;
+                            }
+                            DetourPurpose::WallRepair => {
+                                self.stuck_timer = 0.0;
+                                self.stuck_reference_pos = Some(center);
+                            }
+                        }
+                    }
+                }
+                // Hold this frame; next frame awaits the detour (or runs the fallback).
+                self.drive(state, center, Vec2::ZERO, t.decel, dt);
+                state.next_waypoint_hint = self.current_waypoint_hint();
+                return;
+            }
+            // Approach the subtile center under inertia (brake as we arrive).
+            let dist = to.length();
+            if dist > 1e-6 {
+                self.direction = to / dist;
+            }
+            let brake_limited_speed = (2.0 * t.decel * dist).sqrt();
+            let desired_speed = t.max_speed.min(brake_limited_speed);
+            let desired = self.direction * desired_speed;
+            let steer_rate = if self.velocity.length() > desired_speed {
+                t.decel
+            } else {
+                t.accel
+            };
+            self.drive(state, center, desired, steer_rate, dt);
+            state.next_waypoint_hint = Some(target);
+            return;
+        }
+
         // Proactive look-ahead avoidance (on-screen only). Before a collision
         // even happens, advance the bot's **whole footprint** one subtile along
         // its heading and test it for another creature: a subcell within the
@@ -1066,17 +1181,15 @@ impl LowLevelAction for FollowPath {
                         )
                         .is_err();
                 if creature_ahead {
-                    if let Some(id) = self.enqueue_detour(state, ctx, self.index) {
-                        ctx.trace(format!("look-ahead: creature in leading footprint at {advanced:?} → detour"));
-                        self.detour_request = Some(id);
-                        self.detour_purpose = DetourPurpose::Avoidance;
-                        self.detour_goal = self.index;
-                        self.detour_wait_elapsed = 0.0;
-                        self.detour_fallback = self.step_target(state, ctx, self.direction, rng);
-                        self.drive(state, center, Vec2::ZERO, t.decel, dt);
-                        state.next_waypoint_hint = self.current_waypoint_hint();
-                        return;
-                    }
+                    // Recenter on this subtile, then detour from there (deferred).
+                    let fallback = self.step_target(state, ctx, self.direction, rng);
+                    ctx.trace(format!(
+                        "look-ahead: creature in leading footprint at {advanced:?} → recenter then detour"
+                    ));
+                    self.begin_recenter_detour(state, self.index, DetourPurpose::Avoidance, fallback);
+                    self.drive(state, center, Vec2::ZERO, t.decel, dt);
+                    state.next_waypoint_hint = self.current_waypoint_hint();
+                    return;
                 }
             }
         }
@@ -1145,21 +1258,18 @@ impl LowLevelAction for FollowPath {
                         // step-aside response with the unchanged `bot_detour_chance`.
                         let step = self.step_target(state, ctx, heading, rng);
                         let want_detour = rng::chance(rng, t.bot_detour_chance);
-                        // A detour is planned off-thread: enqueue the request and hold;
-                        // when it lands the bot threads it, otherwise it steps aside / waits.
-                        let enqueued = want_detour
-                            .then(|| self.enqueue_detour(state, ctx, self.index))
-                            .flatten();
-                        match enqueued {
-                            Some(id) => {
-                                ctx.trace(format!("bump at {blocker:?} → detour (fallback {step:?})"));
-                                self.detour_request = Some(id);
-                                self.detour_purpose = DetourPurpose::Avoidance;
-                                self.detour_goal = self.index;
-                                self.detour_wait_elapsed = 0.0;
-                                self.detour_fallback = step;
-                            }
-                            None => match step {
+                        // A detour needs a subtile pathfinder; without one fall back.
+                        let can_detour = ctx.avoidance.is_some() && ctx.pathfind.is_some();
+                        if want_detour && can_detour {
+                            // Recenter on this subtile, then detour from there. The
+                            // bounce above already shoved us off the blocker; the
+                            // recenter settles us onto the cell center before routing.
+                            ctx.trace(format!(
+                                "bump at {blocker:?} → recenter then detour (fallback {step:?})"
+                            ));
+                            self.begin_recenter_detour(state, self.index, DetourPurpose::Avoidance, step);
+                        } else {
+                            match step {
                                 Some(c) => {
                                     ctx.trace(format!("bump at {blocker:?} → step aside to {c:?}"));
                                     self.begin_step_aside(step, rng);
@@ -1192,7 +1302,7 @@ impl LowLevelAction for FollowPath {
                                     ));
                                     self.begin_wait_in_place(rng);
                                 }
-                            },
+                            }
                         }
                     } else {
                         // REAR-ENDED a bot heading our way: don't fight it. Clear any
@@ -1385,6 +1495,8 @@ impl LowLevelAction for FollowPath {
     fn label(&self) -> String {
         if self.escape_target.is_some() {
             "FollowPath (escaping)".to_string()
+        } else if self.recenter_target.is_some() {
+            "FollowPath (recentering)".to_string()
         } else if self.detour_request.is_some() {
             "FollowPath (awaiting detour)".to_string()
         } else if self.on_sub_run() {
@@ -1438,15 +1550,19 @@ impl LowLevelAction for FollowPath {
     }
 
     fn is_awaiting_path(&self) -> bool {
-        // Braked awaiting an async detour, or paused after a step-aside — in
-        // both holding states the bot is intentionally not following its route.
-        self.detour_request.is_some() || self.contact_wait_s > 0.0
+        // Braked awaiting an async detour, recentering before one, or paused after
+        // a step-aside — in all of these the bot is intentionally off its route.
+        self.detour_request.is_some()
+            || self.recenter_target.is_some()
+            || self.contact_wait_s > 0.0
     }
 
     fn is_recovering(&self) -> bool {
-        // Any active collision-recovery maneuver: detour (awaited or threading a
-        // spliced sub-run), step-aside (pending move or post-step pause), or escape.
-        self.detour_request.is_some()
+        // Any active collision-recovery maneuver: recentering before a detour,
+        // detour (awaited or threading a spliced sub-run), step-aside (pending move
+        // or post-step pause), or escape.
+        self.recenter_target.is_some()
+            || self.detour_request.is_some()
             || self.on_sub_run()
             || self.contact_wait_s > 0.0
             || self.pending_wait.is_some()
@@ -1541,6 +1657,12 @@ fn min_dist2_to_chebyshev_ring(center: Vec2, here: IVec2, ring: i32) -> f32 {
 pub fn float_subtile(pos: Vec2) -> IVec2 {
     let sc = SUBTILE_COUNT as f32;
     IVec2::new((pos.x * sc).floor() as i32, (pos.y * sc).floor() as i32)
+}
+
+/// Tile-space center of a subtile cell (inverse of [`float_subtile`]).
+#[inline]
+pub fn subtile_center(sub: IVec2) -> Vec2 {
+    (sub.as_vec2() + Vec2::splat(0.5)) / SUBTILE_COUNT as f32
 }
 
 /// Drops interior subtiles that lie on a straight run, keeping only the
@@ -2075,11 +2197,27 @@ mod tests {
             ..FollowTuning::default()
         };
 
+        // A full-chance bump now recenters onto the subtile first, then enqueues
+        // the detour *from there*. The first tick only arms the recenter.
         fp.execute(&mut state, &ctx, &mut rng, &tuning);
+        assert!(
+            fp.recenter_target.is_some(),
+            "a full-chance bump must recenter before detouring"
+        );
+        assert!(fp.detour_request.is_none(), "the detour is deferred until recentered");
 
+        // Drive onto the subtile center; once there (or after the timeout) the
+        // deferred detour is enqueued.
+        for _ in 0..120 {
+            state.center += state.move_buffer.tile_delta;
+            fp.execute(&mut state, &ctx, &mut rng, &tuning);
+            if fp.detour_request.is_some() {
+                break;
+            }
+        }
         assert!(
             fp.detour_request.is_some(),
-            "a full-chance bump must enqueue a subtile detour request"
+            "after recentering, a full-chance bump must enqueue a subtile detour request"
         );
         let pending = queue.drain_pending();
         assert_eq!(pending.len(), 1);
@@ -3026,14 +3164,90 @@ mod tests {
         };
         let mut rng = rng::seeded(41);
 
+        // The footprint-aware look-ahead detects the off-axis creature and arms a
+        // recenter-before-detour; the detour is enqueued once the bot reaches its
+        // subtile center (or the recenter times out).
         fp.execute(&mut state, &ctx, &mut rng, &FollowTuning::default());
+        assert!(
+            fp.recenter_target.is_some(),
+            "an off-axis creature inside the leading footprint must trigger look-ahead recentering"
+        );
+        assert!(fp.detour_request.is_none(), "the detour is deferred until recentered");
 
+        for _ in 0..120 {
+            state.center += state.move_buffer.tile_delta;
+            fp.execute(&mut state, &ctx, &mut rng, &FollowTuning::default());
+            if fp.detour_request.is_some() {
+                break;
+            }
+        }
         assert!(
             fp.detour_request.is_some(),
-            "an off-axis creature inside the leading footprint must trigger a look-ahead detour"
+            "after recentering, the look-ahead must enqueue a subtile detour"
         );
         assert_eq!(fp.detour_purpose, DetourPurpose::Avoidance);
         let pending = queue.drain_pending();
         assert!(pending.iter().any(|(_, k)| matches!(k, PathKind::SubtileDetour { .. })));
+    }
+
+    // --- Recenter-before-detour ---
+
+    #[test]
+    fn subtile_center_inverts_float_subtile() {
+        for sub in [IVec2::new(0, 0), IVec2::new(25, 25), IVec2::new(-3, 7)] {
+            assert_eq!(
+                float_subtile(subtile_center(sub)),
+                sub,
+                "subtile_center must land inside its own subtile"
+            );
+        }
+    }
+
+    #[test]
+    fn begin_recenter_detour_targets_current_subtile_center() {
+        use crate::actor::brain::test_support::test_state;
+        let mut fp = FollowPath::new(vec![(8, 5)]);
+        let mut state = test_state();
+        state.last_accepted_center_subtile = Some(IVec2::new(25, 25));
+
+        fp.begin_recenter_detour(&state, 3, DetourPurpose::Avoidance, Some((6, 5)));
+
+        assert_eq!(fp.recenter_target, Some(subtile_center(IVec2::new(25, 25))));
+        assert_eq!(fp.detour_goal, 3);
+        assert_eq!(fp.detour_purpose, DetourPurpose::Avoidance);
+        assert_eq!(fp.detour_fallback, Some((6, 5)));
+        assert!(fp.detour_request.is_none(), "the detour is enqueued only after recentering");
+        assert!(fp.is_recovering(), "recentering counts as a recovery maneuver");
+    }
+
+    #[test]
+    fn recenter_drives_toward_subtile_center_then_clears() {
+        use crate::actor::brain::test_support::{ctx_with_charge, test_state};
+        let mut fp = FollowPath::new(vec![(5, 0)]);
+        let target = subtile_center(IVec2::new(2, 2)); // (0.5, 0.5)
+        fp.recenter_target = Some(target);
+        let ctx = ctx_with_charge(1.0);
+        let tuning = FollowTuning::default();
+        let mut rng = rng::seeded(7);
+        let mut state = test_state();
+        state.center = Vec2::new(0.58, 0.42); // off-center within subtile (2,2)
+        state.last_accepted_center_subtile = Some(IVec2::new(2, 2));
+
+        // First tick steers toward the subtile center, not along the route.
+        fp.execute(&mut state, &ctx, &mut rng, &tuning);
+        let toward = state.move_buffer.tile_delta;
+        assert!(toward.x < 0.0 && toward.y > 0.0, "must move toward (0.5,0.5), got {toward:?}");
+
+        for _ in 0..240 {
+            state.center += state.move_buffer.tile_delta;
+            fp.execute(&mut state, &ctx, &mut rng, &tuning);
+            if fp.recenter_target.is_none() {
+                break;
+            }
+        }
+
+        assert!(fp.recenter_target.is_none(), "recenter must finish (arrive or time out)");
+        let miss = (state.center - target).length();
+        assert!(miss < 0.05, "bot should park near its subtile center, off by {miss}");
     }
 }

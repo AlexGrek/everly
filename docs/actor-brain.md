@@ -208,10 +208,25 @@ occupied subcell is in fact impassable, so a wide bot must probe its leading
 (`probe_footprint`'s `previous`), so only the newly-entered leading crescent is
 checked, and the test trips only on `FLAG_CREATURE` (static walls carry no
 creature bit, so they're left to the slide / `WallRepair` path). On a hit the bot
-**enqueues a subtile detour** toward its next path node and holds, steering
-around the obstacle instead of pressing into it. Gated by `BrainContext::on_screen`
-(off-screen bots advance without occupancy, so probing is pointless) and skipped
-while already detouring / stepping / waiting, or below `LOOKAHEAD_MIN_SPEED_SQ`.
+**recenters, then detours** (see below): it parks its float center on the subtile
+it occupies and only then enqueues the subtile detour toward its next path node,
+holding meanwhile, so the grid-aligned route is followed from a grid-aligned
+start. Gated by `BrainContext::on_screen` (off-screen bots advance without
+occupancy, so probing is pointless) and skipped while already detouring /
+recentering / stepping / waiting, or below `LOOKAHEAD_MIN_SPEED_SQ`.
+
+**Recenter before detouring.** Both detour triggers that fire *before* the bot has
+crossed into the obstacle — the look-ahead probe above and the head-on **bounce**
+below — first steer the bot's real float `center` to the center of the subtile it
+occupies (`recenter_target`, threshold `RECENTER_EPS`, capped by `RECENTER_MAX_S`
+so a wedged bot still proceeds), and launch the detour only once it arrives. The
+detour A\* starts from `last_accepted_center_subtile`, so aligning the float center
+to that subtile makes the bot thread the grid-aligned route from a grid-aligned
+position rather than from wherever its center had drifted. While recentering the
+action reports `is_recovering` / `is_awaiting_path`. The stall splice-repair and
+wall re-route detours do **not** recenter (the bot is already wedged, not
+approaching). Off-screen and zero-`bot_detour_chance` / no-pathfind cases skip
+straight to the old step-aside behaviour.
 
 ### Bot-on-bot collision response
 
@@ -229,9 +244,10 @@ hit. Three cases:
    maneuver:
    - **Bounce** the velocity elastically off the contact normal (recoil; feel only).
    - **Roll the response (`FollowTuning::bot_detour_chance`, default `0.5`).**
-     - *Detour* → enqueue a **subtile-level detour** search (see below) toward the
-       next path node and hold until the result lands (or step aside / wait on
-       `NoPath` / timeout).
+     - *Detour* → **recenter on the current subtile** (see *Recenter before
+       detouring* above), then enqueue a **subtile-level detour** search (see below)
+       toward the next path node and hold until the result lands (or step aside /
+       wait on `NoPath` / timeout).
      - *Step aside + pause* → probe **all eight** Moore-neighbour cells, keep the
        ones whose whole footprint is free (`neighbor_free` → `probe_footprint`,
        static + dynamic), and pick one at random — **preferring cells ahead of the
