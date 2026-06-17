@@ -926,6 +926,11 @@ pub(crate) fn black_bot_brain(
                     waypoint_x: waypoint.0,
                     waypoint_y: waypoint.1,
                 },
+                BrainLogEvent::FixerTargetUnreachable { target } => LogEntry::FixerTargetUnreachable {
+                    name: name.to_string(),
+                    target_x: target.0,
+                    target_y: target.1,
+                },
             };
             game_log.push_world_for_bot(current_tile.x, current_tile.y, entry, force, is_selected);
         }

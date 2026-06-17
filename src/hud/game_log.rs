@@ -139,6 +139,12 @@ pub enum LogEntry {
     BotCollisionReset { name: String },
     /// A bot was wedged with no placeable footprint and got teleported out of the jam.
     BotSqueezedOut { name: String },
+    /// A fixer gave up delivering to a stranded bot it cannot reach.
+    FixerTargetUnreachable {
+        name: String,
+        target_x: i32,
+        target_y: i32,
+    },
 }
 
 impl LogEntry {
@@ -157,6 +163,7 @@ impl LogEntry {
             }
             LogEntry::BotCollisionReset { .. } => LogLevel::Warn,
             LogEntry::BotSqueezedOut { .. } => LogLevel::Warn,
+            LogEntry::FixerTargetUnreachable { .. } => LogLevel::Err,
         }
     }
 
@@ -190,6 +197,11 @@ impl LogEntry {
             } => format!("{name} skipped patrol waypoint ({waypoint_x}, {waypoint_y})"),
             LogEntry::BotCollisionReset { name } => format!("{name} reset (collision pressure)"),
             LogEntry::BotSqueezedOut { name } => format!("{name} squeezed out (teleported)"),
+            LogEntry::FixerTargetUnreachable {
+                name,
+                target_x,
+                target_y,
+            } => format!("{name} cannot reach stranded bot at ({target_x}, {target_y})"),
         }
     }
 }
@@ -536,6 +548,14 @@ mod tests {
         let e = LogEntry::BotCollisionReset { name: "Jam".to_string() };
         assert_eq!(e.level(), LogLevel::Warn);
         assert_eq!(e.render(), "Jam reset (collision pressure)");
+
+        let e = LogEntry::FixerTargetUnreachable {
+            name: "Medic".to_string(),
+            target_x: 12,
+            target_y: -3,
+        };
+        assert_eq!(e.level(), LogLevel::Err);
+        assert_eq!(e.render(), "Medic cannot reach stranded bot at (12, -3)");
     }
 
     #[test]

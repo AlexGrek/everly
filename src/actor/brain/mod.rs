@@ -164,6 +164,8 @@ pub enum BrainLogEvent {
     WanderDestinationTimedOut { goal: (i32, i32) },
     /// Patrol leg exceeded its budget; the waypoint is skipped.
     PatrolWaypointSkipped { waypoint: (i32, i32) },
+    /// A fixer claimed a stranded bot it cannot path to.
+    FixerTargetUnreachable { target: (i32, i32) },
 }
 
 /// Side effects a high-level action requests, applied by the owning ECS system

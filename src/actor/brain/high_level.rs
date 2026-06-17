@@ -1047,11 +1047,15 @@ impl GoFixBots {
                 // Can't reach the bot's tile (it's occupied / boxed in): give up,
                 // return home so the task frees for another fixer. Inventory kept.
                 RoutePoll::AtGoal | RoutePoll::Failed => {
+                    let target = (req.location.x, req.location.y);
                     self.abandon_claim(fx, ctx.entity);
                     self.phase = FixPhase::ReturnHome;
                     self.leg = None;
                     self.start_route(pf, ctx, low, home_tile, PathfindReason::FixerReturnHome);
-                    return HighLevelOutcome::running();
+                    return HighLevelOutcome::running_with(BrainEffects {
+                        log: Some(BrainLogEvent::FixerTargetUnreachable { target }),
+                        ..BrainEffects::default()
+                    });
                 }
             }
         }
@@ -2684,6 +2688,53 @@ mod tests {
         );
         assert!(out.effects.clear_inventory, "carried battery is consumed");
         assert!(dispatch.is_empty(), "completed request leaves the board");
+    }
+
+    #[test]
+    fn fixer_logs_error_when_stranded_bot_is_unreachable() {
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let dispatch = DispatchQueue::default();
+        let broken = Entity::from_bits(0xB0B);
+        let target = (5, 5);
+        dispatch.post(broken, RepairPart::MovementEngine, IVec2::new(target.0, target.1));
+
+        let pf = PathfindFixture::new();
+        let mut action = GoFixBots::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = rng::seeded(13);
+        let home = EntityCoordinates::ground(0, 0);
+
+        // Claim + route to depot.
+        let c = fixer_ctx(&passability, &interactive, (0, 0), pf.access(), &dispatch, Some(home), None);
+        action.update(&c, &mut low, &mut rng);
+        pf.resolve_all_routes(vec![(0, 0)], 1);
+
+        // Pick up at depot + route toward the stranded bot.
+        let c = fixer_ctx(&passability, &interactive, (0, 0), pf.access(), &dispatch, Some(home), None);
+        action.update(&c, &mut low, &mut rng);
+        let deliver_pending = pf.queue.drain_pending();
+        assert_eq!(deliver_pending.len(), 1);
+        let (deliver_id, _) = deliver_pending[0];
+        pf.results.insert_for_test(deliver_id, PathOutcome::NoPath);
+
+        // Deliver route fails → abandon the claim and log the unreachable target.
+        let c = fixer_ctx(
+            &passability,
+            &interactive,
+            (0, 0),
+            pf.access(),
+            &dispatch,
+            Some(home),
+            Some(RepairPart::MovementEngine),
+        );
+        let out = action.update(&c, &mut low, &mut rng);
+        assert_eq!(
+            out.effects.log,
+            Some(BrainLogEvent::FixerTargetUnreachable { target })
+        );
+        assert!(dispatch.claim_of(Entity::PLACEHOLDER).is_none(), "claim released");
+        assert!(!dispatch.has_open_within(IVec2::ZERO, 100), "task on give-up cooldown");
     }
 
     #[test]
