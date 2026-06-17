@@ -5,7 +5,7 @@
 //! and *stranded*. While stranded it posts a [`RepairRequest`] to the shared
 //! [`DispatchQueue`] (what part it needs + where it is). A
 //! [`Fixer`](crate::actor::black_bot::BotSpecialization::Fixer) bot loitering
-//! near its home parts depot **claims** the nearest open request, fetches the
+//! near its home parts depot **claims** a random open request, fetches the
 //! part from the depot into its [`BotInventory`] (rendered as a floating marker
 //! above the sphere), drives to the stranded bot, and repairs that part on
 //! contact.
@@ -20,6 +20,8 @@
 use std::sync::Mutex;
 
 use bevy::prelude::*;
+
+use crate::rng::{self, StdRng};
 
 use crate::actor::black_bot::{BlackBotVisual, Breakable};
 use crate::actor::charge::Charge;
@@ -162,6 +164,24 @@ impl DispatchQueue {
                 (r.location.x - from.x).abs() + (r.location.y - from.y).abs()
             })
             .map(|(i, _)| i)?;
+        q[idx].claimed_by = Some(fixer);
+        Some(q[idx])
+    }
+
+    /// Claims a uniformly random **unclaimed, off-cooldown** request, marking it
+    /// claimed by `fixer`. `None` when nothing is open.
+    pub fn claim_random(&self, fixer: Entity, rng: &mut StdRng) -> Option<RepairRequest> {
+        let mut q = self.inner.lock().expect("dispatch queue poisoned");
+        let open: Vec<usize> = q
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.claimed_by.is_none() && r.cooldown <= 0.0)
+            .map(|(i, _)| i)
+            .collect();
+        if open.is_empty() {
+            return None;
+        }
+        let idx = *rng::pick(rng, &open);
         q[idx].claimed_by = Some(fixer);
         Some(q[idx])
     }
@@ -403,6 +423,21 @@ mod tests {
         assert_eq!(still.claimed_by, Some(bot(99)), "claim preserved across refresh");
         assert_eq!(still.part, RepairPart::ControlPlane, "part refreshed");
         assert_eq!(still.location, IVec2::new(5, 5), "location refreshed");
+    }
+
+    #[test]
+    fn claim_random_picks_from_open_pool() {
+        let q = DispatchQueue::default();
+        q.post(bot(1), RepairPart::MovementEngine, IVec2::new(10, 0));
+        q.post(bot(2), RepairPart::MovementEngine, IVec2::new(2, 0));
+        let mut rng = crate::rng::seeded(99);
+        let claimed = q.claim_random(bot(50), &mut rng).unwrap();
+        assert!(
+            claimed.broken_bot == bot(1) || claimed.broken_bot == bot(2),
+            "claims one of the open requests"
+        );
+        assert!(q.claim_random(bot(51), &mut rng).is_some(), "second open request remains");
+        assert!(q.claim_random(bot(52), &mut rng).is_none(), "all claimed");
     }
 
     #[test]

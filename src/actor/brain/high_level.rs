@@ -715,8 +715,9 @@ impl GoFixBots {
         }
     }
 
-    /// Picks a fresh loiter destination: head back toward `home` when displaced
-    /// beyond the loiter radius, otherwise wander to a walkable tile within it.
+    /// Picks a fresh loiter destination: a random walkable tile within the loiter
+    /// radius of `home` (never the depot tile itself). Fixers outside the zone
+    /// path toward such a tile instead of routing to the depot first.
     fn start_loiter_wander(
         &mut self,
         pf: PathfindAccess,
@@ -725,11 +726,6 @@ impl GoFixBots {
         rng: &mut StdRng,
         home: (i32, i32),
     ) {
-        let here = (ctx.main_tile.x, ctx.main_tile.y);
-        if manhattan(here, home) as i32 > FIXER_LOITER_RADIUS {
-            self.start_route(pf, ctx, low, home, PathfindReason::FixerReturnHome);
-            return;
-        }
         match sample_tile_within_radius(rng, home, FIXER_LOITER_RADIUS as f32, ctx.passability) {
             Some(goal) => self.start_route(pf, ctx, low, goal, PathfindReason::FixerLoiter),
             None => {
@@ -891,7 +887,7 @@ impl GoFixBots {
 
         // Watch the dispatch queue only while near the home depot.
         if manhattan(here, home_tile) as i32 <= FIXER_LOITER_RADIUS {
-            if let Some(req) = fx.dispatch.claim_nearest(ctx.entity, ctx.main_tile) {
+            if let Some(req) = fx.dispatch.claim_random(ctx.entity, rng) {
                 self.claim = Some(req);
                 self.phase = FixPhase::FetchPart;
                 self.leg = None;
@@ -2514,6 +2510,40 @@ mod tests {
         let mut c = ctx(passability, interactive, 1.0, tile, pf, None);
         c.fixer = Some(FixerContext { dispatch, home_depot: home, carried });
         c
+    }
+
+    #[test]
+    fn fixer_loiter_outside_radius_does_not_route_to_depot() {
+        // With no open tasks a fixer outside the loiter zone should wander toward
+        // a tile within the zone — not path to the depot tile itself first.
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let dispatch = DispatchQueue::default();
+        let pf = PathfindFixture::new();
+        let mut action = GoFixBots::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = rng::seeded(12);
+        let home = EntityCoordinates::ground(0, 0);
+
+        let c = fixer_ctx(
+            &passability,
+            &interactive,
+            (20, 0),
+            pf.access(),
+            &dispatch,
+            Some(home),
+            None,
+        );
+        action.update(&c, &mut low, &mut rng);
+
+        let routes = pf.drain_world_routes();
+        assert_eq!(routes.len(), 1);
+        let (_, goal) = routes[0];
+        assert_ne!(goal, (0, 0), "loiter wander must not target the depot tile");
+        assert!(
+            manhattan(goal, (0, 0)) <= FIXER_LOITER_RADIUS as u32,
+            "goal {goal:?} should lie within the loiter radius of the depot"
+        );
     }
 
     #[test]
