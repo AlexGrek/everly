@@ -318,7 +318,7 @@ mod tests {
         let blocker = IVec2::new(5 * sc + sc / 2, 5 * sc + sc / 2); // ≈ (5.5, 5.5)
         occ.update(e(1), kin(Vec2::new(5.5, 5.5))); // right on it
         occ.update(e(2), kin(Vec2::new(5.5, 6.4))); // a tile up, farther
-        let (who, k) = occ.resolve_blocker(blocker, Entity::PLACEHOLDER).unwrap();
+        let (who, k) = occ.resolve_blocker(blocker, e(99)).unwrap();
         // Nearest is e(1).
         assert_eq!(who, e(1));
         assert_eq!(k.center, Vec2::new(5.5, 5.5));
@@ -333,8 +333,8 @@ mod tests {
         let blocker = IVec2::new(5 * sc + sc / 2, 5 * sc + sc / 2);
         // Bot two tiles away: outside (radius+1) reach of the probed subtile.
         occ.update(e(1), kin(Vec2::new(7.5, 7.5)));
-        assert!(occ.resolve_blocker(blocker, Entity::PLACEHOLDER).is_none(), "too far to own the cell");
-        assert!(CellOccupancy::default().resolve_blocker(blocker, Entity::PLACEHOLDER).is_none());
+        assert!(occ.resolve_blocker(blocker, e(99)).is_none(), "too far to own the cell");
+        assert!(CellOccupancy::default().resolve_blocker(blocker, e(99)).is_none());
     }
 
     #[test]
@@ -347,7 +347,7 @@ mod tests {
         occ.update(e(1), kin(Vec2::new(4.95, 5.5)));
         // Blocker subtile = first column of tile (5,5), same row band.
         let blocker = IVec2::new(5 * sc, 5 * sc + sc / 2);
-        let got = occ.resolve_blocker(blocker, Entity::PLACEHOLDER);
+        let got = occ.resolve_blocker(blocker, e(99));
         assert_eq!(got.map(|(_, k)| k.center), Some(Vec2::new(4.95, 5.5)));
     }
 }

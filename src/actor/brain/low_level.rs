@@ -1736,6 +1736,171 @@ mod tests {
         );
     }
 
+    // --- Identity-aware bot-on-bot collision (front vs back of the other bot) ---
+
+    /// Builds a [`CellOccupancy`] holding one "other" bot (radius 2) at `center`
+    /// with `heading`, returning the map and the other bot's entity.
+    fn occ_with_other(center: Vec2, heading: Vec2) -> (crate::map::cell_occupancy::CellOccupancy, Entity) {
+        use crate::map::cell_occupancy::{BotKinematics, CellOccupancy};
+        let mut occ = CellOccupancy::default();
+        let other = Entity::from_bits(0xB0B);
+        occ.update(
+            other,
+            BotKinematics {
+                tile: crate::actor::actor_main_tile(center),
+                center,
+                heading,
+                radius_subtiles: 2,
+            },
+        );
+        (occ, other)
+    }
+
+    /// A `FollowPath` heading +X into a blocker on its +X side at world subtile
+    /// (26,25), with `state.center` at (5,5) and a route to (8,5).
+    fn moving_into_blocker() -> (FollowPath, ActorState) {
+        let mut fp = FollowPath::new(vec![(8, 5)]);
+        fp.velocity = Vec2::new(1.0, 0.0);
+        fp.direction = Vec2::new(1.0, 0.0);
+        let state = ActorState {
+            center: Vec2::new(5.0, 5.0),
+            radius_subtiles: 2,
+            rotation: 0.0,
+            heading: Vec2::X,
+            move_buffer: ActorMoveBuffer::default(),
+            last_movement_error: Some(ActorMovementError::BlockedByOccupancy {
+                world_subtile_x: 26,
+                world_subtile_y: 25,
+            }),
+            last_accepted_center_subtile: Some(IVec2::new(25, 25)),
+            last_accepted_radius_subtiles: 2,
+            next_waypoint_hint: None,
+            field_main_tile: None,
+            dirtiness: 0.0,
+            shadow: crate::actor::ActorShadow::default(),
+        };
+        (fp, state)
+    }
+
+    fn collision_ctx<'a>(
+        passability: &'a Hypermap<f32>,
+        interactive: &'a InteractiveEntityMap,
+        neighbors: Option<&'a crate::map::cell_occupancy::CellOccupancy>,
+        center: Vec2,
+    ) -> BrainContext<'a> {
+        BrainContext {
+            entity: Entity::PLACEHOLDER,
+            dt: 0.1,
+            center,
+            radius_subtiles: 2,
+            main_tile: IVec2::new(5, 5),
+            main_tile_changed: false,
+            floor: 0,
+            charge: 1.0,
+            missing_charge_pct: 0.0,
+            depleted: false,
+            broken: false,
+            passability,
+            interactive,
+            on_screen: true,
+            trace: None,
+            avoidance: None,
+            patrol_loop: None,
+            pathfind: None,
+            fixer: None,
+            dynamic_repath: false,
+            neighbors,
+        }
+    }
+
+    #[test]
+    fn rear_end_other_same_way_waits_no_bounce_no_stuck() {
+        // The bot ahead is heading the SAME way (+X): we rear-ended its back.
+        // Expect a brief wait (< 1 s), no elastic bounce, and not "stuck".
+        let (mut fp, mut state) = moving_into_blocker();
+        let (occ, _) = occ_with_other(Vec2::new(5.4, 5.0), Vec2::X);
+        let passability = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let ctx = collision_ctx(&passability, &interactive, Some(&occ), state.center);
+        let mut rng = rng::seeded(1);
+        fp.execute(&mut state, &ctx, &mut rng, &FollowTuning::default());
+
+        assert!(fp.contact_wait_s > 0.0, "rear-end should arm a brief wait");
+        assert!(fp.contact_wait_s < 1.0, "rear-end wait must be under a second");
+        assert!(!fp.take_dynamic_repath_request(), "common case does not reroute (seed 1)");
+        assert!(!fp.is_stuck());
+        // No bounce: velocity is braked toward zero, never reflected to -X.
+        assert!(fp.velocity.x >= 0.0, "rear-end must not bounce backward");
+    }
+
+    #[test]
+    fn head_on_other_facing_me_bounces() {
+        // The other bot faces ME (-X): true head-to-head → elastic bounce, same as
+        // the identity-less path. (Mirrors `follow_path_bounces_*` but with the
+        // blocker resolved and classified as front-on.)
+        let (mut fp, mut state) = moving_into_blocker();
+        let (occ, _) = occ_with_other(Vec2::new(5.4, 5.0), Vec2::NEG_X);
+        let passability = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let ctx = collision_ctx(&passability, &interactive, Some(&occ), state.center);
+        let mut rng = rng::seeded(1);
+        fp.execute(&mut state, &ctx, &mut rng, &FollowTuning::default());
+
+        assert!(fp.velocity.x < 0.0, "head-on collision should reflect X velocity");
+    }
+
+    #[test]
+    fn hit_from_behind_continues_by_default() {
+        // Blocker is BEHIND our heading (we got rear-ended). Default: no reaction —
+        // no wait, no bounce, route not abandoned. (No neighbours needed: this
+        // branch never resolves the other bot.)
+        let mut fp = FollowPath::new(vec![(8, 5)]);
+        fp.velocity = Vec2::new(1.0, 0.0);
+        fp.direction = Vec2::new(1.0, 0.0);
+        let mut state = ActorState {
+            center: Vec2::new(5.0, 5.0),
+            radius_subtiles: 2,
+            rotation: 0.0,
+            heading: Vec2::X,
+            move_buffer: ActorMoveBuffer::default(),
+            // Blocker on our -X side → behind the +X heading.
+            last_movement_error: Some(ActorMovementError::BlockedByOccupancy {
+                world_subtile_x: 24,
+                world_subtile_y: 25,
+            }),
+            last_accepted_center_subtile: Some(IVec2::new(25, 25)),
+            last_accepted_radius_subtiles: 2,
+            next_waypoint_hint: None,
+            field_main_tile: None,
+            dirtiness: 0.0,
+            shadow: crate::actor::ActorShadow::default(),
+        };
+        let passability = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let ctx = collision_ctx(&passability, &interactive, None, state.center);
+        let mut rng = rng::seeded(1);
+        fp.execute(&mut state, &ctx, &mut rng, &FollowTuning::default());
+
+        assert!(!fp.take_dynamic_repath_request(), "default rear-hit does not reroute (seed 1)");
+        assert_eq!(fp.contact_wait_s, 0.0, "no wait when hit from behind");
+        assert!(!fp.is_finished(), "route is not abandoned when hit from behind");
+        assert!(fp.velocity.x >= 0.0, "no bounce when hit from behind");
+    }
+
+    #[test]
+    fn request_dynamic_reroute_is_finished_but_not_stuck() {
+        // The small-probability reroute branch (items 4 & 5): abandon the route and
+        // raise a one-shot dynamic-repath request — but it is deliberate, so the
+        // bot must NOT report as stuck.
+        let (mut fp, mut state) = moving_into_blocker();
+        fp.request_dynamic_reroute(&mut state);
+
+        assert!(fp.is_finished(), "reroute abandons the current route");
+        assert!(!fp.is_stuck(), "a deliberate reroute is not a stuck episode");
+        assert!(fp.take_dynamic_repath_request(), "request raised once");
+        assert!(!fp.take_dynamic_repath_request(), "request cleared after taking");
+    }
+
     #[test]
     fn follow_path_heading_prefers_velocity_then_falls_back_to_direction() {
         let mut fp = FollowPath::new(vec![(8, 5)]);

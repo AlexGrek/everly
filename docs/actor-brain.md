@@ -217,35 +217,57 @@ while already detouring / stepping / waiting, or below `LOOKAHEAD_MIN_SPEED_SQ`.
 
 `FollowPath`'s tile path is planned on **static** geometry only, so it does not
 route around other (moving) bots. When a step is rejected with
-`BlockedByOccupancy` (another bot's footprint):
+`BlockedByOccupancy` (another bot's footprint), the response is **identity-aware**:
+it resolves *which* bot the contact is with (`BrainContext::neighbors` →
+[`CellOccupancy::resolve_blocker`](cell-occupancy.md), the blocked subtile → the
+owning bot's [`BotKinematics`]) and reads that bot's `heading` to decide where it
+hit. Three cases:
 
-1. **Front/back gate.** Classify the contact with `is_front_collision` against
-   the bot's heading (its velocity, or `direction` when stopped). A **rear bump**
-   (blocker behind the heading) is **ignored entirely** — no bounce, step, or
-   detour. Only a **head-on or side** contact provokes a response. (Ambiguous
-   cases — degenerate normal or a stationary bot — count as front.)
-2. **Bounce** the velocity elastically off the contact normal (recoil; feel only).
-3. **Roll the response (`FollowTuning::bot_detour_chance`, default `0.5`).**
-   - *Detour* → enqueue a **subtile-level detour** search (see below) toward the
-     next path node and hold until the result lands (or step aside / wait on
-     `NoPath` / timeout).
-   - *Step aside + pause* → probe **all eight** Moore-neighbour cells, keep the
-     ones whose whole footprint is free (`neighbor_free` → `probe_footprint`,
-     static + dynamic), and pick one at random — **preferring cells ahead of the
-     heading** (positive dot product) so the bot slips forward around the blocker
-     rather than retreating. It then holds at that cell for a random 0.5–1.5 s
-     (`STEP_BACK_WAIT_*_SECS`); the pause arms only once the bot *reaches* it
-     (`pending_wait` → `contact_wait_s`), braking with the normal decel profile.
-   - *Escape, then wait* → if **every** immediate neighbour is taken, the bot
-     first tries the wider **escape** search (`find_escape_cell`,
-     `ESCAPE_SEARCH_TILES` radius) for the nearest cell whose whole footprint is
-     free, and relocates there if one exists. Only when even that finds nothing
-     (genuinely boxed in / no avoidance data) does it `begin_wait_in_place` and
-     brake for 0.5–1.5 s. **This is what breaks open-space two-bot wedges:** a bare
-     wait-in-place reports `is_recovering`, which suspends *both* the stuck-timer
-     escape (skipped by the wait's early return) and the collision-pressure
-     reset (gated off while recovering), so two large bots pressed together with
-     no free neighbour but open space around them would otherwise deadlock forever.
+1. **I hit another bot's FRONT** (it is heading toward me → head-to-head) — also
+   the fallback when the blocker is stationary or can't be identified
+   (`neighbors == None`, e.g. unit tests). This keeps the original head-on
+   maneuver:
+   - **Bounce** the velocity elastically off the contact normal (recoil; feel only).
+   - **Roll the response (`FollowTuning::bot_detour_chance`, default `0.5`).**
+     - *Detour* → enqueue a **subtile-level detour** search (see below) toward the
+       next path node and hold until the result lands (or step aside / wait on
+       `NoPath` / timeout).
+     - *Step aside + pause* → probe **all eight** Moore-neighbour cells, keep the
+       ones whose whole footprint is free (`neighbor_free` → `probe_footprint`,
+       static + dynamic), and pick one at random — **preferring cells ahead of the
+       heading** so the bot slips forward around the blocker rather than retreating.
+       It then holds at that cell for a random 0.5–1.5 s (`STEP_BACK_WAIT_*_SECS`);
+       the pause arms only once the bot *reaches* it (`pending_wait` →
+       `contact_wait_s`), braking with the normal decel profile.
+     - *Escape, then wait* → if **every** immediate neighbour is taken, the bot
+       first tries the wider **escape** search (`find_escape_cell`,
+       `ESCAPE_SEARCH_TILES` radius) for the nearest fully-free cell and relocates
+       there if one exists. Only when even that finds nothing (boxed in / no
+       avoidance data) does it `begin_wait_in_place` and brake for 0.5–1.5 s.
+       **This is what breaks open-space two-bot wedges:** a bare wait-in-place
+       reports `is_recovering`, which suspends *both* the stuck-timer escape and
+       the collision-pressure reset, so two large bots pressed together with no free
+       neighbour but open space around them would otherwise deadlock forever.
+2. **I hit another bot's BACK** (it is heading my way → I rear-ended it). **No
+   bounce** — give it room: brake and hold a brief `< 1 s`
+   (`REAR_END_WAIT_*_SECS`, 0.2–0.9 s) so it pulls ahead. With small probability
+   (`REAR_END_REROUTE_CHANCE`, 0.1) abandon the route for a **dynamic re-route**
+   instead (see below).
+3. **I GOT hit from behind** (blocker behind my heading). **Don't react** — keep
+   steering toward the waypoint. With small probability (`REAR_HIT_REROUTE_CHANCE`,
+   0.05) take the **dynamic re-route**.
+
+A rising-edge latch (`last_head_on_bump`) means each distinct contact provokes one
+reaction, not one per frame while two bots stay pressed together.
+
+**Dynamic re-route from a low-level action.** Cases 2 and 3 can request a re-path
+around current creature positions, but `FollowPath` has no `&mut Brain`. It calls
+`request_dynamic_reroute` — abandon the route (so the high-level replans next tick)
+**without** reporting `is_stuck` (`abandoned_for_reroute`, so no yellow stuck
+flash) and raise a one-shot flag. `Brain::tick` checks
+`LowLevelAction::take_dynamic_repath_request` after `execute` and arms
+`set_dynamic_repath`, so the next enqueued `WorldRoute` uses `include_dynamic`
+(routes around the tiles other bots occupy).
 
 This applies to bot-on-bot bumps only. A **wall** hit (`BlockedByStatic`) is
 handled separately and never shares the bot machinery: it never builds collision

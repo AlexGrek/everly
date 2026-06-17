@@ -16,38 +16,64 @@ entities. `CellOccupancy` is the side index that recovers identity.
 ```rust,ignore
 #[derive(Resource, Default)]
 pub struct CellOccupancy {
-    cells: HashMap<IVec2, Vec<Entity>>,   // tile -> entities on it (sparse)
-    entity_cell: HashMap<Entity, IVec2>,  // entity -> its recorded cell
+    cells: HashMap<IVec2, Vec<Entity>>,        // tile -> entities on it (sparse)
+    info: HashMap<Entity, BotKinematics>,      // entity -> its kinematics (incl. tile)
+}
+
+#[derive(Clone, Copy)]
+pub struct BotKinematics {
+    pub tile: IVec2,            // main tile (the `cells` key)
+    pub center: Vec2,           // tile-space center
+    pub heading: Vec2,          // movement direction (unit; ZERO = none)
+    pub radius_subtiles: i32,   // footprint radius
 }
 ```
 
 - **Sparse:** a tile with no actors holds **no** entry. The vacated cell's `Vec`
   is removed once it empties, so the map only ever holds occupied tiles.
-- **Reverse index:** `entity_cell` is the source of truth for change detection
-  and removal, so both are O(1) — no scanning cells to find an entity.
-- Covers **every** actor (GlitchBot + BlackBot), on-screen or off — anything with
-  an `ActorObject`.
+- **Reverse index:** `info` is the source of truth for change detection and
+  removal (both O(1)) **and** the per-bot motion read API. The `cells` map only
+  mutates on a **tile change**; the kinematics value is refreshed in place every
+  frame (no allocation).
+- Covers **every** actor (on-screen or off) — anything with an `ActorObject`.
 
 | Method | Role |
 |--------|------|
 | `entities_in(tile) -> &[Entity]` | Everyone on `tile` (empty slice if none). |
 | `cell_of(entity) -> Option<IVec2>` | The tile an actor is recorded in. |
-| `set_cell(entity, tile) -> bool` | Record/move an actor; `true` on a real change. |
+| `kinematics_of(entity) -> Option<BotKinematics>` | An actor's position/heading/size. |
+| `resolve_blocker(world_subtile, exclude) -> Option<(Entity, BotKinematics)>` | The bot occupying a (collision) subtile. |
+| `update(entity, BotKinematics) -> bool` | Record/refresh an actor; `true` on a cell change. |
 | `remove(entity)` | Drop an actor (despawn / no longer an actor). |
 | `tracked_len()` / `is_empty()` | Count of tracked actors. |
+
+### Resolving a collision to the bot that caused it
+
+`resolve_blocker(world_subtile, exclude)` turns a blocked subtile (e.g. the
+coordinate in `ActorMovementError::BlockedByOccupancy`) into the **bot** standing
+there. It converts the subtile to its tile, scans that tile **plus its eight
+neighbours** (a footprint can spill one tile past the bot's main cell), and returns
+the nearest-centered candidate whose body can plausibly reach the subtile
+(`dist ≤ (radius + 1) subtiles`), skipping `exclude` (the querying bot). It is the
+basis of the [identity-aware bot-on-bot collision response](actor-brain.md#bot-on-bot-collision-response):
+the responder reads the resolved bot's `heading` to tell whether it struck that
+bot's front (head-on) or back (rear-ended it). Allocation-free — a fixed 3×3 scan
+picking the minimum-distance candidate.
 
 ## Maintenance
 
 [`track_cell_occupancy`] runs in **`Update`** (which executes after the frame's
-`FixedUpdate` movement ticks, so `center` reflects the completed step):
+`FixedUpdate` movement ticks, so `center` reflects the completed step and `heading`
+is the value the brain published this frame):
 
 1. drain [`RemovedComponents<ActorObject>`] → `remove` each despawned actor;
-2. for every live actor, compute `actor_main_tile(center)` and `set_cell`.
+2. for every live actor, build its [`BotKinematics`] (`actor_main_tile(center)` +
+   center/heading/radius) and `update`.
 
-`set_cell` mutates the map **only on a genuine cell change** (the new tile differs
-from the recorded one, or the actor is new). In steady state — no bot crossed a
-cell boundary — the system does pure hash lookups and **allocates nothing**; list
-growth happens only on an actual insert/move.
+`update` moves an entry between `cells` **only on a genuine tile change** (the new
+tile differs from the recorded one, or the actor is new); the kinematics value is
+refreshed in place every frame. In steady state the system does pure hash lookups
+and **allocates nothing**; list growth happens only on an actual insert/move.
 
 Gated on `GameState::InGame` only (not on pause): when paused nothing moves, so the
 map is stable, but the initial population still happens as soon as actors exist.

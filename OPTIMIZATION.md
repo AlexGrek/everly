@@ -613,6 +613,30 @@ Verified green: `cargo test -p everly` (252 passed, 0 failed, 2 ignored) and
 `cargo check -p everly --all-targets` warning-clean. Docs updated:
 `docs/movement.md`, `docs/actor.md`, `.claude/SKILLS/actor-engineer/SKILL.md`.
 
+### Identity-aware collision response — allocation-free kinematics index + blocker resolve (2026-06)
+
+New feature (the bot-on-bot collision response now reads *which* bot it hit and
+that bot's heading) designed against the rules, since it extends a per-frame system
+and adds a lookup on the collision path
+([`src/map/cell_occupancy.rs`](src/map/cell_occupancy.rs),
+[`src/actor/brain/low_level.rs`](src/actor/brain/low_level.rs), `docs/actor-brain.md`).
+
+- **Rule 4 (allocation-free steady state):** [`CellOccupancy`](src/map/cell_occupancy.rs)
+  gained a per-entity [`BotKinematics`] value (center / heading / radius), refreshed
+  **in place** every frame via `update` — the `cells` (tile→entities) map still only
+  mutates on a tile crossing, so steady state stays pure hash writes, no `Vec`
+  growth. `resolve_blocker` is a fixed **3×3 tile** scan that tracks the
+  minimum-distance candidate as it iterates (no intermediate collection), and runs
+  **only on a frame a bot is actually blocked** (cold path), not every tick.
+- **Low-level → brain signal without `&mut Brain` (rule 8 — semantics preserved):**
+  the rear-collision dynamic-reroute uses a one-shot
+  `LowLevelAction::take_dynamic_repath_request` consumed by `Brain::tick`, reusing
+  the existing `set_dynamic_repath` window — no new per-frame work, and the head-on
+  path is byte-identical to before (it is the `neighbors == None` / front fallback).
+
+Verified green: `cargo test -p everly` (305 passed, 0 failed, 2 ignored) and
+`cargo check --tests` warning-clean.
+
 ### Movement collapsed to one sequential pass — no arbitrate split, no jam teleport (2026-06)
 
 Now that propose is sequential, the propose/arbitrate two-system split bought
