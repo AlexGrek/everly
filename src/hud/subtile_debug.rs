@@ -1,13 +1,18 @@
 //! Selected-bot subtile passability debug view.
 //!
 //! When a bot is selected **and** the "Subtile map" debug toggle (inspector
-//! Debug tab) is on, this draws a small pixelated HUD image of the
-//! [`DynamicPassabilityMap`] read buffer for the **3×3 tiles** centered on the
-//! selected bot's tile — `3 × SUBTILE_COUNT = 15` texels per axis, one texel per
-//! subtile. It is the localized, bot-following counterpart to the full-chunk
-//! occupancy overlay (F4): instead of painting the whole world it shows exactly
-//! what the collision grid looks like immediately around one bot, so movement /
-//! collision behavior can be read at a glance.
+//! Debug tab) is on, this draws a small pixelated HUD image of the combined
+//! passability grid for the **3×3 tiles** centered on the selected bot's tile —
+//! `3 × SUBTILE_COUNT = 15` texels per axis, one texel per subtile. It is the
+//! localized, bot-following counterpart to the full-chunk occupancy overlay
+//! (F4): instead of painting the whole world it shows exactly what the collision
+//! grid looks like immediately around one bot, so movement / collision behavior
+//! can be read at a glance.
+//!
+//! Static geometry (walls, void, corners) and dynamic creature footprints live
+//! in **separate** maps — `HypermapRuntime.static_subtile_cache` and the
+//! [`DynamicPassabilityMap`] read buffer respectively — so this ORs both. Reading
+//! only the dynamic map would show bot bodies but never walls.
 //!
 //! ## Colors
 //!
@@ -23,6 +28,11 @@
 //! pixels when scaled up in the UI. It is written every frame while visible (225
 //! texels — trivially cheap) and hidden whenever the feature is off or no bot is
 //! selected.
+//!
+//! On top of the pixel grid, a white **ring at display resolution** marks the
+//! bot's *exact* float circle (`ActorState::center` and `radius_subtiles`), so
+//! the continuous position is visible against the discretized texels the grid
+//! quantizes it to. It is a UI `Node` (border + 50% radius), not a texel.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::ImageSampler;
@@ -32,9 +42,9 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
 use crate::actor::ActorObject;
 use crate::hud::actor_inspector::SelectedActor;
+use crate::map::hypermap_world::HypermapRuntime;
 use crate::map::passability::{
-    DynamicPassabilityMap, SubtilePassabilityMap, FLAG_BLOCKED, FLAG_CREATURE, FLAG_VOID,
-    SUBTILE_COUNT,
+    DynamicPassabilityMap, FLAG_BLOCKED, FLAG_CREATURE, FLAG_VOID, SUBTILE_COUNT,
 };
 use crate::menu::main_menu::GameState;
 use crate::scene::camera::StrategyCameraRig;
@@ -59,6 +69,9 @@ const COLOR_WALL: [u8; 4] = [220, 140, 55, 255];
 const COLOR_VOID: [u8; 4] = [55, 95, 215, 255];
 const COLOR_PASSABLE: [u8; 4] = [26, 28, 34, 235];
 
+/// Exact-position float circle drawn over the pixel grid (a UI ring, not a texel).
+const CIRCLE_COLOR: Color = Color::srgba(1.0, 1.0, 1.0, 0.95);
+
 /// Toggles the selected-bot subtile passability view. Flipped by the "Subtile
 /// map" button in the inspector Debug tab; read by [`update_subtile_debug`].
 #[derive(Resource, Default)]
@@ -71,6 +84,10 @@ struct SubtileDebugImage(Handle<Image>);
 /// Marks the docked debug panel root (whole subtree shows/hides with it).
 #[derive(Component)]
 struct SubtileDebugPanel;
+
+/// The exact-position float circle overlay; its `Node` rect is set each frame.
+#[derive(Component)]
+struct SubtileDebugCircle;
 
 pub struct SubtilePassabilityDebugPlugin;
 
@@ -143,15 +160,45 @@ fn setup_subtile_debug(
                 TextColor(LABEL),
             ));
             root.spawn((
-                ImageNode::new(image),
+                Pickable::IGNORE,
                 Node {
                     width: Val::Px(DISPLAY_PX),
                     height: Val::Px(DISPLAY_PX),
+                    position_type: PositionType::Relative,
+                    overflow: Overflow::clip(),
                     ..default()
                 },
-            ));
+            ))
+            .with_children(|frame| {
+                frame.spawn((
+                    Pickable::IGNORE,
+                    ImageNode::new(image),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Px(0.0),
+                        top: Val::Px(0.0),
+                        width: Val::Px(DISPLAY_PX),
+                        height: Val::Px(DISPLAY_PX),
+                        ..default()
+                    },
+                ));
+                // Bot's true float circle, drawn at display resolution on top of
+                // the discretized pixel grid. Rect is positioned each frame from
+                // `state.center` / `radius_subtiles` in `update_subtile_debug`.
+                frame.spawn((
+                    SubtileDebugCircle,
+                    Pickable::IGNORE,
+                    Node {
+                        position_type: PositionType::Absolute,
+                        border: UiRect::all(Val::Px(2.0)),
+                        border_radius: BorderRadius::all(Val::Percent(50.0)),
+                        ..default()
+                    },
+                    BorderColor::all(CIRCLE_COLOR),
+                ));
+            });
             root.spawn((
-                Text::new("green=here  red=bot  orange=wall  blue=void"),
+                Text::new("white=exact circle  green=cell  red=bot"),
                 TextFont::from_font_size(10.0),
                 TextColor(LEGEND),
             ));
@@ -178,10 +225,12 @@ fn update_subtile_debug(
     enabled: Res<SubtilePassabilityDebugEnabled>,
     selection: Res<SelectedActor>,
     dyn_pass: Res<DynamicPassabilityMap>,
+    runtime: Res<HypermapRuntime>,
     image_res: Res<SubtileDebugImage>,
     mut images: ResMut<Assets<Image>>,
     actors: Query<&ActorObject>,
     mut panel: Query<&mut Visibility, With<SubtileDebugPanel>>,
+    mut circle: Query<&mut Node, With<SubtileDebugCircle>>,
 ) {
     let Ok(mut vis) = panel.single_mut() else {
         return;
@@ -209,18 +258,23 @@ fn update_subtile_debug(
         return;
     };
 
-    let view = SubtilePassabilityMap::new(&dyn_pass);
     let res = GRID_SUBTILES;
     let sc = SUBTILE_COUNT;
+    let dynamic = dyn_pass.inner();
+    let static_cache = &runtime.static_subtile_cache;
     // Top-left texel maps to the (−1, −1) tile's (0, 0) subtile; +y is south
     // (down), matching the top-down camera so the panel reads north-up.
     for ty_off in 0..GRID_TILES {
         for tx_off in 0..GRID_TILES {
             let tile_x = center_tile.x + tx_off as i32 - 1;
             let tile_y = center_tile.y + ty_off as i32 - 1;
+            // Static geometry (walls / void / corners) and dynamic creature
+            // footprints live in separate maps — OR them so both show.
+            let static_tile = static_cache.get(tile_x, tile_y);
+            let dynamic_tile = dynamic.get(tile_x, tile_y);
             for sy in 0..sc {
                 for sx in 0..sc {
-                    let flags = view.flags_xy(tile_x, tile_y, sx as i32, sy as i32);
+                    let flags = static_tile.flags_at(sy, sx) | dynamic_tile.flags_at(sy, sx);
                     let px = tx_off * sc + sx;
                     let py = ty_off * sc + sy;
                     let idx = (py * res + px) * 4;
@@ -242,6 +296,20 @@ fn update_subtile_debug(
     if (0..res as i32).contains(&mpx) && (0..res as i32).contains(&mpy) {
         let idx = (mpy as usize * res + mpx as usize) * 4;
         data[idx..idx + 4].copy_from_slice(&COLOR_SELF);
+    }
+
+    // Overlay the bot's exact float circle at display resolution: real `center`
+    // and `radius_subtiles` mapped from subtile-space to panel pixels. This shows
+    // the continuous position the grid texels above can only approximate.
+    if let Ok(mut node) = circle.single_mut() {
+        let subtile_px = DISPLAY_PX / GRID_SUBTILES as f32;
+        let cx_px = (state.center.x * sc as f32 - origin_x as f32) * subtile_px;
+        let cy_px = (state.center.y * sc as f32 - origin_y as f32) * subtile_px;
+        let r_px = state.radius_subtiles.max(0) as f32 * subtile_px;
+        node.left = Val::Px(cx_px - r_px);
+        node.top = Val::Px(cy_px - r_px);
+        node.width = Val::Px(2.0 * r_px);
+        node.height = Val::Px(2.0 * r_px);
     }
 
     if *vis != Visibility::Inherited {

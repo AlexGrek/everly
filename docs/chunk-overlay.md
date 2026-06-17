@@ -182,10 +182,16 @@ re-upload a texture to the GPU when only the image asset changes.  Call
 
 A localized, bot-following sibling of the occupancy overlay. Instead of painting
 the whole world it draws a small **pixelated HUD image** (top-left) of the
-`DynamicPassabilityMap` **read buffer** for the **3×3 tiles** centered on the
-selected bot — `3 × SUBTILE_COUNT = 15` texels per axis, one texel per subtile,
-nearest-neighbor sampled so it reads as sharp pixels. Repainted every frame while
-visible (225 texels).
+combined passability grid for the **3×3 tiles** centered on the selected bot —
+`3 × SUBTILE_COUNT = 15` texels per axis, one texel per subtile, nearest-neighbor
+sampled so it reads as sharp pixels. Repainted every frame while visible (225
+texels).
+
+Static geometry and creature bodies live in **separate** maps, so the painter ORs
+both: `HypermapRuntime.static_subtile_cache` (walls / void / corners, built by
+`mirror_chunk_into_subtile_cache`) **and** the `DynamicPassabilityMap` read buffer
+(creature footprints). Reading only the dynamic map — as the F4 occupancy overlay
+does — shows bot bodies but **not** walls.
 
 | Texel | Colour |
 |---|---|
@@ -194,6 +200,11 @@ visible (225 texels).
 | `FLAG_BLOCKED` without creature (static wall/corner) | Orange |
 | `FLAG_VOID` | Blue |
 | passable | Dark gray |
+
+A white **ring** is drawn over the grid at display resolution (a UI `Node`, not a
+texel) at the bot's *exact* float position — `ActorState::center` and
+`radius_subtiles` mapped from subtile space to panel pixels — so the continuous
+circle is visible against the discretized texels it collides on.
 
 It reads the grid with [`SubtilePassabilityMap`](../src/map/passability.rs) and,
 being a UI `ImageNode` (not a `StandardMaterial`), needs **no** #20269 workaround —
