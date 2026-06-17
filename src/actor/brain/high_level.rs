@@ -12,7 +12,7 @@ use crate::rng::{self, StdRng};
 
 use crate::actor::black_bot::nearest_reachable_depot;
 use crate::actor::brain::memory::IntegerMemoryId;
-use crate::actor::dispatch::{RepairPart, RepairRequest};
+use crate::actor::dispatch::{RepairPart, RepairRequest, FIXER_TASK_COOLDOWN_S};
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap, HYPERMAP_CHUNK_SIZE};
 use crate::map::hypermap_pathfind::{manhattan, world_tile_walkable};
 use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
@@ -745,7 +745,9 @@ impl GoFixBots {
     /// the carried part persists until the next successful delivery overwrites it.
     fn abandon_claim(&mut self, fx: FixerContext, entity: Entity) {
         if self.claim.take().is_some() {
-            fx.dispatch.release(entity);
+            // Give-up: bar re-claim for a cooldown so the fixer doesn't immediately
+            // re-fetch a target it just failed to reach (depot pickup/drop churn).
+            fx.dispatch.release_with_cooldown(entity, FIXER_TASK_COOLDOWN_S);
         }
     }
 }

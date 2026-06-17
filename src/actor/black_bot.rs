@@ -35,6 +35,7 @@ use crate::actor::brain::{
 use crate::actor::charge::Charge;
 use crate::actor::dispatch::{
     spawn_inventory_marker, BotInventory, DispatchQueue, InventoryMarker, RepairPart,
+    FIXER_TASK_COOLDOWN_S,
 };
 use crate::actor::snapshot::{BreakablePartSnap, BreakableSnap};
 use crate::actor::{
@@ -1335,7 +1336,9 @@ fn track_black_bot_collision_pressure(
         if dispatch.claim_of(entity).is_some() {
             let failures = brain.bump_integer_memory(IntegerMemoryId::HelpFailuresCount, 1);
             if failures > 4 {
-                dispatch.release(entity);
+                // Give-up: cooldown the task so this fixer doesn't instantly
+                // re-claim it and churn pickup/drop at the depot.
+                dispatch.release_with_cooldown(entity, FIXER_TASK_COOLDOWN_S);
                 brain.set_integer_memory(IntegerMemoryId::HelpFailuresCount, 0);
             }
         }

@@ -93,6 +93,13 @@ impl RepairPart {
     }
 }
 
+/// Seconds a request stays **unclaimable** after a fixer gives it up, so the same
+/// (or another) loitering fixer can't instantly re-claim a task it just failed —
+/// the source of the "camp the depot, flicker pickup/drop" loop. After it elapses
+/// the request is retryable again (a transiently-blocked target gets another go; a
+/// permanently-unreachable one is retried only ~once per cooldown, not every tick).
+pub const FIXER_TASK_COOLDOWN_S: f32 = 6.0;
+
 /// One open repair request: a stranded bot wants `part` delivered to `location`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RepairRequest {
@@ -104,6 +111,11 @@ pub struct RepairRequest {
     pub location: IVec2,
     /// The fixer that claimed this request, if any.
     pub claimed_by: Option<Entity>,
+    /// Seconds remaining before this request may be claimed again. Set when a
+    /// fixer gives the task up ([`release_with_cooldown`](DispatchQueue::release_with_cooldown));
+    /// ticked down by [`tick_cooldowns`](DispatchQueue::tick_cooldowns). While
+    /// `> 0` the request is invisible to `claim_nearest` / `has_open_within`.
+    pub cooldown: f32,
 }
 
 /// Global board of open [`RepairRequest`]s. Interior-mutable so the sequential
@@ -127,6 +139,7 @@ impl DispatchQueue {
                 part,
                 location,
                 claimed_by: None,
+                cooldown: 0.0,
             });
         }
     }
@@ -137,14 +150,14 @@ impl DispatchQueue {
         q.iter().find(|r| r.claimed_by == Some(fixer)).copied()
     }
 
-    /// Claims the nearest **unclaimed** request to `from` (Manhattan), marking it
-    /// claimed by `fixer`, and returns it. `None` when nothing is open.
+    /// Claims the nearest **unclaimed, off-cooldown** request to `from` (Manhattan),
+    /// marking it claimed by `fixer`, and returns it. `None` when nothing is open.
     pub fn claim_nearest(&self, fixer: Entity, from: IVec2) -> Option<RepairRequest> {
         let mut q = self.inner.lock().expect("dispatch queue poisoned");
         let idx = q
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.claimed_by.is_none())
+            .filter(|(_, r)| r.claimed_by.is_none() && r.cooldown <= 0.0)
             .min_by_key(|(_, r)| {
                 (r.location.x - from.x).abs() + (r.location.y - from.y).abs()
             })
@@ -153,12 +166,14 @@ impl DispatchQueue {
         Some(q[idx])
     }
 
-    /// `true` when at least one unclaimed request lies within `radius` (Manhattan)
-    /// of `from`. Used by a loitering fixer to decide whether to bother claiming.
+    /// `true` when at least one unclaimed, off-cooldown request lies within `radius`
+    /// (Manhattan) of `from`. Used by a loitering fixer to decide whether to bother
+    /// claiming.
     pub fn has_open_within(&self, from: IVec2, radius: i32) -> bool {
         let q = self.inner.lock().expect("dispatch queue poisoned");
         q.iter().any(|r| {
             r.claimed_by.is_none()
+                && r.cooldown <= 0.0
                 && (r.location.x - from.x).abs() + (r.location.y - from.y).abs() <= radius
         })
     }
@@ -169,6 +184,33 @@ impl DispatchQueue {
         for req in q.iter_mut() {
             if req.claimed_by == Some(fixer) {
                 req.claimed_by = None;
+            }
+        }
+    }
+
+    /// Releases `fixer`'s claim **and** bars the request from being re-claimed for
+    /// `cooldown` seconds. Used when a fixer *gives a task up* (unreachable target,
+    /// or too many collision/stall resets) so it — or any loitering fixer — cannot
+    /// instantly re-claim it and churn pickup/drop at the depot. The plain
+    /// [`release`](Self::release) (offline gate) stays cooldown-free so another
+    /// fixer can cover an incapacitated one immediately.
+    pub fn release_with_cooldown(&self, fixer: Entity, cooldown: f32) {
+        let mut q = self.inner.lock().expect("dispatch queue poisoned");
+        for req in q.iter_mut() {
+            if req.claimed_by == Some(fixer) {
+                req.claimed_by = None;
+                req.cooldown = req.cooldown.max(cooldown);
+            }
+        }
+    }
+
+    /// Decrements every request's claim cooldown by `dt` (floored at 0). Run once
+    /// per frame from [`maintain_dispatch_queue`].
+    pub fn tick_cooldowns(&self, dt: f32) {
+        let mut q = self.inner.lock().expect("dispatch queue poisoned");
+        for req in q.iter_mut() {
+            if req.cooldown > 0.0 {
+                req.cooldown = (req.cooldown - dt).max(0.0);
             }
         }
     }
@@ -287,10 +329,13 @@ fn sync_inventory_markers(
 ///
 /// Runs `.before` the brain tick so loitering fixers see an up-to-date board.
 fn maintain_dispatch_queue(
+    time: Res<Time>,
     dispatch: Res<DispatchQueue>,
     bots: Query<(Entity, &ActorObject, Option<&Breakable>, Option<&Charge>), With<BlackBotVisual>>,
 ) {
     use std::collections::HashSet;
+    // Age out give-up cooldowns so failed tasks become retryable again.
+    dispatch.tick_cooldowns(time.delta_secs());
     let mut stranded_bots: HashSet<Entity> = HashSet::new();
     let mut alive: HashSet<Entity> = HashSet::new();
     for (entity, obj, breakable, charge) in &bots {
@@ -381,6 +426,37 @@ mod tests {
         assert!(q.claim_nearest(bot(51), IVec2::ZERO).is_none());
         q.release(bot(50));
         assert!(q.claim_nearest(bot(51), IVec2::ZERO).is_some(), "released back to pool");
+    }
+
+    #[test]
+    fn release_with_cooldown_bars_reclaim_until_ticked() {
+        let q = DispatchQueue::default();
+        q.post(bot(1), RepairPart::MovementEngine, IVec2::new(3, 3));
+        q.claim_nearest(bot(50), IVec2::ZERO).unwrap();
+        // Give up the task with a cooldown: it returns to the pool but stays
+        // unclaimable until the cooldown elapses.
+        q.release_with_cooldown(bot(50), 1.0);
+        assert!(q.claim_nearest(bot(51), IVec2::ZERO).is_none(), "still cooling down");
+        assert!(!q.has_open_within(IVec2::ZERO, 100), "cooled request is not 'open'");
+        // Not enough time yet.
+        q.tick_cooldowns(0.4);
+        assert!(q.claim_nearest(bot(51), IVec2::ZERO).is_none(), "cooldown not elapsed");
+        // Elapse it.
+        q.tick_cooldowns(0.7);
+        assert!(q.has_open_within(IVec2::ZERO, 100), "claimable again after cooldown");
+        assert!(q.claim_nearest(bot(51), IVec2::ZERO).is_some(), "re-claimable after cooldown");
+    }
+
+    #[test]
+    fn post_refresh_preserves_active_cooldown() {
+        // A stranded bot re-posts every frame; refreshing its request must not
+        // wipe an active give-up cooldown.
+        let q = DispatchQueue::default();
+        q.post(bot(1), RepairPart::MovementEngine, IVec2::new(3, 3));
+        q.claim_nearest(bot(50), IVec2::ZERO).unwrap();
+        q.release_with_cooldown(bot(50), 2.0);
+        q.post(bot(1), RepairPart::MovementEngine, IVec2::new(4, 4)); // re-post (moved? no, refresh)
+        assert!(q.claim_nearest(bot(51), IVec2::ZERO).is_none(), "cooldown survives re-post");
     }
 
     #[test]
