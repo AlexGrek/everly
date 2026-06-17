@@ -129,10 +129,27 @@ pub fn systems_rows(b: &Breakable) -> Vec<InspectRow> {
 /// Memory-tab rows: the bot's persistent memory slots (see `brain::memory`).
 /// Lists the named integer slots; extend as more storages gain functions.
 pub fn memory_rows(memory: &BotMemory) -> Vec<InspectRow> {
-    vec![InspectRow {
+    let mut rows = vec![InspectRow {
         label: "HELP_FAILURES_COUNT",
         value: memory.integer(IntegerMemoryId::HelpFailuresCount).to_string(),
-    }]
+    }];
+    if let Some(tasks) = memory.unreachable_fixer_tasks() {
+        let value = if tasks.points.is_empty() {
+            "(none)".to_string()
+        } else {
+            tasks
+                .points
+                .iter()
+                .map(|p| format!("({}, {})", p.x, p.y))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        rows.push(InspectRow {
+            label: "UNREACHABLE_FIXER_TASKS",
+            value,
+        });
+    }
+    rows
 }
 
 /// Inventory-tab rows: what the bot is currently carrying (fixer bots).

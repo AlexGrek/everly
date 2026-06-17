@@ -7,20 +7,24 @@
 //! [`HighLevelStatus::Done`] the brain drops it and re-plans next tick.
 
 use bevy::ecs::entity::Entity;
-use bevy::math::Vec2;
+use bevy::math::{IVec2, Vec2};
 use crate::rng::{self, StdRng};
 
 use crate::actor::black_bot::nearest_reachable_depot;
 use crate::actor::brain::memory::IntegerMemoryId;
 use crate::actor::dispatch::{RepairPart, RepairRequest, FIXER_TASK_COOLDOWN_S};
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap, HYPERMAP_CHUNK_SIZE};
-use crate::map::hypermap_pathfind::{manhattan, world_tile_walkable};
+use crate::map::hypermap_pathfind::{
+    astar_shortest_world_path, manhattan, world_tile_walkable, HypermapPathResult,
+    HypermapSearchLimits,
+};
 use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
 use crate::map::pathfind_service::{PathKind, PathOutcome, PathfindReason, RequestId};
 
 use super::low_level::{FollowPath, LowLevelAction, LowLevelKind, PendingPath, Wait};
 use super::priority::PriorityKind;
 use super::{BrainContext, BrainEffects, BrainLogEvent, FixerContext, PathfindAccess};
+use super::MAX_REMEMBER_UNREACHABLE_PER_TICK;
 
 /// Wander radius (tiles) for [`GoToRandomPoints`].
 const WANDER_RADIUS: f32 = 15.0;
@@ -746,6 +750,82 @@ impl GoFixBots {
             fx.dispatch.release_with_cooldown(entity, FIXER_TASK_COOLDOWN_S);
         }
     }
+
+    fn push_remember_unreachable(effects: &mut BrainEffects, location: IVec2) {
+        let n = effects.remember_unreachable_len as usize;
+        if n < MAX_REMEMBER_UNREACHABLE_PER_TICK {
+            effects.remember_unreachable[n] = location;
+            effects.remember_unreachable_len += 1;
+        }
+    }
+
+    fn stranded_bot_ignored(fx: FixerContext, location: IVec2) -> bool {
+        fx.ignored_unreachable.contains(&location)
+    }
+
+    fn fixer_can_reach_stranded(ctx: &BrainContext, goal: IVec2) -> bool {
+        let start = (ctx.main_tile.x, ctx.main_tile.y);
+        let goal = (goal.x, goal.y);
+        matches!(
+            astar_shortest_world_path(
+                ctx.passability,
+                start,
+                goal,
+                HypermapSearchLimits {
+                    max_expanded: WANDER_SEARCH_LIMIT,
+                },
+            ),
+            HypermapPathResult::Found { .. }
+        )
+    }
+
+    /// Picks a random open task the fixer has not blacklisted and can path to.
+    /// Unreachable candidates are remembered and left unclaimed for other fixers.
+    fn try_claim_reachable_task(
+        &mut self,
+        pf: PathfindAccess,
+        fx: FixerContext,
+        ctx: &BrainContext,
+        low: &mut Box<dyn LowLevelAction>,
+        rng: &mut StdRng,
+        home_tile: (i32, i32),
+    ) -> Option<HighLevelOutcome> {
+        let mut candidates: Vec<RepairRequest> = fx
+            .dispatch
+            .open_requests()
+            .into_iter()
+            .filter(|req| !Self::stranded_bot_ignored(fx, req.location))
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let mut effects = BrainEffects::default();
+        let mut logged_unreachable = false;
+        while !candidates.is_empty() {
+            let pick = rng::range(rng, 0..candidates.len());
+            let req = candidates.swap_remove(pick);
+            if Self::fixer_can_reach_stranded(ctx, req.location) {
+                let claimed = fx.dispatch.claim_bot(ctx.entity, req.broken_bot)?;
+                self.claim = Some(claimed);
+                self.phase = FixPhase::FetchPart;
+                self.leg = None;
+                low.halt();
+                self.start_route(pf, ctx, low, home_tile, PathfindReason::FixerFetchPart);
+                effects.integer_memory_write = Some((IntegerMemoryId::HelpFailuresCount, 0));
+                return Some(HighLevelOutcome::running_with(effects));
+            }
+            Self::push_remember_unreachable(&mut effects, req.location);
+            if !logged_unreachable {
+                effects.log = Some(BrainLogEvent::FixerTargetUnreachable {
+                    target: (req.location.x, req.location.y),
+                });
+                logged_unreachable = true;
+            }
+        }
+
+        Some(HighLevelOutcome::running_with(effects))
+    }
 }
 
 impl Default for GoFixBots {
@@ -887,17 +967,10 @@ impl GoFixBots {
 
         // Watch the dispatch queue only while near the home depot.
         if manhattan(here, home_tile) as i32 <= FIXER_LOITER_RADIUS {
-            if let Some(req) = fx.dispatch.claim_random(ctx.entity, rng) {
-                self.claim = Some(req);
-                self.phase = FixPhase::FetchPart;
-                self.leg = None;
-                low.halt();
-                self.start_route(pf, ctx, low, home_tile, PathfindReason::FixerFetchPart);
-                // Fresh task: clear the per-task help-failure counter.
-                return HighLevelOutcome::running_with(BrainEffects {
-                    integer_memory_write: Some((IntegerMemoryId::HelpFailuresCount, 0)),
-                    ..BrainEffects::default()
-                });
+            if let Some(outcome) =
+                self.try_claim_reachable_task(pf, fx, ctx, low, rng, home_tile)
+            {
+                return outcome;
             }
         }
 
@@ -1052,10 +1125,12 @@ impl GoFixBots {
                     self.phase = FixPhase::ReturnHome;
                     self.leg = None;
                     self.start_route(pf, ctx, low, home_tile, PathfindReason::FixerReturnHome);
-                    return HighLevelOutcome::running_with(BrainEffects {
+                    let mut effects = BrainEffects {
                         log: Some(BrainLogEvent::FixerTargetUnreachable { target }),
                         ..BrainEffects::default()
-                    });
+                    };
+                    Self::push_remember_unreachable(&mut effects, req.location);
+                    return HighLevelOutcome::running_with(effects);
                 }
             }
         }
@@ -1729,6 +1804,7 @@ fn short_wait_recheck_s(rng: &mut StdRng) -> f32 {
 mod tests {
     use super::*;
     use crate::actor::brain::low_level::{FollowTuning, Idle};
+    use crate::actor::brain::memory::BotMemory;
     use crate::map::interactive_entity::{ChargerEntity, InteractiveEntity};
     use crate::map::pathfind_service::{PathfindQueue, PathfindResults};
     use crate::map::world_map::ChargerFacing;
@@ -2512,7 +2588,12 @@ mod tests {
         carried: Option<RepairPart>,
     ) -> BrainContext<'a> {
         let mut c = ctx(passability, interactive, 1.0, tile, pf, None);
-        c.fixer = Some(FixerContext { dispatch, home_depot: home, carried });
+        c.fixer = Some(FixerContext {
+            dispatch,
+            home_depot: home,
+            carried,
+            ignored_unreachable: &[],
+        });
         c
     }
 
@@ -2688,6 +2769,77 @@ mod tests {
         );
         assert!(out.effects.clear_inventory, "carried battery is consumed");
         assert!(dispatch.is_empty(), "completed request leaves the board");
+    }
+
+    #[test]
+    fn fixer_skips_unreachable_task_at_claim_and_remembers_location() {
+        let passability: Hypermap<f32> = Hypermap::new(0.0);
+        for x in 0..=5 {
+            passability.set(x, 0, 1.0);
+        }
+        // Wall blocks the far side from (0,0).
+        passability.set(6, 0, 0.0);
+
+        let interactive = InteractiveEntityMap::new();
+        let dispatch = DispatchQueue::default();
+        let broken = Entity::from_bits(0xB0B);
+        dispatch.post(broken, RepairPart::MovementEngine, IVec2::new(6, 0));
+
+        let mut memory = BotMemory::default();
+        let pf = PathfindFixture::new();
+        let mut action = GoFixBots::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = rng::seeded(21);
+        let home = EntityCoordinates::ground(0, 0);
+
+        let mut c = fixer_ctx(
+            &passability,
+            &interactive,
+            (0, 0),
+            pf.access(),
+            &dispatch,
+            Some(home),
+            None,
+        );
+        c.fixer = Some(FixerContext {
+            dispatch: &dispatch,
+            home_depot: Some(home),
+            carried: None,
+            ignored_unreachable: &[],
+        });
+
+        let out = action.update(&c, &mut low, &mut rng);
+        assert!(dispatch.claim_of(Entity::PLACEHOLDER).is_none(), "must not claim unreachable task");
+        assert_eq!(out.effects.remember_unreachable_len, 1);
+        assert_eq!(out.effects.remember_unreachable[0], IVec2::new(6, 0));
+        assert_eq!(
+            out.effects.log,
+            Some(BrainLogEvent::FixerTargetUnreachable { target: (6, 0) })
+        );
+
+        memory.remember_unreachable_fixer_task(out.effects.remember_unreachable[0]);
+        let ignored = memory
+            .unreachable_fixer_tasks()
+            .map(|tasks| tasks.points.as_slice())
+            .unwrap_or(&[]);
+        let mut c2 = fixer_ctx(
+            &passability,
+            &interactive,
+            (0, 0),
+            pf.access(),
+            &dispatch,
+            Some(home),
+            None,
+        );
+        c2.fixer = Some(FixerContext {
+            dispatch: &dispatch,
+            home_depot: Some(home),
+            carried: None,
+            ignored_unreachable: ignored,
+        });
+        let out2 = action.update(&c2, &mut low, &mut rng);
+        assert!(out2.effects.remember_unreachable_len == 0, "blacklisted task is not retried");
+        assert!(dispatch.claim_of(Entity::PLACEHOLDER).is_none());
     }
 
     #[test]

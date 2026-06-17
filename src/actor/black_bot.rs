@@ -785,10 +785,15 @@ pub(crate) fn black_bot_brain(
         let patrol_loop = patrol.as_deref().map(|p| p.loop_tiles.as_slice());
 
         // Fixer-only context: shared dispatch board + home depot + carried part.
+        let ignored_unreachable: Vec<IVec2> = brain
+            .unreachable_fixer_tasks()
+            .map(|tasks| tasks.points.clone())
+            .unwrap_or_default();
         let fixer_ctx = fixer.as_deref().map(|f| FixerContext {
             dispatch: &dispatch,
             home_depot: f.home_depot,
             carried: inventory.as_deref().and_then(|inv| inv.carried),
+            ignored_unreachable: &ignored_unreachable,
         });
 
         let charge_level = charge.as_ref().map(|c| c.level).unwrap_or(1.0);
@@ -850,6 +855,9 @@ pub(crate) fn black_bot_brain(
         // clearing HELP_FAILURES_COUNT on a fresh claim / successful delivery).
         if let Some((id, value)) = effects.integer_memory_write {
             brain.set_integer_memory(id, value);
+        }
+        for i in 0..effects.remember_unreachable_len as usize {
+            brain.remember_unreachable_fixer_task(effects.remember_unreachable[i]);
         }
         // A delivered repair / recharge targets a *different* bot; collect for
         // the 2nd pass.

@@ -186,6 +186,25 @@ impl DispatchQueue {
         Some(q[idx])
     }
 
+    /// Every **unclaimed, off-cooldown** request currently on the board.
+    pub fn open_requests(&self) -> Vec<RepairRequest> {
+        let q = self.inner.lock().expect("dispatch queue poisoned");
+        q.iter()
+            .filter(|r| r.claimed_by.is_none() && r.cooldown <= 0.0)
+            .copied()
+            .collect()
+    }
+
+    /// Claims the open request for `broken_bot`, if any.
+    pub fn claim_bot(&self, fixer: Entity, broken_bot: Entity) -> Option<RepairRequest> {
+        let mut q = self.inner.lock().expect("dispatch queue poisoned");
+        let idx = q.iter().position(|r| {
+            r.broken_bot == broken_bot && r.claimed_by.is_none() && r.cooldown <= 0.0
+        })?;
+        q[idx].claimed_by = Some(fixer);
+        Some(q[idx])
+    }
+
     /// `true` when at least one unclaimed, off-cooldown request lies within `radius`
     /// (Manhattan) of `from`. Used by a loitering fixer to decide whether to bother
     /// claiming.

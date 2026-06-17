@@ -17,15 +17,37 @@
 //! [`HelpFailuresCount`](IntegerMemoryId::HelpFailuresCount) keeps accumulating
 //! across the very resets it is meant to count.
 
+use std::any::Any;
+
 use bevy::math::IVec2;
 
 /// Number of addressable slots per storage (one byte of address space).
 pub const MEMORY_SLOTS: usize = 256;
 
 /// Marker trait for values stored in [`FreeformMemory`](BotMemory::freeform).
-/// Consumers downcast (via [`std::any::Any`]-style patterns) as needed; the trait
-/// itself only guarantees the record is thread-safe and inspectable.
-pub trait MemoryRecord: Send + Sync + std::fmt::Debug {}
+/// Consumers downcast through [`Any`] as needed; the trait itself only guarantees
+/// the record is thread-safe and inspectable.
+pub trait MemoryRecord: Send + Sync + std::fmt::Debug + Any {}
+
+/// Stranded-bot tiles this fixer has proved unreachable and must not claim again.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UnreachableFixerTasks {
+    pub points: Vec<IVec2>,
+}
+
+impl UnreachableFixerTasks {
+    pub fn contains(&self, location: IVec2) -> bool {
+        self.points.contains(&location)
+    }
+
+    pub fn remember(&mut self, location: IVec2) {
+        if !self.contains(location) {
+            self.points.push(location);
+        }
+    }
+}
+
+impl MemoryRecord for UnreachableFixerTasks {}
 
 /// Named slots in [`IntegerMemory`](BotMemory::integer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,9 +69,13 @@ pub enum FloatMemoryId {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoordinatesMemoryId {}
 
-/// Named slots in [`FreeformMemory`](BotMemory::freeform). Reserved.
+/// Named slots in [`FreeformMemory`](BotMemory::freeform).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FreeformMemoryId {}
+#[repr(u8)]
+pub enum FreeformMemoryId {
+    /// [`UnreachableFixerTasks`] — stranded-bot tiles this fixer must not re-claim.
+    UnreachableFixerTasks = 0,
+}
 
 /// A bot's four memory storages. Addressed by the per-storage ID enums; the byte
 /// value of an ID is its slot index.
@@ -120,6 +146,29 @@ impl BotMemory {
     pub fn set_freeform(&mut self, id: FreeformMemoryId, value: Option<Box<dyn MemoryRecord>>) {
         self.freeform[id as u8 as usize] = value;
     }
+
+    pub fn freeform_mut(&mut self, id: FreeformMemoryId) -> Option<&mut dyn MemoryRecord> {
+        self.freeform[id as u8 as usize].as_deref_mut()
+    }
+
+    pub fn unreachable_fixer_tasks(&self) -> Option<&UnreachableFixerTasks> {
+        self.freeform(FreeformMemoryId::UnreachableFixerTasks)
+            .and_then(|record| (record as &dyn Any).downcast_ref())
+    }
+
+    pub fn remember_unreachable_fixer_task(&mut self, location: IVec2) {
+        let id = FreeformMemoryId::UnreachableFixerTasks;
+        if self.unreachable_fixer_tasks().is_none() {
+            self.set_freeform(id, Some(Box::new(UnreachableFixerTasks::default())));
+        }
+        let Some(record) = self.freeform_mut(id) else {
+            return;
+        };
+        let tasks = (record as &mut dyn Any)
+            .downcast_mut::<UnreachableFixerTasks>()
+            .expect("UnreachableFixerTasks slot");
+        tasks.remember(location);
+    }
 }
 
 #[cfg(test)]
@@ -154,16 +203,22 @@ mod tests {
 
     #[test]
     fn freeform_stores_and_returns_record() {
-        // Slot 0 stands in for a future FreeformMemoryId; addressed by raw index
-        // through the public API once a variant exists. Here we exercise the
-        // storage mechanics with an explicit transmute-free path: write via the
-        // array's Default (None) then a Box, read it back.
         let mut mem = BotMemory::default();
-        // No FreeformMemoryId variant yet, so drive the array directly through a
-        // helper that mirrors set/get semantics for slot 0.
-        mem.freeform[0] = Some(Box::new(TestRecord(42)));
-        let got = mem.freeform[0].as_deref();
+        mem.set_freeform(FreeformMemoryId::UnreachableFixerTasks, Some(Box::new(TestRecord(42))));
+        let got = mem.freeform(FreeformMemoryId::UnreachableFixerTasks);
         assert!(got.is_some());
         assert_eq!(format!("{:?}", got.unwrap()), "TestRecord(42)");
+    }
+
+    #[test]
+    fn unreachable_fixer_tasks_remembers_unique_points() {
+        let mut mem = BotMemory::default();
+        mem.remember_unreachable_fixer_task(IVec2::new(3, 4));
+        mem.remember_unreachable_fixer_task(IVec2::new(3, 4));
+        mem.remember_unreachable_fixer_task(IVec2::new(5, 6));
+        let tasks = mem
+            .unreachable_fixer_tasks()
+            .expect("slot created on first remember");
+        assert_eq!(tasks.points, vec![IVec2::new(3, 4), IVec2::new(5, 6)]);
     }
 }

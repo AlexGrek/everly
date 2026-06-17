@@ -45,6 +45,7 @@ pub use high_level::{
 pub use low_level::{FollowPath, FollowTuning, Idle, LowLevelAction, LowLevelKind, PendingPath, Wait};
 pub use memory::{
     BotMemory, CoordinatesMemoryId, FloatMemoryId, FreeformMemoryId, IntegerMemoryId, MemoryRecord,
+    UnreachableFixerTasks,
 };
 pub use path::PathNode;
 pub use priority::{Priorities, Priority, PriorityKind};
@@ -86,6 +87,8 @@ pub struct FixerContext<'a> {
     pub home_depot: Option<EntityCoordinates>,
     /// The part the fixer is currently carrying, if any.
     pub carried: Option<RepairPart>,
+    /// Stranded-bot tiles this fixer has proved unreachable and must not re-claim.
+    pub ignored_unreachable: &'a [IVec2],
 }
 
 /// Read-only snapshot of every bot property a behavior / high-level action may
@@ -168,6 +171,9 @@ pub enum BrainLogEvent {
     FixerTargetUnreachable { target: (i32, i32) },
 }
 
+/// Max stranded-bot locations a fixer can remember as unreachable in one tick.
+pub const MAX_REMEMBER_UNREACHABLE_PER_TICK: usize = 8;
+
 /// Side effects a high-level action requests, applied by the owning ECS system
 /// after the tick. Fixed-size — the tick never allocates to report effects.
 #[derive(Debug, Default, Clone, Copy)]
@@ -202,6 +208,10 @@ pub struct BrainEffects {
     pub integer_memory_write: Option<(IntegerMemoryId, i64)>,
     /// Optional in-game log line for this tick.
     pub log: Option<BrainLogEvent>,
+    /// Stranded-bot tiles to append to this fixer's
+    /// [`UnreachableFixerTasks`](UnreachableFixerTasks) memory record.
+    pub remember_unreachable_len: u8,
+    pub remember_unreachable: [IVec2; MAX_REMEMBER_UNREACHABLE_PER_TICK],
     /// Re-assert that this bot is still actively pursuing a station's queue this
     /// tick (liveness keepalive read by [`InteractiveEntityMap::refresh_queue`]).
     /// Set every tick by an action that holds a queue slot; a despawned or
@@ -249,6 +259,13 @@ fn merge_brain_effects(into: &mut BrainEffects, add: BrainEffects) {
     }
     if let Some(v) = add.log {
         into.log = Some(v);
+    }
+    for i in 0..add.remember_unreachable_len as usize {
+        if (into.remember_unreachable_len as usize) < MAX_REMEMBER_UNREACHABLE_PER_TICK {
+            into.remember_unreachable[into.remember_unreachable_len as usize] =
+                add.remember_unreachable[i];
+            into.remember_unreachable_len += 1;
+        }
     }
     if let Some(v) = add.queue_keepalive {
         into.queue_keepalive = Some(v);
@@ -321,6 +338,14 @@ impl Brain {
     /// Adds `delta` to an integer slot and returns the new value.
     pub fn bump_integer_memory(&mut self, id: IntegerMemoryId, delta: i64) -> i64 {
         self.memory.bump_integer(id, delta)
+    }
+
+    pub fn unreachable_fixer_tasks(&self) -> Option<&UnreachableFixerTasks> {
+        self.memory.unreachable_fixer_tasks()
+    }
+
+    pub fn remember_unreachable_fixer_task(&mut self, location: IVec2) {
+        self.memory.remember_unreachable_fixer_task(location);
     }
 
     pub fn rng_seed(&self) -> u64 {
