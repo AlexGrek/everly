@@ -173,3 +173,34 @@ When enabled the generic planes appear and the painter runs (gated like occupanc
 `MeshMaterial3d` does not listen for `AssetEvent<Image>` and will not
 re-upload a texture to the GPU when only the image asset changes.  Call
 `materials.get_mut(mat_handle)` after each image write.
+
+---
+
+## Selected-bot subtile passability HUD
+
+`src/hud/subtile_debug.rs` — `SubtilePassabilityDebugPlugin`
+
+A localized, bot-following sibling of the occupancy overlay. Instead of painting
+the whole world it draws a small **pixelated HUD image** (top-left) of the
+`DynamicPassabilityMap` **read buffer** for the **3×3 tiles** centered on the
+selected bot — `3 × SUBTILE_COUNT = 15` texels per axis, one texel per subtile,
+nearest-neighbor sampled so it reads as sharp pixels. Repainted every frame while
+visible (225 texels).
+
+| Texel | Colour |
+|---|---|
+| Selected bot's own center subtile | Green |
+| `FLAG_CREATURE` (a bot body) | Red |
+| `FLAG_BLOCKED` without creature (static wall/corner) | Orange |
+| `FLAG_VOID` | Blue |
+| passable | Dark gray |
+
+It reads the grid with [`SubtilePassabilityMap`](../src/map/passability.rs) and,
+being a UI `ImageNode` (not a `StandardMaterial`), needs **no** #20269 workaround —
+mutating the `Image` asset re-uploads on its own.
+
+### Toggle
+
+Select a bot, open the inspector's **Debug** tab, and press **"Subtile map"**.
+Off by default; the global toggle is `SubtilePassabilityDebugEnabled`. The panel
+hides whenever the feature is off or no bot is selected.

@@ -24,6 +24,7 @@ use crate::actor::inspect::{
 };
 use crate::actor::ActorObject;
 use crate::edit::actor_spawn::{ActorSpawnState, ActorTool};
+use crate::hud::subtile_debug::SubtilePassabilityDebugEnabled;
 use crate::menu::main_menu::GameState;
 use crate::scene::camera::StrategyCameraRig;
 
@@ -134,6 +135,9 @@ struct BlackBotResetButton;
 struct ActorForceLogsToggleButton;
 
 #[derive(Component)]
+struct SubtileDebugToggleButton;
+
+#[derive(Component)]
 struct ActorDeleteButton;
 
 /// Marker on each tab button; carries which tab it activates.
@@ -175,6 +179,7 @@ impl Plugin for ActorInspectorPlugin {
                     sync_tab_button_visuals,
                     black_bot_reset_button,
                     actor_force_logs_toggle_button,
+                    subtile_debug_toggle_button,
                     actor_delete_button,
                 )
                     .run_if(in_state(GameState::InGame)),
@@ -782,6 +787,62 @@ fn actor_force_logs_toggle_button(
     }
 }
 
+fn spawn_subtile_debug_toggle_button(parent: &mut ChildSpawnerCommands, enabled: bool) {
+    let label = if enabled {
+        "Subtile map: ON"
+    } else {
+        "Subtile map: OFF"
+    };
+    parent
+        .spawn((
+            Name::new("Subtile passability debug toggle"),
+            ActorInspectorActionBtn,
+            SubtileDebugToggleButton,
+            Pickable::default(),
+            Button,
+            Node {
+                min_width: Val::Px(130.0),
+                height: Val::Px(32.0),
+                padding: UiRect::horizontal(Val::Px(14.0)),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(6.0)),
+                ..default()
+            },
+            BorderColor::all(if enabled { ACCENT } else { CARD_BORDER }),
+            BackgroundColor(if enabled {
+                Color::srgba(0.12, 0.18, 0.28, 0.95)
+            } else {
+                Color::srgba(0.14, 0.16, 0.22, 0.9)
+            }),
+        ))
+        .with_children(|btn| {
+            btn.spawn((
+                Text::new(label),
+                TextFont::from_font_size(14.0),
+                TextColor(if enabled { ACCENT } else { TEXT_BRIGHT }),
+            ));
+        });
+}
+
+/// Flips the global [`SubtilePassabilityDebugEnabled`] toggle (drives the
+/// bottom-left selected-bot passability panel) and rebuilds the Debug tab so the
+/// button label updates.
+fn subtile_debug_toggle_button(
+    interactions: Query<&Interaction, (With<SubtileDebugToggleButton>, Changed<Interaction>)>,
+    mut selection: ResMut<SelectedActor>,
+    mut enabled: ResMut<SubtilePassabilityDebugEnabled>,
+) {
+    for interaction in &interactions {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        enabled.0 = !enabled.0;
+        selection.content_stamp = selection.content_stamp.wrapping_add(1);
+    }
+}
+
 fn black_bot_reset_button(
     interactions: Query<&Interaction, (With<BlackBotResetButton>, Changed<Interaction>)>,
     mut selection: ResMut<SelectedActor>,
@@ -884,8 +945,13 @@ fn sync_actor_inspector_panel(
     existing_actions: Query<Entity, With<ActorInspectorActionBtn>>,
     actor_data: Query<(&ActorObject, Option<&Name>), With<ActorInspectable>>,
     black: Query<(&Brain, &BlackBotVisual, Option<&BotSpecialization>)>,
-    actor_extras: Query<(Option<&Charge>, Option<&Breakable>, Option<&BotInventory>)>,
-    force_logs: Query<&ActorForceLogs>,
+    actor_extras: Query<(
+        Option<&Charge>,
+        Option<&Breakable>,
+        Option<&BotInventory>,
+        Option<&ActorForceLogs>,
+    )>,
+    subtile_debug: Res<SubtilePassabilityDebugEnabled>,
     mut state: Local<PanelBuildState>,
 ) {
     let Ok(mut panel_vis) = panel.single_mut() else {
@@ -925,13 +991,11 @@ fn sync_actor_inspector_panel(
         return;
     };
 
-    let (charge, breakable, inventory) = actor_extras
+    let (charge, breakable, inventory, force_logs_on) = actor_extras
         .get(actor)
-        .map(|(c, b, i)| (c.map(|c| c.level), b, i))
-        .unwrap_or((None, None, None));
+        .map(|(c, b, i, f)| (c.map(|c| c.level), b, i, f.map(|f| f.0).unwrap_or(false)))
+        .unwrap_or((None, None, None, false));
     let is_black_bot = black.get(actor).is_ok();
-
-    let force_logs_on = force_logs.get(actor).map(|f| f.0).unwrap_or(false);
 
     let kind_label;
     let rows;
@@ -997,8 +1061,10 @@ fn sync_actor_inspector_panel(
         .with_children(spawn_actor_delete_button);
 
     if *tab == InspectorTab::Debug {
+        let subtile_on = subtile_debug.0;
         commands.entity(host).with_children(|parent| {
             spawn_force_logs_toggle_button(parent, force_logs_on);
+            spawn_subtile_debug_toggle_button(parent, subtile_on);
         });
     }
 

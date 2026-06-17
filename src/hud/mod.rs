@@ -6,3 +6,4 @@ pub mod game_log;
 pub mod overlays;
 pub mod panel_anim;
 pub mod perf_timings;
+pub mod subtile_debug;
