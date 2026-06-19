@@ -1,12 +1,7 @@
 //! Step 11: lamp decorations per house.
 //!
-//! Inner sconces (`Lamp`): placed on wall cells with a facing bit whose
-//! adjacent cell is passable interior.  Each house gets its own dedicated
-//! inner-lamp budget (`MIN_INNER_LAMPS`–`MAX_INNER_LAMPS`).
-//!
-//! Outer sconces (`LampOuter`): placed on road cells just outside the house
-//! adjacent to an outward-facing wall slab.  Separate, smaller budget per
-//! house (`MIN_OUTER_LAMPS`–`MAX_OUTER_LAMPS`).
+//! Each house rolls **2–5** wall/road sconces total (at least one inner when possible).
+//! Inner [`Lamp`] sites are tried first; outer [`LampOuter`] sites fill any remainder.
 
 use std::collections::HashSet;
 
@@ -17,11 +12,8 @@ use crate::map::world_map::{
     LampDecoration, LampFacing, MASK_EAST, MASK_NORTH, MASK_SOUTH, MASK_WEST,
 };
 
-const MIN_INNER_LAMPS: i32 = 5;
-const MAX_INNER_LAMPS: i32 = 12;
-
-const MIN_OUTER_LAMPS: i32 = 0;
-const MAX_OUTER_LAMPS: i32 = 3;
+const MIN_LAMPS_PER_HOUSE: i32 = 2;
+const MAX_LAMPS_PER_HOUSE: i32 = 5;
 
 /// (dx, dz, mask_bit, LampFacing) — direction of movement, slab bitmask for
 /// an inner wall in that direction, and the facing value stored on the lamp.
@@ -47,32 +39,31 @@ fn slab_bit_toward_road(dx: i32, dz: i32) -> u8 {
 impl MapDraft {
     pub fn step_place_lamps(&mut self) {
         for index in 0..self.houses.len() {
-            self.place_inner_lamps(index);
-            self.place_outer_lamps(index);
+            self.place_lamps_for_house(index);
         }
     }
 
-    fn place_inner_lamps(&mut self, house_index: usize) {
-        let count = rng::range(&mut self.rng, MIN_INNER_LAMPS..=MAX_INNER_LAMPS);
+    fn place_lamps_for_house(&mut self, house_index: usize) {
+        let target = rng::range(&mut self.rng, MIN_LAMPS_PER_HOUSE..=MAX_LAMPS_PER_HOUSE);
         let mut used: HashSet<(i32, i32)> = HashSet::new();
-        for _ in 0..count {
+        let mut placed = 0i32;
+
+        while placed < target {
             let Some((x, z, decoration)) = self.pick_inner_lamp(house_index, &used) else {
                 break;
             };
             self.set_lamp(x, z, decoration);
             used.insert((x, z));
+            placed += 1;
         }
-    }
 
-    fn place_outer_lamps(&mut self, house_index: usize) {
-        let count = rng::range(&mut self.rng, MIN_OUTER_LAMPS..=MAX_OUTER_LAMPS);
-        let mut used: HashSet<(i32, i32)> = HashSet::new();
-        for _ in 0..count {
+        while placed < target {
             let Some((x, z, decoration)) = self.pick_outer_lamp(house_index, &used) else {
                 break;
             };
             self.set_lamp(x, z, decoration);
             used.insert((x, z));
+            placed += 1;
         }
     }
 

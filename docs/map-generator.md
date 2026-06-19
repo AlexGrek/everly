@@ -25,8 +25,9 @@ Generation runs on a [`MapDraft`](../../src/map/map_generator/draft.rs) grid (`D
 8. **Inner doors (2-wide)** — [`step_place_inner_doors`](../../src/map/map_generator/step_inner_doors.rs) opens one slab edge at a time until every walkable cell of the house is reachable from the entry. Connectivity is **edge-based**: a `Wall(bits)` cell is walkable floor with slabs on the named edges (not a solid blocker), so passage between two in-house cells is blocked only when a slab sits on their shared edge. It floods the accessible region from the entry interior tile, then clears the slab bits on a random blocked edge bordering a not-yet-reachable in-house cell; after each cut it also widens the opening by clearing the parallel adjacent edge one step along the wall run (when both neighbour cells are in-house and that edge is blocked). This keeps inner doors 2 tiles wide wherever geometry allows. Repeats until the house is one connected region. Only interior edges (both cells in-house) are opened, so the outer shell is never breached.
 9. **Home crawlers** — **marble** (`fm`) BFS wave from the main entry (Manhattan radius 3–5, rng) on all houses. **Glass** (`fg`) center wave only when footprint area ≥ 30 cells ([`grid_fill::count_region_area`](../../src/map/map_generator/grid_fill.rs) at cluster time). Walls, corners, and doors are unchanged for small houses.
 10. **Charging stations** — [`step_place_charging_stations`](../../src/map/map_generator/step_charging_stations.rs) places **1–3** `Charger` tiles per house (uniform random count): each is a walkable interior `Open` cell with **exactly one** orthogonal wall neighbor (back to wall, not a corner), excluding reserved cells around **both** outer doors when present. The lone wall side becomes [`ChargerFacing`](../../src/map/world_map.rs). Runs **last** (after crawlers); chargers stay passable. Houses with fewer qualifying cells get as many as fit.
-11. **Lamp decorations** — [`step_place_lamps`](../../src/map/map_generator/step_place_lamps.rs) places **3–7** lamps per house drawn from two candidate pools: **inner sconces** (`Lamp`) on wall cells where an adjacent cell is interior road/charger; **outer sconces** (`LampOuter`) on road cells just outside the house adjacent to an outward-facing wall slab. Stored in the [`decoration_lamp_map`](../../src/map/hypermap_world.rs) (separate from geometry). Rendered as a small glowing cube (`WALL_THICKNESS³`) at `LAMP_WALL_HEIGHT` (2.0 m), plus a static warm-white point light (no shadows). See `docs/tilemap.md` for token encoding. Saved to `levels/level_{name}/decoration_lamp/{x}_{y}.txt`.
+11. **Lamp decorations** — [`step_place_lamps`](../../src/map/map_generator/step_place_lamps.rs) places **2–5** sconces per house (inner wall [`Lamp`] first, then outer [`LampOuter`] on adjacent road). Stored in the [`decoration_lamp_map`](../../src/map/hypermap_world.rs) (separate from geometry). Rendered as a small glowing cube (`WALL_THICKNESS³`) at `LAMP_WALL_HEIGHT` (2.0 m), plus a static warm-white point light (no shadows). See `docs/tilemap.md` for token encoding. Saved to `levels/level_{name}/decoration_lamp/{x}_{y}.txt`.
 12. **Ponds** — [`step_place_ponds`](../../src/map/map_generator/step_place_ponds.rs) stamps **0–2** square [`CellType::Void`](../../src/map/world_map.rs) holes (edge **4–16** cells) on exterior road after all buildings are built. Ponds never overlap house footprints or each other; interior void reveals the chunk water plane at [`WATER_SURFACE_Y`](../../src/map/world_map.rs).
+13. **Cross-chunk connectors** — [`step_stamp_chunk_connectors`](../../src/map/map_generator/step_chunk_connectors.rs) stamps **1–2** road corridors per chunk side through the void margin (**3–4** cells wide along the edge). When an adjacent chunk is already generated, connector positions are read from that neighbor’s facing edge; otherwise connectors are rolled from the chunk seed. Persisted in `road_connectors` on [`GeneratedChunkMetadata`](../../src/map/map_generator/types.rs) (version 5).
 
 Do **not** stamp per-rectangle [`perimeter_wall_mask`](../../src/map/world_map.rs) loops on overlapping rects (that recreates inner walls). Convex outer corners stay multi-bit wall cells only (no separate pillars there).
 
@@ -48,13 +49,14 @@ single-house entry point [`generate_house_tiles`](../../src/map/map_generator/mo
 This guarantees the hand-placed building uses the **same** shell/door/inner-room/charger
 geometry as procedural chunks — no divergent copy of the wall logic.
 
-## Metadata (`GeneratedChunkMetadata`, version 3)
+## Metadata (`GeneratedChunkMetadata`, version 5)
 
 After generation, reference data is stored in [`HypermapRuntime::procedural_metadata`](../../src/map/hypermap_world.rs) (chunk-local tile coords) and saved as `levels/level_{name}/metadata/{x}_{y}.yaml` on **Save**.
 
 | Field | Meaning |
 |-------|---------|
 | `houses[]` | Each merged building: bounds, `center_x`/`center_z`, `area` (footprint cell count), `entry` |
+| `road_connectors` | Per-side (`west`/`east`/`south`/`north`) lists of `{ start, width }` margin road strips |
 
 World tiles: `runtime.procedural_metadata.get(coord)` then [`house_entry_world`](../../src/map/chunk_metadata.rs) / [`house_center_world`](../../src/map/chunk_metadata.rs).
 

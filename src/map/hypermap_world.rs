@@ -1074,7 +1074,14 @@ pub(crate) fn ensure_chunk_generated(
             Ok(false) => {}
             Err(e) => warn!("level geometry `{}`: {e}", path.display()),
         }
-        fill_chunk_random(chunk, style_floor_map, decoration_lamp_map, coord, chunk_metadata);
+        fill_chunk_random(
+            chunk,
+            map,
+            style_floor_map,
+            decoration_lamp_map,
+            coord,
+            chunk_metadata,
+        );
         if coord == CENTER_CHUNK {
             if let Err(err) = apply_world_map_file_to_floor(chunk, 0, WORLD_MAP_FILE_PATH) {
                 warn!("failed to apply `{WORLD_MAP_FILE_PATH}` to center chunk floor 0: {err}");
@@ -1222,12 +1229,20 @@ pub(crate) fn write_world_wall_style(
 
 fn fill_chunk_random(
     chunk: &mut HypermapChunk<CellType>,
+    map: &Hypermap<CellType>,
     style_floor_map: &Hypermap<TileStyle>,
     decoration_lamp_map: &Hypermap<LampDecoration>,
     coord: ChunkCoord,
     chunk_metadata: &mut ChunkGeneratorMetadata,
 ) {
-    fill_procedural_chunk(chunk, style_floor_map, decoration_lamp_map, coord, chunk_metadata);
+    fill_procedural_chunk(
+        chunk,
+        map,
+        style_floor_map,
+        decoration_lamp_map,
+        coord,
+        chunk_metadata,
+    );
     clear_upper_floors_to_void(chunk);
 }
 
@@ -1274,6 +1289,7 @@ pub(crate) fn regenerate_procedural_chunk(
     runtime.map.with_chunk_write(coord, |chunk| {
         fill_chunk_random(
             chunk,
+            &runtime.map,
             &runtime.style_floor_map,
             &runtime.decoration_lamp_map,
             coord,

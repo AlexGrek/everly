@@ -41,8 +41,14 @@ pub const PONDS_PER_CHUNK_MAX: i32 = 2;
 /// Pond edge length in cells (inclusive range); ponds are axis-aligned squares.
 pub const POND_EDGE_MIN: i32 = 4;
 pub const POND_EDGE_MAX: i32 = 16;
+/// Cross-chunk road corridor width along the chunk edge (inclusive range).
+pub const CHUNK_CONNECTOR_WIDTH_MIN: i32 = 3;
+pub const CHUNK_CONNECTOR_WIDTH_MAX: i32 = 4;
+/// Fresh connectors rolled per chunk side when no neighbor geometry exists (inclusive).
+pub const CONNECTORS_PER_SIDE_MIN: i32 = 1;
+pub const CONNECTORS_PER_SIDE_MAX: i32 = 2;
 
-pub const GENERATED_CHUNK_METADATA_VERSION: u32 = 4;
+pub const GENERATED_CHUNK_METADATA_VERSION: u32 = 5;
 
 /// Main doorway for one house (chunk-local tiles).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -78,12 +84,36 @@ pub struct GeneratedHouse {
     pub entry2: Option<HouseEntrypoint>,
 }
 
+/// One road strip crossing the void margin on a chunk side (chunk-local coords).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RoadConnector {
+    /// Inclusive start along the edge axis (`z` for west/east, `x` for south/north).
+    pub start: i32,
+    /// Width along the edge axis (3–4 cells when freshly rolled).
+    pub width: i32,
+}
+
+/// Per-side cross-chunk road connectors (chunk-local tile coordinates).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ChunkRoadConnectors {
+    #[serde(default)]
+    pub west: Vec<RoadConnector>,
+    #[serde(default)]
+    pub east: Vec<RoadConnector>,
+    #[serde(default)]
+    pub south: Vec<RoadConnector>,
+    #[serde(default)]
+    pub north: Vec<RoadConnector>,
+}
+
 /// Procedural layout reference data for one chunk (persisted as `metadata/{x}_{y}.yaml`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct GeneratedChunkMetadata {
     pub version: u32,
     pub generator_seed: u64,
     pub houses: Vec<GeneratedHouse>,
+    #[serde(default)]
+    pub road_connectors: ChunkRoadConnectors,
 }
 
 #[derive(Debug, Clone)]

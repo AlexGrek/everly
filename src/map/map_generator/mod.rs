@@ -8,6 +8,7 @@ mod corner_pillars;
 mod draft;
 pub mod grid_fill;
 mod house;
+mod step_chunk_connectors;
 mod step_carpet;
 mod step_charging_stations;
 mod step_parts_depot;
@@ -32,9 +33,11 @@ pub use corner_pillars::{detect_corner_pillars, CornerPillarPlacement, WallField
 pub use draft::MapDraft;
 pub use grid_fill::{count_region_area, flood_fill_area};
 pub use types::{
-    GeneratedChunkMetadata, GeneratedHouse, HouseEntrypoint, MapGeneratorConfig,
-    BORDER_CLEARANCE, CHUNK_VOID_MARGIN, GENERATED_CHUNK_METADATA_VERSION, MIN_ROOM_AREA,
-    MIN_ROOM_DIM, MIN_SEED_DISTANCE,
+    ChunkRoadConnectors, GeneratedChunkMetadata, GeneratedHouse, HouseEntrypoint,
+    MapGeneratorConfig, RoadConnector, BORDER_CLEARANCE, CHUNK_CONNECTOR_WIDTH_MAX,
+    CHUNK_CONNECTOR_WIDTH_MIN, CHUNK_VOID_MARGIN, CONNECTORS_PER_SIDE_MAX,
+    CONNECTORS_PER_SIDE_MIN, GENERATED_CHUNK_METADATA_VERSION, MIN_ROOM_AREA, MIN_ROOM_DIM,
+    MIN_SEED_DISTANCE,
 };
 
 use draft::{DraftTile, Room};
@@ -59,7 +62,7 @@ impl MapDraft {
         draft.finish()
     }
 
-    fn run_pipeline(&mut self) {
+    pub(crate) fn run_pipeline(&mut self) {
         self.step_init_carpet();
         self.step_place_primary_seeds();
         self.step_separate_primary_seeds();
@@ -68,6 +71,7 @@ impl MapDraft {
         self.step_cluster_houses();
         self.build_house_structures();
         self.step_place_ponds();
+        self.step_stamp_chunk_connectors();
     }
 
     /// Turns already-populated `self.houses` (sitting on an `Open` carpet) into
@@ -93,10 +97,18 @@ impl MapDraft {
     fn run_into_chunk(
         mut self,
         chunk: &mut HypermapChunk<CellType>,
+        map: &Hypermap<CellType>,
         style_floor_map: &Hypermap<TileStyle>,
         decoration_lamp_map: &Hypermap<LampDecoration>,
         coord: ChunkCoord,
     ) -> GeneratedChunkMetadata {
+        self.connector_plan = step_chunk_connectors::plan_chunk_connectors(
+            map,
+            coord,
+            self.margin,
+            self.size,
+            self.generator_seed,
+        );
         self.run_pipeline();
         let meta = self.build_metadata();
         style_floor_map.with_chunk_write(coord, |style_chunk| {
@@ -110,6 +122,7 @@ impl MapDraft {
 
 pub(crate) fn fill_procedural_chunk(
     chunk: &mut HypermapChunk<CellType>,
+    map: &Hypermap<CellType>,
     style_floor_map: &Hypermap<TileStyle>,
     decoration_lamp_map: &Hypermap<LampDecoration>,
     coord: ChunkCoord,
@@ -119,7 +132,13 @@ pub(crate) fn fill_procedural_chunk(
         seed: random_rng_seed(),
         ..Default::default()
     };
-    let meta = MapDraft::new(config).run_into_chunk(chunk, style_floor_map, decoration_lamp_map, coord);
+    let meta = MapDraft::new(config).run_into_chunk(
+        chunk,
+        map,
+        style_floor_map,
+        decoration_lamp_map,
+        coord,
+    );
     metadata.insert(coord, meta.clone());
     meta
 }
@@ -200,6 +219,7 @@ pub fn generate_chunk_geometry(config: &MapGeneratorConfig) -> String {
     map.with_chunk_write(ChunkCoord::new(0, 0), |chunk| {
         MapDraft::new(config.clone()).run_into_chunk(
             chunk,
+            &map,
             &style_map,
             &lamp_map,
             ChunkCoord::new(0, 0),

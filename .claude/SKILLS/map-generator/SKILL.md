@@ -41,7 +41,7 @@ paths:
 | Config + persisted metadata types | `src/map/map_generator/types.rs` |
 | Union shell helpers | `src/map/map_generator/union.rs` |
 | Concave corner pillar detection (walls only) | `corner_pillars.rs` — see **`docs/corners.md`** |
-| Pipeline steps | `step_carpet.rs`, `step_seeds.rs`, `step_rooms.rs`, `step_shell.rs`, `step_corners.rs`, `step_inner_walls.rs`, `step_inner_doors.rs`, `step_door.rs`, `step_charging_stations.rs`, `step_ponds.rs` |
+| Pipeline steps | `step_carpet.rs`, `step_seeds.rs`, `step_rooms.rs`, `step_shell.rs`, `step_corners.rs`, `step_inner_walls.rs`, `step_inner_doors.rs`, `step_door.rs`, `step_charging_stations.rs`, `step_ponds.rs`, `step_chunk_connectors.rs` |
 | `perimeter_wall_mask`, `CellType`, `WallMask`, `for_each_wall_segment` | `src/map/world_map.rs` |
 | Runtime chunk fill hook | `src/map/hypermap_world.rs` → `ensure_chunk_generated` → `fill_procedural_chunk` |
 | Editor Room brush (must match generator walls) | `src/edit/map_edit.rs` |
@@ -87,15 +87,17 @@ Order in `MapDraft::generate` / `run_into_chunk` — **do not reorder** without 
 13. `step_home_crawlers` — marble wave from main entry; glass center wave only if `footprint_area >= MIN_HOUSE_AREA_FOR_CENTER_WAVE` (30)
 14. `step_place_charging_stations` — **1–3** `Charger` tiles per house (`step_charging_stations.rs`)
 15. `step_place_parts_depots` / `step_place_lamps` — parts depots + lamp decorations
-16. `step_place_ponds` — **0–2** square void ponds (edge 4–16) on exterior road; no house overlap (`step_ponds.rs`); runs at end of [`run_pipeline`](../../src/map/map_generator/mod.rs) before `finish`
-17. `finish` / `write_chunk_floor0_and_styles` — `DraftTile` → `CellType` + `TileStyle` chunk
-18. `build_metadata` → [`GeneratedChunkMetadata`](../../src/map/chunk_metadata.rs) v2 (`houses[]` with embedded `entry`)
+16. `step_place_ponds` — **0–2** square void ponds (edge 4–16) on exterior road; no house overlap (`step_ponds.rs`)
+17. `step_stamp_chunk_connectors` — **1–2** margin road strips per side (**3–4** cells wide); align to generated neighbor edge when present (`step_chunk_connectors.rs`)
+18. `finish` / `write_chunk_floor0_and_styles` — `DraftTile` → `CellType` + `TileStyle` chunk
+19. `build_metadata` → [`GeneratedChunkMetadata`](../../src/map/chunk_metadata.rs) v5 (`houses[]`, `road_connectors`)
 
 `DraftTile` is **not** `CellType`: `Void`, `Open`, `Wall(u8)`, `Corner(WallCorner)`, `Charger(ChargerFacing)` during generation.
 
 ### Metadata fields (chunk-local tiles)
 
 - **`houses[]`**: one entry per merged building — bounds, `center_x`/`center_z`, `area`, `entry`.
+- **`road_connectors`**: per-side `{ start, width }` lists for cross-chunk margin roads.
 - **Area utils**: [`grid_fill.rs`](../../src/map/map_generator/grid_fill.rs) — `flood_fill_area` (connected), `count_region_area` (box); house footprint uses the latter at cluster time.
 - World coords: `meta.house_entry_world(i, chunk)`, `meta.house_center_world(i, chunk)`; `entrypoint_world` = first house entry.
 

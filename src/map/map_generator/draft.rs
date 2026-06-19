@@ -6,7 +6,7 @@ use crate::map::hypermap::{HypermapChunk, LocalCoord};
 use crate::map::world_map::{CellType, ChargerFacing, LampDecoration, TileStyle, WallCorner, WallMask};
 
 use super::house::House;
-use super::types::{GeneratedChunkMetadata, MapGeneratorConfig};
+use super::types::{ChunkRoadConnectors, GeneratedChunkMetadata, MapGeneratorConfig};
 use super::types::{BORDER_CLEARANCE, GENERATED_CHUNK_METADATA_VERSION};
 
 /// In-bounds ranges for seed placement and room growth (derived from config).
@@ -102,6 +102,7 @@ pub struct MapDraft {
     pub(crate) room_records: Vec<RoomRecord>,
     pub(crate) houses: Vec<House>,
     pub(crate) generator_seed: u64,
+    pub(crate) connector_plan: ChunkRoadConnectors,
 }
 
 impl MapDraft {
@@ -124,6 +125,7 @@ impl MapDraft {
             room_records: Vec::new(),
             houses: Vec::new(),
             generator_seed: config.seed,
+            connector_plan: ChunkRoadConnectors::default(),
         }
     }
 
@@ -140,6 +142,7 @@ impl MapDraft {
                 .iter()
                 .map(|h| h.to_generated())
                 .collect(),
+            road_connectors: self.connector_plan.clone(),
         }
     }
 
