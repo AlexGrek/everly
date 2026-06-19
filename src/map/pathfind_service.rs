@@ -3,9 +3,10 @@
 //! All bot route searches (and the per-frame bot-on-bot subtile detour) are
 //! offloaded from the main thread. A caller [`enqueue`](PathfindQueue::enqueue)s
 //! a [`PathKind`] and gets a [`RequestId`]; a dispatcher spawns the actual A\*
-//! onto the [`AsyncComputeTaskPool`], keeping at most [`MAX_IN_FLIGHT`] searches
-//! running; a collector polls finished tasks and stores their [`PathOutcome`] in
-//! [`PathfindResults`]. The caller reads the result back by id.
+//! onto the [`AsyncComputeTaskPool`], keeping at most [`MAX_IN_FLIGHT_PER_STREAM`]
+//! searches per stream ([`MAX_IN_FLIGHT`] total across [`PATHFIND_STREAM_COUNT`]
+//! independent lanes); a collector polls finished tasks and stores their
+//! [`PathOutcome`] in [`PathfindResults`]. The caller reads the result back by id.
 //!
 //! The worker only ever **reads** the shared map data (via the `Arc`-shared
 //! [`Hypermap`] / [`DoubleBufferedHypermap`], whose per-chunk `RwLock`s make
@@ -33,11 +34,16 @@ use crate::menu::main_menu::GameState;
 use crate::hud::game_log::{GameLog, LogEntry};
 use crate::scene::camera::StrategyCamera;
 
-/// Maximum number of pathfinding searches running on the task pool at once.
-pub const MAX_IN_FLIGHT: usize = 10;
+/// Independent dispatch lanes sharing one [`AsyncComputeTaskPool`]. Each lane
+/// caps its own in-flight count so no single stream monopolizes the pool.
+pub const PATHFIND_STREAM_COUNT: usize = 4;
+/// Per-stream cap on spawned-but-not-finished searches.
+pub const MAX_IN_FLIGHT_PER_STREAM: usize = 10;
+/// Total concurrent pathfinding searches across all streams.
+pub const MAX_IN_FLIGHT: usize = PATHFIND_STREAM_COUNT * MAX_IN_FLIGHT_PER_STREAM;
 /// Backlog (queued, not-yet-dispatched requests) above which a throttled warning
 /// is logged.
-pub const BACKLOG_WARN: usize = 10;
+pub const BACKLOG_WARN: usize = 40;
 /// Seconds an unconsumed result lingers in [`PathfindResults`] before pruning, so
 /// a despawned / re-planned bot's stale result can't accumulate forever.
 const RESULT_TTL_S: f32 = 10.0;
@@ -163,11 +169,12 @@ impl PathfindQueue {
 /// Finished results keyed by [`RequestId`], with an age used for pruning.
 ///
 /// A lock-free concurrent map: up to [`MAX_IN_FLIGHT`] async pathfind workers
-/// insert finished outcomes without serializing on a shared `Mutex`, while the
-/// brain reads results back on the main thread. The per-entry age is an
-/// [`AtomicU32`] (holding `f32` bits) so [`age_and_prune`](Self::age_and_prune)
-/// can accumulate `dt` through the shared `&` reference papaya's `retain` hands
-/// out, keeping the original TTL semantics intact.
+/// (across [`PATHFIND_STREAM_COUNT`] dispatch streams) insert finished outcomes
+/// without serializing on a shared `Mutex`, while the brain reads results back on
+/// the main thread. The per-entry age is an [`AtomicU32`] (holding `f32` bits) so
+/// [`age_and_prune`](Self::age_and_prune) can accumulate `dt` through the shared
+/// `&` reference papaya's `retain` hands out, keeping the original TTL semantics
+/// intact.
 #[derive(Resource, Default)]
 pub struct PathfindResults {
     map: papaya::HashMap<RequestId, (PathOutcome, AtomicU32)>,
@@ -210,16 +217,46 @@ impl PathfindResults {
     }
 }
 
-/// Tasks currently running on the pool.
-#[derive(Resource, Default)]
+/// Tasks currently running on the pool, partitioned into independent streams.
+#[derive(Resource)]
 pub struct PathfindInFlight {
-    tasks: Vec<(RequestId, Task<PathOutcome>)>,
+    streams: [Vec<(RequestId, Task<PathOutcome>)>; PATHFIND_STREAM_COUNT],
+    /// Round-robin cursor for the next dispatch attempt.
+    next_stream: usize,
+}
+
+impl Default for PathfindInFlight {
+    fn default() -> Self {
+        Self {
+            streams: std::array::from_fn(|_| Vec::new()),
+            next_stream: 0,
+        }
+    }
 }
 
 impl PathfindInFlight {
     pub fn len(&self) -> usize {
-        self.tasks.len()
+        self.streams.iter().map(Vec::len).sum()
     }
+
+    pub fn stream_len(&self, stream: usize) -> usize {
+        self.streams.get(stream).map_or(0, Vec::len)
+    }
+
+    fn next_available_stream(&self, start: usize) -> Option<usize> {
+        let lens: [usize; PATHFIND_STREAM_COUNT] =
+            std::array::from_fn(|i| self.streams[i].len());
+        pick_pathfind_stream(&lens, start, MAX_IN_FLIGHT_PER_STREAM)
+    }
+}
+
+/// Round-robin pick of the first stream under `per_stream_cap`, starting at `start`.
+fn pick_pathfind_stream(stream_lens: &[usize], start: usize, per_stream_cap: usize) -> Option<usize> {
+    (0..PATHFIND_STREAM_COUNT).find(|offset| {
+        let idx = (start + offset) % PATHFIND_STREAM_COUNT;
+        stream_lens[idx] < per_stream_cap
+    })
+    .map(|offset| (start + offset) % PATHFIND_STREAM_COUNT)
 }
 
 /// Ordering anchor so the brain can run between collect and dispatch.
@@ -257,19 +294,22 @@ fn pathfind_collect(
     mut in_flight: ResMut<PathfindInFlight>,
     results: Res<PathfindResults>,
 ) {
-    let mut still: Vec<(RequestId, Task<PathOutcome>)> = Vec::with_capacity(in_flight.tasks.len());
-    for (id, mut task) in in_flight.tasks.drain(..) {
-        match future::block_on(future::poll_once(&mut task)) {
-            Some(outcome) => results.insert(id, outcome),
-            None => still.push((id, task)),
+    for stream in &mut in_flight.streams {
+        let mut still: Vec<(RequestId, Task<PathOutcome>)> = Vec::with_capacity(stream.len());
+        for (id, mut task) in stream.drain(..) {
+            match future::block_on(future::poll_once(&mut task)) {
+                Some(outcome) => results.insert(id, outcome),
+                None => still.push((id, task)),
+            }
         }
+        *stream = still;
     }
-    in_flight.tasks = still;
     results.age_and_prune(time.delta_secs(), RESULT_TTL_S);
 }
 
-/// Spawns queued searches onto the task pool, keeping at most [`MAX_IN_FLIGHT`]
-/// running. Reads only the `Arc`-shared map snapshots inside each task.
+/// Spawns queued searches onto the task pool, keeping at most
+/// [`MAX_IN_FLIGHT_PER_STREAM`] running per stream ([`MAX_IN_FLIGHT`] total).
+/// Reads only the `Arc`-shared map snapshots inside each task.
 fn pathfind_dispatch(
     queue: Res<PathfindQueue>,
     runtime: Res<HypermapRuntime>,
@@ -280,7 +320,10 @@ fn pathfind_dispatch(
     camera: Query<&StrategyCamera>,
 ) {
     let pool = AsyncComputeTaskPool::get();
-    while in_flight.tasks.len() < MAX_IN_FLIGHT {
+    while in_flight.len() < MAX_IN_FLIGHT && !queue.is_empty() {
+        let Some(stream_idx) = in_flight.next_available_stream(in_flight.next_stream) else {
+            break;
+        };
         let Some((id, kind)) = queue.pop() else {
             break;
         };
@@ -302,7 +345,8 @@ fn pathfind_dispatch(
                 )
             }
         };
-        in_flight.tasks.push((id, task));
+        in_flight.streams[stream_idx].push((id, task));
+        in_flight.next_stream = (stream_idx + 1) % PATHFIND_STREAM_COUNT;
     }
 
     let backlog = queue.len();
@@ -317,7 +361,7 @@ fn pathfind_dispatch(
             wy,
             LogEntry::PathfindBacklog {
                 queued: backlog,
-                in_flight: in_flight.tasks.len(),
+                in_flight: in_flight.len(),
                 cached: results.len(),
                 threshold: BACKLOG_WARN,
             },
@@ -575,5 +619,18 @@ mod tests {
         assert_eq!(drained[0].0, a);
         assert_eq!(drained[1].0, b);
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn pick_pathfind_stream_round_robin_skips_full_streams() {
+        let mut lens = [0; PATHFIND_STREAM_COUNT];
+        lens[0] = MAX_IN_FLIGHT_PER_STREAM;
+
+        assert_eq!(pick_pathfind_stream(&lens, 0, MAX_IN_FLIGHT_PER_STREAM), Some(1));
+        assert_eq!(pick_pathfind_stream(&lens, 2, MAX_IN_FLIGHT_PER_STREAM), Some(2));
+        assert_eq!(pick_pathfind_stream(&lens, 3, MAX_IN_FLIGHT_PER_STREAM), Some(3));
+
+        lens.fill(MAX_IN_FLIGHT_PER_STREAM);
+        assert_eq!(pick_pathfind_stream(&lens, 0, MAX_IN_FLIGHT_PER_STREAM), None);
     }
 }

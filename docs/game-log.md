@@ -63,7 +63,7 @@ log without exclusive access:
 | `<name> <system> broken` | `err` | `black_bot_brain` when a [`Breakable`](../src/actor/black_bot.rs) part newly breaks (`movement engine`, `control plane`, `sensory system`) |
 | `<name> started charging` | `info` | `black_bot_brain` when `BrainEffects::dock` fires (entering the `Charging` phase) |
 | `<name> finished charging` | `success` | `black_bot_brain` when `BrainEffects::undock` fires (charge reached full) |
-| `pathfind backlog: N queued (> T); …` | `warn` | `pathfind_dispatch` every frame while the pathfind queue depth exceeds `BACKLOG_WARN` (10) |
+| `pathfind backlog: N queued (> T); …` | `warn` | `pathfind_dispatch` every frame while the pathfind queue depth exceeds `BACKLOG_WARN` (40) |
 | `<name> wander timed out (x, y)` | `unexpected` | `black_bot_brain` when [`GoToRandomPoints`](../src/actor/brain/high_level.rs) abandons a leg after its Manhattan×3 s budget |
 | `<name> skipped patrol waypoint (x, y)` | `unexpected` | `black_bot_brain` when [`GoToPatrol`](../src/actor/brain/high_level.rs) skips a waypoint after its Manhattan×3 s budget |
 | `<name> reset (collision pressure)` | `warn` | `track_black_bot_collision_pressure` when a BlackBot's collision pressure reaches 50 |

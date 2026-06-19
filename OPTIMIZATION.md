@@ -687,3 +687,22 @@ actor-engineer / field-interactions / bevy-engineer skills.
 
 Verified green: `cargo test -p everly` (272 passed, 0 failed, 2 ignored) and
 `cargo check -p everly --all-targets` warning-clean.
+
+### Pathfind dispatch — 4 round-robin streams, 40 in flight (2026-06)
+
+[`src/map/pathfind_service.rs`](src/map/pathfind_service.rs).
+
+- **Issue:** With many BlackBots replanning together (charger scans, patrol-loop
+  generation, collision-pressure dynamic reroutes), a single 10-wide in-flight cap
+  left dozens of requests queued even when the async pool had spare threads.
+- **Fix:** Partition [`PathfindInFlight`](src/map/pathfind_service.rs) into
+  [`PATHFIND_STREAM_COUNT`](src/map/pathfind_service.rs) = 4 independent lanes,
+  each capped at [`MAX_IN_FLIGHT_PER_STREAM`](src/map/pathfind_service.rs) = 10
+  ([`MAX_IN_FLIGHT`](src/map/pathfind_service.rs) = 40 total). Dispatch still
+  spawns on the shared `AsyncComputeTaskPool` but round-robins across streams so
+  no lane monopolizes the cap. [`BACKLOG_WARN`](src/map/pathfind_service.rs)
+  scaled to 40.
+- **Semantics (rule 8):** route geometry unchanged; only concurrency/backlog
+  visibility differs. Frame-exact result arrival remains non-deterministic.
+- **Tests:** `pick_pathfind_stream_round_robin_skips_full_streams` asserts stream
+  selection; existing service/brain suites unchanged.

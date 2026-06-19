@@ -147,7 +147,7 @@ Bots never block on the helpers above at runtime. They enqueue [`PathKind`] on
 
 - `PathfindServicePlugin` — resources + `pathfind_collect` / `pathfind_dispatch`.
 - `PathfindSet::Collect` runs **before** `black_bot_brain`; `PathfindSet::Dispatch` **after**.
-- `MAX_IN_FLIGHT = 10`; backlog warning when queue > 10.
+- `MAX_IN_FLIGHT = 40` (4 streams × 10 per stream); backlog warning when queue > 40.
 - Workers read `Arc`-cloned `Hypermap` / occupancy snapshots only; write outcomes via collect.
 
 Full docs: **`docs/pathfind-service.md`**. Brain integration: **`docs/actor-brain.md`**.

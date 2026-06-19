@@ -20,7 +20,8 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
                      ActorState.move_buffer  ──▶ process_actor_moves
                               ▲
                      PathfindQueue ──▶ AsyncComputeTaskPool ──▶ PathfindResults
-                     (enqueue)         (≤10 in flight)         (take by RequestId)
+                     (enqueue)         (≤40 in flight, 4×10   (take by RequestId)
+                                        round-robin streams)
 ```
 
 - **[`Behavior`](../src/actor/brain/behavior/mod.rs)** — a rule that runs every

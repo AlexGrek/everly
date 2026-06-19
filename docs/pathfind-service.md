@@ -25,7 +25,7 @@ visible.
 | Resource | Role |
 |----------|------|
 | [`PathfindQueue`] | FIFO of pending `(RequestId, PathKind)` pairs. Interior-mutable (`Mutex` deque + `AtomicU64` id minting) so callers enqueue through a shared `&`. |
-| [`PathfindInFlight`] | Up to [`MAX_IN_FLIGHT`] (10) `Task<PathOutcome>` handles currently on the pool. |
+| [`PathfindInFlight`] | Up to [`MAX_IN_FLIGHT_PER_STREAM`] (10) `Task<PathOutcome>` handles per stream, [`PATHFIND_STREAM_COUNT`] (4) independent lanes, [`MAX_IN_FLIGHT`] (40) total on the shared [`AsyncComputeTaskPool`]. |
 | [`PathfindResults`] | `HashMap<RequestId, (PathOutcome, age)>` of finished outcomes waiting to be consumed. Stale entries prune after [`RESULT_TTL_S`] (10 s). |
 
 [`PathfindAccess`] (on [`BrainContext`]) bundles `&PathfindQueue` + `&PathfindResults`
@@ -77,7 +77,7 @@ pathfind_collect   (PathfindSet::Collect)   — poll finished tasks → Pathfind
         ↓
 black_bot_brain    — behaviors tick; high-level actions enqueue + take results
         ↓
-pathfind_dispatch  (PathfindSet::Dispatch)  — dequeue up to 10 searches → AsyncComputeTaskPool
+pathfind_dispatch  (PathfindSet::Dispatch)  — dequeue up to 40 searches (10 per stream, round-robin) → AsyncComputeTaskPool
 ```
 
 `black_bot_brain` is explicitly ordered
@@ -85,7 +85,9 @@ pathfind_dispatch  (PathfindSet::Dispatch)  — dequeue up to 10 searches → As
 enqueue this frame and read a result that finished last frame before new work is
 spawned.
 
-Dispatch snapshots map data for workers:
+Dispatch snapshots map data for workers (all streams share one
+[`AsyncComputeTaskPool`]; each stream caps its own in-flight count so no lane
+monopolizes the pool):
 
 - **`WorldRoute`** — `HypermapRuntime::static_passability_map` (`Arc` clone).
 - **`SubtileDetour`** — `DynamicPassabilityMap::share_inner()` (read buffer) +
@@ -95,7 +97,7 @@ Workers **only read** those shared structures (per-chunk `RwLock`s inside the
 hypermap). They **never** mutate passability or occupancy. The only write path
 is `pathfind_collect` inserting into `PathfindResults`.
 
-When the pending queue length exceeds [`BACKLOG_WARN`] (10), **every frame**
+When the pending queue length exceeds [`BACKLOG_WARN`] (40), **every frame**
 `pathfind_dispatch` pushes a [`LogEntry::PathfindBacklog`](../src/hud/game_log.rs)
 to the in-game log on the camera's hypertile (yellow `warn` line). There is no
 console logging and no throttle — the check runs each dispatch tick.
@@ -180,5 +182,7 @@ See also [`docs/actor-brain.md`](actor-brain.md) for the full brain stack.
 [`GoToPatrol`]: ../src/actor/brain/high_level.rs
 [`GoToChargeStation`]: ../src/actor/brain/high_level.rs
 [`MAX_IN_FLIGHT`]: ../src/map/pathfind_service.rs
+[`MAX_IN_FLIGHT_PER_STREAM`]: ../src/map/pathfind_service.rs
+[`PATHFIND_STREAM_COUNT`]: ../src/map/pathfind_service.rs
 [`BACKLOG_WARN`]: ../src/map/pathfind_service.rs
 [`RESULT_TTL_S`]: ../src/map/pathfind_service.rs
