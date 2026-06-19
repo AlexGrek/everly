@@ -21,9 +21,9 @@ use super::types::MIN_HOUSE_AREA_FOR_CENTER_WAVE;
 
 /// One inner wall is permitted per this many cells of house footprint area.
 const AREA_PER_INNER_WALL: i32 = 80;
-const MIN_ROOM_AREA: i32 = 6;
-const MIN_ROOM_DIM: i32 = 2;
-const MIN_PARALLEL_WALL_DISTANCE: i32 = 2;
+const MIN_ROOM_AREA: i32 = 9;
+const MIN_ROOM_DIM: i32 = 3;
+const MIN_PARALLEL_WALL_DISTANCE: i32 = 3;
 
 impl MapDraft {
     pub fn step_split_houses_into_rooms(&mut self) {

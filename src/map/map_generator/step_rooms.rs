@@ -9,7 +9,7 @@ impl MapDraft {
         self.room_records.clear();
         for center in self.subseed_centers.clone() {
             let bounds = Room::from_center_growth(center, &mut self.rng, self.bounds);
-            if bounds.area() >= 4 {
+            if bounds.area() >= 9 {
                 self.room_records.push(RoomRecord { bounds });
             }
         }
@@ -22,8 +22,8 @@ impl Room {
         rng: &mut StdRng,
         bounds: super::draft::DraftBounds,
     ) -> Self {
-        let rx = rng::range(rng, 3..=6);
-        let rz = rng::range(rng, 3..=6);
+        let rx = rng::range(rng, 6..=12);
+        let rz = rng::range(rng, 6..=12);
         let x0 = (center.0 - rx).clamp(bounds.grow_lo, bounds.grow_hi);
         let x1 = (center.0 + rx).clamp(bounds.grow_lo, bounds.grow_hi);
         let z0 = (center.1 - rz).clamp(bounds.grow_lo, bounds.grow_hi);

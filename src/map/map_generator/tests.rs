@@ -597,8 +597,8 @@ fn inner_walls_skipped_for_small_houses() {
 
 #[test]
 fn inner_walls_respect_min_room_constraints() {
-    // A house large enough to receive cuts must never produce a sub-room < 6
-    // cells or narrower than 2 cells in either direction.
+    // A house large enough to receive cuts must never produce a sub-room < 9
+    // cells or narrower than 3 cells in either direction.
     for seed in 0..64u64 {
         let mut draft = MapDraft::new(MapGeneratorConfig {
             seed,
@@ -765,16 +765,16 @@ fn inner_doors_make_all_rooms_accessible() {
 
 #[test]
 fn house_tool_rejects_boundaries_below_minimum() {
-    assert!(generate_house_tiles(9, 20, 1).is_none());
-    assert!(generate_house_tiles(20, 9, 1).is_none());
+    assert!(generate_house_tiles(17, 20, 1).is_none());
+    assert!(generate_house_tiles(20, 17, 1).is_none());
     assert!(generate_house_tiles(MIN_HOUSE_TOOL_SIDE, MIN_HOUSE_TOOL_SIDE, 1).is_some());
 }
 
 #[test]
 fn house_tool_fills_boundary_with_a_walled_building() {
-    let width = 14;
-    let height = 11;
-    let tiles = generate_house_tiles(width, height, 7).expect("10x10+ boundary generates a house");
+    let width = 22;
+    let height = 20;
+    let tiles = generate_house_tiles(width, height, 7).expect("18×18+ boundary generates a house");
     assert_eq!(tiles.width, width);
     assert_eq!(tiles.height, height);
     assert_eq!(tiles.cells.len(), height as usize);

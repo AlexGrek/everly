@@ -73,16 +73,16 @@ paths:
 Order in `MapDraft::generate` / `run_into_chunk` — **do not reorder** without revisiting doors and overlap:
 
 1. `step_init_carpet` — `Open` (road) inside margin
-2. `step_place_primary_seeds` — 8–12 random centers
+2. `step_place_primary_seeds` — 4–7 random centers
 3. `step_separate_primary_seeds` — push apart (`MIN_SEED_DISTANCE`, `BORDER_CLEARANCE`)
-4. `step_spawn_subseeds` — 3–6 offsets per primary (`growth_centers`)
-5. `step_grow_rooms` — axis-aligned rects from **`subseed_centers` only** (`area >= 4`; internal `room_records`)
+4. `step_spawn_subseeds` — 2–4 offsets per primary (`growth_centers`)
+5. `step_grow_rooms` — axis-aligned rects from **`subseed_centers` only** (`area >= 9`; internal `room_records`)
 6. `step_cluster_houses` — merge touching / overlapping rects into [`House`](../../src/map/map_generator/house.rs) footprints (subseed data dropped)
 7. `step_paint_union_interior` — all house tiles → `Open` (no walls)
 8. `step_build_union_outer_walls` — **`union_perimeter_wall_mask`** on the combined outer shell only
 9. `step_stamp_union_inner_corner_pillars` — [`detect_corner_pillars`](../../src/map/map_generator/corner_pillars.rs) (see **`docs/corners.md`**)
 10. `step_place_house_doors` — **at least one** door per house; **50%** chance of a second non-overlapping door (`step_door.rs`). Each opening prefers 2-wide when geometry allows.
-11. `step_split_houses_into_rooms` — skipped when `footprint_area < 30`. Budget `floor(area / 80)` cuts (ceiling-to-H, floor-to-V, ≤3 each) per house (`step_inner_walls.rs`). Rule: min sub-room area 6, min dim 2, min distance 2 to any parallel wall (outer **and** inner). Stamps `MASK_NORTH` / `MASK_WEST`; skips Corner pillars, concave voids, and the outer door cell. Rooms isolated, no inner doors.
+11. `step_split_houses_into_rooms` — skipped when `footprint_area < 30`. Budget `floor(area / 80)` cuts (ceiling-to-H, floor-to-V, ≤3 each) per house (`step_inner_walls.rs`). Rule: min sub-room area 9, min dim 3, min distance 3 to any parallel wall (outer **and** inner). Stamps `MASK_NORTH` / `MASK_WEST`; skips Corner pillars, concave voids, and the outer door cell. Rooms isolated, no inner doors.
 12. `step_place_inner_doors` — opens one inner-wall slab edge at a time until every walkable house cell is reachable from the entry (`step_inner_doors.rs`). **Edge-based** connectivity: `Wall(bits)` is walkable floor with edge slabs, so a door is a single shared edge with its slab bits cleared (not a whole cell opened). Only interior edges (both cells in-house) are opened — outer shell stays intact.
 13. `step_home_crawlers` — marble wave from main entry; glass center wave only if `footprint_area >= MIN_HOUSE_AREA_FOR_CENTER_WAVE` (30)
 14. `step_place_charging_stations` — **1–3** `Charger` tiles per house, random count (`step_charging_stations.rs`). Each picks an interior `Open` cell with **exactly one** orthogonal wall neighbor (back to wall, not a corner), skipping reserved door tiles; the lone wall side sets `ChargerFacing`. Runs **after** crawlers; chargers stay passable.
@@ -144,9 +144,9 @@ Union shell uses `union_perimeter_wall_mask` in `union.rs` (not per-room `perime
 
 ## House count
 
-- Primaries: `PRIMARY_SEED_COUNT_MIN`–`MAX` (8–12). Subseeds per primary: 3–6.
+- Primaries: `PRIMARY_SEED_COUNT_MIN`–`MAX` (4–7). Subseeds per primary: 2–4.
 - Clustering merges **overlapping** rects only; edge-touching subseed rooms become separate houses.
-- Smaller subseed rooms and tighter seed spacing (`MIN_SEED_DISTANCE` 12) help distinct footprints fit without merging as often.
+- Larger subseed rooms and wider seed spacing (`MIN_SEED_DISTANCE` 24) yield fewer, bigger footprints with more road between buildings.
 
 ## Overlapping rooms
 

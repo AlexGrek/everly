@@ -43,7 +43,7 @@ use crate::map::level::encode_chunk_geometry;
 use crate::map::world_map::{CellType, LampDecoration, TileStyle};
 
 /// Smallest boundary side (in cells) the editor "House" tool accepts.
-pub const MIN_HOUSE_TOOL_SIDE: i32 = 10;
+pub const MIN_HOUSE_TOOL_SIDE: i32 = 18;
 /// Exterior road ring kept around a tool-generated house so doors can open
 /// onto road on every side (matches the procedural carpet that surrounds
 /// houses in a full chunk).
