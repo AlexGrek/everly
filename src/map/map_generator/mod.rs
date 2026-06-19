@@ -12,6 +12,7 @@ mod step_carpet;
 mod step_charging_stations;
 mod step_parts_depot;
 mod step_place_lamps;
+mod step_ponds;
 mod step_corners;
 mod step_door;
 mod step_home_crawler;
@@ -67,6 +68,7 @@ impl MapDraft {
         self.step_grow_rooms();
         self.step_cluster_houses();
         self.build_house_structures();
+        self.step_place_ponds();
     }
 
     /// Turns already-populated `self.houses` (sitting on an `Open` carpet) into
@@ -76,7 +78,7 @@ impl MapDraft {
     /// Shared by the procedural pipeline (after seed clustering) and the editor
     /// "House" tool (a single hand-placed footprint) so both paths produce
     /// identical building geometry.
-    fn build_house_structures(&mut self) {
+    pub(crate) fn build_house_structures(&mut self) {
         self.step_paint_union_interior();
         self.step_build_union_outer_walls();
         self.step_stamp_union_inner_corner_pillars();

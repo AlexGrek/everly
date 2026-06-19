@@ -35,6 +35,12 @@ pub const AREA_PER_INNER_WALL: i32 = 80;
 pub const MAX_INNER_WALL_CUTS: i32 = 6;
 /// At most this many horizontal or vertical inner lines per house.
 pub const MAX_INNER_WALL_CUTS_PER_AXIS: i32 = 3;
+/// Square ponds stamped per chunk (inclusive range).
+pub const PONDS_PER_CHUNK_MIN: i32 = 0;
+pub const PONDS_PER_CHUNK_MAX: i32 = 2;
+/// Pond edge length in cells (inclusive range); ponds are axis-aligned squares.
+pub const POND_EDGE_MIN: i32 = 4;
+pub const POND_EDGE_MAX: i32 = 16;
 
 pub const GENERATED_CHUNK_METADATA_VERSION: u32 = 4;
 

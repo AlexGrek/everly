@@ -41,7 +41,7 @@ paths:
 | Config + persisted metadata types | `src/map/map_generator/types.rs` |
 | Union shell helpers | `src/map/map_generator/union.rs` |
 | Concave corner pillar detection (walls only) | `corner_pillars.rs` — see **`docs/corners.md`** |
-| Pipeline steps | `step_carpet.rs`, `step_seeds.rs`, `step_rooms.rs`, `step_shell.rs`, `step_corners.rs`, `step_inner_walls.rs`, `step_inner_doors.rs`, `step_door.rs`, `step_charging_stations.rs` |
+| Pipeline steps | `step_carpet.rs`, `step_seeds.rs`, `step_rooms.rs`, `step_shell.rs`, `step_corners.rs`, `step_inner_walls.rs`, `step_inner_doors.rs`, `step_door.rs`, `step_charging_stations.rs`, `step_ponds.rs` |
 | `perimeter_wall_mask`, `CellType`, `WallMask`, `for_each_wall_segment` | `src/map/world_map.rs` |
 | Runtime chunk fill hook | `src/map/hypermap_world.rs` → `ensure_chunk_generated` → `fill_procedural_chunk` |
 | Editor Room brush (must match generator walls) | `src/edit/map_edit.rs` |
@@ -85,9 +85,11 @@ Order in `MapDraft::generate` / `run_into_chunk` — **do not reorder** without 
 11. `step_split_houses_into_rooms` — skipped when `footprint_area < MIN_HOUSE_AREA_FOR_INNER_WALLS` (100). Rolls `1…min(floor(area / 80), 6)` cuts (ceiling-to-H, floor-to-V, ≤3 per axis). Rule: min sub-room area 9, min dim 3, min distance 3 to any parallel wall (outer **and** inner). Stamps `MASK_NORTH` / `MASK_WEST`; skips Corner pillars, concave voids, and the outer door cell. Rooms isolated, no inner doors.
 12. `step_place_inner_doors` — opens one inner-wall slab edge at a time until every walkable house cell is reachable from the entry (`step_inner_doors.rs`). **Edge-based** connectivity: `Wall(bits)` is walkable floor with edge slabs, so a door is a single shared edge with its slab bits cleared (not a whole cell opened). Only interior edges (both cells in-house) are opened — outer shell stays intact.
 13. `step_home_crawlers` — marble wave from main entry; glass center wave only if `footprint_area >= MIN_HOUSE_AREA_FOR_CENTER_WAVE` (30)
-14. `step_place_charging_stations` — **1–3** `Charger` tiles per house, random count (`step_charging_stations.rs`). Each picks an interior `Open` cell with **exactly one** orthogonal wall neighbor (back to wall, not a corner), skipping reserved door tiles; the lone wall side sets `ChargerFacing`. Runs **after** crawlers; chargers stay passable.
-15. `finish` / `write_chunk_floor0_and_styles` — `DraftTile` → `CellType` + `TileStyle` chunk
-16. `build_metadata` → [`GeneratedChunkMetadata`](../../src/map/chunk_metadata.rs) v2 (`houses[]` with embedded `entry`)
+14. `step_place_charging_stations` — **1–3** `Charger` tiles per house (`step_charging_stations.rs`)
+15. `step_place_parts_depots` / `step_place_lamps` — parts depots + lamp decorations
+16. `step_place_ponds` — **0–2** square void ponds (edge 4–16) on exterior road; no house overlap (`step_ponds.rs`); runs at end of [`run_pipeline`](../../src/map/map_generator/mod.rs) before `finish`
+17. `finish` / `write_chunk_floor0_and_styles` — `DraftTile` → `CellType` + `TileStyle` chunk
+18. `build_metadata` → [`GeneratedChunkMetadata`](../../src/map/chunk_metadata.rs) v2 (`houses[]` with embedded `entry`)
 
 `DraftTile` is **not** `CellType`: `Void`, `Open`, `Wall(u8)`, `Corner(WallCorner)`, `Charger(ChargerFacing)` during generation.
 
@@ -164,6 +166,7 @@ Overlapping subseed rects are intentional: they merge into a single open floor. 
 | `BORDER_CLEARANCE` | 2-tile safe zone in from void margin (seeds + building rects) |
 | `MIN_HOUSE_AREA_FOR_INNER_WALLS` | Footprint threshold before inner splits (100 cells) |
 | `AREA_PER_INNER_WALL` / `MAX_INNER_WALL_CUTS` | Inner wall roll: 1…min(floor(area / 80), 6), ≤3 per axis |
+| `POND_EDGE_MIN` / `MAX`, `PONDS_PER_CHUNK_*` | Square road ponds: 0–2 per chunk, edge 4–16 cells (`CellType::Void`) |
 | `CHUNK_VOID_MARGIN` | Void ring; must stay aligned with hypermap void inset (`docs/hypermap.md`) |
 | `MapGeneratorConfig` | `size`, `margin`, `seed` (`StdRng`, `rand 0.8` `gen_range`) |
 
