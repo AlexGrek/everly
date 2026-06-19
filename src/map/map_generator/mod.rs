@@ -32,7 +32,8 @@ pub use draft::MapDraft;
 pub use grid_fill::{count_region_area, flood_fill_area};
 pub use types::{
     GeneratedChunkMetadata, GeneratedHouse, HouseEntrypoint, MapGeneratorConfig,
-    BORDER_CLEARANCE, CHUNK_VOID_MARGIN, GENERATED_CHUNK_METADATA_VERSION, MIN_SEED_DISTANCE,
+    BORDER_CLEARANCE, CHUNK_VOID_MARGIN, GENERATED_CHUNK_METADATA_VERSION, MIN_ROOM_AREA,
+    MIN_ROOM_DIM, MIN_SEED_DISTANCE,
 };
 
 use draft::{DraftTile, Room};
@@ -42,8 +43,9 @@ use crate::map::hypermap::{random_rng_seed, ChunkCoord, Hypermap, HypermapChunk}
 use crate::map::level::encode_chunk_geometry;
 use crate::map::world_map::{CellType, LampDecoration, TileStyle};
 
-/// Smallest boundary side (in cells) the editor "House" tool accepts.
-pub const MIN_HOUSE_TOOL_SIDE: i32 = 18;
+/// Smallest boundary side (in cells) the editor "House" tool accepts — large
+/// enough for several [`MIN_ROOM_DIM`]×[`MIN_ROOM_DIM`] inner rooms.
+pub const MIN_HOUSE_TOOL_SIDE: i32 = MIN_ROOM_DIM * 6;
 /// Exterior road ring kept around a tool-generated house so doors can open
 /// onto road on every side (matches the procedural carpet that surrounds
 /// houses in a full chunk).

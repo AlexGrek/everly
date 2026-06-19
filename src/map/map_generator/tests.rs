@@ -15,16 +15,40 @@ use super::union::union_contains;
 
 #[test]
 fn seeds_respect_min_distance_after_separation() {
-    let mut draft = MapDraft::new(MapGeneratorConfig {
-        seed: 1,
-        ..Default::default()
-    });
-    draft.step_place_primary_seeds();
-    draft.step_separate_primary_seeds();
-    for i in 0..draft.primary_seeds.len() {
-        for j in (i + 1)..draft.primary_seeds.len() {
+    for seed in 0..128u64 {
+        let mut draft = MapDraft::new(MapGeneratorConfig {
+            seed,
+            ..Default::default()
+        });
+        draft.step_place_primary_seeds();
+        for i in 0..draft.primary_seeds.len() {
+            for j in (i + 1)..draft.primary_seeds.len() {
+                assert!(
+                    manhattan(draft.primary_seeds[i], draft.primary_seeds[j]) >= MIN_SEED_DISTANCE,
+                    "seed {seed}: primary seeds {i} and {j} too close"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn grown_subseed_rooms_meet_min_dimensions() {
+    for seed in 0..128u64 {
+        let mut draft = MapDraft::new(MapGeneratorConfig {
+            seed,
+            ..Default::default()
+        });
+        draft.step_init_carpet();
+        draft.step_place_primary_seeds();
+        draft.step_separate_primary_seeds();
+        draft.step_spawn_subseeds();
+        draft.step_grow_rooms();
+        for (idx, record) in draft.room_records.iter().enumerate() {
             assert!(
-                manhattan(draft.primary_seeds[i], draft.primary_seeds[j]) >= MIN_SEED_DISTANCE,
+                record.bounds.meets_min_room_size(),
+                "seed {seed} room {idx}: {:?} below MIN_ROOM_DIM/MIN_ROOM_AREA",
+                record.bounds
             );
         }
     }
@@ -223,7 +247,7 @@ fn metadata_has_houses_with_entries() {
     for house in &meta.houses {
         assert!(house.x0 <= house.center_x && house.center_x <= house.x1);
         assert!(house.z0 <= house.center_z && house.center_z <= house.z1);
-        assert!(house.area >= 4, "footprint area should be stored on each house");
+        assert!(house.area >= MIN_ROOM_AREA, "footprint area should be stored on each house");
         assert_eq!(
             entrypoint_walk_tile(house.entry.wall_x, house.entry.wall_z, house.entry.outward_edge),
             (house.entry.walk_x, house.entry.walk_z)
@@ -355,6 +379,9 @@ fn home_crawler_wave_stays_within_manhattan_radius() {
         };
         for z in house.z0..=house.z1 {
             for x in house.x0..=house.x1 {
+                if !house.contains(x, z) {
+                    continue;
+                }
                 if draft.floor_styles[z as usize][x as usize] != TileStyle::FLOOR_MARBLE {
                     continue;
                 }
@@ -527,15 +554,15 @@ fn house_entry_is_open_tile_inside_doorway() {
 fn inner_walls_split_house_into_rooms() {
     let mut draft = MapDraft::new(MapGeneratorConfig {
         seed: 3,
-        size: 16,
+        size: 24,
         margin: 1,
     });
     draft.room_records = vec![RoomRecord {
         bounds: Room {
-            x0: 3,
-            z0: 3,
-            x1: 11,
-            z1: 11,
+            x0: 2,
+            z0: 2,
+            x1: 17,
+            z1: 17,
         },
     }];
     draft.step_init_carpet();
@@ -546,8 +573,8 @@ fn inner_walls_split_house_into_rooms() {
     draft.step_split_houses_into_rooms();
 
     let mut inner_wall_cells = 0u32;
-    for z in 4..=10 {
-        for x in 4..=10 {
+    for z in 3..=16 {
+        for x in 3..=16 {
             if let DraftTile::Wall(_) = draft.get(x, z) {
                 inner_wall_cells += 1;
             }
@@ -555,13 +582,13 @@ fn inner_walls_split_house_into_rooms() {
     }
     assert!(
         inner_wall_cells > 0,
-        "9x9 house should receive at least one inner wall"
+        "16×16 house should receive at least one inner wall"
     );
 }
 
 #[test]
 fn inner_walls_skipped_for_small_houses() {
-    // Houses with footprint_area < 30 must not receive any inner walls.
+    // Houses with footprint_area < MIN_HOUSE_AREA_FOR_INNER_WALLS must not receive inner walls.
     let mut draft = MapDraft::new(MapGeneratorConfig {
         seed: 5,
         size: 12,
@@ -583,7 +610,7 @@ fn inner_walls_skipped_for_small_houses() {
     draft.step_place_house_doors();
     draft.step_split_houses_into_rooms();
 
-    // 4x4 house has area 16 < 30, so the split step is skipped entirely.
+    // 4×4 house has area 16, well below MIN_HOUSE_AREA_FOR_INNER_WALLS — no inner walls.
     for z in 4..=5 {
         for x in 4..=5 {
             assert_eq!(

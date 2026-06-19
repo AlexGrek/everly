@@ -1,11 +1,12 @@
 //! Step 9b: split each house into rooms with axis-aligned inner walls (no doors yet).
 //!
-//! Total lines allowed = `footprint_area / 30` (one per 30 sq units). The budget
-//! is split evenly between horizontal and vertical orientations (ceiling to H).
+//! Inner wall budget rolls randomly between 1 and
+//! min(`footprint_area / AREA_PER_INNER_WALL`, `MAX_INNER_WALL_CUTS`) per house.
+//! The budget is split evenly between horizontal and vertical orientations (ceiling to H).
 //! A candidate cut is accepted only when:
 //!   1. every resulting sub-room has area >= [`MIN_ROOM_AREA`] cells,
-//!   2. every resulting sub-room is at least [`MIN_ROOM_DIM`] cells in either
-//!      direction (no 1-unit-wide spaces),
+//!   2. every resulting sub-room is at least [`MIN_ROOM_DIM`] cells in **each**
+//!      dimension (no sliver rooms),
 //!   3. the cut is at least [`MIN_PARALLEL_WALL_DISTANCE`] cells away from any
 //!      existing parallel wall — outer perimeter or inner wall placed earlier.
 
@@ -17,18 +18,15 @@ use crate::map::world_map::{MASK_NORTH, MASK_WEST};
 
 use super::draft::{DraftTile, MapDraft};
 use super::step_door::house_entry_wall_cells;
-use super::types::MIN_HOUSE_AREA_FOR_CENTER_WAVE;
-
-/// One inner wall is permitted per this many cells of house footprint area.
-const AREA_PER_INNER_WALL: i32 = 80;
-const MIN_ROOM_AREA: i32 = 9;
-const MIN_ROOM_DIM: i32 = 3;
-const MIN_PARALLEL_WALL_DISTANCE: i32 = 3;
+use super::types::{
+    AREA_PER_INNER_WALL, MAX_INNER_WALL_CUTS, MAX_INNER_WALL_CUTS_PER_AXIS,
+    MIN_HOUSE_AREA_FOR_INNER_WALLS, MIN_PARALLEL_WALL_DISTANCE, MIN_ROOM_AREA, MIN_ROOM_DIM,
+};
 
 impl MapDraft {
     pub fn step_split_houses_into_rooms(&mut self) {
         for idx in 0..self.houses.len() {
-            if self.houses[idx].footprint_area < MIN_HOUSE_AREA_FOR_CENTER_WAVE {
+            if self.houses[idx].footprint_area < MIN_HOUSE_AREA_FOR_INNER_WALLS {
                 continue;
             }
             self.split_house_into_rooms(idx);
@@ -41,10 +39,13 @@ impl MapDraft {
             (h.x0, h.z0, h.x1, h.z1, h.footprint_area)
         };
 
-        // Total lines = floor(area / 30); split ceiling-to-H, floor-to-V.
-        let budget = (area / AREA_PER_INNER_WALL) as usize;
-        let h_max = (budget + 1) / 2;
-        let v_max = budget / 2;
+        let cap = (area / AREA_PER_INNER_WALL).min(MAX_INNER_WALL_CUTS);
+        if cap == 0 {
+            return;
+        }
+        let budget = rng::range(&mut self.rng, 1..=cap) as usize;
+        let h_max = ((budget + 1) / 2).min(MAX_INNER_WALL_CUTS_PER_AXIS as usize);
+        let v_max = (budget / 2).min(MAX_INNER_WALL_CUTS_PER_AXIS as usize);
 
         // Walls live on lines *between* cell rows/columns. Outer walls are at
         // lines z0 / z1+1 (horizontal) and x0 / x1+1 (vertical).

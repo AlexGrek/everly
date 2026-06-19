@@ -25,8 +25,8 @@ impl DraftBounds {
         Self {
             place_lo: m + BORDER_CLEARANCE,
             place_hi: sz - m - BORDER_CLEARANCE - 1,
-            grow_lo: m + 1,
-            grow_hi: sz - m - 2,
+            grow_lo: m + BORDER_CLEARANCE,
+            grow_hi: sz - m - BORDER_CLEARANCE - 1,
         }
     }
 }
@@ -44,6 +44,24 @@ impl Room {
         x >= self.x0 && x <= self.x1 && z >= self.z0 && z <= self.z1
     }
 
+    pub(crate) fn width(&self) -> i32 {
+        self.x1 - self.x0 + 1
+    }
+
+    pub(crate) fn height(&self) -> i32 {
+        self.z1 - self.z0 + 1
+    }
+
+    pub(crate) fn area(&self) -> i32 {
+        self.width().max(0) * self.height().max(0)
+    }
+
+    pub(crate) fn meets_min_room_size(&self) -> bool {
+        use super::types::{MIN_ROOM_AREA, MIN_ROOM_DIM};
+        self.width() >= MIN_ROOM_DIM
+            && self.height() >= MIN_ROOM_DIM
+            && self.area() >= MIN_ROOM_AREA
+    }
 }
 
 
