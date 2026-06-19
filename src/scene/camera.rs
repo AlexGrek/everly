@@ -105,7 +105,7 @@ pub struct StrategyCameraPlugin;
 impl Plugin for StrategyCameraPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<AmbientFillEnabled>()
-            .add_systems(OnEnter(GameState::InGame), spawn_camera)
+            .add_systems(OnEnter(GameState::Loading), spawn_camera)
             .add_systems(
                 Update,
                 (
@@ -115,7 +115,7 @@ impl Plugin for StrategyCameraPlugin {
                     sync_camera_transform,
                     sync_ambient_fill_brightness,
                 )
-                    .run_if(in_state(GameState::InGame)),
+                    .run_if(crate::menu::main_menu::in_world_session),
             );
     }
 }

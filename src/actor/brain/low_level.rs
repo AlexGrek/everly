@@ -30,6 +30,7 @@ use crate::map::pathfind_service::{PathKind, PathOutcome, PathfindReason, Reques
 
 use super::path::PathNode;
 use super::BrainContext;
+use crate::map::cell_occupancy::BotKinematics;
 
 /// Bounding-box margin (subtiles) added around the start/goal of a bot-on-bot
 /// subtile detour search. Lets the route bulge out by ~1 tile to get around a
@@ -56,6 +57,9 @@ const RECENTER_EPS: f32 = 0.03;
 /// subtile center (e.g. pressed by another bot), launch the detour anyway rather
 /// than hold forever.
 const RECENTER_MAX_S: f32 = 0.5;
+/// Seconds a wall-blocked bot holds a chokepoint with followers queued behind before
+/// it backs out via escape / abandon.
+const WALL_TRAIN_ESCAPE_SECS: f32 = 2.0;
 
 /// Inclusive bounds (seconds) of the pause a bot holds after stepping aside from
 /// a head-on bot-on-bot bump.
@@ -93,6 +97,14 @@ const NEIGHBOR_DIRS: [(i32, i32); 8] = [
     (0, -1),
     (1, -1),
 ];
+
+/// Which neighbouring cells [`step_target`] and [`find_escape_cell`] prefer when
+/// breaking a train jam (backward) vs a normal head-on bump (forward).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StepBias {
+    Forward,
+    Backward,
+}
 
 /// Tuning for [`FollowPath`]. Defaults reproduce BlackBot's historical movement
 /// feel so the planning refactor changes nothing about how a bot moves.
@@ -504,6 +516,8 @@ pub struct FollowPath {
     /// Seconds spent approaching [`recenter_target`](Self::recenter_target); bounded
     /// by [`RECENTER_MAX_S`] so a wedged bot still launches its detour.
     recenter_elapsed: f32,
+    /// Seconds spent wall-blocked while another bot queues behind along our heading.
+    wall_train_timer: f32,
 }
 
 /// Why an in-flight subtile detour was requested, which decides its fallback.
@@ -558,6 +572,7 @@ impl FollowPath {
             dynamic_repath_request: false,
             recenter_target: None,
             recenter_elapsed: 0.0,
+            wall_train_timer: 0.0,
         }
     }
 
@@ -747,14 +762,16 @@ impl FollowPath {
     /// The tile to step aside into on a head-on bump: probe all **eight**
     /// neighbouring cells, keep the free ones, and pick one at random —
     /// **preferring cells ahead of `heading`** (positive dot product) so the bot
-    /// tends to slip forward around the blocker rather than retreat. Returns
-    /// `None` only when every neighbour is taken (caller then waits in place).
+    /// tends to slip forward around the blocker rather than retreat. With
+    /// [`StepBias::Backward`] the preference is reversed (train-jam escape).
+    /// Returns `None` only when every neighbour is taken (caller then waits in place).
     fn step_target(
         &self,
         state: &ActorState,
         ctx: &BrainContext,
         heading: Vec2,
         rng: &mut StdRng,
+        bias: StepBias,
     ) -> Option<(i32, i32)> {
         let cur = ctx.main_tile;
         let h = heading.normalize_or_zero();
@@ -776,10 +793,14 @@ impl FollowPath {
                 nb += 1;
             }
         }
-        if nf > 0 {
-            Some(front[rng::range(rng, 0..nf)])
-        } else if nb > 0 {
-            Some(back[rng::range(rng, 0..nb)])
+        let (prefer, fallback) = match bias {
+            StepBias::Forward => (&front[..nf], &back[..nb]),
+            StepBias::Backward => (&back[..nb], &front[..nf]),
+        };
+        if !prefer.is_empty() {
+            Some(prefer[rng::range(rng, 0..prefer.len())])
+        } else if !fallback.is_empty() {
+            Some(fallback[rng::range(rng, 0..fallback.len())])
         } else {
             None
         }
@@ -795,7 +816,14 @@ impl FollowPath {
     /// of other creatures and static geometry (its own current footprint is
     /// bypassed, so the cell it already stands in is eligible). Returns the tile,
     /// or `None` when avoidance data is unavailable or nothing is free in range.
-    fn find_escape_cell(&self, state: &ActorState, ctx: &BrainContext) -> Option<(i32, i32)> {
+    /// With [`StepBias::Backward`] the nearest free cell **behind** `self.direction`
+    /// is preferred when one exists (train-jam / wall-leader escape).
+    fn find_escape_cell(
+        &self,
+        state: &ActorState,
+        ctx: &BrainContext,
+        bias: StepBias,
+    ) -> Option<(i32, i32)> {
         let views = ctx.avoidance.as_ref()?;
         let sc = SUBTILE_COUNT as i32;
         let radius = state.radius_subtiles;
@@ -808,9 +836,19 @@ impl FollowPath {
         let blocked = views.blocked_flags;
         let here = ctx.main_tile;
         let center = state.center;
+        let away = match bias {
+            StepBias::Forward => None,
+            StepBias::Backward => {
+                let h = self.direction.normalize_or_zero();
+                if h == Vec2::ZERO { None } else { Some(h) }
+            }
+        };
 
         let mut best: Option<((i32, i32), f32)> = None;
-        for ring in 0..=ESCAPE_SEARCH_TILES {
+        let mut best_back: Option<((i32, i32), f32)> = None;
+        // Ring 0 is the current tile — always "free" because the probe bypasses
+        // our own footprint, so skip it; escape must move to a different cell.
+        for ring in 1..=ESCAPE_SEARCH_TILES {
             for_each_chebyshev_ring(ring, |dx, dy| {
                 let tile = (here.x + dx, here.y + dy);
                 let goal_center = IVec2::new(tile.0 * sc + sc / 2, tile.1 * sc + sc / 2);
@@ -822,9 +860,17 @@ impl FollowPath {
                     if best.map_or(true, |(_, bd)| d2 < bd) {
                         best = Some((tile, d2));
                     }
+                    if let Some(h) = away {
+                        if (waypoint_center(tile) - center).dot(h) < -1e-4
+                            && best_back.map_or(true, |(_, bd)| d2 < bd)
+                        {
+                            best_back = Some((tile, d2));
+                        }
+                    }
                 }
             });
-            if let Some((_, bd)) = best {
+            let term = if away.is_some() { best_back.or(best) } else { best };
+            if let Some((_, bd)) = term {
                 if ring < ESCAPE_SEARCH_TILES
                     && min_dist2_to_chebyshev_ring(center, here, ring + 1) > bd
                 {
@@ -832,7 +878,7 @@ impl FollowPath {
                 }
             }
         }
-        best.map(|(t, _)| t)
+        best_back.or(best).map(|(t, _)| t)
     }
 
     /// Drives toward the active [`escape_target`](Self::escape_target). On arrival
@@ -946,9 +992,16 @@ impl FollowPath {
     /// splice-repair: relocate to the nearest free cell (vacating the chokepoint
     /// before rescheduling), or abandon in place when no free cell / avoidance
     /// data is available (headless tests).
-    fn escape_or_abandon(&mut self, state: &mut ActorState, ctx: &BrainContext, t: &FollowTuning, dt: f32) {
+    fn escape_or_abandon(
+        &mut self,
+        state: &mut ActorState,
+        ctx: &BrainContext,
+        t: &FollowTuning,
+        dt: f32,
+        bias: StepBias,
+    ) {
         let center = state.center;
-        if let Some(target) = self.find_escape_cell(state, ctx) {
+        if let Some(target) = self.find_escape_cell(state, ctx, bias) {
             ctx.trace(format!(
                 "stall → escape to tile {target:?} (center {:.2},{:.2}, main {:?})",
                 center.x, center.y, ctx.main_tile
@@ -959,6 +1012,7 @@ impl FollowPath {
             self.pending_wait = None;
             self.stuck_timer = 0.0;
             self.stuck_reference_pos = Some(center);
+            self.wall_train_timer = 0.0;
             self.run_escape(state, ctx, t, dt);
         } else {
             ctx.trace(format!(
@@ -970,8 +1024,82 @@ impl FollowPath {
             self.last_head_on_bump = None;
             self.velocity = Vec2::ZERO;
             self.prev_center = None;
+            self.wall_train_timer = 0.0;
             state.move_buffer = ActorMoveBuffer::default();
             state.next_waypoint_hint = None;
+        }
+    }
+
+    /// Head-on (or train-jam) bump response: bounce, then detour / step-aside /
+    /// escape / wait. Returns `true` when an escape maneuver took over the tick.
+    fn respond_head_on_bump(
+        &mut self,
+        state: &mut ActorState,
+        ctx: &BrainContext,
+        rng: &mut StdRng,
+        t: &FollowTuning,
+        dt: f32,
+        heading: Vec2,
+        world_subtile_x: i32,
+        world_subtile_y: i32,
+        bias: StepBias,
+    ) -> bool {
+        let center = state.center;
+        let normal = occupancy_collision_normal(center, world_subtile_x, world_subtile_y);
+        self.velocity = reflect_velocity(self.velocity, normal);
+        if self.velocity.length_squared() > 1e-8 {
+            self.direction = self.velocity.normalize();
+        } else {
+            self.direction = -self.direction;
+        }
+        self.prev_center = None;
+
+        self.drop_sub_run();
+        self.clear_detour_request();
+        self.pending_wait = None;
+        self.clear_step_aside_insertion();
+
+        let step = self.step_target(state, ctx, heading, rng, bias);
+        let want_detour = rng::chance(rng, t.bot_detour_chance);
+        let can_detour = ctx.avoidance.is_some() && ctx.pathfind.is_some();
+        if want_detour && can_detour {
+            ctx.trace(format!(
+                "bump at ({world_subtile_x},{world_subtile_y}) → recenter then detour (fallback {step:?})"
+            ));
+            self.begin_recenter_detour(state, self.index, DetourPurpose::Avoidance, step);
+            return false;
+        }
+
+        match step {
+            Some(c) => {
+                ctx.trace(format!(
+                    "bump at ({world_subtile_x},{world_subtile_y}) → step aside to {c:?}"
+                ));
+                self.begin_step_aside(step, rng);
+                false
+            }
+            None => {
+                if let Some(target) = self.find_escape_cell(state, ctx, bias) {
+                    ctx.trace(format!(
+                        "bump at ({world_subtile_x},{world_subtile_y}) → neighbours taken, escape to {target:?}"
+                    ));
+                    self.escape_target = Some(target);
+                    self.drop_sub_run();
+                    self.last_head_on_bump = None;
+                    self.pending_wait = None;
+                    self.stuck_timer = 0.0;
+                    self.stuck_reference_pos = Some(center);
+                    self.wall_train_timer = 0.0;
+                    self.run_escape(state, ctx, t, dt);
+                    true
+                } else {
+                    ctx.trace(format!(
+                        "bump at ({world_subtile_x},{world_subtile_y}) → neighbours taken, no escape → wait"
+                    ));
+                    self.begin_wait_in_place(rng);
+                    false
+                }
+            }
         }
     }
 
@@ -1048,7 +1176,7 @@ impl LowLevelAction for FollowPath {
                 match purpose {
                     DetourPurpose::Avoidance => self.step_aside_or_wait(fallback, rng),
                     DetourPurpose::Repair => {
-                        self.escape_or_abandon(state, ctx, t, dt);
+                        self.escape_or_abandon(state, ctx, t, dt, StepBias::Forward);
                         return;
                     }
                     DetourPurpose::WallRepair => {
@@ -1104,7 +1232,7 @@ impl LowLevelAction for FollowPath {
                         match purpose {
                             DetourPurpose::Avoidance => self.step_aside_or_wait(fallback, rng),
                             DetourPurpose::Repair => {
-                                self.escape_or_abandon(state, ctx, t, dt);
+                                self.escape_or_abandon(state, ctx, t, dt, StepBias::Forward);
                                 return;
                             }
                             DetourPurpose::WallRepair => {
@@ -1182,7 +1310,7 @@ impl LowLevelAction for FollowPath {
                         .is_err();
                 if creature_ahead {
                     // Recenter on this subtile, then detour from there (deferred).
-                    let fallback = self.step_target(state, ctx, self.direction, rng);
+                    let fallback = self.step_target(state, ctx, self.direction, rng, StepBias::Forward);
                     ctx.trace(format!(
                         "look-ahead: creature in leading footprint at {advanced:?} → recenter then detour"
                     ));
@@ -1198,8 +1326,8 @@ impl LowLevelAction for FollowPath {
         // contact is with (via `CellOccupancy`) and react by where it hit:
         //  - I hit another bot's FRONT (it heads toward me) → head-to-head: bounce
         //    then detour (`bot_detour_chance`) / step-aside / escape / wait.
-        //  - I hit another bot's BACK (it heads my way) → rear-ended it: no bounce,
-        //    a brief wait (< 1 s) so it pulls away, or rarely a dynamic re-route.
+        //  - I hit another bot's BACK (it heads my way) → rear-ended it: brief wait
+        //    unless the leader is itself blocked (train jam) → head-on with backward bias.
         //  - I GOT hit from behind (blocker behind my heading) → don't react, keep
         //    going; rarely a dynamic re-route.
         if let Some(ActorMovementError::BlockedByOccupancy {
@@ -1230,84 +1358,38 @@ impl LowLevelAction for FollowPath {
                         Some((_, o)) if o.is_moving() => o.heading.dot(center - o.center) > 0.0,
                         _ => true,
                     };
+                    let train_jam = other.as_ref().is_some_and(|(_, o)| leader_is_train_anchor(o, center));
 
-                    if hit_their_front {
-                        if let Some((who, _)) = other {
+                    if hit_their_front || train_jam {
+                        let bias = if train_jam && !hit_their_front {
+                            StepBias::Backward
+                        } else {
+                            StepBias::Forward
+                        };
+                        if train_jam && !hit_their_front {
+                            if let Some((who, _)) = other {
+                                ctx.trace(format!(
+                                    "rear-ended blocked {who:?} at {blocker:?} → train jam (back)"
+                                ));
+                            }
+                        } else if let Some((who, _)) = other {
                             ctx.trace(format!("hit {who:?}'s front at {blocker:?} → head-on"));
                         }
-                        // HEAD-TO-HEAD: elastic bounce, then detour / step-aside / wait.
-                        let normal = occupancy_collision_normal(center, world_subtile_x, world_subtile_y);
-                        self.velocity = reflect_velocity(self.velocity, normal);
-                        if self.velocity.length_squared() > 1e-8 {
-                            self.direction = self.velocity.normalize();
-                        } else {
-                            self.direction = -self.direction;
-                        }
-                        // Skip achieved-vs-planned clamping this frame so reflection is preserved.
-                        self.prev_center = None;
-
-                        // A fresh bump invalidates any in-progress detour, pending pause,
-                        // unreached step-aside insertion, or awaited detour before re-deciding.
-                        self.drop_sub_run();
-                        self.clear_detour_request();
-                        self.pending_wait = None;
-                        self.clear_step_aside_insertion();
-
-                        // Pick the step-aside cell (front-preferred free neighbour;
-                        // `None` = every neighbour taken → wait). Roll the detour vs
-                        // step-aside response with the unchanged `bot_detour_chance`.
-                        let step = self.step_target(state, ctx, heading, rng);
-                        let want_detour = rng::chance(rng, t.bot_detour_chance);
-                        // A detour needs a subtile pathfinder; without one fall back.
-                        let can_detour = ctx.avoidance.is_some() && ctx.pathfind.is_some();
-                        if want_detour && can_detour {
-                            // Recenter on this subtile, then detour from there. The
-                            // bounce above already shoved us off the blocker; the
-                            // recenter settles us onto the cell center before routing.
-                            ctx.trace(format!(
-                                "bump at {blocker:?} → recenter then detour (fallback {step:?})"
-                            ));
-                            self.begin_recenter_detour(state, self.index, DetourPurpose::Avoidance, step);
-                        } else {
-                            match step {
-                                Some(c) => {
-                                    ctx.trace(format!("bump at {blocker:?} → step aside to {c:?}"));
-                                    self.begin_step_aside(step, rng);
-                                }
-                                // Genuine wedge: no free immediate neighbour. A bare
-                                // wait-in-place here would suspend BOTH the stuck-timer
-                                // escape (skipped by the early return) and the
-                                // collision-pressure relocate (gated off while
-                                // `is_recovering`), so two big bots pressed together in
-                                // open space deadlock forever. Try the wider escape
-                                // search (nearest fully-free cell, radius
-                                // `ESCAPE_SEARCH_TILES`) first; only wait if even that
-                                // finds nothing (genuinely boxed in / no avoidance data).
-                                None => {
-                                    if let Some(target) = self.find_escape_cell(state, ctx) {
-                                        ctx.trace(format!(
-                                            "bump at {blocker:?} → neighbours taken, escape to {target:?}"
-                                        ));
-                                        self.escape_target = Some(target);
-                                        self.drop_sub_run();
-                                        self.last_head_on_bump = None;
-                                        self.pending_wait = None;
-                                        self.stuck_timer = 0.0;
-                                        self.stuck_reference_pos = Some(center);
-                                        self.run_escape(state, ctx, t, dt);
-                                        return;
-                                    }
-                                    ctx.trace(format!(
-                                        "bump at {blocker:?} → neighbours taken, no escape → wait"
-                                    ));
-                                    self.begin_wait_in_place(rng);
-                                }
-                            }
+                        if self.respond_head_on_bump(
+                            state,
+                            ctx,
+                            rng,
+                            t,
+                            dt,
+                            heading,
+                            world_subtile_x,
+                            world_subtile_y,
+                            bias,
+                        ) {
+                            return;
                         }
                     } else {
-                        // REAR-ENDED a bot heading our way: don't fight it. Clear any
-                        // in-flight maneuver, then either re-route (rarely) or brake
-                        // and wait briefly (< 1 s) so it pulls ahead. No bounce.
+                        // REAR-ENDED a bot heading our way that can still move: don't fight it.
                         self.drop_sub_run();
                         self.clear_detour_request();
                         self.pending_wait = None;
@@ -1396,6 +1478,25 @@ impl LowLevelAction for FollowPath {
         // and has not moved more than `stuck_progress_eps` from its reference
         // position for `stuck_repath_secs` (near waypoints included).
         let in_queue = ctx.interactive.is_in_any_queue(ctx.entity);
+        let train_jam_leader = is_train_jam_leader(state, ctx, self.direction, in_queue);
+
+        // Wall-/chokepoint-blocked leader with a train queued behind: cap how long we
+        // hold the chokepoint before backing out (see [`WALL_TRAIN_ESCAPE_SECS`]).
+        if train_jam_leader && self.escape_target.is_none() {
+            self.wall_train_timer += dt;
+            if self.wall_train_timer >= WALL_TRAIN_ESCAPE_SECS {
+                ctx.trace(format!(
+                    "wall train jam {:.1}s → escape backward",
+                    self.wall_train_timer
+                ));
+                self.wall_train_timer = 0.0;
+                self.escape_or_abandon(state, ctx, t, dt, StepBias::Backward);
+                return;
+            }
+        } else {
+            self.wall_train_timer = 0.0;
+        }
+
         tick_stall_timer(
             &mut self.stuck_timer,
             &mut self.stuck_reference_pos,
@@ -1409,7 +1510,8 @@ impl LowLevelAction for FollowPath {
             // A wall (static) wedge is treated differently from a bot wedge: it
             // never builds collision pressure, never marks the bot stuck, and is
             // **always** answered with a fresh subtile subpath toward the next
-            // waypoint (re-armable), never the escape/abandon last resort.
+            // waypoint (re-armable), never the escape/abandon last resort — unless
+            // [`WALL_TRAIN_ESCAPE_SECS`] already fired above.
             let wall_blocked = matches!(
                 state.last_movement_error,
                 Some(ActorMovementError::BlockedByStatic { .. })
@@ -1451,7 +1553,7 @@ impl LowLevelAction for FollowPath {
                 self.stuck_timer = 0.0;
                 self.stuck_reference_pos = Some(center);
             } else {
-                self.escape_or_abandon(state, ctx, t, dt);
+                self.escape_or_abandon(state, ctx, t, dt, StepBias::Forward);
                 return;
             }
         }
@@ -1490,6 +1592,7 @@ impl LowLevelAction for FollowPath {
         self.clear_detour_request();
         self.last_head_on_bump = None;
         self.dynamic_repath_request = false;
+        self.wall_train_timer = 0.0;
     }
 
     fn label(&self) -> String {
@@ -1592,6 +1695,84 @@ pub fn reached_waypoint(center: Vec2, tile: (i32, i32), eps: f32) -> bool {
 #[inline]
 fn node_reached(center: Vec2, node: PathNode, eps: f32) -> bool {
     (node.center() - center).length_squared() <= eps * eps
+}
+
+/// `true` when the bot ahead in a train is wedged and followers should not wait
+/// politely behind it (rear-end → head-on with backward bias).
+fn leader_is_train_anchor(leader: &BotKinematics, our_center: Vec2) -> bool {
+    if !leader.is_moving() {
+        return true;
+    }
+    if !leader.movement_blocked() {
+        return false;
+    }
+    if leader.heading.length_squared() <= 1e-8 {
+        return true;
+    }
+    let from_leader = our_center - leader.center;
+    if from_leader.length_squared() <= 1e-8 {
+        return leader.movement_blocked();
+    }
+    // Rear-end geometry: follower sits behind the leader along its heading.
+    from_leader.dot(leader.heading) < 0.0
+}
+
+/// `true` when this bot is wedged at a chokepoint with another bot queued behind
+/// along its heading — the leader in a dead-end train jam.
+fn is_train_jam_leader(
+    state: &ActorState,
+    ctx: &BrainContext,
+    heading: Vec2,
+    in_queue: bool,
+) -> bool {
+    if in_queue || !creature_follows_behind(state, ctx, heading) {
+        return false;
+    }
+    matches!(
+        state.last_movement_error,
+        Some(ActorMovementError::BlockedByStatic { .. })
+            | Some(ActorMovementError::BlockedByOccupancy { .. })
+    )
+}
+
+/// `true` when another creature sits within one tile behind `heading` (footprint-
+/// aware scan along the subtile grid, not just the immediately adjacent subtile).
+fn creature_follows_behind(state: &ActorState, ctx: &BrainContext, heading: Vec2) -> bool {
+    let Some(views) = ctx.avoidance.as_ref() else {
+        return false;
+    };
+    let h = heading.normalize_or_zero();
+    if h == Vec2::ZERO {
+        return false;
+    }
+    let radius = state.radius_subtiles;
+    let start = state
+        .last_accepted_center_subtile
+        .unwrap_or_else(|| float_subtile(state.center));
+    let step = IVec2::new(h.x.round() as i32, h.y.round() as i32);
+    if step == IVec2::ZERO {
+        return false;
+    }
+    // One tile of reach — enough for bumper-to-bumper spacing at radius 2.
+    let max_steps = SUBTILE_COUNT as i32;
+    let mut probe_at = start;
+    for _ in 0..max_steps {
+        probe_at -= step;
+        if views
+            .dynamic
+            .probe_footprint(
+                probe_at,
+                radius,
+                Some((start, radius)),
+                FLAG_CREATURE,
+                views.static_subtiles,
+            )
+            .is_err()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Advance a no-progress timer; reset when `center` moves past `progress_eps` or
@@ -1862,7 +2043,12 @@ mod tests {
 
     /// Builds a [`CellOccupancy`] holding one "other" bot (radius 2) at `center`
     /// with `heading`, returning the map and the other bot's entity.
-    fn occ_with_other(center: Vec2, heading: Vec2) -> (crate::map::cell_occupancy::CellOccupancy, Entity) {
+    fn occ_with_other(
+        center: Vec2,
+        heading: Vec2,
+        blocked_by_static: bool,
+        blocked_by_creature: bool,
+    ) -> (crate::map::cell_occupancy::CellOccupancy, Entity) {
         use crate::map::cell_occupancy::{BotKinematics, CellOccupancy};
         let mut occ = CellOccupancy::default();
         let other = Entity::from_bits(0xB0B);
@@ -1873,6 +2059,8 @@ mod tests {
                 center,
                 heading,
                 radius_subtiles: 2,
+                blocked_by_static,
+                blocked_by_creature,
             },
         );
         (occ, other)
@@ -1940,7 +2128,7 @@ mod tests {
         // The bot ahead is heading the SAME way (+X): we rear-ended its back.
         // Expect a brief wait (< 1 s), no elastic bounce, and not "stuck".
         let (mut fp, mut state) = moving_into_blocker();
-        let (occ, _) = occ_with_other(Vec2::new(5.4, 5.0), Vec2::X);
+        let (occ, _) = occ_with_other(Vec2::new(5.4, 5.0), Vec2::X, false, false);
         let passability = Hypermap::new(1.0);
         let interactive = InteractiveEntityMap::new();
         let ctx = collision_ctx(&passability, &interactive, Some(&occ), state.center);
@@ -1956,12 +2144,47 @@ mod tests {
     }
 
     #[test]
+    fn rear_end_blocked_leader_is_train_jam_not_polite_wait() {
+        // Leader heading +X but wall-blocked last frame: follower must not rear-end
+        // wait — it gets the head-on bounce / backward-biased response instead.
+        let (mut fp, mut state) = moving_into_blocker();
+        let (occ, _) = occ_with_other(Vec2::new(5.4, 5.0), Vec2::X, true, false);
+        let passability = Hypermap::new(1.0);
+        let interactive = InteractiveEntityMap::new();
+        let ctx = collision_ctx(&passability, &interactive, Some(&occ), state.center);
+        let mut rng = rng::seeded(1);
+        fp.execute(&mut state, &ctx, &mut rng, &FollowTuning { bot_detour_chance: 0.0, ..FollowTuning::default() });
+
+        assert_eq!(fp.contact_wait_s, 0.0, "train jam must not arm rear-end wait");
+        assert!(fp.velocity.x < 0.0, "train jam should bounce backward");
+    }
+
+    #[test]
+    fn leader_is_train_anchor_detects_blocked_leader_ahead() {
+        let leader = BotKinematics {
+            tile: IVec2::new(5, 5),
+            center: Vec2::new(5.4, 5.0),
+            heading: Vec2::X,
+            radius_subtiles: 2,
+            blocked_by_static: true,
+            blocked_by_creature: false,
+        };
+        assert!(leader_is_train_anchor(&leader, Vec2::new(5.0, 5.0)));
+        let moving_clear = BotKinematics {
+            blocked_by_static: false,
+            blocked_by_creature: false,
+            ..leader
+        };
+        assert!(!leader_is_train_anchor(&moving_clear, Vec2::new(5.0, 5.0)));
+    }
+
+    #[test]
     fn head_on_other_facing_me_bounces() {
         // The other bot faces ME (-X): true head-to-head → elastic bounce, same as
         // the identity-less path. (Mirrors `follow_path_bounces_*` but with the
         // blocker resolved and classified as front-on.)
         let (mut fp, mut state) = moving_into_blocker();
-        let (occ, _) = occ_with_other(Vec2::new(5.4, 5.0), Vec2::NEG_X);
+        let (occ, _) = occ_with_other(Vec2::new(5.4, 5.0), Vec2::NEG_X, false, false);
         let passability = Hypermap::new(1.0);
         let interactive = InteractiveEntityMap::new();
         let ctx = collision_ctx(&passability, &interactive, Some(&occ), state.center);
@@ -2412,7 +2635,7 @@ mod tests {
             );
         }
         assert_eq!(
-            fp.step_target(&state, &ctx, Vec2::new(1.0, 0.0), &mut rng),
+            fp.step_target(&state, &ctx, Vec2::new(1.0, 0.0), &mut rng, StepBias::Forward),
             None,
             "all neighbour footprints blocked → step_target yields None"
         );
@@ -2469,7 +2692,7 @@ mod tests {
         };
 
         assert_eq!(
-            fp.step_target(&state, &ctx, Vec2::new(1.0, 0.0), &mut rng),
+            fp.step_target(&state, &ctx, Vec2::new(1.0, 0.0), &mut rng, StepBias::Forward),
             None,
             "all immediate neighbours blocked → no step cell"
         );
@@ -2719,7 +2942,8 @@ mod tests {
             DynamicPassabilityMap, SubtilePassability, FLAG_BLOCKED, FLAG_VOID,
         };
 
-        // Everything is free, so the nearest free cell is the bot's own tile (0,0).
+        // Everything is free. Escape must pick a *different* cell — ring 0 (here)
+        // is skipped because the footprint probe always passes on our own tile.
         let dynamic = DynamicPassabilityMap::new();
         let static_subtiles: Hypermap<SubtilePassability> = Hypermap::new(SubtilePassability::EMPTY);
         let passability = Hypermap::new(1.0);
@@ -2784,14 +3008,14 @@ mod tests {
 
         assert_eq!(
             fp.escape_target,
-            Some((0, 0)),
-            "a stalled bot should target the nearest free cell instead of abandoning"
+            Some((0, -1)),
+            "a stalled bot should target the nearest free cell outside its footprint"
         );
         assert!(!fp.abandoned, "escape must not reschedule until the free cell is reached");
         assert!(!fp.is_stuck());
 
         // Arrive at the free cell center: now the route is abandoned for replanning.
-        state.center = Vec2::new(0.5, 0.5);
+        state.center = Vec2::new(0.5, -0.5);
         let ctx = make_ctx(state.center);
         fp.execute(&mut state, &ctx, &mut rng, &tuning);
 

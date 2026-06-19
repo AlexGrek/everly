@@ -2,8 +2,10 @@
 //!
 //! Lists every level discovered on disk under `levels/level_*/` and lets the
 //! player pick one. Choosing a level writes [`crate::map::level::LevelName`]
-//! and transitions [`GameState`] from `MainMenu` to `InGame`, at which point
-//! the camera, HUD, hypermap renderer, and editor systems wake up.
+//! and transitions [`GameState`] to [`GameState::Loading`], where the strategy
+//! camera and hypermap renderer spin up behind a loading overlay; once the
+//! initial visible chunks are meshed, the app enters [`GameState::InGame`] and
+//! the HUD plus editor systems wake up.
 //!
 //! The menu owns its own UI camera (a `Camera2d`), independent from the
 //! gameplay strategy camera, so the two views never share entities.
@@ -16,13 +18,22 @@ use bevy::ui::widget::Button;
 
 use crate::map::level::{create_new_level_with_road_origin, pick_new_level_name, LevelName};
 
+use super::loading_screen::LoadingScreenPlugin;
+
 /// App-wide screen flag. `MainMenu` is the default so the player always lands
 /// on the menu first; gameplay plugins gate their setup on `OnEnter(InGame)`.
 #[derive(States, Default, Debug, Clone, Eq, PartialEq, Hash)]
 pub enum GameState {
     #[default]
     MainMenu,
+    /// World is bootstrapping and initial chunk meshes are baking/spawning.
+    Loading,
     InGame,
+}
+
+/// True while the 3D world session is active (initial load or gameplay).
+pub fn in_world_session(state: Res<State<GameState>>) -> bool {
+    matches!(*state.get(), GameState::Loading | GameState::InGame)
 }
 
 const MENU_BG: Color = Color::srgb(0.04, 0.05, 0.07);
@@ -70,6 +81,7 @@ impl Plugin for MainMenuPlugin {
     fn build(&self, app: &mut App) {
         app.init_state::<GameState>()
             .init_resource::<AvailableLevels>()
+            .add_plugins(LoadingScreenPlugin)
             .add_systems(
                 OnEnter(GameState::MainMenu),
                 (scan_available_levels, spawn_main_menu).chain(),
@@ -279,7 +291,7 @@ fn main_menu_load_buttons(
         }
         info!("loading level `{}`", btn.0);
         level.0 = btn.0.clone();
-        next.set(GameState::InGame);
+        next.set(GameState::Loading);
         return;
     }
 }
@@ -314,7 +326,7 @@ fn main_menu_new_level_button(
             Ok(()) => {
                 info!("created new level `{name}` (road-only origin chunk)");
                 level.0 = name;
-                next.set(GameState::InGame);
+                next.set(GameState::Loading);
             }
             Err(e) => warn!("failed to create new level `{name}`: {e}"),
         }

@@ -305,6 +305,26 @@ impl HypermapRuntime {
         self.desired_chunks.iter().copied().collect()
     }
 
+    /// Count of desired visible chunks that have finished spawning (`loaded`, `total`).
+    pub fn visible_chunks_spawned(&self) -> (usize, usize) {
+        let total = self.desired_chunks.len();
+        let loaded = self
+            .desired_chunks
+            .iter()
+            .filter(|coord| self.chunk_roots.contains_key(coord))
+            .count();
+        (loaded, total)
+    }
+
+    /// True once every chunk in the current visibility set has a spawned root entity.
+    pub fn initial_visible_world_ready(&self) -> bool {
+        !self.desired_chunks.is_empty()
+            && self
+                .desired_chunks
+                .iter()
+                .all(|coord| self.chunk_roots.contains_key(coord))
+    }
+
     /// Returns `true` when the chunk that contains world tile `(world_x, world_z)` has a
     /// spawned mesh entity — i.e. the tile is currently visible on screen.
     pub fn is_world_pos_rendered(&self, world_x: i32, world_z: i32) -> bool {
@@ -383,12 +403,12 @@ pub struct SyncChargerVisualsSet;
 impl Plugin for HypermapWorldPlugin {
     fn build(&self, app: &mut App) {
         // `setup_water` runs in `Startup` (before any state transition), so by
-        // the time we enter `GameState::InGame` its resources are ready and
+        // the time we enter `GameState::Loading` its resources are ready and
         // the cross-schedule `.after(setup_water)` from before is no longer
         // needed.
         app.init_resource::<WaterRenderingEnabled>()
             .add_systems(
-                OnEnter(GameState::InGame),
+                OnEnter(GameState::Loading),
                 (setup_hypermap_runtime, setup_hypermap_assets).chain(),
             )
             .add_systems(
@@ -399,23 +419,23 @@ impl Plugin for HypermapWorldPlugin {
                     render_chunks_30fps,
                 )
                     .chain()
-                    .run_if(in_state(GameState::InGame)),
+                    .run_if(crate::menu::main_menu::in_world_session),
             )
             .add_systems(
                 Update,
                 sync_water_visibility
-                    .run_if(in_state(GameState::InGame))
+                    .run_if(crate::menu::main_menu::in_world_session)
                     .run_if(resource_changed::<WaterRenderingEnabled>),
             )
             .configure_sets(
                 Update,
-                SyncChargerVisualsSet.run_if(in_state(GameState::InGame)),
+                SyncChargerVisualsSet.run_if(crate::menu::main_menu::in_world_session),
             )
             .add_systems(
                 Update,
                 sync_charger_visuals
                     .in_set(SyncChargerVisualsSet)
-                    .run_if(in_state(GameState::InGame)),
+                    .run_if(crate::menu::main_menu::in_world_session),
             );
     }
 }

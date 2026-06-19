@@ -11,7 +11,7 @@
 //! keeps a [`BotKinematics`] snapshot so a neighbour's motion can be reasoned about
 //! without re-querying the ECS.
 //!
-//! Updated by [`track_cell_occupancy`] once per frame: each actor's current main
+//! Updated by [`track_cell_occupancy`] once per fixed movement tick: each actor's
 //! tile drives the (sparse) tile→entities map — only a genuine cell change mutates
 //! it — while the kinematics value is refreshed in place every frame (no
 //! allocation). Despawned actors are dropped via [`RemovedComponents`].
@@ -19,9 +19,9 @@
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 
-use crate::actor::{actor_main_tile, ActorObject};
-use crate::map::passability::SUBTILE_COUNT;
+use crate::actor::{actor_main_tile, process_actor_moves, ActorMovementError, ActorObject};
 use crate::menu::main_menu::GameState;
+use crate::map::passability::SUBTILE_COUNT;
 
 /// Per-bot kinematics tracked alongside cell occupancy: enough to reason about a
 /// neighbour's motion (where it is, which way it's going, how big it is) without
@@ -37,6 +37,10 @@ pub struct BotKinematics {
     pub heading: Vec2,
     /// Footprint radius in subtiles.
     pub radius_subtiles: i32,
+    /// Last frame ended with a static wall/void block (`BlockedByStatic`).
+    pub blocked_by_static: bool,
+    /// Last frame ended blocked by another creature (`BlockedByOccupancy`).
+    pub blocked_by_creature: bool,
 }
 
 impl BotKinematics {
@@ -44,6 +48,12 @@ impl BotKinematics {
     #[inline]
     pub fn is_moving(&self) -> bool {
         self.heading != Vec2::ZERO
+    }
+
+    /// `true` when the bot could not advance last frame (wall or creature ahead).
+    #[inline]
+    pub fn movement_blocked(&self) -> bool {
+        self.blocked_by_static || self.blocked_by_creature
     }
 }
 
@@ -194,10 +204,9 @@ impl CellOccupancy {
 /// records each live actor's current main tile + kinematics (mutating the tile map
 /// only on a real cell change; refreshing kinematics in place every frame).
 ///
-/// Runs in `Update`, which executes after the frame's `FixedUpdate` movement ticks,
-/// so `center` reflects the completed step and `heading` reflects the value the
-/// brain just published (including off-screen
-/// [`advance_unchecked`](crate::actor::movement) travel).
+/// Runs in `FixedUpdate` immediately after [`process_actor_moves`], so kinematics
+/// and blocked flags reflect the tick the brain will read on the **next** fixed
+/// step (same lag as `last_movement_error`).
 fn track_cell_occupancy(
     mut occupancy: ResMut<CellOccupancy>,
     actors: Query<(Entity, &ActorObject)>,
@@ -208,6 +217,10 @@ fn track_cell_occupancy(
     }
     for (entity, obj) in &actors {
         let s = obj.inner.state();
+        let blocked_by_static =
+            matches!(s.last_movement_error, Some(ActorMovementError::BlockedByStatic { .. }));
+        let blocked_by_creature =
+            matches!(s.last_movement_error, Some(ActorMovementError::BlockedByOccupancy { .. }));
         occupancy.update(
             entity,
             BotKinematics {
@@ -215,6 +228,8 @@ fn track_cell_occupancy(
                 center: s.center,
                 heading: s.heading,
                 radius_subtiles: s.radius_subtiles,
+                blocked_by_static,
+                blocked_by_creature,
             },
         );
     }
@@ -226,8 +241,10 @@ pub struct CellOccupancyPlugin;
 impl Plugin for CellOccupancyPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CellOccupancy>().add_systems(
-            Update,
-            track_cell_occupancy.run_if(in_state(GameState::InGame)),
+            FixedUpdate,
+            track_cell_occupancy
+                .after(process_actor_moves)
+                .run_if(in_state(GameState::InGame)),
         );
     }
 }
@@ -248,6 +265,8 @@ mod tests {
             center,
             heading: Vec2::ZERO,
             radius_subtiles: 2,
+            blocked_by_static: false,
+            blocked_by_creature: false,
         }
     }
 

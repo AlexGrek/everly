@@ -40,7 +40,7 @@ pub struct SunPlugin;
 impl Plugin for SunPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SunEnabled>()
-            .add_systems(OnEnter(GameState::InGame), spawn_sun)
+            .add_systems(OnEnter(GameState::Loading), spawn_sun)
             .add_systems(
                 Update,
                 sync_sun_enabled

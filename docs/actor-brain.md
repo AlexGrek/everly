@@ -266,9 +266,14 @@ hit. Three cases:
        neighbour but open space around them would otherwise deadlock forever.
 2. **I hit another bot's BACK** (it is heading my way → I rear-ended it). **No
    bounce** — give it room: brake and hold a brief `< 1 s`
-   (`REAR_END_WAIT_*_SECS`, 0.2–0.9 s) so it pulls ahead. With small probability
-   (`REAR_END_REROUTE_CHANCE`, 0.1) abandon the route for a **dynamic re-route**
-   instead (see below).
+   (`REAR_END_WAIT_*_SECS`, 0.2–0.9 s) so it pulls ahead — **unless the leader
+   is itself blocked** (`BotKinematics::movement_blocked`, refreshed from
+   `last_movement_error` each frame). In that **train-jam** case the follower
+   gets the full head-on response (bounce, step-aside, escape) with
+   **backward-biased** neighbour / escape selection so the queue backs out of
+   the chokepoint instead of waiting forever. With small probability
+   (`REAR_END_REROUTE_CHANCE`, 0.1) a *moving* leader still triggers a
+   **dynamic re-route** instead of the wait.
 3. **I GOT hit from behind** (blocker behind my heading). **Don't react** — keep
    steering toward the waypoint. With small probability (`REAR_HIT_REROUTE_CHANCE`,
    0.05) take the **dynamic re-route**.
@@ -292,8 +297,13 @@ it just **wall-slides** (the movement pipeline snaps the blocked axis and keeps 
 free one). If a wall actually wedges it (no progress for `stuck_repath_secs`),
 FollowPath **always re-routes with a subtile subpath toward the next waypoint** — a
 `SubtileDetour` with `DetourPurpose::WallRepair`, re-armable every stall, whose
-failure path simply resets and keeps steering (never escape/abandon). So walls are
-resolved purely by subcell re-routing; only bot-on-bot wedges can escalate to
+failure path simply resets and keeps steering (never escape/abandon) **while no
+train is queued behind**. When the bot is wall-blocked **or** creature-blocked at a chokepoint **and**
+[`creature_follows_behind`](../src/actor/brain/low_level.rs) detects another bot
+within one tile along its heading for [`WALL_TRAIN_ESCAPE_SECS`](../src/actor/brain/low_level.rs)
+(**2 s**), the leader **backs out** via the same escape / abandon path used for
+bot wedges (backward-biased cell search). So walls are normally resolved by
+subcell re-routing; train jams at a dead-end/corner escalate to
 escape / relocate.
 
 ### Debugging a single bot (selected-bot trace)

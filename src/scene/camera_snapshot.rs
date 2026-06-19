@@ -169,7 +169,7 @@ pub struct CameraSnapshotPlugin;
 impl Plugin for CameraSnapshotPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
-            OnEnter(GameState::InGame),
+            OnEnter(GameState::Loading),
             load_level_camera_on_enter.after(crate::scene::camera::spawn_camera),
         );
     }
