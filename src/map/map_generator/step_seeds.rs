@@ -54,7 +54,7 @@ impl MapDraft {
                 SUBSEEDS_PER_PRIMARY_MIN..=SUBSEEDS_PER_PRIMARY_MAX,
             );
             for _ in 0..sub_count {
-                let dist = rng::range(&mut self.rng, 5..=12);
+                let dist = rng::range(&mut self.rng, 2..=5);
                 let dir = rng::range(&mut self.rng, 0..8);
                 let (dx, dz) = subseed_offset(dir, dist);
                 let x = (sx + dx).clamp(self.bounds.grow_lo, self.bounds.grow_hi);

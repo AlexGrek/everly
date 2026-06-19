@@ -792,16 +792,16 @@ fn inner_doors_make_all_rooms_accessible() {
 
 #[test]
 fn house_tool_rejects_boundaries_below_minimum() {
-    assert!(generate_house_tiles(17, 20, 1).is_none());
-    assert!(generate_house_tiles(20, 17, 1).is_none());
+    assert!(generate_house_tiles(11, 20, 1).is_none());
+    assert!(generate_house_tiles(20, 11, 1).is_none());
     assert!(generate_house_tiles(MIN_HOUSE_TOOL_SIDE, MIN_HOUSE_TOOL_SIDE, 1).is_some());
 }
 
 #[test]
 fn house_tool_fills_boundary_with_a_walled_building() {
-    let width = 22;
-    let height = 20;
-    let tiles = generate_house_tiles(width, height, 7).expect("18×18+ boundary generates a house");
+    let width = 14;
+    let height = 12;
+    let tiles = generate_house_tiles(width, height, 7).expect("12×12+ boundary generates a house");
     assert_eq!(tiles.width, width);
     assert_eq!(tiles.height, height);
     assert_eq!(tiles.cells.len(), height as usize);

@@ -44,9 +44,8 @@ use crate::map::hypermap::{random_rng_seed, ChunkCoord, Hypermap, HypermapChunk}
 use crate::map::level::encode_chunk_geometry;
 use crate::map::world_map::{CellType, LampDecoration, TileStyle};
 
-/// Smallest boundary side (in cells) the editor "House" tool accepts — large
-/// enough for several [`MIN_ROOM_DIM`]×[`MIN_ROOM_DIM`] inner rooms.
-pub const MIN_HOUSE_TOOL_SIDE: i32 = MIN_ROOM_DIM * 6;
+/// Smallest boundary side (in cells) the editor "House" tool accepts.
+pub const MIN_HOUSE_TOOL_SIDE: i32 = MIN_ROOM_DIM * 4;
 /// Exterior road ring kept around a tool-generated house so doors can open
 /// onto road on every side (matches the procedural carpet that surrounds
 /// houses in a full chunk).

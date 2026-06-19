@@ -13,11 +13,11 @@ pub const CHUNK_VOID_MARGIN: i32 = 2;
 pub const PRIMARY_SEED_COUNT_MIN: i32 = 8;
 pub const PRIMARY_SEED_COUNT_MAX: i32 = 12;
 /// Subseed room sprouts per primary (inclusive range).
-pub const SUBSEEDS_PER_PRIMARY_MIN: i32 = 2;
-pub const SUBSEEDS_PER_PRIMARY_MAX: i32 = 4;
+pub const SUBSEEDS_PER_PRIMARY_MIN: i32 = 1;
+pub const SUBSEEDS_PER_PRIMARY_MAX: i32 = 2;
 /// Subseed room growth radius from center (inclusive); width/depth = `2 * radius + 1`.
-pub const SUBSEED_ROOM_RADIUS_MIN: i32 = 8;
-pub const SUBSEED_ROOM_RADIUS_MAX: i32 = 15;
+pub const SUBSEED_ROOM_RADIUS_MIN: i32 = 4;
+pub const SUBSEED_ROOM_RADIUS_MAX: i32 = 8;
 /// Minimum width and depth (cells) for any room — procedural subseed rect or inner split.
 pub const MIN_ROOM_DIM: i32 = 3;
 /// Minimum floor area (cells) for any room; [`MIN_ROOM_DIM`]².
@@ -26,7 +26,7 @@ pub const MIN_ROOM_AREA: i32 = MIN_ROOM_DIM * MIN_ROOM_DIM;
 pub const MIN_PARALLEL_WALL_DISTANCE: i32 = MIN_ROOM_DIM;
 
 /// Minimum house footprint before inner room walls are considered.
-pub const MIN_HOUSE_AREA_FOR_INNER_WALLS: i32 = 100;
+pub const MIN_HOUSE_AREA_FOR_INNER_WALLS: i32 = 64;
 /// Minimum house footprint (1 m² cells) for the center glass floor wave.
 pub const MIN_HOUSE_AREA_FOR_CENTER_WAVE: i32 = 30;
 /// One inner wall line is budgeted per this many footprint cells (before caps).
