@@ -3,6 +3,7 @@
 pub mod actor_inspector;
 pub mod game_hud;
 pub mod game_log;
+pub mod leaderboard;
 pub mod overlays;
 pub mod panel_anim;
 pub mod perf_timings;

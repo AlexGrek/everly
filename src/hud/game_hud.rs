@@ -15,6 +15,7 @@ use crate::map::dirt::DirtMap;
 use crate::map::hypermap_world::{HypermapChunkRemeshQueue, HypermapRuntime};
 use crate::map::temperature::TemperatureMap;
 use crate::map::floor_level::{ActiveFloorLevel, HYPERMAP_FLOOR_MAX};
+use crate::hud::leaderboard::LeaderboardToggleButton;
 use crate::hud::panel_anim::PanelAnim;
 use crate::menu::main_menu::GameState;
 
@@ -224,6 +225,32 @@ pub(crate) fn spawn_bottom_hud(mut commands: Commands, camera: Query<Entity, Wit
                     p.spawn((
                         OverlaysToggleLabel,
                         Text::new("Overlays"),
+                        TextFont::from_font_size(17.0),
+                        TextColor(TEXT_MAIN),
+                    ));
+                });
+
+            parent
+                .spawn((
+                    Name::new("HUD leaderboard toggle"),
+                    LeaderboardToggleButton,
+                    Button,
+                    Node {
+                        min_width: Val::Px(72.0),
+                        height: Val::Px(36.0),
+                        padding: UiRect::horizontal(Val::Px(12.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(1.0)),
+                        border_radius: BorderRadius::all(Val::Px(6.0)),
+                        ..default()
+                    },
+                    BorderColor::all(BTN_BORDER),
+                    BackgroundColor(BTN_BG),
+                ))
+                .with_children(|p| {
+                    p.spawn((
+                        Text::new("Bots"),
                         TextFont::from_font_size(17.0),
                         TextColor(TEXT_MAIN),
                     ));

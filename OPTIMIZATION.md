@@ -688,6 +688,37 @@ actor-engineer / field-interactions / bevy-engineer skills.
 Verified green: `cargo test -p everly` (272 passed, 0 failed, 2 ignored) and
 `cargo check -p everly --all-targets` warning-clean.
 
+### Wall/box mesh baking — corrected winding enables backface culling (2026-06)
+
+Chunk wall slabs, corner pillars, charger/depot cubes, and lamp cubes are all
+baked through the shared [`append_box`](src/map/hypermap_world.rs) helper. Its
+**±Z** faces were wound *inward* — the CCW front face pointed opposite the stored
+outward normal — so every opaque box material (`wall_material`, `lamp_material`,
+the charger `charger_metal`/`glow`/`connector` materials, the `depot_*` materials)
+disabled culling with `cull_mode: None` to avoid rendering inside-out. With culling
+off, the GPU rasterizes **both** faces of every wall slab — including the interior
+face that is always occluded by the slab's own outer face — roughly doubling wall
+fragment + overdraw work on a heavily-walled scene.
+
+- **Fix (rule 8 — visual semantics identical):** corrected the ±Z face vertex
+  order in `append_box` so all six faces wind front-out, then dropped
+  `cull_mode: None` from the seven **opaque** box materials so they use default
+  backface culling. The slabs look identical (they were always solid and viewed
+  from outside) but the GPU now skips the occluded interior faces. Only
+  `glass_wall_material` keeps `cull_mode: None`: it is transparent
+  (`AlphaMode::Blend`) and legitimately wants its far faces visible through the
+  near ones. The flat overlay planes (`dirt_overlay`/`chunk_overlay`/
+  `temperature_overlay`) are unrelated single-quad meshes and keep their own
+  `cull_mode: None`.
+- **Pinned by `append_box_faces_front_outward`** (`src/map/hypermap_world.rs`),
+  which asserts every emitted triangle's CCW geometric normal agrees with its
+  stored vertex normal — so a future edit to `append_box` can't silently
+  re-introduce an inward face.
+
+Docs updated: `docs/rendering-pipeline.md` § Notes, `docs/add_new_tile.md`.
+Verified green: `cargo test -p everly` and `cargo check -p everly --all-targets`
+warning-clean.
+
 ### Pathfind dispatch — 4 round-robin streams, 40 in flight (2026-06)
 
 [`src/map/pathfind_service.rs`](src/map/pathfind_service.rs).

@@ -116,7 +116,9 @@ cargo run            # fly to a NEW chunk — cached chunks keep old tiles
   you don't shadow doorways or crawler waves.
 - **New chunks only.** Procedural changes appear on freshly generated chunks;
   use the editor **Re-gen** button or move to an ungenerated chunk to see them.
-- **Box meshes need `cull_mode: None`.** `append_box` winds its ±Z faces inward,
-  so a material using default backface culling renders the box inside-out (flipped
-  normals). Set `cull_mode: None` like the wall/charger materials do. See
+- **Opaque box meshes use default backface culling.** `append_box` winds all six
+  faces outward (front face along the stored normal), so opaque box materials keep
+  default culling and the interior faces are dropped — like the wall/charger/depot
+  materials do. Only set `cull_mode: None` for a **transparent** box (e.g. the
+  glass wall), where the far faces should show through the near ones. See
   `docs/rendering-pipeline.md` § Notes.

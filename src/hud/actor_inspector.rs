@@ -32,7 +32,7 @@ use crate::scene::camera::StrategyCameraRig;
 const PLAYFIELD_BOTTOM_MARGIN_PX: f32 = 120.0;
 
 /// Width of the docked properties panel.
-const PANEL_WIDTH_PX: f32 = 340.0;
+const PANEL_WIDTH_PX: f32 = 320.0;
 
 const ACCENT: Color = Color::srgb(0.48, 0.78, 0.96);
 const TEXT_BRIGHT: Color = Color::srgba(0.97, 0.98, 1.0, 0.96);
@@ -43,9 +43,9 @@ const CARD_BG: Color = Color::srgba(0.09, 0.11, 0.15, 0.97);
 const CARD_BORDER: Color = Color::srgba(0.55, 0.62, 0.72, 0.35);
 const ROW_DIVIDER: Color = Color::srgba(0.4, 0.45, 0.52, 0.25);
 
-const TAB_ACTIVE_BG: Color = Color::srgba(0.48, 0.78, 0.96, 0.15);
-const TAB_ACTIVE_BORDER: Color = Color::srgba(0.48, 0.78, 0.96, 0.7);
-const TAB_INACTIVE_BG: Color = Color::srgba(0.12, 0.14, 0.18, 0.7);
+/// Minimalist tabs are text-only with a bottom accent rule on the active one.
+const TAB_UNDERLINE_ACTIVE: Color = ACCENT;
+const TAB_UNDERLINE_INACTIVE: Color = Color::NONE;
 
 /// Logical pixels per mouse-wheel line (matches Bevy UI scroll example).
 const SCROLL_LINE_HEIGHT: f32 = 21.0;
@@ -293,7 +293,6 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                     position_type: PositionType::Absolute,
                     padding: UiRect::axes(Val::Px(10.0), Val::Px(5.0)),
                     border: UiRect::all(Val::Px(1.0)),
-                    border_radius: BorderRadius::all(Val::Px(8.0)),
                     ..default()
                 },
                 BackgroundColor(TOOLTIP_BG),
@@ -323,10 +322,9 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                     bottom: Val::Px(132.0),
                     width: Val::Px(PANEL_WIDTH_PX),
                     flex_direction: FlexDirection::Column,
-                    padding: UiRect::all(Val::Px(18.0)),
-                    row_gap: Val::Px(12.0),
+                    padding: UiRect::all(Val::Px(12.0)),
+                    row_gap: Val::Px(9.0),
                     border: UiRect::all(Val::Px(1.0)),
-                    border_radius: BorderRadius::all(Val::Px(12.0)),
                     overflow: Overflow::clip(),
                     ..default()
                 },
@@ -347,21 +345,21 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                     header
                         .spawn(Node {
                             flex_direction: FlexDirection::Column,
-                            row_gap: Val::Px(6.0),
+                            row_gap: Val::Px(3.0),
                             flex_grow: 1.0,
                             ..default()
                         })
                         .with_children(|titles| {
                             titles.spawn((
                                 ActorInspectorKindBadge,
-                                Text::new("Actor"),
-                                TextFont::from_font_size(12.0),
+                                Text::new("ACTOR"),
+                                TextFont::from_font_size(10.0),
                                 TextColor(ACCENT),
                             ));
                             titles.spawn((
                                 ActorInspectorTitle,
                                 Text::new("-"),
-                                TextFont::from_font_size(22.0),
+                                TextFont::from_font_size(16.0),
                                 TextColor(TEXT_BRIGHT),
                             ));
                         });
@@ -373,21 +371,18 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                             Pickable::default(),
                             Button,
                             Node {
-                                width: Val::Px(32.0),
-                                height: Val::Px(32.0),
+                                width: Val::Px(24.0),
+                                height: Val::Px(24.0),
                                 justify_content: JustifyContent::Center,
                                 align_items: AlignItems::Center,
-                                border: UiRect::all(Val::Px(1.0)),
-                                border_radius: BorderRadius::all(Val::Px(8.0)),
                                 ..default()
                             },
-                            BorderColor::all(CARD_BORDER),
-                            BackgroundColor(Color::srgba(0.14, 0.16, 0.2, 0.8)),
+                            BackgroundColor(Color::srgba(0.16, 0.18, 0.22, 0.6)),
                         ))
                         .with_children(|btn| {
                             btn.spawn((
                                 Text::new("X"),
-                                TextFont::from_font_size(20.0),
+                                TextFont::from_font_size(13.0),
                                 TextColor(TEXT_MUTED),
                             ));
                         });
@@ -397,10 +392,10 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                 card.spawn((
                     Node {
                         width: Val::Percent(100.0),
-                        height: Val::Px(2.0),
+                        height: Val::Px(1.0),
                         ..default()
                     },
-                    BackgroundColor(ACCENT.with_alpha(0.45)),
+                    BackgroundColor(ACCENT.with_alpha(0.3)),
                 ));
 
                 // Tab bar: Status | Systems | Route | Inventory | Memory | Debug
@@ -408,8 +403,8 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                     width: Val::Percent(100.0),
                     flex_direction: FlexDirection::Row,
                     flex_wrap: FlexWrap::Wrap,
-                    column_gap: Val::Px(6.0),
-                    row_gap: Val::Px(4.0),
+                    column_gap: Val::Px(12.0),
+                    row_gap: Val::Px(2.0),
                     ..default()
                 })
                 .with_children(|tabs| {
@@ -427,7 +422,7 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                     Node {
                         width: Val::Percent(100.0),
                         flex_direction: FlexDirection::Row,
-                        column_gap: Val::Px(8.0),
+                        column_gap: Val::Px(6.0),
                         ..default()
                     },
                 ));
@@ -441,7 +436,7 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
                         flex_grow: 1.0,
                         flex_shrink: 1.0,
                         min_height: Val::Px(0.0),
-                        row_gap: Val::Px(8.0),
+                        row_gap: Val::Px(6.0),
                         overflow: Overflow::scroll_y(),
                         ..default()
                     },
@@ -452,29 +447,27 @@ fn spawn_actor_inspector_ui(mut commands: Commands, camera: Query<Entity, With<S
 }
 
 fn spawn_tab_button(parent: &mut ChildSpawnerCommands, label: &str, tab: InspectorTab, active: bool) {
-    let bg = if active { TAB_ACTIVE_BG } else { TAB_INACTIVE_BG };
-    let border = if active { TAB_ACTIVE_BORDER } else { CARD_BORDER };
+    let underline = if active { TAB_UNDERLINE_ACTIVE } else { TAB_UNDERLINE_INACTIVE };
     parent
         .spawn((
             ActorInspectorTabBtn(tab),
             Pickable::default(),
             Button,
             Node {
-                height: Val::Px(28.0),
-                padding: UiRect::horizontal(Val::Px(11.0)),
+                height: Val::Px(22.0),
+                padding: UiRect::new(Val::Px(2.0), Val::Px(2.0), Val::Px(0.0), Val::Px(3.0)),
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
-                border: UiRect::all(Val::Px(1.0)),
-                border_radius: BorderRadius::all(Val::Px(6.0)),
+                border: UiRect::bottom(Val::Px(2.0)),
                 ..default()
             },
-            BorderColor::all(border),
-            BackgroundColor(bg),
+            BorderColor::all(underline),
+            BackgroundColor(Color::NONE),
         ))
         .with_children(|btn| {
             btn.spawn((
                 Text::new(label.to_string()),
-                TextFont::from_font_size(13.0),
+                TextFont::from_font_size(11.0),
                 TextColor(if active { ACCENT } else { TEXT_MUTED }),
             ));
         });
@@ -594,8 +587,8 @@ fn sync_tab_button_visuals(
     }
     for (btn, mut bg, mut border, children) in &mut tab_buttons {
         let active = btn.0 == *tab;
-        *bg = BackgroundColor(if active { TAB_ACTIVE_BG } else { TAB_INACTIVE_BG });
-        *border = BorderColor::all(if active { TAB_ACTIVE_BORDER } else { CARD_BORDER });
+        *bg = BackgroundColor(Color::NONE);
+        *border = BorderColor::all(if active { TAB_UNDERLINE_ACTIVE } else { TAB_UNDERLINE_INACTIVE });
         for child in children.iter() {
             if let Ok(mut color) = tab_texts.get_mut(child) {
                 *color = TextColor(if active { ACCENT } else { TEXT_MUTED });
@@ -707,13 +700,12 @@ fn spawn_black_bot_reset_button(parent: &mut ChildSpawnerCommands) {
             Pickable::default(),
             Button,
             Node {
-                min_width: Val::Px(64.0),
-                height: Val::Px(32.0),
-                padding: UiRect::horizontal(Val::Px(12.0)),
+                min_width: Val::Px(56.0),
+                height: Val::Px(26.0),
+                padding: UiRect::horizontal(Val::Px(10.0)),
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
                 border: UiRect::all(Val::Px(1.0)),
-                border_radius: BorderRadius::all(Val::Px(6.0)),
                 ..default()
             },
             BorderColor::all(CARD_BORDER),
@@ -722,7 +714,7 @@ fn spawn_black_bot_reset_button(parent: &mut ChildSpawnerCommands) {
         .with_children(|btn| {
             btn.spawn((
                 Text::new("Reset"),
-                TextFont::from_font_size(14.0),
+                TextFont::from_font_size(12.0),
                 TextColor(TEXT_BRIGHT),
             ));
         });
@@ -742,13 +734,12 @@ fn spawn_force_logs_toggle_button(parent: &mut ChildSpawnerCommands, enabled: bo
             Pickable::default(),
             Button,
             Node {
-                min_width: Val::Px(120.0),
-                height: Val::Px(32.0),
-                padding: UiRect::horizontal(Val::Px(14.0)),
+                min_width: Val::Px(110.0),
+                height: Val::Px(26.0),
+                padding: UiRect::horizontal(Val::Px(12.0)),
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
                 border: UiRect::all(Val::Px(1.0)),
-                border_radius: BorderRadius::all(Val::Px(6.0)),
                 ..default()
             },
             BorderColor::all(if enabled { ACCENT } else { CARD_BORDER }),
@@ -761,7 +752,7 @@ fn spawn_force_logs_toggle_button(parent: &mut ChildSpawnerCommands, enabled: bo
         .with_children(|btn| {
             btn.spawn((
                 Text::new(label),
-                TextFont::from_font_size(14.0),
+                TextFont::from_font_size(12.0),
                 TextColor(if enabled { ACCENT } else { TEXT_BRIGHT }),
             ));
         });
@@ -801,13 +792,12 @@ fn spawn_subtile_debug_toggle_button(parent: &mut ChildSpawnerCommands, enabled:
             Pickable::default(),
             Button,
             Node {
-                min_width: Val::Px(130.0),
-                height: Val::Px(32.0),
-                padding: UiRect::horizontal(Val::Px(14.0)),
+                min_width: Val::Px(120.0),
+                height: Val::Px(26.0),
+                padding: UiRect::horizontal(Val::Px(12.0)),
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
                 border: UiRect::all(Val::Px(1.0)),
-                border_radius: BorderRadius::all(Val::Px(6.0)),
                 ..default()
             },
             BorderColor::all(if enabled { ACCENT } else { CARD_BORDER }),
@@ -820,7 +810,7 @@ fn spawn_subtile_debug_toggle_button(parent: &mut ChildSpawnerCommands, enabled:
         .with_children(|btn| {
             btn.spawn((
                 Text::new(label),
-                TextFont::from_font_size(14.0),
+                TextFont::from_font_size(12.0),
                 TextColor(if enabled { ACCENT } else { TEXT_BRIGHT }),
             ));
         });
@@ -876,13 +866,12 @@ fn spawn_actor_delete_button(parent: &mut ChildSpawnerCommands) {
             Pickable::default(),
             Button,
             Node {
-                min_width: Val::Px(64.0),
-                height: Val::Px(32.0),
-                padding: UiRect::horizontal(Val::Px(12.0)),
+                min_width: Val::Px(56.0),
+                height: Val::Px(26.0),
+                padding: UiRect::horizontal(Val::Px(10.0)),
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
                 border: UiRect::all(Val::Px(1.0)),
-                border_radius: BorderRadius::all(Val::Px(6.0)),
                 ..default()
             },
             BorderColor::all(DELETE_BORDER),
@@ -891,7 +880,7 @@ fn spawn_actor_delete_button(parent: &mut ChildSpawnerCommands) {
         .with_children(|btn| {
             btn.spawn((
                 Text::new("Delete"),
-                TextFont::from_font_size(14.0),
+                TextFont::from_font_size(12.0),
                 TextColor(DELETE_TEXT),
             ));
         });
@@ -1078,7 +1067,7 @@ fn sync_actor_inspector_panel(
                 .with_children(|block| {
                     block.spawn((
                         Text::new("No data for this tab."),
-                        TextFont::from_font_size(14.0),
+                        TextFont::from_font_size(12.0),
                         TextColor(TEXT_MUTED),
                     ));
                 });
@@ -1094,20 +1083,20 @@ fn sync_actor_inspector_panel(
                     Node {
                         width: Val::Percent(100.0),
                         flex_direction: FlexDirection::Column,
-                        row_gap: Val::Px(2.0),
-                        padding: UiRect::vertical(Val::Px(4.0)),
+                        row_gap: Val::Px(1.0),
+                        padding: UiRect::vertical(Val::Px(3.0)),
                         ..default()
                     },
                 ))
                 .with_children(|block| {
                     block.spawn((
                         Text::new(row.label),
-                        TextFont::from_font_size(12.0),
+                        TextFont::from_font_size(10.0),
                         TextColor(TEXT_MUTED),
                     ));
                     block.spawn((
                         Text::new(row.value.clone()),
-                        TextFont::from_font_size(15.0),
+                        TextFont::from_font_size(13.0),
                         TextColor(TEXT_BRIGHT),
                     ));
                     if i + 1 < rows.len() {
@@ -1115,7 +1104,7 @@ fn sync_actor_inspector_panel(
                             Node {
                                 width: Val::Percent(100.0),
                                 height: Val::Px(1.0),
-                                margin: UiRect::top(Val::Px(6.0)),
+                                margin: UiRect::top(Val::Px(5.0)),
                                 ..default()
                             },
                             BackgroundColor(ROW_DIVIDER),

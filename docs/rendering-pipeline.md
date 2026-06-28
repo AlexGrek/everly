@@ -61,15 +61,17 @@ This avoids per-tile entity churn and reduces frame spikes.
 
 ## Notes
 
-- **`append_box` winding quirk — box meshes must use `cull_mode: None`.** The
-  shared `append_box` helper (`src/map/hypermap_world.rs`) winds its **±X and ±Y**
-  faces outward but its **±Z** faces *inward* (the +Z/−Z triangle front faces point
-  opposite their stored normals). Stored normals are correct, so **lighting** is
-  fine, but the default backface culling drops the two Z faces and the box reads as
-  inside-out. Any material applied to box geometry — `wall_material`,
-  `glass_wall_material`, and the charger `charger_metal_material` /
-  `charger_glow_material` — therefore sets **`cull_mode: None`**. Floor quads
-  (`append_quad`, used for road/floor meshes) only emit the +Y face, which *is*
-  wound correctly, so they keep default culling. If you add a new box-based mesh,
-  set `cull_mode: None` on its material (or fix the Z-face winding in `append_box`,
-  which is shared by walls).
+- **`append_box` winds all six faces outward; opaque box meshes use default
+  backface culling.** The shared `append_box` helper
+  (`src/map/hypermap_world.rs`) emits every face so its CCW front face points
+  along the stored (outward) normal, so the default backface culling keeps the
+  outward face and drops the inward one — interior wall faces are never
+  rasterized. Opaque box materials (`wall_material`, `lamp_material`, the charger
+  `charger_metal_material` / `charger_glow_material` / `charger_connector_material`,
+  and the depot `depot_*` materials) therefore use **default culling**. The
+  invariant is pinned by `append_box_faces_front_outward` in `hypermap_world.rs`;
+  if you add a new box-based mesh you need no special `cull_mode`. The only box
+  material that still sets **`cull_mode: None`** is `glass_wall_material`, which is
+  transparent (`AlphaMode::Blend`) and wants the slab's far faces visible through
+  its near ones. Floor quads (`append_quad`, road/floor meshes) emit only the +Y
+  face and likewise keep default culling.

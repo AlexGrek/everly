@@ -19,6 +19,7 @@ Current behavior docs:
 - `docs/pathfind-service.md` — async pathfinding queue (`PathfindQueue` / `PathfindResults`), scheduling, bot enqueue/await flow, test split.
 - `docs/dispatch.md` — **DISPATCH_QUEUE** repair board + bot **inventory**: stranded bots post requests, `FIXER` bots claim/fetch/deliver parts (`GoFixBots`).
 - `docs/charge.md` — bot **battery charge**: `Charge` component, discharge system, depletion → movement disabled, inspector display, persistence.
+- `docs/leaderboard.md` — HUD **bot leaderboard** modal: per-bot name/role/charge/health rows ranked by charge, plus aggregate alive/broken/discharged counts and percentages.
 - `docs/chunk-overlay.md` — per-chunk RGBA overlays: temperature heatmap (F5), dirt, generic/paths layer (F6), occupancy debug (F4), plus the selected-bot **subtile passability HUD** (inspector Debug tab).
 - `docs/tile-fields.md` — tile-resolution scalar fields (dirt, temperature) and shared `TileFieldMap`.
 - `docs/field-interactions.md` — actor main-tile tracking and dirt deposits on tiles actors leave.
