@@ -312,7 +312,7 @@ impl BotSpecialization {
     /// `1/8` (the rarest), else [`Patrol`](Self::Patrol) at `1/4` of the rest,
     /// otherwise [`DoNothing`](Self::DoNothing).
     pub fn roll(rng: &mut StdRng) -> Self {
-        if rng::one_in(rng, 8) {
+        if rng::one_in(rng, 6) {
             Self::Fixer
         } else if rng::one_in(rng, 4) {
             Self::Patrol
