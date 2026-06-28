@@ -146,7 +146,6 @@ fn setup_subtile_debug(
                 row_gap: Val::Px(6.0),
                 padding: UiRect::all(Val::Px(8.0)),
                 border: UiRect::all(Val::Px(1.0)),
-                border_radius: BorderRadius::all(Val::Px(8.0)),
                 ..default()
             },
             BackgroundColor(PANEL_BG),
@@ -191,7 +190,6 @@ fn setup_subtile_debug(
                     Node {
                         position_type: PositionType::Absolute,
                         border: UiRect::all(Val::Px(2.0)),
-                        border_radius: BorderRadius::all(Val::Percent(50.0)),
                         ..default()
                     },
                     BorderColor::all(CIRCLE_COLOR),

@@ -179,7 +179,6 @@ fn spawn_main_menu(mut commands: Commands, available: Res<AvailableLevels>) {
                     row_gap: Val::Px(10.0),
                     padding: UiRect::axes(Val::Px(28.0), Val::Px(22.0)),
                     border: UiRect::all(Val::Px(1.0)),
-                    border_radius: BorderRadius::all(Val::Px(10.0)),
                     min_width: Val::Px(320.0),
                     max_height: Val::Percent(60.0),
                     overflow: Overflow::clip_y(),
@@ -211,7 +210,6 @@ fn spawn_level_button(parent: &mut ChildSpawnerCommands, level_name: &str) {
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
                 border: UiRect::all(Val::Px(1.0)),
-                border_radius: BorderRadius::all(Val::Px(7.0)),
                 ..default()
             },
             BorderColor::all(BTN_BORDER),
@@ -241,7 +239,6 @@ fn spawn_new_level_button(parent: &mut ChildSpawnerCommands) {
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
                 border: UiRect::all(Val::Px(1.0)),
-                border_radius: BorderRadius::all(Val::Px(7.0)),
                 ..default()
             },
             BorderColor::all(BTN_BORDER),

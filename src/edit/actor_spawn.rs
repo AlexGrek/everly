@@ -261,7 +261,6 @@ pub(crate) fn spawn_actor_spawn_palette(
                         justify_content: JustifyContent::Center,
                         align_items: AlignItems::Center,
                         border: UiRect::all(Val::Px(1.0)),
-                        border_radius: BorderRadius::all(Val::Px(5.0)),
                         ..default()
                     },
                     BorderColor::all(border),
@@ -286,7 +285,6 @@ pub(crate) fn spawn_actor_spawn_palette(
                     justify_content: JustifyContent::Center,
                     align_items: AlignItems::Center,
                     border: UiRect::all(Val::Px(1.0)),
-                    border_radius: BorderRadius::all(Val::Px(5.0)),
                     ..default()
                 },
                 BorderColor::all(RESURRECT_BTN_BORDER),
@@ -310,7 +308,6 @@ pub(crate) fn spawn_actor_spawn_palette(
                     justify_content: JustifyContent::Center,
                     align_items: AlignItems::Center,
                     border: UiRect::all(Val::Px(1.0)),
-                    border_radius: BorderRadius::all(Val::Px(5.0)),
                     ..default()
                 },
                 BorderColor::all(BULK_BTN_BORDER),

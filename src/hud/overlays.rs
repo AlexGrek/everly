@@ -186,7 +186,6 @@ fn spawn_overlays_ui(mut commands: Commands, camera: Query<Entity, With<Strategy
                             padding: UiRect::all(Val::Px(16.0)),
                             row_gap: Val::Px(10.0),
                             border: UiRect::all(Val::Px(1.0)),
-                            border_radius: BorderRadius::all(Val::Px(10.0)),
                             ..default()
                         },
                         BackgroundColor(CARD_BG),
@@ -221,7 +220,6 @@ fn spawn_overlays_ui(mut commands: Commands, camera: Query<Entity, With<Strategy
                                         justify_content: JustifyContent::Center,
                                         align_items: AlignItems::Center,
                                         border: UiRect::all(Val::Px(1.0)),
-                                        border_radius: BorderRadius::all(Val::Px(6.0)),
                                         ..default()
                                     },
                                     BorderColor::all(CARD_BORDER),
@@ -284,7 +282,6 @@ fn spawn_vis_button(
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
                 border: UiRect::all(Val::Px(1.0)),
-                border_radius: BorderRadius::all(Val::Px(5.0)),
                 ..default()
             },
             BorderColor::all(BTN_BORDER),

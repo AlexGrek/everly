@@ -202,7 +202,6 @@ pub(crate) fn spawn_map_edit_palette(mut commands: Commands, camera: Query<Entit
                         justify_content: JustifyContent::Center,
                         align_items: AlignItems::Center,
                         border: UiRect::all(Val::Px(1.0)),
-                        border_radius: BorderRadius::all(Val::Px(5.0)),
                         ..default()
                     },
                     BorderColor::all(BTN_BORDER),
@@ -227,7 +226,6 @@ pub(crate) fn spawn_map_edit_palette(mut commands: Commands, camera: Query<Entit
                     justify_content: JustifyContent::Center,
                     align_items: AlignItems::Center,
                     border: UiRect::all(Val::Px(1.0)),
-                    border_radius: BorderRadius::all(Val::Px(5.0)),
                     ..default()
                 },
                 BorderColor::all(BTN_BORDER),
@@ -251,7 +249,6 @@ pub(crate) fn spawn_map_edit_palette(mut commands: Commands, camera: Query<Entit
                     justify_content: JustifyContent::Center,
                     align_items: AlignItems::Center,
                     border: UiRect::all(Val::Px(1.0)),
-                    border_radius: BorderRadius::all(Val::Px(5.0)),
                     ..default()
                 },
                 BorderColor::all(BTN_BORDER),
