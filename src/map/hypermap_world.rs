@@ -510,9 +510,11 @@ fn setup_hypermap_assets(
         base_color: Color::srgb(0.78, 0.79, 0.82),
         perceptual_roughness: 0.72,
         metallic: 0.02,
-        cull_mode: None,
         ..default()
     });
+    // Transparent glass keeps `cull_mode: None` so the slab's far faces stay
+    // visible through the near ones — opaque box geometry instead relies on
+    // `append_box`'s now-correct winding and default backface culling.
     let glass_wall_material = materials.add(StandardMaterial {
         base_color: Color::srgba(0.58, 0.80, 0.96, 0.20),
         perceptual_roughness: 0.04,
@@ -528,17 +530,13 @@ fn setup_hypermap_assets(
         emissive: LAMP_EMISSIVE,
         perceptual_roughness: 0.15,
         metallic: 0.0,
-        cull_mode: None,
         ..default()
     });
-    // `cull_mode: None` matches the wall materials: `append_box` winds its ±Z faces
-    // inward, so backface culling would otherwise drop them and the boxes look flipped.
     let charger_metal_material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.55, 0.57, 0.60),
         perceptual_roughness: 0.25,
         metallic: 0.95,
         reflectance: 0.60,
-        cull_mode: None,
         ..default()
     });
     // Emissive HDR blue — the camera's Bloom + Hdr stack make this read as a glow.
@@ -547,7 +545,6 @@ fn setup_hypermap_assets(
         emissive: CHARGER_GLOW_EMISSIVE_IDLE,
         perceptual_roughness: 0.30,
         metallic: 0.0,
-        cull_mode: None,
         ..default()
     });
     // Bulky matte-black transformer box that anchors the charger to the wall.
@@ -555,7 +552,6 @@ fn setup_hypermap_assets(
         base_color: Color::srgb(0.03, 0.03, 0.04),
         perceptual_roughness: 0.80,
         metallic: 0.20,
-        cull_mode: None,
         ..default()
     });
     // Parts depot: dark industrial metal cabinet.
@@ -563,7 +559,6 @@ fn setup_hypermap_assets(
         base_color: Color::srgb(0.12, 0.11, 0.09),
         perceptual_roughness: 0.70,
         metallic: 0.35,
-        cull_mode: None,
         ..default()
     });
     // Amber emissive indicator strip on the cabinet front.
@@ -572,7 +567,6 @@ fn setup_hypermap_assets(
         emissive: DEPOT_INDICATOR_EMISSIVE,
         perceptual_roughness: 0.30,
         metallic: 0.0,
-        cull_mode: None,
         ..default()
     });
     let normalized_dir = settings.wave_direction.normalize_or_zero();
@@ -2099,7 +2093,6 @@ fn new_charger_glow_material(materials: &mut Assets<StandardMaterial>, active: b
         emissive,
         perceptual_roughness: 0.30,
         metallic: 0.0,
-        cull_mode: None,
         ..default()
     })
 }
@@ -2752,28 +2745,28 @@ fn append_box(
         [cx - hx, cy + hy, cz + hz],
         [-1.0, 0.0, 0.0],
     );
-    // +Z
+    // +Z — wound so the front face (CCW) points toward +Z, matching the stored normal.
     append_quad(
         positions,
         normals,
         uvs,
         indices,
         [cx - hx, cy - hy, cz + hz],
-        [cx + hx, cy - hy, cz + hz],
-        [cx + hx, cy + hy, cz + hz],
         [cx - hx, cy + hy, cz + hz],
+        [cx + hx, cy + hy, cz + hz],
+        [cx + hx, cy - hy, cz + hz],
         [0.0, 0.0, 1.0],
     );
-    // -Z
+    // -Z — wound so the front face (CCW) points toward -Z, matching the stored normal.
     append_quad(
         positions,
         normals,
         uvs,
         indices,
         [cx + hx, cy - hy, cz - hz],
-        [cx - hx, cy - hy, cz - hz],
-        [cx - hx, cy + hy, cz - hz],
         [cx + hx, cy + hy, cz - hz],
+        [cx - hx, cy + hy, cz - hz],
+        [cx - hx, cy - hy, cz - hz],
         [0.0, 0.0, -1.0],
     );
 }
@@ -3062,6 +3055,50 @@ fn apply_world_map_file_to_floor(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod box_winding_tests {
+    use super::*;
+
+    /// Every triangle `append_box` emits must wind so its CCW front face
+    /// (Bevy/wgpu default) points along the stored vertex normals. If a face is
+    /// wound inward the box reads inside-out under backface culling — the bug the
+    /// opaque wall/charger/depot materials used to mask with `cull_mode: None`.
+    #[test]
+    fn append_box_faces_front_outward() {
+        let mut positions = Vec::new();
+        let mut normals = Vec::new();
+        let mut uvs = Vec::new();
+        let mut indices = Vec::new();
+        // Asymmetric size + off-origin center so no axis is degenerate.
+        append_box(
+            &mut positions,
+            &mut normals,
+            &mut uvs,
+            &mut indices,
+            3.0,
+            7.0,
+            -2.0,
+            0.2,
+            3.0,
+            1.4,
+        );
+
+        for tri in indices.chunks_exact(3) {
+            let [i0, i1, i2] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
+            let p0 = Vec3::from_array(positions[i0]);
+            let p1 = Vec3::from_array(positions[i1]);
+            let p2 = Vec3::from_array(positions[i2]);
+            // CCW front-face normal in a right-handed system.
+            let geo = (p1 - p0).cross(p2 - p0);
+            let stored = Vec3::from_array(normals[i0]);
+            assert!(
+                geo.dot(stored) > 0.0,
+                "triangle {tri:?} front face points opposite its stored normal {stored:?}",
+            );
+        }
+    }
 }
 
 #[cfg(test)]
