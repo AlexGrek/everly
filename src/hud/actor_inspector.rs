@@ -18,6 +18,7 @@ use crate::actor::black_bot::{BlackBotVisual, BotSpecialization, Breakable};
 use crate::actor::brain::Brain;
 use crate::actor::charge::Charge;
 use crate::actor::dispatch::BotInventory;
+use crate::actor::genetics::Genome;
 use crate::actor::inspect::{
     debug_rows, display_actor_name, inventory_rows, memory_rows, route_rows, status_rows,
     systems_rows,
@@ -933,7 +934,7 @@ fn sync_actor_inspector_panel(
     existing_rows: Query<Entity, With<ActorInspectorRow>>,
     existing_actions: Query<Entity, With<ActorInspectorActionBtn>>,
     actor_data: Query<(&ActorObject, Option<&Name>), With<ActorInspectable>>,
-    black: Query<(&Brain, &BlackBotVisual, Option<&BotSpecialization>)>,
+    black: Query<(&Brain, &BlackBotVisual, Option<&BotSpecialization>, Option<&Genome>)>,
     actor_extras: Query<(
         Option<&Charge>,
         Option<&Breakable>,
@@ -988,7 +989,7 @@ fn sync_actor_inspector_panel(
 
     let kind_label;
     let rows;
-    if let Ok((brain, vis, spec)) = black.get(actor) {
+    if let Ok((brain, vis, spec, genome)) = black.get(actor) {
         kind_label = "BlackBot";
         let Ok((obj, _)) = actor_data.get(actor) else {
             return;
@@ -1000,6 +1001,7 @@ fn sync_actor_inspector_panel(
                 Some(brain),
                 spec.copied(),
                 Some(vis.collision_pressure()),
+                genome.map(|g| g.traits()),
             ),
             InspectorTab::Systems => breakable.map(|b| systems_rows(b)).unwrap_or_default(),
             InspectorTab::Route => route_rows(brain),

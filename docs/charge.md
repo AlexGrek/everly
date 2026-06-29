@@ -39,9 +39,16 @@ pub struct Charge {
 while `GameState::InGame` **and** not [`Paused`](../src/actor/mod.rs):
 
 ```text
-level -= DISCHARGE_PER_S * dt        // DISCHARGE_PER_S = 0.002 → ~500 s full→empty
-level  = level.max(0.0)              // clamp at 0.0; never goes negative
+level -= DISCHARGE_PER_S * dt * mult  // DISCHARGE_PER_S = 0.002 → ~500 s full→empty at mult = 1
+level  = level.max(0.0)               // clamp at 0.0; never goes negative
 ```
+
+`mult` is the bot's **genetic battery-drain multiplier**,
+`1 / battery_quality`, read from its [`Genome`](../src/actor/genetics.rs)
+([`GeneticTraits::discharge_multiplier`]); a bot with no genome drains at the
+baseline (`mult = 1`). Battery quality is half-normal and capped at 100% (the most
+common variant), so most bots drain near the baseline and a tail of lower-quality
+batteries drains faster. See [actor.md § Genetics](actor.md#genetics).
 
 The drain is gated on `not(is_paused)` so a paused simulation freezes the
 battery along with everything else — consistent with the rest of the actor
@@ -96,7 +103,7 @@ so pre-charge save files still load. See
 
 | Constant | Value | Meaning |
 |----------|-------|---------|
-| `DISCHARGE_PER_S` | `0.002` | Fraction of full charge drained per second (~500 s full→empty) |
+| `DISCHARGE_PER_S` | `0.002` | Baseline fraction of full charge drained per second, for a perfect (quality `1.0`) battery (~500 s full→empty) |
 | `SPAWN_CHARGE_MIN` | `0.3` | Lower bound of random spawn charge |
 | `SPAWN_CHARGE_MAX` | `1.0` | Upper bound of random spawn charge |
 
@@ -104,9 +111,10 @@ All three live in [`src/actor/charge.rs`](../src/actor/charge.rs).
 
 ## Not yet wired
 
-- **Uniform drain.** Every bot discharges at the same rate regardless of class,
-  speed, or activity. Per-class rates would live as a field on `Charge` or a
-  small per-class lookup, not a single global constant.
+- **Activity-independent drain.** A bot's drain rate is scaled by its genetic
+  battery quality (see above) but not by what it is *doing* — moving, idling, and
+  charging-queue waiting all drain at the same genetic rate. Activity-weighted
+  drain would multiply by a per-frame activity factor in `discharge_actors`.
 
 ## Related code
 

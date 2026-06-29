@@ -10,11 +10,15 @@
 use bevy::prelude::*;
 use crate::rng::{self, StdRng};
 
+use crate::actor::genetics::Genome;
 use crate::actor::is_paused;
 use crate::menu::main_menu::GameState;
 
-/// Fraction of full charge drained per second while the simulation runs.
-/// At this rate a fully charged bot takes ~500 s (≈8 min) to deplete.
+/// Baseline fraction of full charge drained per second while the simulation
+/// runs, for a bot with a **perfect** (quality `1.0`) battery. At this rate a
+/// fully charged perfect-battery bot takes ~500 s (≈8 min) to deplete; a bot
+/// with a lower-quality genetic battery drains proportionally faster (see
+/// [`GeneticTraits::discharge_multiplier`](crate::actor::genetics::GeneticTraits::discharge_multiplier)).
 const DISCHARGE_PER_S: f32 = 0.002;
 
 /// Inclusive bounds for a freshly spawned bot's random starting charge.
@@ -65,14 +69,17 @@ impl Plugin for ChargePlugin {
     }
 }
 
-fn discharge_actors(time: Res<Time>, mut charges: Query<&mut Charge>) {
-    let drop = DISCHARGE_PER_S * time.delta_secs();
-    if drop <= 0.0 {
+fn discharge_actors(time: Res<Time>, mut charges: Query<(&mut Charge, Option<&Genome>)>) {
+    let base_drop = DISCHARGE_PER_S * time.delta_secs();
+    if base_drop <= 0.0 {
         return;
     }
-    for mut charge in &mut charges {
+    for (mut charge, genome) in &mut charges {
         if charge.level > 0.0 {
-            charge.level = (charge.level - drop).max(0.0);
+            // Worse genetic battery quality → faster drain. A bot without a
+            // genome drains at the baseline rate.
+            let mult = genome.map_or(1.0, |g| g.traits().discharge_multiplier());
+            charge.level = (charge.level - base_drop * mult).max(0.0);
         }
     }
 }

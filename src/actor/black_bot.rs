@@ -33,6 +33,7 @@ use crate::actor::brain::{
     IntegerMemoryId, PathfindAccess, Patroller, RandomWalker,
 };
 use crate::actor::charge::Charge;
+use crate::actor::genetics::Genome;
 use crate::actor::dispatch::{
     spawn_inventory_marker, BotInventory, DispatchQueue, InventoryMarker, RepairPart,
     FIXER_TASK_COOLDOWN_S,
@@ -350,6 +351,25 @@ impl BotSpecialization {
         };
         Brain::new(vec![routine, Box::new(ChargeSelfKeeper::new())], make_high_level, seed)
     }
+}
+
+/// Builds the bot's [`Brain`] and its [`Genome`] from one `seed`, overriding the
+/// brain's movement tuning with the genome's heritable traits.
+///
+/// Speed and acceleration are **genetic**: the [`Genome`] is rolled
+/// deterministically from `seed` (the same seed that drives the brain RNG, so a
+/// reloaded bot reproduces identical genes — see `genetics.rs`), and its decoded
+/// [`max_speed`](crate::actor::genetics::GeneticTraits::max_speed) /
+/// [`acceleration`](crate::actor::genetics::GeneticTraits::acceleration) replace
+/// the default [`FollowTuning`](crate::actor::brain::FollowTuning) values. The
+/// genome is returned so it can be attached to the entity, keeping the raw genes
+/// accessible after creation.
+fn build_brain_with_genome(spec: BotSpecialization, seed: u64) -> (Brain, Genome) {
+    let genome = Genome::from_seed(seed);
+    let mut brain = spec.build_brain(seed);
+    brain.tuning.max_speed = genome.traits().max_speed;
+    brain.tuning.accel = genome.traits().acceleration;
+    (brain, genome)
 }
 
 /// Fixed patrol route for a [`BotSpecialization::Patrol`] bot: an ordered loop of
@@ -1691,6 +1711,7 @@ pub fn spawn_black_bot_from_snapshot(
     let mat = black_bot_material(materials);
     let mesh = meshes.add(Sphere::new(SPHERE_RADIUS).mesh().ico(3).unwrap());
 
+    let (brain, genome) = build_brain_with_genome(spec, rng_seed);
     let parent = commands
         .spawn((
             Name::new(name.to_string()),
@@ -1707,7 +1728,8 @@ pub fn spawn_black_bot_from_snapshot(
                 depleted_logged: false,
                 collision_pressure: 0,
             },
-            spec.build_brain(rng_seed),
+            brain,
+            genome,
             ActorObject::new(Box::new(bot)),
             BotInventory::default(),
             Transform::default(),
@@ -1749,6 +1771,7 @@ pub fn spawn_black_bot(
     let mat = black_bot_material(materials);
     let mesh = meshes.add(Sphere::new(SPHERE_RADIUS).mesh().ico(3).unwrap());
 
+    let (brain, genome) = build_brain_with_genome(spec, brain_seed);
     let parent = commands
         .spawn((
             Name::new(random_actor_name()),
@@ -1766,7 +1789,8 @@ pub fn spawn_black_bot(
                 depleted_logged: false,
                 collision_pressure: 0,
             },
-            spec.build_brain(brain_seed),
+            brain,
+            genome,
             ActorObject::new(Box::new(bot)),
             BotInventory::default(),
             Transform::default(),

@@ -6,6 +6,7 @@ use crate::actor::black_bot::{BotSpecialization, Breakable, BreakablePartState};
 use crate::actor::brain::memory::{BotMemory, IntegerMemoryId};
 use crate::actor::brain::Brain;
 use crate::actor::dispatch::RepairPart;
+use crate::actor::genetics::GeneticTraits;
 use crate::actor::{actor_main_tile, ActorObject};
 
 /// One label/value row in the inspector modal.
@@ -44,13 +45,14 @@ pub fn black_bot_rows(
     main_tile: IVec2,
     spec: Option<BotSpecialization>,
     collision_pressure: Option<u32>,
+    genome: Option<&GeneticTraits>,
 ) -> Vec<InspectRow> {
     let priority = brain
         .current_priority()
         .map(|p| format!("{:?} ({:.0})", p.kind, p.value))
         .unwrap_or_else(|| "-".to_string());
     let specialization = spec.map(|s| s.label()).unwrap_or("-");
-    vec![
+    let mut rows = vec![
         InspectRow { label: "specialization", value: specialization.to_string() },
         InspectRow { label: "main_tile", value: format!("({}, {})", main_tile.x, main_tile.y) },
         InspectRow { label: "stuck", value: brain.is_stuck().to_string() },
@@ -64,7 +66,23 @@ pub fn black_bot_rows(
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "-".to_string()),
         },
-    ]
+    ];
+    // Genetic (immutable) movement traits — decoded once from the bot's genome.
+    if let Some(t) = genome {
+        rows.push(InspectRow {
+            label: "gene_max_speed",
+            value: format!("{:.3} tiles/s", t.max_speed),
+        });
+        rows.push(InspectRow {
+            label: "gene_acceleration",
+            value: format!("{:.3} tiles/s²", t.acceleration),
+        });
+        rows.push(InspectRow {
+            label: "gene_battery_quality",
+            value: format!("{:.0}%", t.battery_quality * 100.0),
+        });
+    }
+    rows
 }
 
 fn format_part(p: &BreakablePartState) -> String {
@@ -82,6 +100,7 @@ pub fn status_rows(
     black: Option<&Brain>,
     spec: Option<BotSpecialization>,
     collision_pressure: Option<u32>,
+    genome: Option<&GeneticTraits>,
 ) -> Vec<InspectRow> {
     let mut rows = common_actor_rows(obj.inner.state());
     if let Some(level) = charge {
@@ -89,7 +108,7 @@ pub fn status_rows(
     }
     if let Some(brain) = black {
         let main_tile = actor_main_tile(obj.inner.state().center);
-        rows.extend(black_bot_rows(brain, main_tile, spec, collision_pressure));
+        rows.extend(black_bot_rows(brain, main_tile, spec, collision_pressure, genome));
     }
     rows
 }

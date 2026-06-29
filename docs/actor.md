@@ -153,6 +153,53 @@ immobilized **in its think system** (zeroing `move_buffer`), not in
 why the gate must live in `think`, the discharge rate, spawn ranges, inspector
 display, and persistence.
 
+## Genetics
+
+Every BlackBot carries a [`Genome`](../src/actor/genetics.rs) component that
+fixes its **immutable, heritable movement traits** — `max_speed` and
+`acceleration`. The model (`src/actor/genetics.rs`):
+
+- **`Genes`** — 258 random unsigned bytes, the raw genome. Generated **once** at
+  creation from a seed (`Genes::from_seed`) via the seeded [`StdRng`] (never
+  `thread_rng`, so a reloaded bot reproduces an identical genome) and never
+  mutated afterward.
+- **`GeneticTraits`** — the decoded phenotype (`max_speed`, `acceleration`,
+  `battery_quality`), computed once and cached. Runtime code reads only these;
+  the raw genes stay accessible via [`Genome::genes`] but are otherwise dormant
+  after creation.
+
+**Genome → trait mapping** is pure and deterministic. Each trait derives a single
+**seed byte** from the genome through its own formula, then feeds that byte (mixed
+with a per-trait salt so colliding bytes still decorrelate) into `normal_sample`
+— a Box–Muller draw from a freshly seeded `StdRng` — to produce a normally
+distributed value, clamped to a sane range. The canonical formula (speed):
+
+1. `byte(143) ^ 123`,
+2. `X = byte(42) % 128` selects which byte to mix in,
+3. XOR step 1 with `byte(X)`.
+
+Acceleration and battery quality use distinct formulas in the same spirit. Add a
+new trait by adding a `GeneticTraits` field, a `*_seed` formula, and its
+distribution constants.
+
+**Battery quality** (`battery_quality`, in `(0, 1]`) is a special **upper-clamped
+half-normal**: a `N(1.0, spread)` draw clamped to `[min, 1.0]`. The whole upper
+half (samples ≥ 1.0) collapses onto exactly `1.0`, so a perfect battery is the
+single most popular variant — quality *cannot exceed* 100% but can fall below it.
+It feeds [`GeneticTraits::discharge_multiplier`](../src/actor/genetics.rs) =
+`1 / battery_quality`, which [`discharge_actors`](../src/actor/charge.rs)
+multiplies the baseline drain by: a perfect battery drains at the base rate, a
+worse one proportionally faster. See [`charge.md`](charge.md).
+
+**Wiring.** `build_brain_with_genome` (in `black_bot.rs`) rolls the genome from
+the bot's brain seed and overwrites the default
+[`FollowTuning`](../src/actor/brain/low_level.rs) `max_speed` / `accel` with the
+genome's traits, so bot movement speed and acceleration are genetic. The genome
+is attached as a component at spawn; the inspector **Status** tab shows
+`gene_max_speed` / `gene_acceleration` / `gene_battery_quality`. Genes are not
+serialized — they are re-derived deterministically from the persisted brain
+`rng_seed` on load.
+
 ## Selection and inspection
 
 Left-clicking a bot's mesh sets the [`SelectedActor`](../src/hud/actor_inspector.rs)
