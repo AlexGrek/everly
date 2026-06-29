@@ -521,8 +521,19 @@ shared routine wish value lives in `behavior_utils.rs`.
   - while charging, request `recharge` (`RECHARGE_PER_S`, an **infinite station** —
     the charger's stored energy is intentionally ignored) until full, then request
     `undock` and report `Done`.
-  - if movement reports `stuck` while not already charging, clear queue state and
-    re-run charger search immediately.
+  - **Reroute to a *different* charger** while committed (`Traveling` /
+    `WaitingQueue`, never `Charging`) in two cases — both release the queue slots,
+    drop any in-flight dock approach, and restart the seek with the abandoned
+    charger excluded from candidates (`begin_seek_into`'s `exclude`), so the bot
+    picks another station:
+    - **Overcrowded queue:** the chosen charger's waiting queue holds **more than
+      `CHARGER_REROUTE_WAITING_LIMIT` (2)** *other* bots
+      (`InteractiveEntityMap::waiting_len_excluding`, self not counted). Higher than
+      the `< 2` selection preference so a bot doesn't bounce off the moment a second
+      bot arrives — only a genuinely crowded queue (3+ others) forces the move.
+    - **Stuck:** movement reports `stuck` (rising edge only, not every frame).
+    The excluded charger is kept only when it is the *sole* candidate, so a lone
+    charger never strands the bot; the next ordinary seek re-includes everything.
 
 ### Effects
 

@@ -118,6 +118,13 @@ const WAITING_RECHECK_MAX_S: f32 = 0.4;
 /// nearby — pick the N closest by Manhattan distance.
 const MAX_CHARGER_CANDIDATES: usize = 5;
 
+/// While already committed to a charger (Traveling / WaitingQueue), bail to a
+/// different station once **more than** this many *other* bots are waiting at it.
+/// Higher than the `< 2` selection preference so a bot doesn't bounce off a
+/// charger the instant a second bot arrives — only a genuinely crowded queue
+/// (3+ others) forces a reroute.
+const CHARGER_REROUTE_WAITING_LIMIT: usize = 2;
+
 /// Result of a [`HighLevelAction::update`].
 pub enum HighLevelStatus {
     Running,
@@ -1552,17 +1559,23 @@ impl GoToChargeStation {
 
     /// Starts a charger scan: gather candidates, enqueue a route to each, and
     /// park the bot. Falls back to a retry `Wait` when there are no candidates.
+    ///
+    /// `exclude`, when set, drops that charger from the candidate list so a
+    /// reroute (stuck / overcrowded queue) genuinely picks a *different* station
+    /// — unless it is the only candidate, in which case it is kept rather than
+    /// stranding the bot with no charger at all.
     fn begin_seek_into(
         &mut self,
         pf: PathfindAccess,
         ctx: &BrainContext,
         low: &mut Box<dyn LowLevelAction>,
         effects: &mut BrainEffects,
+        exclude: Option<EntityCoordinates>,
     ) {
         self.phase = ChargePhase::Seeking;
         self.seek = None;
         let here = (ctx.main_tile.x, ctx.main_tile.y);
-        let candidates = gather_charger_candidates(ctx);
+        let candidates = gather_charger_candidates(ctx, exclude);
         if candidates.is_empty() {
             self.clear_queues(effects);
             self.charger = None;
@@ -1646,6 +1659,24 @@ impl GoToChargeStation {
         }
     }
 
+    /// Abandons the current charger and restarts the scan, dropping `exclude`
+    /// from the candidate set so the bot reroutes to a *different* station.
+    /// Used by both reroute triggers (stuck, overcrowded queue).
+    fn reseek_excluding(
+        &mut self,
+        pf: PathfindAccess,
+        ctx: &BrainContext,
+        low: &mut Box<dyn LowLevelAction>,
+        exclude: Option<EntityCoordinates>,
+    ) -> BrainEffects {
+        let mut effects = BrainEffects::default();
+        self.clear_queues(&mut effects);
+        self.charger = None;
+        self.dock_route = None;
+        self.begin_seek_into(pf, ctx, low, &mut effects, exclude);
+        effects
+    }
+
     fn retarget(&mut self, coords: EntityCoordinates, effects: &mut BrainEffects) {
         if self.queued_wanting != Some(coords) {
             if let Some(old) = self.queued_wanting.replace(coords) {
@@ -1719,17 +1750,28 @@ impl HighLevelAction for GoToChargeStation {
 
         let low_stuck = low.is_stuck();
         if low_stuck && !self.prev_low_stuck && self.phase != ChargePhase::Charging {
-            // Handler for "need charge but got stuck": restart charger selection
-            // on the rising edge only — not every frame while stalled.
-            let mut effects = BrainEffects::default();
-            self.clear_queues(&mut effects);
-            self.charger = None;
-            self.dock_route = None;
-            self.begin_seek_into(pf, ctx, low, &mut effects);
+            // Handler for "need charge but got stuck": reroute to a *different*
+            // charger on the rising edge only — not every frame while stalled.
+            let effects = self.reseek_excluding(pf, ctx, low, self.charger);
             self.prev_low_stuck = low.is_stuck();
             return HighLevelOutcome::running_with(effects);
         }
         self.prev_low_stuck = low_stuck;
+
+        // Bail to a less crowded charger when the chosen one's waiting queue has
+        // grown past the limit (counting other bots only). Applies once we are
+        // committed to a station and heading for / waiting at it; the in-flight
+        // dock approach is dropped by `reseek_excluding`.
+        if matches!(self.phase, ChargePhase::Traveling | ChargePhase::WaitingQueue) {
+            if let Some(charger) = self.charger {
+                if ctx.interactive.waiting_len_excluding(charger, ctx.entity)
+                    > CHARGER_REROUTE_WAITING_LIMIT
+                {
+                    let effects = self.reseek_excluding(pf, ctx, low, Some(charger));
+                    return HighLevelOutcome::running_with(effects);
+                }
+            }
+        }
 
         match self.phase {
             ChargePhase::Seeking => {
@@ -1740,7 +1782,7 @@ impl HighLevelAction for GoToChargeStation {
                     return HighLevelOutcome::running();
                 }
                 let mut effects = BrainEffects::default();
-                self.begin_seek_into(pf, ctx, low, &mut effects);
+                self.begin_seek_into(pf, ctx, low, &mut effects, None);
                 HighLevelOutcome::running_with(effects)
             }
             ChargePhase::Traveling => {
@@ -1914,7 +1956,10 @@ pub fn sample_tile_within_radius(
 /// Coordinates of every charger in the nearest 4 hypertiles on the bot's floor.
 /// The reachability / path-cost ranking happens later from the async route
 /// results (see [`rank_charger_candidates`]).
-fn gather_charger_candidates(ctx: &BrainContext) -> Vec<EntityCoordinates> {
+fn gather_charger_candidates(
+    ctx: &BrainContext,
+    exclude: Option<EntityCoordinates>,
+) -> Vec<EntityCoordinates> {
     let here = (ctx.main_tile.x, ctx.main_tile.y);
     let nearby_chunks = nearest_hypertiles_4(here);
     let mut out = Vec::new();
@@ -1927,6 +1972,13 @@ fn gather_charger_candidates(ctx: &BrainContext) -> Vec<EntityCoordinates> {
             continue;
         }
         out.push(entry.coordinates);
+    }
+    // Drop the charger we're bailing from — but only if at least one other
+    // candidate remains, so a lone charger is never excluded into starvation.
+    if let Some(skip) = exclude {
+        if out.iter().any(|&c| c != skip) {
+            out.retain(|&c| c != skip);
+        }
     }
     // Keep only the N nearest by Manhattan distance to avoid flooding the
     // pathfind queue — one A* request is enqueued per candidate.
@@ -2509,6 +2561,108 @@ mod tests {
         let routes = pf.drain_world_routes();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0], ((0, 0), (6, 0)));
+    }
+
+    /// Drives the action through seek → resolve → commit to the nearer charger,
+    /// returning the two charger coordinates so a reroute test can assert which
+    /// station the bot bailed to.
+    fn commit_to_close_charger(
+        passability: &Hypermap<f32>,
+        interactive: &InteractiveEntityMap,
+        pf: &PathfindFixture,
+        action: &mut GoToChargeStation,
+        low: &mut Box<dyn LowLevelAction>,
+        rng: &mut StdRng,
+        close: EntityCoordinates,
+    ) {
+        action.update(&ctx(passability, interactive, 0.1, (0, 0), pf.access(), None), low, rng);
+        pf.resolve_routes_with_costs(vec![(0, 0), (2, 0)], &[((2, 0), 2), ((6, 0), 6)]);
+        let out = action.update(&ctx(passability, interactive, 0.1, (0, 0), pf.access(), None), low, rng);
+        assert_eq!(out.effects.queue_want, Some(close), "commits to the nearer charger");
+    }
+
+    fn two_charger_world() -> (Hypermap<f32>, InteractiveEntityMap, EntityCoordinates, EntityCoordinates) {
+        let passability: Hypermap<f32> = Hypermap::new(0.0);
+        for x in 0..=8 {
+            passability.set(x, 0, 1.0);
+        }
+        let mut interactive = InteractiveEntityMap::new();
+        let close = EntityCoordinates::ground(2, 0);
+        let far = EntityCoordinates::ground(6, 0);
+        interactive.insert(InteractiveEntity::Charger(ChargerEntity::new(close, ChargerFacing::North)));
+        interactive.insert(InteractiveEntity::Charger(ChargerEntity::new(far, ChargerFacing::North)));
+        (passability, interactive, close, far)
+    }
+
+    #[test]
+    fn recharge_reroutes_when_chosen_queue_overcrowded() {
+        let (passability, mut interactive, close, _far) = two_charger_world();
+        let pf = PathfindFixture::new();
+        let mut action = GoToChargeStation::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = rng::seeded(0);
+
+        commit_to_close_charger(&passability, &interactive, &pf, &mut action, &mut low, &mut rng, close);
+
+        // Three *other* bots pile into the close charger's waiting queue.
+        interactive.add_waiting(close, Entity::from_bits(100));
+        interactive.add_waiting(close, Entity::from_bits(101));
+        interactive.add_waiting(close, Entity::from_bits(102));
+
+        let out = action.update(
+            &ctx(&passability, &interactive, 0.1, (0, 0), pf.access(), None),
+            &mut low,
+            &mut rng,
+        );
+        assert_eq!(out.effects.queue_unwant, Some(close), "overcrowded charger is released");
+        assert!(is_pending(low.as_ref()), "reroute parks the bot while re-seeking");
+        let goals: Vec<(i32, i32)> = pf.drain_world_routes().into_iter().map(|(_, g)| g).collect();
+        assert_eq!(goals, vec![(6, 0)], "reroute must skip the overcrowded charger");
+    }
+
+    #[test]
+    fn recharge_keeps_charger_with_two_or_fewer_others() {
+        let (passability, mut interactive, close, _far) = two_charger_world();
+        let pf = PathfindFixture::new();
+        let mut action = GoToChargeStation::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = rng::seeded(0);
+
+        commit_to_close_charger(&passability, &interactive, &pf, &mut action, &mut low, &mut rng, close);
+
+        // Two others is at the limit, not over it — the bot stays committed.
+        interactive.add_waiting(close, Entity::from_bits(100));
+        interactive.add_waiting(close, Entity::from_bits(101));
+
+        let out = action.update(
+            &ctx(&passability, &interactive, 0.1, (0, 0), pf.access(), None),
+            &mut low,
+            &mut rng,
+        );
+        assert_eq!(out.effects.queue_unwant, None, "two waiters must not trigger a reroute");
+        assert!(pf.queue.is_empty(), "no reroute → no fresh seek requests");
+    }
+
+    #[test]
+    fn recharge_stuck_reroutes_to_different_charger() {
+        let (passability, interactive, close, _far) = two_charger_world();
+        let pf = PathfindFixture::new();
+        let mut action = GoToChargeStation::new();
+        let mut low: Box<dyn LowLevelAction> = Box::new(Idle);
+        let mut rng = rng::seeded(0);
+
+        commit_to_close_charger(&passability, &interactive, &pf, &mut action, &mut low, &mut rng, close);
+
+        // The bot wedges en route to the close charger.
+        low = Box::new(StuckLowAction);
+        let out = action.update(
+            &ctx(&passability, &interactive, 0.1, (0, 0), pf.access(), None),
+            &mut low,
+            &mut rng,
+        );
+        assert_eq!(out.effects.queue_unwant, Some(close), "stuck releases the committed charger");
+        let goals: Vec<(i32, i32)> = pf.drain_world_routes().into_iter().map(|(_, g)| g).collect();
+        assert_eq!(goals, vec![(6, 0)], "stuck reroute must pick a different charger");
     }
 
     #[test]

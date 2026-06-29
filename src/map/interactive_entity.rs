@@ -802,6 +802,15 @@ impl InteractiveEntityMap {
         self.queues.get(&coords).map_or(0, |q| q.waiting.len())
     }
 
+    /// Number of waiting actors at `coords` other than `actor` (allocation-free).
+    /// Used to decide whether a bot already committed to a charger should bail to
+    /// a less crowded one.
+    pub fn waiting_len_excluding(&self, coords: EntityCoordinates, actor: Entity) -> usize {
+        self.queues
+            .get(&coords)
+            .map_or(0, |q| q.waiting.iter().filter(|&&e| e != actor).count())
+    }
+
     /// `true` when `actor` is first in waiting queue for `coords`.
     pub fn is_waiting_front(&self, coords: EntityCoordinates, actor: Entity) -> bool {
         self.queues
