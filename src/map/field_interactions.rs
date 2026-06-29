@@ -7,6 +7,7 @@ use std::collections::HashSet;
 
 use bevy::prelude::*;
 
+use crate::actor::black_bot::Cleaner;
 use crate::actor::{actor_main_tile, process_actor_moves, ActorObject};
 use crate::map::dirt::{DirtMap, DIRT_TRACK_DEPOSIT};
 use crate::map::hypermap::Hypermap;
@@ -137,15 +138,29 @@ impl Plugin for FieldInteractionsPlugin {
 /// Exchanges dirt between each actor and the tile it left this frame. Actors on a
 /// cleaner floor wipe dirt onto it; actors on a dirtier floor pick dirt up. No
 /// floor writes happen for actors that did not change main tile.
+///
+/// A **cleaner in cleaning mode** ([`Cleaner::cleaning`]) overrides the exchange:
+/// it zeroes the dirt of the tile it currently occupies *every frame* (not just on
+/// a transition), so every cell it crawls across — including the destination it
+/// stops on — is fully scrubbed, and the bot itself stays clean.
 pub(crate) fn dirt_actor_interaction(
-    mut actors: Query<&mut ActorObject>,
+    mut actors: Query<(&mut ActorObject, Option<&Cleaner>)>,
     dirt: Res<DirtMap>,
     hypermap: Res<HypermapRuntime>,
 ) {
     let world = hypermap.map.as_ref();
-    for mut actor_obj in actors.iter_mut() {
+    for (mut actor_obj, cleaner) in actors.iter_mut() {
         let state = actor_obj.inner.state_mut();
         let center = state.center;
+        if cleaner.is_some_and(|c| c.cleaning) {
+            let tile = actor_main_tile(center);
+            state.field_main_tile = Some(tile);
+            if !matches!(world.get(tile.x, tile.y), CellType::Void) {
+                dirt.set_tile(tile.x, tile.y, 0.0);
+            }
+            state.dirtiness = 0.0;
+            continue;
+        }
         let Some(t) = main_tile_transition(&mut state.field_main_tile, center) else {
             continue;
         };

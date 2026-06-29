@@ -61,6 +61,15 @@ each main-tile transition the actor **exchanges** dirt with the tile it just **l
 Dirt is stored in a **tile-only** [`DoubleBufferedHypermap<f32>`](../src/map/tile_field.rs)
 (one value per world tile), not per subtile. The actor's dirtiness lives on the actor.
 
+### Cleaner override
+
+A **cleaner bot in cleaning mode** ([`Cleaner::cleaning`](../src/actor/black_bot.rs),
+set by [`GoClean`](actor-brain.md#high-level-actions)) bypasses the exchange entirely:
+`dirt_actor_interaction` **zeroes the dirt of the cell it currently occupies every
+frame** (not just on a transition) and keeps the bot's own `dirtiness` at `0.0`. So a
+cleaning bot fully scrubs every cell it crawls across — including the dirty cell it was
+routed to and stops on — instead of merely tracking 5% around. `Void` tiles are skipped.
+
 **Persistence:** deposits and procedural seeds stay in memory until the player uses
 map editor **Save**, which writes `levels/level_{name}/dirt.bin` (all loaded dirt chunks).
 See [`level-persistence.md`](level-persistence.md).

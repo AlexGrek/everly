@@ -447,7 +447,7 @@ fn rebuild_stats(commands: &mut Commands, host: Entity, ranked: &[BotRow]) {
     let mut broken = 0usize;
     let mut alive = 0usize;
     // [DoNothing, Patrol, Fixer]
-    let mut alive_spec = [0usize; 3];
+    let mut alive_spec = [0usize; 4];
     for (_, _, charge, breakable, spec) in ranked {
         let depleted = charge.map_or(false, |c| c.is_depleted());
         let immobilized = breakable
@@ -462,6 +462,7 @@ fn rebuild_stats(commands: &mut Commands, host: Entity, ranked: &[BotRow]) {
                 BotSpecialization::DoNothing => alive_spec[0] += 1,
                 BotSpecialization::Patrol => alive_spec[1] += 1,
                 BotSpecialization::Fixer => alive_spec[2] += 1,
+                BotSpecialization::Cleaner => alive_spec[3] += 1,
             }
         }
     }
@@ -483,8 +484,8 @@ fn rebuild_stats(commands: &mut Commands, host: Entity, ranked: &[BotRow]) {
         );
         line(
             format!(
-                "  DO_NOTHING {}   PATROL {}   FIXER {}",
-                alive_spec[0], alive_spec[1], alive_spec[2]
+                "  DO_NOTHING {}   PATROL {}   FIXER {}   CLEANER {}",
+                alive_spec[0], alive_spec[1], alive_spec[2], alive_spec[3]
             ),
             10.0,
             TEXT_MUTED,
@@ -695,6 +696,7 @@ fn spec_text_color(spec: BotSpecialization) -> Color {
         BotSpecialization::DoNothing => TEXT_MUTED,
         BotSpecialization::Patrol => Color::srgb(0.45, 0.70, 1.0),
         BotSpecialization::Fixer => Color::srgb(1.0, 0.42, 0.42),
+        BotSpecialization::Cleaner => Color::srgb(0.35, 0.85, 0.85),
     }
 }
 

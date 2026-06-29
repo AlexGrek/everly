@@ -180,6 +180,7 @@ pub fn make_high_level(kind: PriorityKind) -> Box<dyn HighLevelAction> {
         PriorityKind::RandomWalking => Box::new(GoToRandomPoints::default()),
         PriorityKind::Patrolling => Box::new(GoToPatrol::new()),
         PriorityKind::Fixing => Box::new(GoFixBots::new()),
+        PriorityKind::Cleaning => Box::new(GoClean::default()),
         PriorityKind::RechargeYourself => Box::new(GoToChargeStation::new()),
     }
 }
@@ -302,6 +303,223 @@ impl HighLevelAction for GoToRandomPoints {
         self.prev_low_stuck = low.is_stuck();
         self.prev_low_finished = low.is_finished();
         HighLevelOutcome::running()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GoClean
+// ---------------------------------------------------------------------------
+
+/// Half-width (tiles) of the square a cleaner scans for the dirtiest cell.
+const CLEAN_SCAN_RADIUS: i32 = 6;
+/// Minimum dirt (`0.0..=1.0`) a cell must carry to be worth cleaning. Below this
+/// the cleaner relocates instead of scrubbing.
+const CLEAN_THRESHOLD: f32 = 0.3;
+/// Speed multiplier while driving a cleaning leg (−50% speed).
+const CLEAN_SPEED_SCALE: f32 = 0.5;
+/// Inclusive ring (tiles) a cleaner relocates into when its surroundings are clean.
+const RELOCATE_MIN_TILES: f32 = 10.0;
+const RELOCATE_MAX_TILES: f32 = 30.0;
+
+/// Picks a random *walkable* tile in the annulus `min..=max` (Euclidean, tiles)
+/// around `center`, or `None` if none was found this tick. Used by a cleaner to
+/// relocate to a fresh area to scan.
+pub fn sample_ring_goal(
+    rng: &mut StdRng,
+    center: (i32, i32),
+    min_radius: f32,
+    max_radius: f32,
+    passability: &Hypermap<f32>,
+) -> Option<(i32, i32)> {
+    for _ in 0..MAX_TARGET_ATTEMPTS {
+        let dx: f32 = rng::range(rng, -max_radius..max_radius);
+        let dy: f32 = rng::range(rng, -max_radius..max_radius);
+        let d2 = dx * dx + dy * dy;
+        if d2 > max_radius * max_radius || d2 < min_radius * min_radius {
+            continue;
+        }
+        let target = (center.0 + dx.round() as i32, center.1 + dy.round() as i32);
+        if target == center {
+            continue;
+        }
+        if world_tile_walkable(passability, target.0, target.1) {
+            return Some(target);
+        }
+    }
+    None
+}
+
+/// Finds the dirtiest walkable tile within [`CLEAN_SCAN_RADIUS`] of `here` whose
+/// dirt exceeds [`CLEAN_THRESHOLD`]. The current tile is excluded (a cleaning leg
+/// scrubs the cell the bot already stands on). `None` when the dirt field is
+/// unavailable or nothing nearby is dirty enough.
+fn dirtiest_cell(ctx: &BrainContext, here: (i32, i32)) -> Option<(i32, i32)> {
+    let dirt = ctx.dirt?;
+    let mut best: Option<((i32, i32), f32)> = None;
+    for dy in -CLEAN_SCAN_RADIUS..=CLEAN_SCAN_RADIUS {
+        for dx in -CLEAN_SCAN_RADIUS..=CLEAN_SCAN_RADIUS {
+            let tile = (here.0 + dx, here.1 + dy);
+            if tile == here || !world_tile_walkable(ctx.passability, tile.0, tile.1) {
+                continue;
+            }
+            let value = dirt.get(tile.0, tile.1);
+            if value <= CLEAN_THRESHOLD {
+                continue;
+            }
+            if best.map_or(true, |(_, b)| value > b) {
+                best = Some((tile, value));
+            }
+        }
+    }
+    best.map(|(tile, _)| tile)
+}
+
+/// Perpetual cleaning duty: scan a [`CLEAN_SCAN_RADIUS`]-tile window for the
+/// dirtiest cell; if one exceeds [`CLEAN_THRESHOLD`], crawl to it at half speed
+/// ([`CLEAN_SPEED_SCALE`]) in **cleaning mode** (the floor it crosses is zeroed by
+/// [`dirt_actor_interaction`](crate::map::field_interactions) and it glows teal);
+/// otherwise relocate [`RELOCATE_MIN_TILES`]–[`RELOCATE_MAX_TILES`] tiles away and
+/// scan again. Routing is asynchronous, mirroring [`GoToRandomPoints`]. Never
+/// reports `Done`.
+#[derive(Default)]
+pub struct GoClean {
+    /// In-flight route request id while awaiting a path.
+    awaiting: Option<RequestId>,
+    await_elapsed: f32,
+    /// `true` when the current/awaited leg heads to a dirty cell (cleaning leg);
+    /// `false` for a relocation leg.
+    cleaning_leg: bool,
+    /// Active leg travel budget while [`FollowPath`] is driving.
+    leg: Option<LegDeadline>,
+    prev_low_stuck: bool,
+    prev_low_finished: bool,
+}
+
+impl GoClean {
+    /// Scans for the dirtiest nearby cell and routes to it (cleaning leg); if the
+    /// surroundings are clean, relocates to a fresh area; falls back to a short
+    /// retry `Wait` when nothing can be sampled this tick.
+    fn scan_and_request(
+        &mut self,
+        pf: PathfindAccess,
+        ctx: &BrainContext,
+        low: &mut Box<dyn LowLevelAction>,
+        rng: &mut StdRng,
+        reason: PathfindReason,
+    ) {
+        let here = (ctx.main_tile.x, ctx.main_tile.y);
+        let (goal, cleaning) = match dirtiest_cell(ctx, here) {
+            Some(dirty) => (Some(dirty), true),
+            None => (
+                sample_ring_goal(rng, here, RELOCATE_MIN_TILES, RELOCATE_MAX_TILES, ctx.passability),
+                false,
+            ),
+        };
+        match goal {
+            Some(goal) => {
+                let id = pf.queue.enqueue(PathKind::WorldRoute {
+                    start: here,
+                    goal,
+                    max_expanded: WANDER_SEARCH_LIMIT,
+                    simplify_buffer: PATH_CORNER_BUFFER,
+                    include_dynamic: ctx.dynamic_repath,
+                    radius: ctx.radius_subtiles,
+                }, ctx.entity, reason);
+                self.awaiting = Some(id);
+                self.await_elapsed = 0.0;
+                self.cleaning_leg = cleaning;
+                self.leg = Some(LegDeadline::new(here, goal));
+                *low = Box::new(PendingPath::with_velocity(low.velocity()));
+            }
+            None => {
+                self.awaiting = None;
+                self.leg = None;
+                self.cleaning_leg = false;
+                *low = Box::new(Wait::retry(RETRY_S));
+            }
+        }
+    }
+
+    /// `true` while the bot is actively driving a cleaning leg (so the owning
+    /// system scrubs the floor and lights the teal glow this tick).
+    fn cleaning_now(&self, low: &dyn LowLevelAction) -> bool {
+        self.cleaning_leg && is_follow_path(low) && !low.is_finished()
+    }
+
+    fn running(&self, low: &dyn LowLevelAction) -> HighLevelOutcome {
+        HighLevelOutcome::running_with(BrainEffects {
+            set_cleaning: Some(self.cleaning_now(low)),
+            ..BrainEffects::default()
+        })
+    }
+}
+
+impl HighLevelAction for GoClean {
+    fn kind(&self) -> PriorityKind {
+        PriorityKind::Cleaning
+    }
+    fn label(&self) -> String {
+        "GoClean".to_string()
+    }
+    fn preempt(&mut self, _ctx: &BrainContext) -> BrainEffects {
+        // Leaving cleaning duty (e.g. for a recharge): drop cleaning mode so the
+        // bot stops scrubbing / glowing.
+        BrainEffects { set_cleaning: Some(false), ..BrainEffects::default() }
+    }
+    fn update(
+        &mut self,
+        ctx: &BrainContext,
+        low: &mut Box<dyn LowLevelAction>,
+        rng: &mut StdRng,
+    ) -> HighLevelOutcome {
+        let Some(pf) = ctx.pathfind else {
+            return HighLevelOutcome::running();
+        };
+
+        if let Some(id) = self.awaiting {
+            self.await_elapsed += ctx.dt;
+            if let Some(outcome) = pf.results.take(id) {
+                self.awaiting = None;
+                match outcome {
+                    PathOutcome::Route { path, raw_len } if raw_len > 1 => {
+                        if let Some(leg) = &mut self.leg {
+                            leg.reset_elapsed();
+                        }
+                        let follow = FollowPath::new(path);
+                        *low = Box::new(if self.cleaning_leg {
+                            follow.with_speed_scale(CLEAN_SPEED_SCALE)
+                        } else {
+                            follow
+                        });
+                    }
+                    _ => self.scan_and_request(pf, ctx, low, rng, PathfindReason::WanderPathFailed),
+                }
+            } else if self.await_elapsed >= PATH_WAIT_RETRY_S {
+                self.scan_and_request(pf, ctx, low, rng, PathfindReason::WanderRetry);
+            }
+            self.prev_low_stuck = low.is_stuck();
+            self.prev_low_finished = low.is_finished();
+            return self.running(low.as_ref());
+        }
+
+        if let Some(leg) = &mut self.leg {
+            if is_follow_path(low.as_ref()) && !low.is_finished() && leg.tick(ctx.dt) {
+                self.leg = None;
+                low.halt();
+                self.scan_and_request(pf, ctx, low, rng, PathfindReason::WanderLegTimedOut);
+                self.prev_low_stuck = low.is_stuck();
+                self.prev_low_finished = low.is_finished();
+                return self.running(low.as_ref());
+            }
+        }
+
+        if low_level_needs_replan(low.as_ref(), self.prev_low_stuck, self.prev_low_finished) {
+            self.leg = None;
+            self.scan_and_request(pf, ctx, low, rng, PathfindReason::WanderNewGoal);
+        }
+        self.prev_low_stuck = low.is_stuck();
+        self.prev_low_finished = low.is_finished();
+        self.running(low.as_ref())
     }
 }
 
@@ -1974,6 +2192,7 @@ mod tests {
             depleted: charge <= 0.0,
             broken: false,
             passability,
+            dirt: None,
             interactive,
             avoidance: None,
             on_screen: true,
@@ -3008,6 +3227,108 @@ mod tests {
         assert!(
             !is_pending(low.as_ref()),
             "an orphaned PendingPath must be recovered, not coasted forever"
+        );
+    }
+
+    // --- GoClean (cleaner) -------------------------------------------------
+
+    /// A `BrainContext` for a cleaner: like [`ctx`] but with a dirt field wired in.
+    fn cleaning_ctx<'a>(
+        passability: &'a Hypermap<f32>,
+        dirt: &'a Hypermap<f32>,
+        interactive: &'a InteractiveEntityMap,
+        tile: (i32, i32),
+        pf: PathfindAccess<'a>,
+    ) -> BrainContext<'a> {
+        let mut c = ctx(passability, interactive, 1.0, tile, pf, None);
+        c.dirt = Some(dirt);
+        c
+    }
+
+    #[test]
+    fn cleaner_routes_to_dirtiest_cell_when_dirty() {
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let dirt: Hypermap<f32> = Hypermap::new(0.0);
+        // One clearly-dirtiest cell within scan radius, above threshold.
+        dirt.set(3, 1, 0.4);
+        dirt.set(2, 0, 0.9); // the dirtiest
+        let interactive = InteractiveEntityMap::new();
+        let pf = PathfindFixture::new();
+        let mut action = GoClean::default();
+        let mut low: Box<dyn LowLevelAction> = Box::new(StuckLowAction);
+        let mut rng = rng::seeded(7);
+
+        let out = action.update(
+            &cleaning_ctx(&passability, &dirt, &interactive, (0, 0), pf.access()),
+            &mut low,
+            &mut rng,
+        );
+        // While awaiting the route it isn't yet driving the cleaning leg.
+        assert!(matches!(out.status, HighLevelStatus::Running));
+        assert_eq!(out.effects.set_cleaning, Some(false));
+        assert!(is_pending(low.as_ref()), "cleaner parks while awaiting its route");
+        let routes = pf.drain_world_routes();
+        assert_eq!(routes.len(), 1, "exactly one route to the dirtiest cell");
+        assert_eq!(routes[0], ((0, 0), (2, 0)), "routes to the dirtiest cell");
+    }
+
+    #[test]
+    fn cleaner_drives_cleaning_leg_and_reports_cleaning() {
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let dirt: Hypermap<f32> = Hypermap::new(0.0);
+        dirt.set(2, 0, 0.9);
+        let interactive = InteractiveEntityMap::new();
+        let pf = PathfindFixture::new();
+        let mut action = GoClean::default();
+        let mut low: Box<dyn LowLevelAction> = Box::new(StuckLowAction);
+        let mut rng = rng::seeded(7);
+
+        // Tick 1: enqueue + park.
+        action.update(
+            &cleaning_ctx(&passability, &dirt, &interactive, (0, 0), pf.access()),
+            &mut low,
+            &mut rng,
+        );
+        // Resolve the route and tick again to install the cleaning FollowPath.
+        pf.resolve_all_routes(vec![(0, 0), (2, 0)], 2);
+        let out = action.update(
+            &cleaning_ctx(&passability, &dirt, &interactive, (0, 0), pf.access()),
+            &mut low,
+            &mut rng,
+        );
+        assert_eq!(low.kind(), LowLevelKind::FollowPath, "installs a follow path");
+        assert_eq!(
+            out.effects.set_cleaning,
+            Some(true),
+            "a driving cleaning leg reports cleaning mode on",
+        );
+    }
+
+    #[test]
+    fn cleaner_relocates_when_surroundings_clean() {
+        let passability: Hypermap<f32> = Hypermap::new(1.0);
+        let dirt: Hypermap<f32> = Hypermap::new(0.0); // nothing above threshold
+        let interactive = InteractiveEntityMap::new();
+        let pf = PathfindFixture::new();
+        let mut action = GoClean::default();
+        let mut low: Box<dyn LowLevelAction> = Box::new(StuckLowAction);
+        let mut rng = rng::seeded(7);
+
+        let out = action.update(
+            &cleaning_ctx(&passability, &dirt, &interactive, (0, 0), pf.access()),
+            &mut low,
+            &mut rng,
+        );
+        assert_eq!(out.effects.set_cleaning, Some(false), "relocation is not cleaning");
+        let routes = pf.drain_world_routes();
+        assert_eq!(routes.len(), 1, "relocates to a fresh area to scan");
+        let (start, goal) = routes[0];
+        assert_eq!(start, (0, 0));
+        let d2 = (goal.0 as f32).powi(2) + (goal.1 as f32).powi(2);
+        assert!(
+            d2 >= RELOCATE_MIN_TILES * RELOCATE_MIN_TILES
+                && d2 <= RELOCATE_MAX_TILES * RELOCATE_MAX_TILES,
+            "relocation goal {goal:?} must land in the 10–30 tile ring (d²={d2})",
         );
     }
 }

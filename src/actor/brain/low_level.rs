@@ -518,6 +518,10 @@ pub struct FollowPath {
     recenter_elapsed: f32,
     /// Seconds spent wall-blocked while another bot queues behind along our heading.
     wall_train_timer: f32,
+    /// Multiplier applied to [`FollowTuning::max_speed`] while following this path
+    /// (`1.0` = full speed). A cleaner's cleaning leg sets this to `0.5` so it
+    /// moves at half speed while scrubbing the floor; acceleration is unaffected.
+    speed_scale: f32,
 }
 
 /// Why an in-flight subtile detour was requested, which decides its fallback.
@@ -573,7 +577,16 @@ impl FollowPath {
             recenter_target: None,
             recenter_elapsed: 0.0,
             wall_train_timer: 0.0,
+            speed_scale: 1.0,
         }
+    }
+
+    /// Sets the speed multiplier applied to [`FollowTuning::max_speed`] while
+    /// following this path. Used by a cleaner to crawl at half speed
+    /// (`with_speed_scale(0.5)`) during a cleaning leg.
+    pub fn with_speed_scale(mut self, scale: f32) -> Self {
+        self.speed_scale = scale;
+        self
     }
 
     /// `true` while the cursor points at a spliced `Sub` node (threading a detour).
@@ -1128,6 +1141,11 @@ impl FollowPath {
 
 impl LowLevelAction for FollowPath {
     fn execute(&mut self, state: &mut ActorState, ctx: &BrainContext, rng: &mut StdRng, t: &FollowTuning) {
+        // Apply this path's speed multiplier (cleaning legs crawl at half speed).
+        // Only `max_speed` is scaled; acceleration/braking are unchanged. Every
+        // helper below takes `t`, so shadowing it here is the single touch point.
+        let scaled = FollowTuning { max_speed: t.max_speed * self.speed_scale, ..*t };
+        let t = &scaled;
         let dt = ctx.dt;
         let center = state.center;
         self.track_tiles(ctx.main_tile);
@@ -1983,6 +2001,37 @@ mod tests {
     }
 
     #[test]
+    fn speed_scale_halves_cruise_speed() {
+        use crate::actor::brain::test_support::{ctx_with_charge, test_state};
+        let tuning = FollowTuning::default();
+        // Peak velocity reached cruising along a long straight open path.
+        let peak = |scale: f32| {
+            let mut fp = FollowPath::new(vec![(0, 0), (40, 0)]).with_speed_scale(scale);
+            let ctx = ctx_with_charge(1.0);
+            let mut rng = rng::seeded(0);
+            let mut state = test_state();
+            let mut peak = 0.0f32;
+            for _ in 0..400 {
+                fp.execute(&mut state, &ctx, &mut rng, &tuning);
+                state.center += state.move_buffer.tile_delta;
+                peak = peak.max(fp.velocity().length());
+            }
+            peak
+        };
+
+        let full = peak(1.0);
+        let half = peak(0.5);
+        assert!(
+            (full - tuning.max_speed).abs() < 0.05,
+            "full-speed cruise should reach max_speed (got {full})",
+        );
+        assert!(
+            (half - 0.5 * tuning.max_speed).abs() < 0.05,
+            "half-speed cruise should reach 0.5·max_speed (got {half})",
+        );
+    }
+
+    #[test]
     fn follow_path_bounces_velocity_on_bot_collision() {
         let mut fp = FollowPath::new(vec![(8, 5)]);
         fp.velocity = Vec2::new(1.0, 0.0);
@@ -2020,6 +2069,7 @@ mod tests {
             depleted: false,
             broken: false,
             passability: &passability,
+            dirt: None,
             interactive: &interactive,
             on_screen: true,
             trace: None,
@@ -2111,6 +2161,7 @@ mod tests {
             depleted: false,
             broken: false,
             passability,
+            dirt: None,
             interactive,
             on_screen: true,
             trace: None,
@@ -2313,6 +2364,7 @@ mod tests {
             depleted: false,
             broken: false,
             passability: &passability,
+            dirt: None,
             interactive: &interactive,
             on_screen: true,
             trace: None,
@@ -2397,6 +2449,7 @@ mod tests {
             depleted: false,
             broken: false,
             passability: &passability,
+            dirt: None,
             interactive: &interactive,
             on_screen: true,
             trace: None,
@@ -2473,6 +2526,7 @@ mod tests {
             depleted: false,
             broken: false,
             passability: &passability,
+            dirt: None,
             interactive: &interactive,
             on_screen: true,
             trace: None,
@@ -2551,6 +2605,7 @@ mod tests {
             depleted: false,
             broken: false,
             passability,
+            dirt: None,
             interactive,
             avoidance: None,
             on_screen: true,
@@ -2798,6 +2853,7 @@ mod tests {
             depleted: false,
             broken: false,
             passability: &passability,
+            dirt: None,
             interactive: &interactive,
             on_screen: true,
             trace: None,
@@ -2857,6 +2913,7 @@ mod tests {
                 depleted: false,
                 broken: false,
                 passability: &passability,
+                dirt: None,
                 interactive: &interactive,
                 on_screen: true,
                 trace: None,
@@ -2915,6 +2972,7 @@ mod tests {
                 depleted: false,
                 broken: false,
                 passability: &passability,
+                dirt: None,
                 interactive: &interactive,
                 on_screen: true,
                 trace: None,
@@ -2985,6 +3043,7 @@ mod tests {
             depleted: false,
             broken: false,
             passability: &passability,
+            dirt: None,
             interactive: &interactive,
             on_screen: true,
             trace: None,
@@ -3062,6 +3121,7 @@ mod tests {
                 depleted: false,
                 broken: false,
                 passability: &passability,
+                dirt: None,
                 interactive: &interactive,
                 on_screen: true,
                 trace: None,
@@ -3196,6 +3256,7 @@ mod tests {
             depleted: false,
             broken: false,
             passability: &passability,
+            dirt: None,
             interactive: &interactive,
             on_screen: true,
             trace: None,
@@ -3280,6 +3341,7 @@ mod tests {
             depleted: false,
             broken: false,
             passability: &passability,
+            dirt: None,
             interactive: &interactive,
             on_screen: true,
             trace: None,
@@ -3372,6 +3434,7 @@ mod tests {
             depleted: false,
             broken: false,
             passability: &passability,
+            dirt: None,
             interactive: &interactive,
             on_screen: true,
             trace: None,

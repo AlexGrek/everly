@@ -36,9 +36,9 @@ use crate::map::interactive_entity::{EntityCoordinates, InteractiveEntityMap};
 use crate::map::passability::{DynamicPassabilityMap, SubtilePassability};
 use crate::map::pathfind_service::{PathfindQueue, PathfindResults};
 
-pub use behavior::{Behavior, ChargeSelfKeeper, FixerDuty, Patroller, RandomWalker};
+pub use behavior::{Behavior, ChargeSelfKeeper, CleanerDuty, FixerDuty, Patroller, RandomWalker};
 pub use high_level::{
-    assemble_patrol_loop, enqueue_patrol_candidates, make_high_level, GoFixBots,
+    assemble_patrol_loop, enqueue_patrol_candidates, make_high_level, GoClean, GoFixBots,
     GoToChargeStation, GoToPatrol, GoToRandomPoints, HighLevelAction, HighLevelStatus,
     RECHARGE_PER_S,
 };
@@ -109,6 +109,10 @@ pub struct BrainContext<'a> {
     pub depleted: bool,
     pub broken: bool,
     pub passability: &'a Hypermap<f32>,
+    /// Tile-resolution dirt field (read map). `Some` only for cleaner bots, which
+    /// scan it for the dirtiest nearby cell ([`GoClean`](high_level::GoClean));
+    /// `None` for every other bot and most tests.
+    pub dirt: Option<&'a Hypermap<f32>>,
     pub interactive: &'a InteractiveEntityMap,
     /// Occupancy views for the bot-on-bot subtile detour; `None` disables it.
     pub avoidance: Option<AvoidanceViews<'a>>,
@@ -218,6 +222,11 @@ pub struct BrainEffects {
     /// abandoned bot stops emitting it, so the queue watchdog can evict its stale
     /// membership. The coordinates are informational — refresh is keyed by entity.
     pub queue_keepalive: Option<EntityCoordinates>,
+    /// Set this cleaner's [`Cleaner::cleaning`](crate::actor::black_bot::Cleaner)
+    /// flag this tick: `Some(true)` while driving a cleaning leg (so the floor is
+    /// scrubbed and the bot glows teal), `Some(false)` while scanning / relocating.
+    /// `None` leaves it unchanged. Set by [`GoClean`](high_level::GoClean).
+    pub set_cleaning: Option<bool>,
 }
 
 fn merge_brain_effects(into: &mut BrainEffects, add: BrainEffects) {
@@ -269,6 +278,9 @@ fn merge_brain_effects(into: &mut BrainEffects, add: BrainEffects) {
     }
     if let Some(v) = add.queue_keepalive {
         into.queue_keepalive = Some(v);
+    }
+    if let Some(v) = add.set_cleaning {
+        into.set_cleaning = Some(v);
     }
 }
 
@@ -555,6 +567,7 @@ pub(crate) mod test_support {
             depleted: charge <= 0.0,
             broken: false,
             passability: empty_passability(),
+            dirt: None,
             interactive: empty_interactive(),
             on_screen: true,
             trace: None,

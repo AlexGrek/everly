@@ -37,6 +37,9 @@ pub enum PriorityKind {
     /// Routine fixer duty: loiter near the home depot, claim repair requests, and
     /// deliver parts to stranded bots. Mapped to [`super::GoFixBots`].
     Fixing,
+    /// Routine cleaning duty: scan for the dirtiest nearby cell and scrub a path to
+    /// it, relocating when the surroundings are clean. Mapped to [`super::GoClean`].
+    Cleaning,
     /// Top up the battery. Mapped to [`super::GoToChargeStation`].
     RechargeYourself,
 }

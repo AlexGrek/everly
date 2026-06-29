@@ -44,11 +44,13 @@ level  = level.max(0.0)               // clamp at 0.0; never goes negative
 ```
 
 `mult` is the bot's **genetic battery-drain multiplier**,
-`1 / battery_quality`, read from its [`Genome`](../src/actor/genetics.rs)
+`BEST_BATTERY_DRAIN_MULT / battery_quality`, read from its
+[`Genome`](../src/actor/genetics.rs)
 ([`GeneticTraits::discharge_multiplier`]); a bot with no genome drains at the
 baseline (`mult = 1`). Battery quality is half-normal and capped at 100% (the most
-common variant), so most bots drain near the baseline and a tail of lower-quality
-batteries drains faster. See [actor.md § Genetics](actor.md#genetics).
+common variant), so a top-quality battery drains at `mult = 0.5` (~1000 s
+full→empty, the longest-lasting) and a tail of lower-quality batteries scale up
+toward and past the baseline. See [actor.md § Genetics](actor.md#genetics).
 
 The drain is gated on `not(is_paused)` so a paused simulation freezes the
 battery along with everything else — consistent with the rest of the actor

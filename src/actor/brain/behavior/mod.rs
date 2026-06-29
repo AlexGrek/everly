@@ -20,11 +20,13 @@
 
 pub mod behavior_utils;
 pub mod charge_self_keeper;
+pub mod cleaner;
 pub mod fixer;
 pub mod patroller;
 pub mod random_walker;
 
 pub use charge_self_keeper::ChargeSelfKeeper;
+pub use cleaner::CleanerDuty;
 pub use fixer::FixerDuty;
 pub use patroller::Patroller;
 pub use random_walker::RandomWalker;

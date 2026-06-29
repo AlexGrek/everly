@@ -29,8 +29,8 @@ use crate::actor::actor_name::random_actor_name;
 use crate::actor::actor_pick::{ActorForceLogs, ActorInspectable, ActorPickMesh};
 use crate::actor::brain::{
     assemble_patrol_loop, enqueue_patrol_candidates, make_high_level, AvoidanceViews, Behavior,
-    Brain, BrainContext, BrainEffects, BrainLogEvent, ChargeSelfKeeper, FixerContext, FixerDuty,
-    IntegerMemoryId, PathfindAccess, Patroller, RandomWalker,
+    Brain, BrainContext, BrainEffects, BrainLogEvent, ChargeSelfKeeper, CleanerDuty, FixerContext,
+    FixerDuty, IntegerMemoryId, PathfindAccess, Patroller, RandomWalker,
 };
 use crate::actor::charge::Charge;
 use crate::actor::genetics::Genome;
@@ -47,6 +47,7 @@ use crate::actor::{
 use std::collections::HashMap;
 use crate::map::cell_occupancy::CellOccupancy;
 use crate::map::chunk_overlay::{ChunkOverlayState, OVERLAY_RES};
+use crate::map::dirt::DirtMap;
 use crate::map::hypermap::{world_to_chunk_local, ChunkCoord, Hypermap};
 use crate::map::hypermap_world::{HypermapChunkRemeshQueue, HypermapRuntime};
 use crate::map::interactive_entity::{
@@ -140,6 +141,10 @@ const RING_DO_NOTHING: Color = Color::srgb(0.02, 0.02, 0.02);
 const RING_PATROL: Color = Color::srgb(0.10, 0.45, 1.0);
 /// `FIXER` ring color (red).
 const RING_FIXER: Color = Color::srgb(1.0, 0.12, 0.12);
+/// `CLEANER` ring color (teal).
+const RING_CLEANER: Color = Color::srgb(0.0, 0.8, 0.8);
+/// Tint a cleaner's sphere glows while in cleaning mode (teal).
+const CLEANING_TEAL: Color = Color::srgb(0.0, 0.85, 0.85);
 
 /// State of one breakable sub-component of a [`Breakable`] bot.
 #[derive(Debug, Clone)]
@@ -306,15 +311,23 @@ pub enum BotSpecialization {
     /// [`DispatchQueue`](crate::actor::dispatch::DispatchQueue) requests, fetch the
     /// part, and deliver it. Red ring. Rarer than [`Patrol`](Self::Patrol).
     Fixer,
+    /// Scrub dirt: scan for the dirtiest nearby cell and crawl to it at half speed
+    /// in cleaning mode, zeroing every cell it crosses ([`CleanerDuty`] +
+    /// [`GoClean`](crate::actor::brain::GoClean)); relocate when the surroundings
+    /// are clean. Teal ring; glows teal while cleaning.
+    Cleaner,
 }
 
 impl BotSpecialization {
     /// Rolls a specialization at spawn: [`Fixer`](Self::Fixer) with probability
-    /// `1/8` (the rarest), else [`Patrol`](Self::Patrol) at `1/4` of the rest,
-    /// otherwise [`DoNothing`](Self::DoNothing).
+    /// `1/6` (the rarest), else [`Cleaner`](Self::Cleaner) at `1/4` of the rest,
+    /// else [`Patrol`](Self::Patrol) at `1/4` of the rest, otherwise
+    /// [`DoNothing`](Self::DoNothing).
     pub fn roll(rng: &mut StdRng) -> Self {
         if rng::one_in(rng, 6) {
             Self::Fixer
+        } else if rng::one_in(rng, 4) {
+            Self::Cleaner
         } else if rng::one_in(rng, 4) {
             Self::Patrol
         } else {
@@ -328,6 +341,7 @@ impl BotSpecialization {
             Self::DoNothing => RING_DO_NOTHING,
             Self::Patrol => RING_PATROL,
             Self::Fixer => RING_FIXER,
+            Self::Cleaner => RING_CLEANER,
         }
     }
 
@@ -337,6 +351,7 @@ impl BotSpecialization {
             Self::DoNothing => "DO_NOTHING",
             Self::Patrol => "PATROL",
             Self::Fixer => "FIXER",
+            Self::Cleaner => "CLEANER",
         }
     }
 
@@ -348,6 +363,7 @@ impl BotSpecialization {
             Self::DoNothing => Box::new(RandomWalker),
             Self::Patrol => Box::new(Patroller),
             Self::Fixer => Box::new(FixerDuty),
+            Self::Cleaner => Box::new(CleanerDuty),
         };
         Brain::new(vec![routine, Box::new(ChargeSelfKeeper::new())], make_high_level, seed)
     }
@@ -410,6 +426,17 @@ pub struct Fixer {
     /// Seconds until the next home-depot search while `home_depot` is `None`
     /// (depots may stream in after spawn). `0.0` searches immediately.
     retry_cooldown: f32,
+}
+
+/// Per-bot state for a [`BotSpecialization::Cleaner`]: whether the bot is
+/// currently in **cleaning mode** this tick. Set each tick from
+/// [`GoClean`](crate::actor::brain::GoClean)'s `set_cleaning` effect. While
+/// `true`, [`dirt_actor_interaction`](crate::map::field_interactions) zeroes the
+/// floor the bot crosses and the status visual glows the sphere teal. Only
+/// present on `CLEANER` bots; not serialized (re-derived from the plan on load).
+#[derive(Component, Default)]
+pub struct Cleaner {
+    pub cleaning: bool,
 }
 
 /// Max BFS steps when a fixer searches for its closest reachable home depot.
@@ -604,6 +631,7 @@ pub(crate) fn black_bot_brain(
     remesh: Res<HypermapChunkRemeshQueue>,
     pathfind_queue: Res<PathfindQueue>,
     pathfind_results: Res<PathfindResults>,
+    dirt: Res<DirtMap>,
     mut interactive: ResMut<InteractiveEntityMap>,
     dispatch: Res<DispatchQueue>,
     game_log: Res<GameLog>,
@@ -620,6 +648,7 @@ pub(crate) fn black_bot_brain(
         Option<&mut Breakable>,
         Option<&mut Patrol>,
         Option<&mut Fixer>,
+        Option<&mut Cleaner>,
         Option<&mut BotInventory>,
         Option<&OffScreenActor>,
     )>,
@@ -642,7 +671,7 @@ pub(crate) fn black_bot_brain(
     let mut repairs: Vec<(Entity, RepairPart)> = Vec::new();
     let mut recharges: Vec<(Entity, f32)> = Vec::new();
 
-    for (entity, name, mut obj, mut brain, mut vis, force_logs, mut charge, mut breakable, mut patrol, mut fixer, mut inventory, off_screen) in
+    for (entity, name, mut obj, mut brain, mut vis, force_logs, mut charge, mut breakable, mut patrol, mut fixer, mut cleaner, mut inventory, off_screen) in
         &mut query
     {
         let force = force_logs.0;
@@ -832,6 +861,7 @@ pub(crate) fn black_bot_brain(
                 depleted,
                 broken,
                 passability,
+                dirt: cleaner.is_some().then(|| dirt.read_map()),
                 interactive: &interactive,
                 avoidance: Some(AvoidanceViews {
                     dynamic: &dynamic,
@@ -870,6 +900,12 @@ pub(crate) fn black_bot_brain(
             if effects.clear_inventory {
                 inv.carried = None;
             }
+        }
+        // Cleaner mode: GoClean reports whether it is driving a cleaning leg this
+        // tick; the flag drives floor-scrubbing (field interactions) and the teal
+        // glow (status visual).
+        if let (Some(c), Some(cleaning)) = (cleaner.as_deref_mut(), effects.set_cleaning) {
+            c.cleaning = cleaning;
         }
         // Memory writes requested by the high-level action this tick (e.g. a fixer
         // clearing HELP_FAILURES_COUNT on a fresh claim / successful delivery).
@@ -970,7 +1006,7 @@ pub(crate) fn black_bot_brain(
     // can't mutate another bot's `Breakable` while that bot's row is borrowed in
     // the main loop). Resets the delivered part's wear and clears its broken flag.
     for (target, part) in repairs.drain(..) {
-        let Ok((_, name, obj, _, _, force_logs, _, mut breakable, _, _, _, _)) = query.get_mut(target)
+        let Ok((_, name, obj, _, _, force_logs, _, mut breakable, _, _, _, _, _)) = query.get_mut(target)
         else {
             continue;
         };
@@ -1001,7 +1037,7 @@ pub(crate) fn black_bot_brain(
     // (same cross-bot borrow constraint as repairs above). Lifts a discharged bot
     // straight to the delivered level, waking it from the depleted gate next tick.
     for (target, level) in recharges.drain(..) {
-        let Ok((_, name, obj, _, _, force_logs, mut charge, _, _, _, _, _)) = query.get_mut(target)
+        let Ok((_, name, obj, _, _, force_logs, mut charge, _, _, _, _, _, _)) = query.get_mut(target)
         else {
             continue;
         };
@@ -1448,12 +1484,19 @@ fn lerp_srgb(a: Color, b: Color, t: f32) -> Color {
 /// actually changes, so a settled (non-flashing) bot costs no asset writes.
 fn sync_black_bot_status_visual(
     time: Res<Time>,
-    mut bots: Query<(&ActorObject, &Breakable, &Brain, &mut BlackBotVisual, &Children)>,
+    mut bots: Query<(
+        &ActorObject,
+        &Breakable,
+        &Brain,
+        &mut BlackBotVisual,
+        &Children,
+        Option<&Cleaner>,
+    )>,
     pick_meshes: Query<&MeshMaterial3d<StandardMaterial>, With<ActorPickMesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let dt = time.delta_secs();
-    for (obj, b, brain, mut vis, children) in &mut bots {
+    for (obj, b, brain, mut vis, children, cleaner) in &mut bots {
         // A blocked movement step this frame relights the flash; otherwise it
         // keeps fading. Wall grazes always count, but a bot-on-bot bump only
         // counts when it is **head-on** — a rear bump is ignored (mirrors the
@@ -1467,13 +1510,18 @@ fn sync_black_bot_status_visual(
             vis.stuck_flash = 1.0;
         }
 
+        let cleaning = cleaner.is_some_and(|c| c.cleaning);
         let cp_broken = b.control_plane.broken;
         let target_color = if cp_broken {
             BROKEN_WHITE
         } else if vis.stuck_flash > 0.0 {
             lerp_srgb(BLACK_TINT, STUCK_YELLOW, vis.stuck_flash)
-        } else {
+        } else if vis.collision_flash > 0.0 {
             lerp_srgb(BLACK_TINT, ALERT_RED, vis.collision_flash)
+        } else if cleaning {
+            CLEANING_TEAL
+        } else {
+            BLACK_TINT
         };
 
         if vis.applied_color != Some(target_color) {
@@ -1688,6 +1736,9 @@ fn attach_specialization(commands: &mut Commands, parent: Entity, spec: BotSpeci
         }
         BotSpecialization::Fixer => {
             commands.entity(parent).insert(Fixer::default());
+        }
+        BotSpecialization::Cleaner => {
+            commands.entity(parent).insert(Cleaner::default());
         }
         BotSpecialization::DoNothing => {}
     }

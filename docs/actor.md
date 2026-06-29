@@ -187,9 +187,11 @@ half-normal**: a `N(1.0, spread)` draw clamped to `[min, 1.0]`. The whole upper
 half (samples ≥ 1.0) collapses onto exactly `1.0`, so a perfect battery is the
 single most popular variant — quality *cannot exceed* 100% but can fall below it.
 It feeds [`GeneticTraits::discharge_multiplier`](../src/actor/genetics.rs) =
-`1 / battery_quality`, which [`discharge_actors`](../src/actor/charge.rs)
-multiplies the baseline drain by: a perfect battery drains at the base rate, a
-worse one proportionally faster. See [`charge.md`](charge.md).
+`BEST_BATTERY_DRAIN_MULT / battery_quality`, which
+[`discharge_actors`](../src/actor/charge.rs) multiplies the baseline drain by: a
+perfect battery drains at `BEST_BATTERY_DRAIN_MULT` (`0.5` — *below* baseline, so
+the best batteries last ~twice as long), and a worse one scales up from there,
+draining proportionally faster. See [`charge.md`](charge.md).
 
 **Wiring.** `build_brain_with_genome` (in `black_bot.rs`) rolls the genome from
 the bot's brain seed and overwrites the default

@@ -155,6 +155,13 @@ const BATTERY_QUALITY_SPREAD: f32 = 0.2;
 const BATTERY_QUALITY_MIN: f32 = 0.4;
 const BATTERY_QUALITY_PEAK: f32 = 1.0;
 
+/// Discharge multiplier of a **perfect** (quality `1.0`) battery, relative to
+/// the baseline rate. Below `1.0`, so a top-quality battery drains *slower* than
+/// baseline (here, half as fast → roughly double the runtime); lower-quality
+/// batteries scale up from this toward and past the baseline. See
+/// [`GeneticTraits::discharge_multiplier`].
+const BEST_BATTERY_DRAIN_MULT: f32 = 0.5;
+
 /// Movement-speed distribution (tiles/s). Mean tracks the historical
 /// [`FollowTuning`](crate::actor::brain::FollowTuning) default; the clamp keeps
 /// the normal tails from producing a stationary or absurdly fast bot.
@@ -218,12 +225,14 @@ impl GeneticTraits {
         }
     }
 
-    /// How much faster than baseline this bot's battery drains: `1 /
-    /// battery_quality`. A perfect battery (`quality == 1.0`) drains at the base
-    /// rate; a worse one (`quality < 1.0`) drains proportionally faster.
+    /// Battery drain rate relative to baseline:
+    /// `BEST_BATTERY_DRAIN_MULT / battery_quality`. A perfect battery
+    /// (`quality == 1.0`) drains at [`BEST_BATTERY_DRAIN_MULT`] — *below* baseline,
+    /// so the best batteries last longest; a worse one (`quality < 1.0`) scales up
+    /// from there, draining proportionally faster.
     #[inline]
     pub fn discharge_multiplier(&self) -> f32 {
-        1.0 / self.battery_quality
+        BEST_BATTERY_DRAIN_MULT / self.battery_quality
     }
 }
 
@@ -377,8 +386,11 @@ mod tests {
             acceleration: 1.0,
             battery_quality: 0.5,
         };
-        assert!((perfect.discharge_multiplier() - 1.0).abs() < 1e-6);
-        assert!((poor.discharge_multiplier() - 2.0).abs() < 1e-6);
+        // Perfect battery drains at the sub-baseline best rate; quality 0.5
+        // doubles that. Either way a worse battery drains faster.
+        assert!((perfect.discharge_multiplier() - BEST_BATTERY_DRAIN_MULT).abs() < 1e-6);
+        assert!((poor.discharge_multiplier() - 2.0 * BEST_BATTERY_DRAIN_MULT).abs() < 1e-6);
+        assert!(perfect.discharge_multiplier() < 1.0, "top quality must drain below baseline");
         assert!(poor.discharge_multiplier() > perfect.discharge_multiplier());
     }
 

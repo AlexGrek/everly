@@ -128,14 +128,16 @@ Behaviors  ──raise──▶  Priorities (sorted wishes)
 `sync_black_bot_status_visual` (in `black_bot.rs`, runs after `process_actor_moves`)
 recolors the sphere by priority: **white** when the control plane breaks, a
 **yellow stuck flash** when `Brain::is_stuck` (relit to full yellow, then
-fading back over `STUCK_FLASH_FADE_SECS`), otherwise a **collision flash** — a
+fading back over `STUCK_FLASH_FADE_SECS`), then a **collision flash** — a
 blocked movement step relights `BlackBotVisual::collision_flash` to `1.0`, which
 then fades linearly back to black over `COLLISION_FLASH_FADE_SECS` (a quick red
 blink). A wall graze (`BlockedByStatic`) always counts, but a bot-on-bot bump
 (`BlockedByOccupancy`) only flashes when it is **head-on** — a rear bump is
 ignored, exactly mirroring the movement response below (both call
-[`is_front_collision`](../src/actor/mod.rs)). The material is only rewritten when
-the displayed color changes, so a settled bot costs no per-frame asset writes.
+[`is_front_collision`](../src/actor/mod.rs)). With none of those active, a
+**cleaner in cleaning mode** glows steady **teal** (its `Cleaner::cleaning` flag),
+otherwise the bot is black. The material is only rewritten when the displayed
+color changes, so a settled bot costs no per-frame asset writes.
 
 ### Collision pressure reset
 
@@ -379,15 +381,17 @@ a search does not block the tick on A\*.
 
 Every BlackBot has a **specialization** (`BotSpecialization` in
 [`black_bot.rs`](../src/actor/black_bot.rs)) — rolled randomly at spawn
-(`BotSpecialization::roll`: `FIXER` with probability **1/8** (rarest), else
-`PATROL` at **1/4** of the rest, else `DO_NOTHING`). A specialization is just a
-*named behavior set* plus a **ring color** rendered around the sphere:
+(`BotSpecialization::roll`: `FIXER` with probability **1/6** (rarest), else
+`CLEANER` at **1/4** of the rest, else `PATROL` at **1/4** of the rest, else
+`DO_NOTHING`). A specialization is just a *named behavior set* plus a **ring
+color** rendered around the sphere:
 
 | Specialization | Behaviors | Routine | Ring |
 |----------------|-----------|---------|------|
 | `DO_NOTHING` | `[RandomWalker, ChargeSelfKeeper]` | wander to random cells | black |
 | `PATROL` | `[Patroller, ChargeSelfKeeper]` | stick to a fixed loop of cells | blue |
 | `FIXER` | `[FixerDuty, ChargeSelfKeeper]` | loiter near home depot, repair stranded bots | red |
+| `CLEANER` | `[CleanerDuty, ChargeSelfKeeper]` | scrub the dirtiest nearby cells, relocate when clean | teal |
 
 `BotSpecialization::build_brain` constructs the matching [`Brain`]; all share
 `ChargeSelfKeeper`, so any specialization still leaves its routine to recharge.
@@ -432,6 +436,8 @@ shared routine wish value lives in `behavior_utils.rs`.
   value **15**, so a recharge need still pre-empts it.
 - **`FixerDuty`** (`FIXER`) — always wishes `Fixing` at the same routine value
   **15**; the loiter/claim/fetch/deliver machine lives in `GoFixBots`.
+- **`CleanerDuty`** (`CLEANER`) — always wishes `Cleaning` at the same routine
+  value **15**; the scan/clean/relocate machine lives in `GoClean`.
 - **`ChargeSelfKeeper`** (all specializations) — latches once charge ≤ **25%**, releasing only at full.
   While latched it wishes `RechargeYourself` at `missing-charge%` (≥75 at the
   trigger, rising as charge falls), floored at **50** so a near-full top-up still
@@ -480,6 +486,24 @@ shared routine wish value lives in `behavior_utils.rs`.
   The home depot lives on the bot's `Fixer` component (closest *reachable* depot,
   located lazily at spawn via `find_accessible_within`); the claim lives on the
   shared board. `preempt` (recharge) releases the claim and drops the carried part.
+- **`GoClean`** (serves `Cleaning`) — perpetual cleaner routine, async-routed like
+  `GoToRandomPoints`. Each scan reads `BrainContext::dirt` (the dirt read map,
+  `Some` only for cleaners) over a `CLEAN_SCAN_RADIUS` (**6**)-tile window and
+  picks the **dirtiest walkable cell** whose dirt exceeds `CLEAN_THRESHOLD`
+  (**0.3**), excluding the current tile.
+  - **Found** → enqueue a `WorldRoute`, park in `PendingPath`, and install a
+    `FollowPath` with **`speed_scale` 0.5** (−50% speed) when the route lands — a
+    **cleaning leg**. While driving it the action reports
+    `BrainEffects::set_cleaning = Some(true)`, which `black_bot_brain` writes to
+    the bot's `Cleaner` component: `dirt_actor_interaction` then **zeroes the dirt
+    of every cell the bot occupies** (including the destination) and the status
+    visual glows the sphere **teal**.
+  - **None** (surroundings clean) → sample a reachable tile **10–30** tiles away
+    (`sample_ring_goal`), route there at full speed (`set_cleaning = Some(false)`),
+    and scan again on arrival.
+  - On `FollowPath` finish / stuck / leg-timeout it returns to scanning (reuses the
+    `low_level_needs_replan` + `LegDeadline` patterns). `preempt` (e.g. recharge)
+    clears cleaning mode. Perpetual.
 - **`GoToChargeStation`** (serves `RechargeYourself`) — `Seeking` → `Traveling` →
   `WaitingQueue` → `Charging`:
   - gather chargers in the bot's 4 nearest hypertiles (current chunk + nearest X/Y
